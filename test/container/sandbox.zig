@@ -1,7 +1,5 @@
-//! Chock's own sandbox, over a root filesystem that came out of a container
-//! image. No container runtime runs at any point, and a test skips when no
-//! runtime is installed. `Sandbox.spawn` calls `fork`, whose caller must be
-//! single threaded, so each test starts `rootfs_probe.zig` and reads its status.
+//! Chock's own sandbox, over a root filesystem that came out of a container image.
+//! `Sandbox.spawn` calls `fork`, so each test starts `rootfs_probe.zig` and reads its status.
 
 const std = @import("std");
 const chock_container = @import("chock-container");
@@ -15,7 +13,6 @@ const probe_path = @import("rootfs_probe_path").rootfs_probe_path;
 
 const test_image = "alpine:3.20";
 
-/// Kept in step with `rootfs_probe.zig`'s own status by name.
 const spawn_refused = 253;
 
 const Arranged = struct {
@@ -79,8 +76,7 @@ fn arrangeOrSkip(allocator: std.mem.Allocator) !Arranged {
         owned.deinit(std.testing.io);
     }
 
-    // Built before the struct literal, never inside it. `arena` is copied by
-    // value below, so a block allocated inside the literal is never freed.
+    // Built before the struct literal: `arena` is copied by value below, so a block allocated inside it is never freed.
     const mounts_text = try mountsBlob(arena.allocator(), image);
     const env_text = try envBlob(arena.allocator(), image);
 
@@ -198,8 +194,7 @@ test "an absolute link inside the image resolves once the image is the root" {
 }
 
 test "the network namespace still applies over an image" {
-    // The namespace is compared, never a connection. `wget` also fails with no
-    // name to resolve, which would pass over the host's own namespace.
+    // The namespace is compared, never a connection, since a failed lookup would also pass over the host's namespace.
     const allocator = std.testing.allocator;
     var arranged = try arrangeOrSkip(allocator);
     defer arranged.deinit();
@@ -252,8 +247,7 @@ test "the pid namespace still applies over an image" {
         try runInside(&arranged, allocator, &.{ "/bin/busybox", "sh", "-c", script }),
     );
 
-    // A `/proc` that is not mounted makes `grep -c` answer 0, so the upper
-    // bound alone would report isolation over nothing.
+    // A `/proc` that is not mounted makes `grep -c` answer 0, so the upper bound alone proves nothing.
     try std.testing.expectEqual(
         @as(u8, 0),
         try runInside(&arranged, allocator, &.{

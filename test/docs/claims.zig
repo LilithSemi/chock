@@ -1,12 +1,5 @@
-//! Every test here reads a claim out of a file a person reads and compares it
-//!
-//! Every check here reads the documentation off the disk at run time.
-//! with the code. The truth always comes from the code or from the disk, never
-//! from a second list in this file.
-//!
-//! Each test collects what it found into one string and compares that against
-//! the empty string, so one run reports every wrong sentence and nothing goes
-//! to standard error, which `zig build test` refuses.
+//! Reads documentation claims off disk and checks each one against the code,
+//! so the truth is never duplicated into a second list here.
 
 const std = @import("std");
 const chock_main = @import("chock_main");
@@ -14,8 +7,7 @@ const chock_core = @import("chock-core");
 const chock_policy = @import("chock-policy");
 const chock_sandbox = @import("chock-sandbox");
 
-/// From `build.zig`. Not the working directory: a test binary cannot say what
-/// directory `zig build` was started from.
+/// From `build.zig`, not the working directory a test binary cannot know.
 const repo_root = @import("repo_root").repo_root;
 
 const testing = std.testing;
@@ -24,14 +16,10 @@ const max_doc_bytes = 512 * 1024;
 
 const max_source_bytes = 4 * 1024 * 1024;
 
-/// Words the documentation shows after `chock` on purpose that name no command:
-/// the pages teach the first word with a line that is refused. Both ends are
-/// checked, so an entry cannot rot.
+/// Words the documentation shows after `chock` on purpose that name no command.
 const refused_examples = [_][]const u8{ "fix", "rnu" };
 
-/// Options the documentation names that belong to another program. `--jitless`
-/// is Node's, and `--offline` is Nix's, where it turns a substituter off without
-/// stopping a fixed output build from fetching. Both ends are checked.
+/// Options the documentation names that belong to another program.
 const foreign_options = [_][]const u8{ "--jitless", "--offline" };
 
 const Doc = struct {
@@ -39,9 +27,7 @@ const Doc = struct {
     text: []const u8,
 };
 
-/// The root is read one level deep, because the fetched packages under
-/// `zig-pkg/` carry markdown of their own and are not ours. Sorted by path, so
-/// a failure reads the same way twice.
+/// Reads docs one level deep. `zig-pkg/` carries markdown that is not ours.
 fn loadDocs(arena: std.mem.Allocator, io: std.Io) ![]Doc {
     var docs: std.ArrayList(Doc) = .empty;
 
@@ -114,9 +100,7 @@ fn loadSources(arena: std.mem.Allocator, io: std.Io, tops: []const []const u8) !
 
 const all_code = [_][]const u8{ "src", "lib" };
 
-/// `lib/` never parses a command line, so every option is a literal under
-/// `src/`. A search of the libraries too would accept `--quiet`, which
-/// `chock-broker` gives to git.
+/// Only `src/` parses a command line. `lib/` never does.
 const command_line_code = [_][]const u8{"src"};
 
 const Span = struct {
@@ -126,7 +110,7 @@ const Span = struct {
     fenced: bool,
 };
 
-/// A fenced block gives one span per line, because a command line is a line.
+/// A fenced block gives one span per line.
 fn collectSpans(arena: std.mem.Allocator, doc: Doc, out: *std.ArrayList(Span)) !void {
     var lines = std.mem.splitScalar(u8, doc.text, '\n');
     var number: usize = 0;
@@ -183,8 +167,7 @@ fn optionName(token: []const u8) ?[]const u8 {
     return token[0..end];
 }
 
-/// Both spellings, because `src/tty.zig` reads `--color=<when>` with one
-/// literal that carries the `=`.
+/// Checks both the bare option and the `=value` spelling.
 fn sourceHasOption(source: []const u8, option: []const u8, arena: std.mem.Allocator) !bool {
     const plain = try std.fmt.allocPrint(arena, "\"{s}\"", .{option});
     if (std.mem.indexOf(u8, source, plain) != null) return true;
@@ -339,8 +322,7 @@ test "every path the documentation names is in the repository" {
 
     const spans = try allSpans(arena, docs);
     for (spans) |span| {
-        // A fence holds an example of what a reader writes in their own
-        // project, so a path in one is theirs and not ours.
+        // A fenced path is the reader's own example, not ours.
         if (span.fenced) continue;
         var words = std.mem.tokenizeAny(u8, span.text, " \t,()");
         while (words.next()) |word| {
@@ -396,8 +378,7 @@ test "every command the documentation shows is a command Chock answers to" {
         });
     }
 
-    // A floor well under what the pages hold today, so an ordinary edit never
-    // reaches it and a scanner that stopped working does.
+    // Low enough to survive an edit, high enough to catch a broken scanner.
     try testing.expect(checked >= 20);
     try testing.expectEqualStrings("", wrong.items);
 }
@@ -484,8 +465,7 @@ test "every option the documentation names is an option the code reads" {
         if (!isChockLine(span) and !bare_option) continue;
 
         var words = std.mem.tokenizeAny(u8, span.text, " \t");
-        // A message Chock writes is not a command line. One can name another
-        // program's option inside Chock's own sentence.
+        // A message Chock writes is not a command line.
         if (isChockLine(span)) {
             var head = std.mem.tokenizeAny(u8, span.text, " \t");
             _ = head.next();
@@ -700,9 +680,7 @@ test "every action a table row names is an action the code has" {
 }
 
 test "a message the documentation shows is a message the code writes" {
-    // Byte for byte is not possible: a sample block carries a session
-    // identifier, a hash and a path from another machine. Only the words in
-    // front of the first of those are compared.
+    // Only the words before a session identifier, hash, or path are compared.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -799,8 +777,7 @@ test "the sandbox page counts the calls it blocks and the proc entries it masks"
     try testing.expectEqualStrings("", wrong.items);
 }
 
-/// Every ```` ```zon ```` block of one page, each with the line its fence opened
-/// on. A block and not a line, because a `.zon` value spans lines.
+/// Every ```` ```zon ```` block of one page, with the line its fence opened on.
 fn zonBlocksIn(arena: std.mem.Allocator, doc: Doc) ![]const Span {
     var out: std.ArrayList(Span) = .empty;
     var lines = std.mem.splitScalar(u8, doc.text, '\n');
@@ -834,9 +811,7 @@ fn zonBlocksIn(arena: std.mem.Allocator, doc: Doc) ![]const Span {
 }
 
 test "the microVM page counts the roots a guest is granted and the offers it takes" {
-    // Both numbers bound how much of the host a compromised VMM can name, so both
-    // are worth saying out loud on a page an operator reads, and a number a reader
-    // has to trust is a number that rots.
+    // Both numbers bound how much of the host a compromised VMM can name.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -864,9 +839,7 @@ test "the microVM page counts the roots a guest is granted and the offers it tak
 }
 
 test "the guest size table is the size the code chooses for that machine" {
-    // The two curves are the one place an operator reads how much of their machine
-    // a guest takes. A table written by hand beside them agrees with itself for
-    // ever, so every row here is recomputed from the code that answers.
+    // Every row here is recomputed from the code, not read from the table.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -893,8 +866,7 @@ test "the guest size table is the size the code chooses for that machine" {
         const said_memory_mb = megabytesIn(memory_cell) orelse continue;
         rows += 1;
 
-        // Linux, which is what the table says it is: a Mac's count is clamped by
-        // the interrupt controller and the page says so in words beside it.
+        // Linux: a Mac's count is clamped by the interrupt controller instead.
         const processors = chock_policy.sandbox.processorsOn(machine, .linux);
         const memory_mb = chock_policy.sandbox.memoryOn(machine, .linux);
         if (said_processors != processors or said_memory_mb != memory_mb) {
@@ -942,10 +914,7 @@ fn megabytesIn(cell: []const u8) ?u64 {
 }
 
 test "every sandbox block the documentation shows is read the way the page says" {
-    // `sandbox.parse` answers an empty block for a value it cannot read, which is
-    // a page showing a driver that silently means `native`. So each block is
-    // parsed and the driver it came back with is compared against the name the
-    // block spells.
+    // Each block is parsed and checked against the driver name it spells.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1003,17 +972,14 @@ test "the microVM page's memory encryption claims are the ones the code makes" {
 
     var wrong: std.ArrayList(u8) = .empty;
 
-    // The page says the policy is zero, and a policy that allowed debugging
-    // would undo what encryption is for. A change to either end has to change
-    // both.
+    // The page claim and the code setting must change together.
     const says_zero = std.mem.indexOf(u8, page, "The launch policy is zero") != null;
     const is_zero = std.mem.indexOf(u8, code, "const sev_policy: u32 = 0;") != null;
     if (says_zero != is_zero) {
         try wrong.print(arena, "the page says the policy is zero: {}, the code sets zero: {}\n", .{ says_zero, is_zero });
     }
 
-    // The page says SEV-ES is not selected. The call that would select it is
-    // Mirage's `createSevEs`, so the claim holds exactly while nothing names it.
+    // The claim holds exactly while nothing names Mirage's `createSevEs`.
     const says_no_es = std.mem.indexOf(u8, page, "SEV-ES is not selected") != null;
     const names_es = std.mem.indexOf(u8, code, "createSevEs") != null;
     if (says_no_es and names_es) {

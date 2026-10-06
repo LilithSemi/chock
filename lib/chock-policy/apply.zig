@@ -8,27 +8,11 @@ pub const file_name = "chock.zon";
 
 pub const max_file_bytes = 1 << 20;
 
-/// Named for what the project needs and not for what is given up.
-/// `workspace.no_branch_move` would make an author work out what that had to do
-/// with them.
-/// A rule that names nothing reaches this row, because `workspace.integrate` is
-/// matched by a catch all and by `workspace.*`. A rule naming `workspace.apply`
-/// alone never reaches it.
-///
-/// There is no mode that means "move nothing". The ref is written on every
-/// apply before any branch is touched, and "do not integrate" already has two
-/// answers: a person says no to the approval, and an organisation denies this
-/// row.
 pub const integrate_action = "workspace.integrate";
 
-/// An organisation that writes `workspace.*` with `deny` refuses the apply
-/// itself as well as the integration, which is more than it asked for and never
-/// less.
 pub const namespace = "workspace";
 
 pub const Mode = enum {
-    /// The default, and the conservative one of the three that move a branch: a
-    /// merge keeps both histories, and a rebase and a squash each rewrite one.
     merge,
     rebase,
     squash,
@@ -43,8 +27,6 @@ pub const Mode = enum {
         };
     }
 
-    /// Two types and not one with a hole in it, so no reader below this point
-    /// has to wonder what `ask` does in a git call.
     pub fn settled(self: Mode) ?Landing {
         return switch (self) {
             .merge => .merge,
@@ -54,8 +36,6 @@ pub const Mode = enum {
         };
     }
 
-    /// `ask` is not one of them: a person is answering the question, not asking
-    /// it again. Null moves no branch.
     pub fn fromAnswer(said: []const u8) ?Landing {
         const trimmed = std.mem.trim(u8, said, " \t\r\n");
         inline for (.{ Landing.merge, Landing.rebase, Landing.squash }) |landing| {
@@ -65,9 +45,6 @@ pub const Mode = enum {
     }
 };
 
-/// What one apply really does to a branch. Every member moves a branch of the
-/// user's: "no branch moves" is not a landing, so a caller that has none holds
-/// null with a `chock_broker.integrate.Reason` beside it.
 pub const Landing = enum {
     merge,
     rebase,
@@ -81,8 +58,6 @@ pub const Landing = enum {
         };
     }
 
-    /// Present tense and about the user's own branch, because the person
-    /// reading it is deciding whether to let that happen.
     pub fn promise(self: Landing) []const u8 {
         return switch (self) {
             .merge => "your checked out branch is merged with this work, and your working tree " ++
@@ -95,20 +70,11 @@ pub const Landing = enum {
     }
 };
 
-/// `merge` and not a park. The prompt names the landing and the branch before
-/// a person answers, so being asked and saying yes must do the act and not a
-/// smaller act the person then finishes by hand.
 pub const Settings = struct {
     mode: Mode = .merge,
 };
 
-/// The mode `chock.zon` asked for, bounded by what the policy row permits. Null
-/// is "no landing at all", and a caller that reads null parks the work.
-///
-/// This bounds the permission and never the landing. `deny` is the one decision
-/// that takes the capability away. An optional and not a member of `Mode`,
-/// because a `Mode.ref` would write the row's own judgement a second time and a
-/// project could then ask for it.
+/// Null is "no landing at all", and a caller that reads null parks the work.
 pub fn boundBy(mode: Mode, decision: table.Decision) ?Mode {
     return switch (decision) {
         .allow, .ask, .agent_review, .agent_then_human => mode,
@@ -125,8 +91,6 @@ pub const LoadError = ParseError || error{
     ReadFailed,
 };
 
-/// The two ZON variants own memory, because they hold the syntax tree their
-/// message points into. A caller that receives one must call `deinit`.
 pub const Diagnostic = union(enum) {
     file_not_zon: std.zon.parse.Diagnostics,
     block_not_valid: std.zon.parse.Diagnostics,

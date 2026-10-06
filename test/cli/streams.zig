@@ -1,21 +1,12 @@
-//! The two streams of the real `chock` binary, read apart. A unit test cannot
-//! see this: `tty.streams` falls back to sending every row to standard error,
-//! so a `main` that never called `tty.useStreams` passes every test in
-//! `src/tty.zig`. Only a real process has a real fd 1 and a real fd 2.
-//!
-//! The last test builds a project whose provider cannot be reached, so a real
-//! session starts, calls the model, fails to connect and writes its own ending.
+//! The two streams of the real `chock` binary, read apart. Only a real process has a real fd 1 and fd 2.
+//! The last test builds a project whose provider cannot be reached, so a real session starts and ends on its own.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const chock_path = @import("chock_path").chock_path;
-/// Found by `build.zig`, which has an environment to search. Empty when there is
-/// none, and the one test that needs it then skips.
+/// Found by `build.zig`. Empty when there is none, and the one test that needs it then skips.
 const git_path = @import("chock_path").git_path;
-/// The one thing read from the program's own source. `src/main.zig` pins it
-/// against `build.zig.zon` off the disk, so this compares the binary to the
-/// manifest. Everything else here is written out, because a test that imports
-/// what the program prints agrees with itself for ever.
+/// The one thing read from the program's own source, so this compares the binary against the manifest.
 const version_line = @import("chock_main").version_line;
 
 const testing = std.testing;
@@ -62,8 +53,7 @@ fn runChock(
     return .{ .out = result.stdout, .err = result.stderr, .code = codeOf(result.term) };
 }
 
-/// `std.process.SpawnOptions.StdIo.file` passes the same open file as both
-/// descriptors, so what comes back is the order the program really wrote in.
+/// Passes the same open file as both descriptors, so what comes back is the order the program really wrote in.
 fn runOntoOneFile(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -92,8 +82,7 @@ fn runOntoOneFile(
     return dir.readFileAlloc(io, name, gpa, .limited(1024 * 1024));
 }
 
-/// The environment is built from nothing, not copied from the person running the
-/// suite, so a `NO_COLOR` or a `TERM` of theirs cannot decide the answer.
+/// The environment is built from nothing, so a `NO_COLOR` or `TERM` of the running user cannot decide the answer.
 const Sandbox = struct {
     tmp: testing.TmpDir,
     env: std.process.Environ.Map,
@@ -125,8 +114,7 @@ const Sandbox = struct {
     }
 };
 
-/// Read back out of the program's own message. A second copy of
-/// `session.projectKey` would agree with itself for ever.
+/// Read back out of the program's own message, rather than a second copy of `session.projectKey`.
 fn sessionDirOf(gpa: std.mem.Allocator, io: std.Io, box: *Sandbox) ![]u8 {
     var told = try runChock(gpa, io, &box.env, &.{ "plan", "--project", box.root });
     defer told.deinit(gpa);
@@ -214,8 +202,7 @@ test "a piped stream gets no escape sequence, and --color=always still paints on
 }
 
 test "standard output is flushed before standard error, so one file holds them in the written order" {
-    // Standard output is buffered and standard error is not, so without the
-    // `flushOut()` in `tty.print` the warning reaches the file first.
+    // Standard output is buffered and standard error is not, so `tty.print` must call `flushOut()` first.
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -278,8 +265,7 @@ test "every command still exits with the code it did, including the refusals" {
         .{ .args = &.{"--version"}, .want = 0, .why = "a version was asked for and given" },
         .{ .args = &.{"help"}, .want = 0, .why = "help was asked for and given" },
         .{ .args = &.{"nonesuch"}, .want = 1, .why = "there is no such command" },
-        // The flag comes after the command: `main` reads the command first and
-        // hands the rest to `takeGlobalFlags`.
+        // The flag comes after the command, since `main` reads the command first.
         .{ .args = &.{ "sessions", "--color=maybe" }, .want = 1, .why = "--color took a value it does not have" },
         .{ .args = &.{"askpass"}, .want = 1, .why = "the helper takes one prompt and was given none" },
         .{ .args = &.{ "doctor", "--help" }, .want = 0, .why = "help was asked for and given" },
@@ -310,20 +296,17 @@ test "every command still exits with the code it did, including the refusals" {
     try testing.expectEqualStrings("", did_nothing.out);
 }
 
-/// Spelled here rather than imported: this file holds nothing of the built
-/// binary's own source.
+/// Spelled here rather than imported, so this file holds nothing of the built binary's own source.
 const alt_screen_on = "\x1b[?1049h";
 
 const Project = struct {
     path: []u8,
 
-    /// Port 1 on the loopback address. Nothing listens there, and nothing may:
-    /// it is below the range an unprivileged program can bind.
+    /// Port 1 on the loopback address, below the range an unprivileged program can bind.
     const dead_provider = "http://127.0.0.1:1/v1";
 
     fn make(gpa: std.mem.Allocator, io: std.Io, box: *Sandbox) !Project {
-        // `Sandbox` builds its environment from nothing, so the workspace builder
-        // would find no `git`. `PATH` and nothing else.
+        // `Sandbox` builds its environment from nothing, so the workspace builder would find no `git`.
         try box.env.put("PATH", std.fs.path.dirname(git_path) orelse "/usr/bin");
 
         const config_dir = try std.fmt.allocPrint(gpa, "{s}/chock", .{box.root});
@@ -359,7 +342,6 @@ const Project = struct {
             .data = "a project with one commit\n",
         });
 
-        // `git worktree add` checks a commit out, so the repository needs one.
         // The identity is on the command line, so no git configuration is read.
         try git(gpa, io, git_path, &box.env, path, &.{ "init", "--quiet", "." });
         try git(gpa, io, git_path, &box.env, path, &.{ "add", "-A" });
@@ -406,9 +388,7 @@ const Project = struct {
 };
 
 test "chock run never takes the alternate screen, whatever the colour flags say" {
-    // The `session.end` line below is what stops this passing for a command that
-    // stopped before the decision. The session builds a git worktree, so a
-    // machine with no `git` skips rather than reports success.
+    // The session builds a git worktree, so a machine with no `git` skips rather than reports success.
     if (git_path.len == 0) return error.SkipZigTest;
 
     const gpa = testing.allocator;
@@ -437,8 +417,7 @@ test "chock run never takes the alternate screen, whatever the colour flags say"
     }
 }
 
-/// Three files rather than pipes, because `std.process.RunOptions` has no way to
-/// give a child its standard input. A file is a stream that is not a terminal.
+/// Three files rather than pipes, since `std.process.RunOptions` has no way to give a child its standard input.
 fn runChockOnStdin(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -448,8 +427,7 @@ fn runChockOnStdin(
     message: []const u8,
     args: []const []const u8,
 ) !Run {
-    // Absolute, because the child starts somewhere else. `chock_path` is a build
-    // output path, relative to the directory the suite runs in.
+    // Absolute, because the child starts somewhere else, and `chock_path` is relative to the suite's own directory.
     var suite_dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
     defer suite_dir.close(io);
     var here: [std.fs.max_path_bytes]u8 = undefined;
@@ -504,8 +482,7 @@ test "a message on standard input runs a session with no display and no escape b
     var project = try Project.make(gpa, io, &box);
     defer project.deinit(gpa);
 
-    // No arguments, because bare `chock` is the command. A word after it would
-    // be a command name, so the project is named by the working directory.
+    // No arguments, because bare `chock` is the command, so the project is named by the working directory.
     var piped = try runChockOnStdin(
         gpa,
         io,
@@ -528,8 +505,7 @@ test "a message on standard input runs a session with no display and no escape b
     try testing.expect(std.mem.indexOf(u8, piped.out, header) == null);
 }
 
-/// Read rather than listed, so this tracks `chock run` instead of holding a
-/// second copy of its options. A name ends at the first `=` or space.
+/// Read rather than listed, so this tracks `chock run` instead of holding a second copy of its options.
 fn optionsRunAdvertises(gpa: std.mem.Allocator, text: []const u8) ![]const []const u8 {
     var found: std.ArrayList([]const u8) = .empty;
     errdefer found.deinit(gpa);
@@ -601,8 +577,7 @@ test "an option nobody knows gets the same answer from bare chock as from chock 
 }
 
 test "the two words chock answers itself still open with a dash and are still not options" {
-    // `--help` and `--version` are `src/main.zig`'s own, so the rule that an
-    // option is not a command name has to let them through.
+    // `--help` and `--version` are `src/main.zig`'s own, so the rule has to let them through.
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -637,9 +612,7 @@ fn expectMissing(haystack: []const u8, needle: []const u8) !void {
     return sayWhatItSaid(haystack, needle);
 }
 
-/// `expectEqualStrings` prints both sides, so the report a real process wrote
-/// lands inside the failure. Nothing here may write to standard error:
-/// `zig build` reads a run step that does as a failed command.
+/// `expectEqualStrings` prints both sides, so the report a real process wrote lands inside the failure.
 fn sayWhatItSaid(haystack: []const u8, needle: []const u8) !void {
     try testing.expectEqualStrings(needle, haystack);
     return error.TestUnexpectedResult;
@@ -651,10 +624,7 @@ const doctor_first_run_heading = "Before a first run";
 
 const doctor_layers_heading = "Sandbox layers";
 
-/// The names differ by platform because the mechanisms differ: a user namespace,
-/// Landlock and seccomp are Linux calls that no macOS release has. Written out
-/// rather than read from `src/doctor.zig`, because a test that imported the
-/// constant the program prints would agree with itself for ever.
+/// The names differ by platform, since a user namespace, Landlock and seccomp are Linux calls macOS has none of.
 const doctor_layer_names: []const []const u8 = switch (builtin.os.tag) {
     .macos => &.{
         "seatbelt",
@@ -762,8 +732,7 @@ test "chock doctor prints a column of layers or the one sentence about the drive
 }
 
 test "chock doctor leaves nothing of its own behind" {
-    // The kernel makes the overlay's own `work/work` with mode 0, which stops a
-    // plain `deleteTree` halfway.
+    // The kernel makes the overlay's own `work/work` with mode 0, which stops a plain `deleteTree` halfway.
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -778,8 +747,7 @@ test "chock doctor leaves nothing of its own behind" {
     const session_dir = try sessionDirOf(gpa, io, &box);
     defer gpa.free(session_dir);
 
-    // The probe tree carries the running process's id, so this test cannot name
-    // it: a name built here would agree with itself for ever.
+    // The probe tree carries the running process's id, so this test cannot name it.
     var opened = try std.Io.Dir.openDirAbsolute(io, session_dir, .{ .iterate = true });
     defer opened.close(io);
     var it = opened.iterate();

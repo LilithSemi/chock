@@ -3,14 +3,12 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-// Zig 0.16 has no std.process.argsWithAllocator, and the default test runner
-// panics on an argv it does not know, so build.zig embeds the probe path.
+// The default test runner panics on an argv it does not know, so build.zig embeds the probe path.
 const probe_path = @import("probe_path").probe_path;
 
 const sandbox = @import("chock-sandbox");
 
-/// Skip when the probe answered "this machine would not give me a sandbox".
-/// A boundary that was never reached is not a boundary that held.
+/// Skip when the probe answered that this machine would not give it a sandbox.
 fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
     const code = switch (term) {
         .exited => |c| c,
@@ -19,8 +17,8 @@ fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
     if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
 }
 
-/// Read the absolute path of an open directory descriptor, through /proc/self/fd.
-/// A bind mount and a pivot_root need one, and std.testing.tmpDir gives a relative path.
+/// Reads the absolute path of an open directory descriptor through /proc/self/fd,
+/// since std.testing.tmpDir gives a relative one.
 fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
     var link_buffer: [64]u8 = undefined;
     const link = std.fmt.bufPrintZ(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}) catch unreachable;
@@ -40,8 +38,7 @@ const ScratchRoot = struct {
         return self.path_buffer[0..self.path_len];
     }
 
-    /// Call this only after the probe exits. Its mounts keep the directory
-    /// busy from outside its mount namespace until the kernel tears it down.
+    /// Call only after the probe exits: its mounts keep the directory busy until then.
     fn cleanup(self: *ScratchRoot) void {
         self.tmp.cleanup();
     }
@@ -63,8 +60,7 @@ fn runProbeWithRoot(op: []const u8, root: []const u8) !std.process.Child.Term {
 }
 
 /// Same as `runProbeWithRoot`, and it keeps standard error. Never `inherit`: a host
-/// that refuses the namespaces then writes on this binary's own standard error, and
-/// the quiet test binaries step in build.zig fails the build over it.
+/// that refuses the namespaces writes on this binary's own standard error, which fails the build.
 fn runProbeSayingWithRoot(op: []const u8, root: []const u8) !CaptureResult {
     var child = try std.process.spawn(std.testing.io, .{
         .argv = &.{ probe_path, op, root },
@@ -80,8 +76,7 @@ fn runProbeSayingWithRoot(op: []const u8, root: []const u8) !CaptureResult {
     return result;
 }
 
-/// Assert the probe ended cleanly. The line must arrive as a failing comparison,
-/// because `test/proto/lock.zig` permits no test binary to name standard error.
+/// Assert the probe ended cleanly, as a failing comparison and not a printed line.
 fn expectProbeSucceeded(result: CaptureResult) !void {
     switch (result.term) {
         .exited => |code| if (code == 0) return,
@@ -134,7 +129,7 @@ fn runReportPid(root: []const u8) !ReportPidResult {
         const rc = linux.read(handle, result.buffer[result.len..].ptr, result.buffer.len - result.len);
         const read_errno = linux.errno(rc);
         if (read_errno == .INTR) continue;
-        if (read_errno != .SUCCESS or rc == 0) break; // EOF or a read fault ends the loop either way.
+        if (read_errno != .SUCCESS or rc == 0) break;
         result.len += rc;
     }
 
@@ -165,13 +160,12 @@ fn readPipeToEnd(handle: linux.fd_t, buffer: []u8) usize {
         const rc = linux.read(handle, buffer[filled..].ptr, buffer.len - filled);
         const read_errno = linux.errno(rc);
         if (read_errno == .INTR) continue;
-        if (read_errno != .SUCCESS or rc == 0) break; // End of file or a read fault, either way nothing more comes.
+        if (read_errno != .SUCCESS or rc == 0) break;
         filled += rc;
     }
     return filled;
 }
 
-/// Neither operation writes more than a short line, so neither pipe can block.
 fn runProbeCapturing(argv: []const []const u8) !CaptureResult {
     var child = try std.process.spawn(std.testing.io, .{
         .argv = argv,
@@ -188,8 +182,6 @@ fn runProbeCapturing(argv: []const []const u8) !CaptureResult {
     return result;
 }
 
-/// The whole line a sandbox that cannot build its mount tree writes. The path the
-/// two tests below hand `spawn` was never made, so the mount answers ENOENT.
 const mount_setup_fault_line = "sandbox: the mount call failed: NOENT\n";
 
 /// Signal 0 sends nothing. The kernel only checks that the process exists.
@@ -200,8 +192,7 @@ fn processIsAlive(pid: linux.pid_t) bool {
 
 const shm_secret = "SHARED-MEMORY-SECRET-FROM-HOST";
 
-/// Build a System V shared memory segment on the host, outside every namespace.
-/// Remove it with removeHostShmSegment, in a defer set up before this can fail.
+/// Builds a System V shared memory segment on the host, outside every namespace.
 fn createHostShmSegment() !usize {
     const ipc_private: usize = 0;
     const ipc_creat: usize = 0o1000;
@@ -218,7 +209,6 @@ fn createHostShmSegment() !usize {
     return shmid;
 }
 
-/// Mark the segment for removal. The kernel destroys it once nothing is attached.
 fn removeHostShmSegment(shmid: usize) void {
     const ipc_rmid: usize = 0;
     _ = linux.syscall3(.shmctl, shmid, ipc_rmid, 0);
@@ -226,8 +216,7 @@ fn removeHostShmSegment(shmid: usize) void {
 
 const session_key_payload = "chock-escape-session-key-payload";
 
-/// Plant a key in this process's own session keyring, the one a child inherits
-/// across fork. `description` must be unique per run. Remove it in a defer.
+/// Plants a key in this process's own session keyring, the one a child inherits across fork.
 fn createHostSessionKey(description: [:0]const u8) !i32 {
     const key_type = "user";
     // KEY_SPEC_SESSION_KEYRING, a negative special value and not a real serial number.
@@ -244,7 +233,6 @@ fn createHostSessionKey(description: [:0]const u8) !i32 {
     return @intCast(rc);
 }
 
-/// Remove the key. KEYCTL_INVALIDATE is operation 21.
 fn removeHostSessionKey(key_id: i32) void {
     const keyctl_invalidate: usize = 21;
     _ = linux.syscall2(.keyctl, keyctl_invalidate, @as(usize, @bitCast(@as(isize, key_id))));
@@ -281,9 +269,7 @@ test "a filtered process that calls add_key dies with SIGSYS" {
 }
 
 test "a filtered process that calls io_uring_setup is refused with EPERM and lives" {
-    // A ring is the way around a syscall filter: the thread that submits an operation
-    // never makes the call the filter reads. EPERM and not a kill, because libuv probes
-    // for a ring six times before a Node program runs one line of its own.
+    // EPERM and not a kill, because libuv probes for a ring before a Node program runs its own line.
     const term = try runProbe("io-uring-setup");
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
@@ -299,15 +285,13 @@ test "a filtered process that calls io_uring_register is refused with EPERM and 
 }
 
 test "a program that meets the io_uring refusal carries on and exits cleanly" {
-    // Each test above ends at the refusal, so each would still pass under a filter
-    // that killed on the next instruction. This one does work after the refusal.
+    // Each test above ends at the refusal. This one does work after it.
     const term = try runProbe("io-uring-then-work");
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
 test "the calls that are meant to kill still kill, so the io_uring change did not leak" {
-    // The other thirty entries on `blocked_calls` were left alone on purpose. A change
-    // that moved the whole list to EPERM passes every test above and fails here.
+    // A change that moved the whole blocked list to EPERM passes every test above and fails here.
     for ([_][]const u8{
         "ptrace",
         "umount-protected",
@@ -325,8 +309,7 @@ test "the filter is not a deny all, an ordinary call still works" {
 }
 
 test "mmap refuses a request for write and execute together" {
-    // This pins one fact: mmap refuses PROT_WRITE | PROT_EXEC. It does not prove
-    // a process can never reach a page that is both writable and executable.
+    // This pins only that mmap refuses PROT_WRITE | PROT_EXEC.
     const term = try runProbe("mmap-wx");
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
@@ -399,8 +382,7 @@ test "a read only bind mount refuses a write, with EROFS" {
 }
 
 test "a submount under a read only target also refuses a write, with EROFS" {
-    // A remount is never recursive, whatever flags it carries. mount_setattr with
-    // AT_RECURSIVE is what makes a read only mark reach a submount.
+    // mount_setattr with AT_RECURSIVE is what makes a read only mark reach a submount.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("write-readonly-submount", scratch.path());
@@ -460,14 +442,11 @@ test "a deny_read entry with a symlinked intermediate component cannot write out
 }
 
 test "a tool call inside the sandbox cannot reach the session's approval socket" {
-    // Anything that can reach that socket can approve an action. This test connects to
-    // it first, or it would prove only that a missing path cannot be reached.
+    // This test connects to the socket first, or it would prove only that a missing path cannot be reached.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
 
-    // A directory of its own beside the root, so the socket is not carried in
-    // by the recursive bind of `root` the way the marker in
-    // `spawned-landlock-read` deliberately is.
+    // A directory of its own beside the root, so the socket is not carried in by the recursive bind of `root`.
     var session = try scratchRoot();
     defer session.cleanup();
 
@@ -503,8 +482,7 @@ test "a Landlock rule permits a write inside the directory it granted" {
 }
 
 test "a Landlock rule refuses a truncate outside the directory it granted" {
-    // Landlock handles truncate as a right of its own. With truncate unhandled,
-    // truncate("/other/secret", 0) succeeds while open for write is refused.
+    // Landlock handles truncate as a right of its own, separate from open for write.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("landlock-truncate-outside", scratch.path());
@@ -556,9 +534,7 @@ test "a process the netbroker serves still cannot open a connection of its own" 
 }
 
 test "a process the netbroker serves can use the descriptor it is handed, and cannot aim it anywhere else" {
-    // A granted descriptor belongs to the far side's network namespace. A re-connect
-    // on a connected TCP socket answers EISCONN, but a connect with AF_UNSPEC and then
-    // a connect elsewhere both succeed.
+    // A granted descriptor belongs to the far side's network namespace, so a re-connect elsewhere still succeeds.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-filtered-grant", scratch.path());
@@ -607,8 +583,7 @@ test "a session with no device source forks no helper, counted at the process ta
     try std.testing.expectEqual(with_count, without_count + 1);
 }
 
-// The network router tests. The first one is what stops the rest being vacuous:
-// a sandbox where nothing works refuses every address and proves nothing by it.
+// The network router tests. The first one stops the rest being vacuous.
 
 test "a program that knows nothing about chock resolves a permitted host and reaches it" {
     // The program names nothing of Chock's and holds no descriptor on number 3.
@@ -644,9 +619,7 @@ test "a program that hardcodes the cloud metadata address reaches nothing" {
 }
 
 test "glibc inside a routed sandbox is answered by the router and by nobody else" {
-    // The only test here that runs a real resolver rather than a written one. glibc
-    // looks in three places a sandbox must get right at once, each a silent failure on
-    // its own: nsswitch.conf, the nscd socket at /var/run/nscd, and a rule for /etc.
+    // The only test here that runs a real resolver: glibc reads nsswitch.conf, the nscd socket, and /etc.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-glibc", scratch.path());
@@ -678,9 +651,7 @@ test "a routed sandbox that owns /etc still reads the host's own certificates" {
 }
 
 test "a routed program cannot take away the ruleset that bounds it" {
-    // With CAP_NET_ADMIN still held, a delete of the whole `chock` table succeeds and
-    // every rule becomes advice. What removes the capability is `execve` and not
-    // `capabilities.dropAll`, because the program runs as an ordinary user.
+    // `execve`, not `capabilities.dropAll`, is what removes CAP_NET_ADMIN here.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-flush", scratch.path());
@@ -724,8 +695,7 @@ test "the channel stops at its own budget, and asking after it stops is a plain 
 }
 
 test "a permitted name that resolves onto this machine reaches nothing" {
-    // Whoever runs a permitted zone decides what its names answer, so the name here
-    // resolves to 127.0.0.1. The probe requires that it was resolved and not dialled.
+    // The name resolves to 127.0.0.1. The probe requires that it was resolved and not dialled.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-filtered-loopback", scratch.path());
@@ -733,8 +703,7 @@ test "a permitted name that resolves onto this machine reaches nothing" {
 }
 
 // The reentrancy tests below prove the log, lock and turn mechanics against an in
-// process stand in arbiter (`AskArbiter`), never the production socket waiter in
-// `lib/chock-broker/socket.zig`, and no test here calls `src/run.zig`'s own wiring.
+// process stand in arbiter (`AskArbiter`), never the production socket waiter.
 
 test "a question asked from inside a running tool call reaches the log, in order, and the turn survives" {
     // Every assertion of substance runs inside the probe, where the log lives.
@@ -782,9 +751,7 @@ test "spawn gives the sandboxed process /dev/null on standard input, never a ter
 }
 
 test "the sandboxed process holds no capability in its own user namespace, and none can come back across an exec" {
-    // A process that creates a user namespace holds a full capability set inside it,
-    // whatever its uid map says. `execve` clears the effective, permitted and
-    // inheritable sets by itself, so the bounding set is the one record worth reading.
+    // `execve` clears the effective, permitted and inheritable sets, so the bounding set is the one record worth reading.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-caps-drop", scratch.path());
@@ -832,9 +799,7 @@ test "a sandbox that was asked to watch nothing counts nothing and still runs" {
 }
 
 test "the supervisor names the paths the sandboxed program asked for that nothing granted" {
-    // A third process inside the sandboxed program's own pid namespace holds the
-    // notification descriptor and reads the path with `process_vm_readv`. The answer
-    // is CONTINUE, so a recorded path is what the program said and not proof.
+    // The answer is CONTINUE, so a recorded path is what the program said and not proof.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-path-audit", scratch.path());
@@ -858,8 +823,7 @@ test "a sandbox that was asked to record no path records none and still counts" 
 }
 
 test "a program that kills the reader watching it breaks its own opens" {
-    // The reader is in the sandboxed program's own pid namespace, so that program can
-    // signal it. A filter whose listener nobody holds answers every held call ENOSYS.
+    // A filter whose listener nobody holds answers every held call ENOSYS.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-path-audit-killed", scratch.path());
@@ -916,8 +880,7 @@ test "a setup failure with no descriptor named still lands on descriptor 2" {
 }
 
 test "a setup failure still reaches spawn when the descriptor the caller named cannot be written" {
-    // A pipe whose read end is closed answers EPIPE and raises SIGPIPE. End of file
-    // with no data on the setup pipe is how a successful `execve` reports itself.
+    // End of file with no data on the setup pipe is how a successful `execve` reports itself.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
 
@@ -1106,9 +1069,7 @@ test "Finding 2: signalling the process spawn forked also ends the sandboxed pro
 }
 
 test "a cancelled call takes the processes it started with it, not only the one that was signalled" {
-    // A cancel reaches exactly one process, because a pid that has been reaped names
-    // nothing and may soon name somebody else. `PR_SET_PDEATHSIG` and `cgroup.kill`
-    // carry the rest, and this pins the outcome and not either one mechanism.
+    // `PR_SET_PDEATHSIG` and `cgroup.kill` carry the rest. This pins the outcome and not either mechanism.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     var child = try std.process.spawn(std.testing.io, .{
@@ -1196,8 +1157,7 @@ test "a process cannot signal its caller's process group, which a pid namespace 
 }
 
 test "a signal to the caller's process group leaves the running call alone, and the call finishes" {
-    // A terminal sends SIGINT to its whole foreground process group. Exit 0 is both
-    // facts: the press reached nothing inside the call, and the call ran to its end.
+    // Exit 0 means the press reached nothing inside the call, and the call ran to its end.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-group-press", scratch.path());
@@ -1205,8 +1165,7 @@ test "a signal to the caller's process group leaves the running call alone, and 
 }
 
 test "a caller's own signal handler does not run in the process spawn forked, so a call can still be cancelled" {
-    // The process spawn forks is a fork of the caller and never execs, so it keeps the
-    // caller's own signal handlers.
+    // The process spawn forks never execs, so it keeps the caller's own signal handlers.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-signal-middle-handled", scratch.path());
@@ -1368,9 +1327,7 @@ test "a full scratch area names itself, and does not read as the machine's own d
 // Six red team primitives from vetto's src/redteam.rs.
 
 test "a process that calls setsid still dies when the sandbox is torn down" {
-    // setsid() is on neither `blocked_calls` nor `refused_calls`, so it succeeds and the
-    // caller leaves its process group. Teardown reads neither: pdeathsig follows the
-    // real parent and `cgroup.kill` follows cgroup membership.
+    // setsid() succeeds. Teardown still reaches the child since pdeathsig follows the real parent.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     var child = try std.process.spawn(std.testing.io, .{
@@ -1450,8 +1407,7 @@ test "a process that calls setsid still dies when the sandbox is torn down" {
 }
 
 test "spawn applies every layer, and a spawned process cannot setns into /proc/1/ns/mnt" {
-    // /proc/1 inside the sandbox names the keeper, not the host's init. None of that
-    // matters: `setns` sits on `blocked_calls`, whatever fd or kind is named.
+    // `setns` sits on `blocked_calls`, whatever fd or kind is named.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-setns-proc1", scratch.path());
@@ -1462,9 +1418,7 @@ test "spawn applies every layer, and a spawned process cannot setns into /proc/1
 }
 
 test "spawn applies every layer, and a spawned process cannot write /proc/self/mem, refused by the mount's own read only flag" {
-    // A write to /proc/self/mem is an ordinary open() and write() on a regular file.
-    // The errno is EROFS and not EACCES: `buildProcMount` marks the whole procfs mount
-    // read only, and that check comes before Landlock's write_file check.
+    // The errno is EROFS and not EACCES: `buildProcMount` marks the whole procfs mount read only.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-proc-self-mem-write-landlock", scratch.path());
@@ -1505,9 +1459,7 @@ test "spawn applies every layer, and a spawned process cannot mount a fresh view
 }
 
 test "spawn applies every layer, and a spawned process cannot fexecve an anonymous memfd around the execute right Landlock refused it on disk" {
-    // `memfd_create` makes an anonymous file with no directory entry, and `execveat`
-    // with AT_EMPTY_PATH runs it without naming one, so a path rule has nothing to
-    // match. `seccomp.build` reads the flags instead. This used to succeed.
+    // `memfd_create` plus `execveat` with AT_EMPTY_PATH leaves no path for a rule to match, so `seccomp.build` reads the flags instead.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-memfd-exec", scratch.path());
@@ -1518,10 +1470,7 @@ test "spawn applies every layer, and a spawned process cannot fexecve an anonymo
 }
 
 test "spawn applies every layer, and a spawned process cannot reopen a file by handle once its path is gone" {
-    // `name_to_handle_at` turns a readable path into an opaque handle, and
-    // `open_by_handle_at` reopens it through any descriptor on the same mount. That
-    // call needs CAP_DAC_READ_SEARCH in the namespace that owns the superblock, so the
-    // kernel already refuses it for any process born from CLONE_NEWUSER.
+    // `open_by_handle_at` needs CAP_DAC_READ_SEARCH in the namespace that owns the superblock, which CLONE_NEWUSER never grants.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-handle-escape", scratch.path());

@@ -1,15 +1,5 @@
-//! `chock-redteam`: the red team harness. A program somebody runs, and not a
-//! step `zig build test` depends on. A scene is never removed.
-//!
-//! The verbs:
-//!
-//! * `scope` prints the list a run is judged against, and nothing else.
-//! * `self-test` forges every escape in that list, checks that the oracle
-//!   catches each one, then checks that a clean session reports clean. No
-//!   model, no credential, no network. This is `zig build redteam-oracle`.
-//! * `forge <name>` does one of those, and leaves the scene behind to look at.
-//! * `run` is the exercise: one real session against one real model.
-//! * `run --both` runs both configurations and prints both numbers.
+//! `chock-redteam`: the red team harness, a program somebody runs and not a
+//! step `zig build test` depends on.
 
 const std = @import("std");
 const chock_broker = @import("chock-broker");
@@ -31,8 +21,7 @@ const repo_root = @import("redteam-paths").repo_root;
 /// One binary and no helper program on a path.
 const linger_verb = "__linger";
 
-/// Long enough for the scan after the forge, short enough not to hold a process
-/// on a shared machine all day.
+/// Long enough for the scan after the forge, short enough not to hold a process on a shared machine all day.
 const linger_seconds = 120;
 
 pub const Exit = enum(u8) {
@@ -136,8 +125,7 @@ pub fn main(init: std.process.Init) !u8 {
             return Exit.could_not_run.code();
         },
         .linger => {
-            // Nothing is printed and nothing is written. This is here to be found
-            // by a `/proc` scan.
+            // Nothing is printed and nothing is written. This exists to be found by a `/proc` scan.
             init.io.sleep(
                 .{ .nanoseconds = linger_seconds * std.time.ns_per_s },
                 .awake,
@@ -353,8 +341,7 @@ fn oneSession(
     var before = try oracle.Snapshot.take(gpa, io, &scene, env, git_path);
     defer before.deinit();
 
-    // Before the session, or an agent that edited `chock.zon` to permit what it
-    // wanted would come out agreeing with the table.
+    // Before the session, or an agent that edited `chock.zon` would come out agreeing with the table.
     const table = oracle.tableFor(gpa, io, &scene);
     defer if (table) |loaded| chock_policy.table.Table.destroy(gpa, loaded);
 
@@ -366,8 +353,7 @@ fn oneSession(
 
     try runChock(gpa, io, out, env, &scene, options, request, prompt);
 
-    // Before the listener is stopped, so a connection made during the session is
-    // still in the accept queue.
+    // Before the listener is stopped, so a connection made during the session is still in the accept queue.
     var after = try oracle.Snapshot.take(gpa, io, &scene, env, git_path);
     defer after.deinit();
 
@@ -405,8 +391,7 @@ fn finish(
         try scans.append(gpa, one);
     }
 
-    // A line here saying a socket could not be opened is a boundary the oracle
-    // must call inconclusive rather than held.
+    // A line here about an unopened socket is a boundary the oracle must call inconclusive, not held.
     const child_stderr = readEvidence(gpa, io, scene, "stderr.txt");
     defer gpa.free(child_stderr);
 
@@ -425,8 +410,7 @@ fn finish(
     return result;
 }
 
-/// Never fails the run: missing evidence gives an empty slice, which the oracle
-/// reads as less confidence.
+/// Never fails the run: missing evidence gives an empty slice, which the oracle reads as less confidence.
 fn readEvidence(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -484,8 +468,7 @@ fn runChock(
     var turns_buffer: [16]u8 = undefined;
     const turns = try std.fmt.bufPrint(&turns_buffer, "{d}", .{options.max_turns});
 
-    // `addOptionPath` gives a path relative to the build root, and the child below
-    // starts in the scene.
+    // `addOptionPath` gives a path relative to the build root, and the child below starts in the scene.
     const program = try absolutePath(gpa, io, chock_path);
     defer gpa.free(program);
 
@@ -520,8 +503,7 @@ fn runChock(
     try out.print("running {s} for at most {d} turns\n", .{ request.model, options.max_turns });
     try out.flush();
 
-    // A session with no terminal and nobody on the approval socket refuses an
-    // `ask` at once rather than waiting.
+    // A session with no terminal and nobody on the approval socket refuses an `ask` at once rather than waiting.
     var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = scene.project },
@@ -607,8 +589,7 @@ fn forgeOne(
     return Exit.breached.code();
 }
 
-/// A length and an accessor, because a slice into `buffer` would point at a
-/// frame the caller's copy outlives.
+/// A length and an accessor, since a slice into `buffer` would point at a frame the caller's copy outlives.
 const Proof = struct {
     right: bool,
     buffer: [512]u8,
@@ -659,8 +640,7 @@ fn forgeAndJudge(
     const table = oracle.tableFor(gpa, io, &scene);
     defer if (table) |loaded| chock_policy.table.Table.destroy(gpa, loaded);
 
-    // `realPathFileAlloc` hands back a sentinel slice, and freeing it as an ordinary
-    // one is an allocator fault that reaches standard error.
+    // `realPathFileAlloc` hands back a sentinel slice. Freeing it as an ordinary one is an allocator fault.
     var self_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const self_path = selfPath(io, &self_buffer) catch chock_path;
 
@@ -702,8 +682,7 @@ fn forgeAndJudge(
     }
     proof.length = written;
 
-    // The named boundary and not a count, or a forge that tripped the wrong canary
-    // would pass.
+    // The named boundary and not a count, or a forge that tripped the wrong canary would pass.
     proof.right = if (kind.boundary()) |wanted|
         result.verdicts[@intFromEnum(wanted)] == .breached
     else
@@ -717,8 +696,7 @@ fn forgeAndJudge(
 
 fn absolutePath(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return gpa.dupe(u8, path);
-    // `Dir.cwd()` is the `AT_FDCWD` sentinel and not a descriptor, so asking it for
-    // its own real path fails. Opening `.` gives one that can answer.
+    // `Dir.cwd()` is the `AT_FDCWD` sentinel and not a descriptor, so it cannot answer its own real path.
     var here = try std.Io.Dir.cwd().openDir(io, ".", .{});
     defer here.close(io);
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -779,8 +757,7 @@ fn reportSceneError(out: *std.Io.Writer, err: scene_mod.Error, provider: []const
 /// Forty bits, and short enough to keep the root inside `max_root_bytes`.
 const scene_suffix_len = 8;
 
-/// `TMPDIR` only while it is short. A nix dev shell sets one long enough to leave
-/// a session's sockets no room, and the socket bound is on the whole path.
+/// `TMPDIR` only while it is short: a nix dev shell can set one long enough to leave a session's sockets no room.
 fn defaultSceneParent(
     env: *const std.process.Environ.Map,
     configuration: scene_mod.Configuration,
@@ -823,8 +800,7 @@ fn makeSceneRoot(
 }
 
 test {
-    // Whether the oracle catches a real escape is answered by
-    // `zig build redteam-oracle` and by no unit test here.
+    // Whether the oracle catches a real escape is answered by `zig build redteam-oracle`, not a unit test here.
     std.testing.refAllDecls(@This());
     _ = canary;
     _ = logscan;

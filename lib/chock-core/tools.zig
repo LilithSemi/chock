@@ -40,8 +40,6 @@ pub const max_grep_matches: usize = 200;
 
 pub const content_hash_length: usize = 16;
 
-/// A short hash of a file's exact bytes. It refuses an edit that is anchored
-/// on a file which changed after the read. Not a cryptographic hash.
 pub fn contentHash(content: []const u8) [content_hash_length]u8 {
     var out: [content_hash_length]u8 = undefined;
     const digest = std.hash.Wyhash.hash(0, content);
@@ -55,8 +53,6 @@ pub const ProviderCapabilities = struct {
     images: bool = false,
 };
 
-/// An arbitrator reads a case and answers. It holds no tool, so it cannot act
-/// on the reason for an act, which only it is told.
 pub const Role = enum {
     worker,
     arbitrator,
@@ -69,7 +65,6 @@ pub const Role = enum {
     }
 };
 
-/// Says what to do instead, and never why the act is guarded.
 pub const arbitrator_holds_no_tool = "nothing ran: this session holds no tools. You were given a " ++
     "case to read and one answer to give, and reading anything else is not part of it. Answer " ++
     "from what you were told.";
@@ -81,8 +76,6 @@ pub const Support = struct {
     provisioning: bool = false,
     nix_eval: bool = false,
     nix_build: bool = false,
-    /// True when this session found at least one skill. See
-    /// `lib/chock-core/skills.zig`.
     skills: bool = false,
     role: Role = .worker,
 
@@ -95,15 +88,6 @@ pub const Support = struct {
     }
 };
 
-/// The bytes a tool result carries in place of `output`, or null when `output`
-/// is already text. `std.json.Stringify` writes a `[]const u8` that is not
-/// valid UTF-8 as an array of integers and not a string, and the provider then
-/// answers 400. Zig 0.16:
-/// ```
-/// input:  .{ .text = <10 bytes, invalid utf8> }
-/// output: {"text":[120,156,75,202,201,255,254,128,129,0]}
-/// ```
-/// An embedded NUL is valid UTF-8 and is escaped, so it passes through.
 pub fn outputForModel(
     allocator: std.mem.Allocator,
     output: []const u8,
@@ -113,8 +97,6 @@ pub fn outputForModel(
     return note;
 }
 
-/// The largest image `read_image` carries, before base64. Base64 adds a third,
-/// so this stays under the 5 MB an Anthropic request takes for one image.
 pub const max_image_bytes: usize = 3 * 1024 * 1024;
 
 const max_image_bytes_text = std.fmt.comptimePrint("{d}", .{max_image_bytes});
@@ -157,7 +139,6 @@ pub fn sniffImage(bytes: []const u8) Sniffed {
     if (std.mem.startsWith(u8, bytes, "GIF87a") or std.mem.startsWith(u8, bytes, "GIF89a")) {
         return .{ .carried = .gif };
     }
-    // RIFF, then four bytes of length, then the form type.
     if (bytes.len >= 12 and std.mem.startsWith(u8, bytes, "RIFF") and
         std.mem.eql(u8, bytes[8..12], "WEBP"))
     {
@@ -172,7 +153,6 @@ pub fn sniffImage(bytes: []const u8) Sniffed {
         return .{ .other_image = "image/tiff" };
     }
     if (std.mem.startsWith(u8, bytes, "\x00\x00\x01\x00")) return .{ .other_image = "image/vnd.microsoft.icon" };
-    // ISO base media: four bytes of box length, then "ftyp", then the brand.
     if (bytes.len >= 12 and std.mem.eql(u8, bytes[4..8], "ftyp")) {
         const brand = bytes[8..12];
         if (std.mem.eql(u8, brand, "avif") or std.mem.eql(u8, brand, "avis")) {
@@ -184,7 +164,6 @@ pub fn sniffImage(bytes: []const u8) Sniffed {
             return .{ .other_image = "image/heic" };
         }
     }
-    // SVG is text, so the marker can follow whitespace and an XML declaration.
     const head = bytes[0..@min(bytes.len, 512)];
     const trimmed = std.mem.trimStart(u8, head, " \t\r\n");
     if (std.mem.startsWith(u8, trimmed, "<svg") or
@@ -196,28 +175,14 @@ pub fn sniffImage(bytes: []const u8) Sniffed {
     return .not_an_image;
 }
 
-/// How large `spawnCapturing` tries to grow the pipe. A size above the running
-/// kernel's limit is refused, and the call keeps whatever size it has.
 const pipe_target_bytes: usize = 1024 * 1024;
 
 pub const default_timeout_ns: u64 = 120 * std.time.ns_per_s;
 
-/// How much room the workspace filesystem must have before a writing tool call
-/// starts. A floor and not a cap: it is stale when it is read, it bounds no
-/// total, and it cannot stop one call that then writes a hundred gigabytes.
-/// The workspace cannot be a capped tmpfs, because a reboot would then lose
-/// the work `Workspace.apply` hands back.
 pub const default_workspace_free_floor_bytes: u64 = 1 << 30;
 
-/// Where `runInSandbox` binds the one resolved executable, inside the sandbox.
-/// The last path component must be the real command name. A Nix coreutils
-/// install gives `cat` and `ls` as symlinks to one multi-call binary that reads
-/// its own `argv[0]`, and a fixed stand-in name made every such call fail.
 const tool_bin_dir = sandbox.runtime_prefix ++ "/tool-bin";
 
-/// Where a write tool binds the host file holding the bytes it puts in the
-/// workspace. A write tool never opens the destination on the host: it runs
-/// `cp` inside the sandbox, so the kernel resolves the destination path.
 const tool_in_path = sandbox.runtime_prefix ++ "/tool-in/content";
 
 pub const Error = sandbox.Sandbox.SpawnError;
@@ -281,8 +246,6 @@ pub const Tool = enum {
         if (!support.offers(self.needs())) return false;
         return switch (self) {
             .read_memory, .write_memory => support.memory,
-            // Not "always offered": what skills exist is known before the first
-            // turn, so a session with none carries no tool it cannot use.
             .read_skill => support.skills,
             .provide_tool => support.provisioning,
             .nix_eval => support.nix_eval,
@@ -296,9 +259,6 @@ pub const Tool = enum {
             .edit_file,
             .run_command,
             .read_guidance,
-            // Always offered. A static tool list cannot carry an answer that changes
-            // during a session, so each of these is offered and a call that cannot be
-            // honoured is told exactly why.
             .spawn_agent,
             .update_plan,
             .restrict_self,
@@ -315,38 +275,22 @@ pub const Tool = enum {
 
     const store_class = "nix.store";
 
-    /// The class segment for a program in a store path the session mounted at its
-    /// start. Separate from `store_class` because a store path is immutable but the
-    /// set of store paths is not: a session can evaluate and build new ones, which
-    /// a blanket allow written for the startup closure must not cover.
     const devshell_class = "devshell";
 
     const workspace_class = "workspace";
 
-    /// The class segment for a bare name with no `/`. Kept apart from every other
-    /// class: nothing here resolves `PATH`, so this file never learns which store
-    /// entry, if any, the name would reach.
     const path_class = "path";
 
     const store_prefix = "/nix/store/";
 
     const call_prefix = "call";
 
-    /// The action name a `web_search` call asks the arbiter about live, at
-    /// `gateToolCall`. Not `"call.web_search"`: this action is asked as an
-    /// ordinary policy question and not answered by the loop before the gate,
-    /// unlike `fetch_url`'s `net.fetch`.
     const web_search_action = "web.search";
 
-    /// Answered when `arguments` names no program this file can read. Never null:
-    /// null means a name that does not fit, and every call needs a row in the table.
     const unparsed_action = exec_prefix ++ ".unparsed";
 
     const max_raw_path_bytes = std.Io.Dir.max_path_bytes;
 
-    /// The longest action name `actionInto` can build. The path term is three times
-    /// its own length, because an escaped byte costs three, and it carries one more
-    /// separator than the worst case, which is two segments and not one.
     pub const max_action_bytes = exec_prefix.len + 1 + store_class.len + 1 +
         3 * max_raw_path_bytes;
 
@@ -356,15 +300,6 @@ pub const Tool = enum {
         return buffer[0..text.len];
     }
 
-    /// Writes one path segment into `buffer` at `cursor`, with a dot or a percent
-    /// sign escaped, and answers the new cursor.
-    ///
-    /// Every dot and every percent sign is escaped, with no exception, so a plain
-    /// dot in a built name always marks a boundary `actionInto` wrote. That is what
-    /// makes the scheme a bijection: two paths can never share a built name.
-    ///
-    /// No bound check on `buffer` here. Every caller checks `buffer.len` against
-    /// `max_action_bytes` first.
     pub fn writeSegmentEscaped(buffer: []u8, cursor: usize, segment: []const u8) usize {
         var at = cursor;
         for (segment) |byte| {
@@ -398,15 +333,6 @@ pub const Tool = enum {
         return false;
     }
 
-    /// The action name for a `run_command` call. The first two lines differ only in
-    /// the closure of store paths the session mounted at its start.
-    /// ```
-    /// /nix/store/dev-zig/bin/zig  ->  exec.devshell.dev-zig.bin.zig
-    /// /nix/store/abc-jq/bin/jq    ->  exec.nix.store.abc-jq.bin.jq
-    /// ./build.sh                  ->  exec.workspace.build%2Esh
-    /// build.sh                    ->  exec.path.build%2Esh
-    /// a/../b                      ->  exec.unparsed
-    /// ```
     fn runCommandActionInto(
         buffer: []u8,
         argv0: ?[]const u8,
@@ -491,12 +417,7 @@ pub const Tool = enum {
         return switch (self) {
             .run_command => runCommandActionInto(buffer, argv0, project_root, closure),
             .nix_build => null,
-            // Per layer, and the layer is a property of the skill this call names,
-            // which only `gateToolCall` can resolve. `skills.Layer.actionName` holds
-            // the three names.
             .read_skill => null,
-            // A bespoke name, and not the automatic "call.web_search": `gateToolCall`
-            // asks this action live, and `lib/chock-policy/defaults.zig` answers it.
             .web_search => writeWhole(buffer, web_search_action),
             .read_file,
             .read_image,
@@ -852,8 +773,6 @@ pub const Registry = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    /// Run one tool call inside the sandbox and report what happened. Call this
-    /// only from a single threaded process: it forks.
     pub fn dispatch(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -993,8 +912,6 @@ pub const request_needs_a_session = "nothing was carried back: work is carried b
     "without the session that holds either. Say in your answer that the work is not carried " ++
     "back.";
 
-/// The kernel refuses a directory mounted over a regular file, so each path
-/// carries the kind that was read for it.
 pub const ToolchainMount = struct {
     source: []const u8,
     target: []const u8,
@@ -1023,13 +940,8 @@ pub const NetSeam = struct {
 
 pub const trust_store_inside = sandbox.trust_store_inside;
 
-/// Where a secret bound as a file lands, with the variable's own name after it.
-/// Directly under the runtime prefix, the way the trust store is, so it needs no
-/// directory the sandbox does not already make.
 pub const secret_file_prefix = sandbox.runtime_prefix ++ "/secret-";
 
-/// The host paths a trust store is kept at, most specific first. The third is
-/// what Alpine and macOS write.
 const host_trust_stores = [_][]const u8{
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/pki/tls/certs/ca-bundle.crt",
@@ -1047,8 +959,6 @@ fn hostTrustStore(allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
 
 const max_trust_store_bytes = 4 << 20;
 
-/// `SSL_CERT_FILE` is undefined in POSIX. A dev shell that sets its own would
-/// otherwise win or lose depending on which one a libc reads first.
 fn trustEnvironment(
     allocator: std.mem.Allocator,
     base: []const []const u8,
@@ -1072,15 +982,9 @@ pub const Context = struct {
     approval_wait_ns: ?*const std.atomic.Value(u64) = null,
     net: ?NetSeam = null,
     credentials: ?credentials_mod.Seam = null,
-    /// The action name this call was gated under. Empty for a caller that
-    /// names none, and then nothing that reads it grants anything.
     action: []const u8 = "",
-    /// What secrets this call may be given. Null for a session that grants
-    /// none, which is every session whose project named none.
     secrets: ?tool_secrets_mod.Seam = null,
     memory_dir: ?[]const u8 = null,
-    /// Every skill this session found, bodies and all, in the order the layers
-    /// apply. `read_skill` answers out of this and reads no file.
     skills: []const skills.Skill = &.{},
     cache_dir: ?[]const u8 = null,
     scratch_dir: ?[]const u8 = null,
@@ -1089,9 +993,6 @@ pub const Context = struct {
     tasks: ?*tasks.Table = null,
     session_id: []const u8 = "",
     store_paths: []const []const u8 = &.{"/nix/store"},
-    /// Every path bound read only beside the store: the session's toolchain, and
-    /// each operator skill's own directory. One list, because each entry needs
-    /// the same mount and the same Landlock rule whatever put it there.
     read_only_mounts: []const ToolchainMount = &.{},
     provisioning: bool = false,
     role: Role = .worker,
@@ -1505,8 +1406,6 @@ fn runCommand(
         config.env = entries;
     }
 
-    // The scratchpad is two bind mounts and never one, plus the capped tmpfs
-    // `TMPDIR` points at.
     var emptied: ?scratchpad.Size = null;
     var scratch_source: ?[]u8 = null;
     defer if (scratch_source) |path| allocator.free(path);
@@ -1515,8 +1414,6 @@ fn runCommand(
     var trust_staged: ?Staged = null;
     defer if (trust_staged) |*staged| staged.deinit(allocator, io);
 
-    // What a background task takes over, so nothing here deletes a file its
-    // own thread has not bound yet. See `tasks.Request.staged`.
     var handed: std.ArrayList([]const u8) = .empty;
     defer handed.deinit(allocator);
 
@@ -1562,9 +1459,6 @@ fn runCommand(
         config.env = entries;
     }
 
-    // A routed call is given a trust store, or it has a network it cannot verify.
-    // Anything under the overlay target is shadowed the moment the overlay goes on,
-    // so the copy is staged in the routed step that runs after it.
     if (context.net != null) {
         if (hostTrustStore(allocator, io)) |host_bundle| {
             defer allocator.free(host_bundle);
@@ -1591,14 +1485,10 @@ fn runCommand(
                     error.OutOfMemory => return error.OutOfMemory,
                     error.StagingFailed => {},
                 }
-            } else |_| {
-                // Best effort, the same as a staging failure above.
-            }
+            } else |_| {}
         }
     }
 
-    // Released however the call ends, including a failure to start the program.
-    // `release` takes a call that was granted nothing.
     defer if (context.secrets) |seam| seam.release(call.call_id);
 
     var armed: ?credentials_mod.Armed = null;
@@ -1621,9 +1511,6 @@ fn runCommand(
         }
     }
 
-    // Asked right before the sandbox is built, so a value lives for the length
-    // of one program. A background command outlives its call, so a grant for one
-    // would reach work that nobody approved it for.
     var staged_secrets: std.ArrayList(Staged) = .empty;
     defer {
         for (staged_secrets.items) |*one| one.deinit(allocator, io);
@@ -1687,8 +1574,6 @@ fn runCommand(
         .extra_rules = extra_rules.items,
         .timeout_ns = if (in_background) tasks.default_timeout_ns else context.timeout_ns,
         .background = if (in_background) context.tasks else null,
-        // `run_command` and no other tool: it is the one call that runs a program the
-        // model named.
         .idle = if (in_background) null else if (credential_chain.seam != null)
             credential_chain.idle()
         else
@@ -1758,7 +1643,6 @@ fn runCommand(
         else => |e| return e,
     };
 
-    // The task owns them now, and `Table.start` already copied every path.
     if (ran == .started and handed.items.len != 0) {
         if (trust_staged) |*staged| {
             staged.release(allocator);
@@ -1778,10 +1662,7 @@ fn runCommand(
     );
     if (config.network == .none and result.is_error and namesTheNetwork(result.output)) {
         result.note = try allocator.dupe(u8, no_network_note);
-    }
-    // `else if` and not a second `if`: the two notes must never overwrite
-    // each other.
-    else if (ran == .captured and ran.captured.waited_for_approval_ns > 0) {
+    } else if (ran == .captured and ran.captured.waited_for_approval_ns > 0) {
         result.note = try std.fmt.allocPrint(
             allocator,
             "[chock: this call's own {d}ms limit was extended by {d}ms while a person was asked " ++
@@ -1795,10 +1676,6 @@ fn runCommand(
     return result;
 }
 
-/// What a guest said when it refused, for the four errors that carry a sentence.
-///
-/// The driver keeps the reason and the error name alone does not: `GuestRefused`
-/// told a reader nothing while the sentence behind it sat unread.
 fn guestReason(driver: sandbox.Sandbox.Driver, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.GuestRefused,
@@ -1828,8 +1705,6 @@ fn backgroundRun(
     const captured = spawnCapturing(
         allocator,
         io,
-        // A background task is sandboxed the same way a foreground call is. The
-        // table holds no context, so it carries the driver with the request.
         request.driver,
         request.config,
         request.argv,
@@ -1853,8 +1728,6 @@ fn backgroundRun(
             ) catch "",
     };
 
-    // A background task meets the same limits a foreground call does, and nobody
-    // is watching, so nothing extends its deadline.
     const output = withLimitNote(allocator, captured.output, captured.limits);
 
     if (captured.timed_out) return .{
@@ -1911,8 +1784,6 @@ fn workspaceRefusal(
     );
 }
 
-/// A secret bound as a file could not be written. A fault on this machine, and
-/// the call is refused rather than run with the variable naming nothing.
 pub const secret_file_failed = "the command was not run: the secret that arrives as {s} could not " ++
     "be written to a file for it. This is a fault on this machine and not a refusal, and nothing " ++
     "was given to the command.\n";
@@ -1961,7 +1832,6 @@ const network_fault_phrases = [_][]const u8{
     "SOCK_RAW",
     "cap_net_raw",
     "Network is unreachable",
-    // The first two wordings are glibc, the third is BSD and macOS.
     "Temporary failure in name resolution",
     "Name or service not known",
     "nodename nor servname provided",
@@ -2014,7 +1884,6 @@ fn readFile(
         return deniedPathResult(allocator, call, denied);
     }
 
-    // `--` so a path that begins with a dash is a path and never an option.
     const argv = [_][]const u8{ "cat", "--", parsed.value.path };
     const captured = (try fixedProgram(allocator, io, env, workspace_config, .{
         .argv = &argv,
@@ -2328,7 +2197,6 @@ fn grepFiles(
         .timeout_ns = timeout_ns,
     })) orelse return notFoundResult(allocator, call, "grep");
 
-    // grep says 1 for "nothing matched", which is an answer and not a failure.
     return boundedResult(allocator, call, captured, .{
         .max_lines = max_grep_matches,
         .noun = "matching lines",
@@ -2354,8 +2222,6 @@ fn globFiles(
     if (leavesProject(path, workspace_config.cwd)) {
         return outsideProjectResult(allocator, call, .glob, path);
     }
-    // `find` has no `--`, so a path that begins with a dash is read as an option.
-    // A path is made relative first, so it can never begin with one.
     if (path.len != 0 and path[0] == '-') {
         return toolErrorResult(allocator, call, try allocator.dupe(
             u8,
@@ -2363,8 +2229,6 @@ fn globFiles(
         ));
     }
 
-    // The whole file list first, matched afterwards in this process, because
-    // `find` has no glob of this shape.
     var argv: [2 + glob_find_arguments.len][]const u8 = undefined;
     argv[0] = "find";
     argv[1] = path;
@@ -2466,11 +2330,6 @@ fn writeFile(
     );
 }
 
-/// Replace one exact piece of text in one file. `old_string` must appear once,
-/// and `file_hash` must match when the call gives one. Nothing checks that the
-/// line was one a tool actually showed the model: that needs a record of every
-/// read, and this library is a fresh process per call, so it has nowhere to
-/// keep one.
 fn editFile(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2731,9 +2590,6 @@ fn readGuidance(allocator: std.mem.Allocator, call: ToolCall) Error!ToolResult {
     };
 }
 
-/// The body of one skill. **No file is read here**: `skills.discover` read
-/// every body at session start, so the index in the prompt and the body a call
-/// answers with come from the same read of the same file.
 fn readSkill(allocator: std.mem.Allocator, call: ToolCall, context: Context) Error!ToolResult {
     const named = try skills.namedIn(allocator, context.skills, call.arguments);
     const one = switch (named) {
@@ -3139,13 +2995,6 @@ fn boundedResult(
     };
 }
 
-/// Whether `path` matches `pattern`. The pattern comes from the model and
-/// backtracking over it is exponential, so `matchGlob` carries a step budget.
-///
-/// `*` matches any run of bytes inside one component, `**` matches any run of
-/// components, and `?` matches one byte that is not `/`. Every other byte
-/// matches itself, `[` included. `lib/chock-policy/workspace.zig` documents
-/// these same rules for the `workspace` block, which matches with this.
 pub fn matchGlob(pattern: []const u8, path: []const u8) bool {
     var budget: usize = glob_step_budget;
     return matchGlobBudgeted(pattern, path, &budget);
@@ -3198,8 +3047,6 @@ const Staged = struct {
         self.* = undefined;
     }
 
-    /// Free the name and leave the file. **Only after something else took the
-    /// path**, or the file stays for as long as the directory holding it.
     fn release(self: *Staged, allocator: std.mem.Allocator) void {
         allocator.free(self.host_path);
         self.* = undefined;
@@ -3216,8 +3063,6 @@ fn stageContent(
     env: *const std.process.Environ.Map,
     content: []const u8,
 ) StageError!Staged {
-    // Resolved, because on a build that moves a path the rule must name the path
-    // the sandbox sees.
     var resolved_dir: [std.fs.max_path_bytes]u8 = undefined;
     const dir = sandbox.resolvedPath(io, env.get("TMPDIR") orelse "/tmp", &resolved_dir);
 
@@ -3263,9 +3108,6 @@ const RunError = error{
     ExecutableNotFound,
 } || Error || tasks.StartError;
 
-/// The program names `runInSandbox` refuses to bind as `argv[0]`. A bound shell
-/// finds no other program in the tool bin and exits 127, so the refusal turns a
-/// puzzle into a statement. It takes away nothing that ever ran.
 const shell_names = [_][]const u8{
     "sh",   "bash",  "dash", "ash",        "zsh", "ksh",
     "mksh", "csh",   "tcsh", "fish",       "rc",  "elvish",
@@ -3279,12 +3121,6 @@ fn isShellName(name: []const u8) bool {
     return false;
 }
 
-/// The program launchers `runInSandbox` refuses to bind as `argv[0]`. A denylist
-/// and not a boundary: any build tool that takes a program argument has the same
-/// shape, and no list of names reaches them all. `find` is one of them, through
-/// `-exec`, and is refused by its arguments instead. What bounds a call is the
-/// namespaces, the Landlock rules and the seccomp filter, none of which read
-/// `argv[0]`.
 const launcher_names = [_][]const u8{
     "env",      "nice",     "timeout", "xargs",     "setsid",
     "nohup",    "stdbuf",   "chrt",    "ionice",    "taskset",
@@ -3322,9 +3158,6 @@ fn hostDirHasFile(io: std.Io, host_dir: []const u8, name: []const u8) bool {
     return true;
 }
 
-/// True when the workspace holds a file called `name` in its own top directory.
-/// A linked worktree keeps `.git` as a file, and an overlay keeps two
-/// directories, so both are looked in.
 fn workspaceHasFile(io: std.Io, config: sandbox.Config, name: []const u8) bool {
     for (config.mounts) |mount| switch (mount) {
         .bind => |bind| {
@@ -3381,18 +3214,10 @@ const ExecOptionProgram = struct {
     options: []const []const u8,
 };
 
-/// The programs that start another program through an option, and the options
-/// that do it. A reduction and not a boundary: an interpreter execs whatever it
-/// is told, a short option in a cluster is not read, and a copy of `find` in the
-/// workspace runs with no name check at all. A shell in the dev shell closure
-/// is reachable by any program in the sandbox that can exec.
 const exec_option_programs = [_]ExecOptionProgram{
-    // `-ok` and `-okdir` ask on standard input, which a tool call does not have,
-    // so they hang until the deadline rather than run.
     .{ .program = "find", .options = &.{ "-exec", "-execdir", "-ok", "-okdir" } },
     .{ .program = "fd", .options = &.{ "-x", "-X", "--exec", "--exec-batch" } },
     .{ .program = "fdfind", .options = &.{ "-x", "-X", "--exec", "--exec-batch" } },
-    // `rg --pre` names a preprocessor `rg` execs for every file it reads.
     .{ .program = "rg", .options = &.{ "--pre", "--hostname-bin" } },
 };
 
@@ -3445,8 +3270,6 @@ const SandboxCall = struct {
     background: ?*tasks.Table = null,
     idle: ?idle_mod.Idle = null,
     approval_wait_ns: ?*const std.atomic.Value(u64) = null,
-    /// Host files a background task takes over. Ignored for a foreground call,
-    /// whose own frame outlives the program. See `tasks.Request.staged`.
     staged: []const []const u8 = &.{},
 };
 
@@ -3455,11 +3278,6 @@ const Ran = union(enum) {
     started: [tasks.id_length]u8,
 };
 
-/// `workspace_config` with the store and every `read_only_mounts` entry bound
-/// in, read only. Each
-/// path needs one mount and one matching Landlock rule: a mount with no rule is
-/// present and unreachable. Each path's kind is read here, in the parent,
-/// because Landlock refuses a directory rule over a regular file.
 pub fn withStore(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3500,8 +3318,6 @@ pub fn withStore(
         };
         next += 1;
     }
-    // The rule names the path inside the sandbox. Landlock is applied in the child,
-    // after the mount tree is built.
     for (read_only_mounts) |one| {
         rules[next] = .{
             .path = one.target,
@@ -3592,9 +3408,6 @@ pub fn prepare(
 ) RunError!Prepared {
     if (argv.len == 0) return error.EmptyArgv;
 
-    // A name with a `/` in it is a file in the workspace, and it runs. A shell or a
-    // launcher is refused before `PATH` is read, because a shell on the host is
-    // still a shell.
     const workspace_program = std.mem.indexOfScalar(u8, argv[0], '/') != null;
     if (workspace_program) {
         if (leavesProject(argv[0], workspace_config.cwd)) return error.InvalidExecutableName;
@@ -3609,7 +3422,6 @@ pub fn prepare(
     else
         try resolveOnPath(allocator, io, env, argv[0]) orelse return error.ExecutableNotFound;
 
-    // The last path component must be argv[0] itself: see `tool_bin_dir`.
     const staged_target: ?[]const u8 = if (resolved) |path|
         if (sandbox.expresses.moved_paths)
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_bin_dir, argv[0] })
@@ -3636,13 +3448,8 @@ pub fn prepare(
     if (bind_source) |source| {
         try mounts.append(allocator, .{ .bind = .{ .source = source, .target = bin_target, .read_only = true } });
     }
-    // /dev/null, which git opens directly and many other programs expect.
     try mounts.append(allocator, .{ .bind = .{ .source = "/dev/null", .target = "/dev/null", .read_only = false } });
-    // A procfs of the sandbox's own, which git and many toolchains read through
-    // /proc/self/exe. Only on a build whose driver has one: macOS has no procfs.
     if (sandbox.expresses.procfs) try mounts.append(allocator, .{ .proc = .{} });
-    // Last, so a caller that named the same target wins: the kernel takes the last
-    // matching mount.
     try mounts.appendSlice(allocator, extra_mounts);
 
     var rules: std.ArrayList(sandbox.Config.Rule) = .empty;
@@ -3652,7 +3459,6 @@ pub fn prepare(
         try rules.append(allocator, .{ .path = bin_target, .access = .{ .execute = true, .read_file = true } });
     }
     try rules.append(allocator, .{ .path = "/dev/null", .access = .{ .read_file = true, .write_file = true } });
-    // The procfs read only. Landlock has to permit the read for /proc/self/exe.
     if (sandbox.expresses.procfs) {
         try rules.append(allocator, .{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only });
     }
@@ -3670,8 +3476,6 @@ pub fn prepare(
     return .{ .config = call_config, .argv = try full_argv.toOwnedSlice(allocator) };
 }
 
-// Two sources can both hold the file, and the kernel gives the last one.
-// An overlay never counts: its lower directory is not a path in the sandbox.
 fn sandboxPathOf(
     allocator: std.mem.Allocator,
     mounts: []const sandbox.namespace.Mount,
@@ -3746,8 +3550,6 @@ fn resolveOnPath(
     return null;
 }
 
-/// Whether a `PATH` candidate is something a call could run. A permission error
-/// or a dangling link on one entry does not stop the rest of `PATH`.
 fn candidateRuns(io: std.Io, candidate: []const u8, kind: std.Io.File.Kind) bool {
     if (kind == .directory) return false;
     if (kind != .sym_link) return true;
@@ -3766,19 +3568,11 @@ const Captured = struct {
     waited_for_approval_ns: u64 = 0,
 };
 
-/// What the thread inside `spawnCapturing` reports back. A raw `std.Thread.spawn`
-/// and not `std.Io.concurrent`: the probe hands `dispatch` a failing allocator,
-/// which makes `concurrent` answer `ConcurrencyUnavailable` without running the
-/// function, and `Group.async` fall back to running it synchronously. The second
-/// brings back the deadlock, because nothing reads the pipe while the program runs.
 const SpawnThread = struct {
     allocator: std.mem.Allocator,
     driver: sandbox.Sandbox.Driver,
     config: sandbox.Config,
     argv: []const []const u8,
-    /// Written by `Sandbox.spawn` right after its own first fork. Read `pid` with an
-    /// explicit acquire load, or the compiler caches a stale zero. `fd` needs no
-    /// atomic: it is written before the release store of `pid`.
     middle: sandbox.Middle = .{},
     done: std.atomic.Value(bool) = .init(false),
     term: std.process.Child.Term = undefined,
@@ -3800,21 +3594,8 @@ const SpawnThread = struct {
     }
 };
 
-/// Which way of sandboxing every tool call of this process gets.
-///
-/// **Process level and not per call**, for two reasons. The operator chooses it in
-/// their own `config.zon` and it is fixed before the first turn, so there is one
-/// answer for the life of the process. And threading it would put a parameter
-/// through every built-in tool, most of which hold no `Context` at all, for a value
-/// none of them would ever vary.
-///
-/// **Nothing an agent says reaches this.** It is set once by `src/run.zig` from a
-/// file the sandbox puts beyond the agent's reach, and there is no tool that writes
-/// it.
 var chosen_driver: sandbox.Sandbox.Driver = sandbox.Sandbox.native_driver;
 
-/// Say which driver this process sandboxes with. Called once, before the first
-/// tool call.
 pub fn useDriver(one: sandbox.Sandbox.Driver) void {
     chosen_driver = one;
 }
@@ -3823,8 +3604,6 @@ pub fn driverNow() sandbox.Sandbox.Driver {
     return chosen_driver;
 }
 
-/// The cancellation handle of every call this process runs now. A free slot holds
-/// -1. A handle and never a pid: a pid that was reaped can name another process.
 var running_tool_handles: [tasks.max_tasks + 1]std.atomic.Value(std.posix.fd_t) = @splat(.init(-1));
 
 fn takeRunningSlot(handle: std.posix.fd_t) ?usize {
@@ -3840,22 +3619,10 @@ fn releaseRunningSlot(slot: ?usize) void {
     running_tool_handles[index].store(-1, .release);
 }
 
-/// End every call this process is running now, and every process each of them
-/// started. Safe to call from a signal handler: it reads atomics and calls
-/// `kill`, and it neither allocates nor locks.
-///
-/// `Sandbox.spawn` puts every process of a call in a group of its own, so a
-/// terminal signal no longer reaches a call and a caller has to do this itself.
-///
-/// A handler can read a slot and then be descheduled while another thread closes
-/// and reuses that descriptor, so this can reach another process of this process.
-/// It can never reach a process this process did not start.
 pub fn cancelRunningTool() void {
     for (&running_tool_handles) |*slot| {
         const handle = slot.load(.monotonic);
         if (handle < 0) continue;
-        // Through the driver this process sandboxes with: a guest's call is not
-        // signalled by a syscall of this kernel's.
         chosen_driver.signalMiddle(handle, std.posix.SIG.KILL) catch {};
     }
 }
@@ -3903,12 +3670,8 @@ fn spawnCapturingIo(
     const read_file: std.Io.File = .{ .handle = read_fd, .flags = .{ .nonblocking = false } };
     const write_file: std.Io.File = .{ .handle = write_fd, .flags = .{ .nonblocking = false } };
 
-    // Best effort. A kernel that refuses this size keeps the one it has. Does
-    // nothing on Darwin.
     chock_io_driver.growPipeBuffer(write_fd, pipe_target_bytes);
 
-    // A private arena over `std.heap.page_allocator`, so this thread shares no lock
-    // with the calling thread for `fork` to freeze mid-hold.
     var thread_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer thread_arena_state.deinit();
 
@@ -3931,8 +3694,6 @@ fn spawnCapturingIo(
         return error.Unexpected;
     };
 
-    // Wait, bounded, for `Sandbox.spawn` to learn its own middle process or to
-    // fail. The fork that must inherit the write end has already happened by then.
     const wait_step: std.Io.Duration = .fromMilliseconds(1);
     const wait_bound: std.Io.Duration = .fromSeconds(5);
     var waited: std.Io.Duration = .zero;
@@ -3954,7 +3715,6 @@ fn spawnCapturingIo(
 
     std.Io.File.close(write_file, io);
 
-    // Every fork this process makes has already happened by the time this runs.
     const drained = drainCapture(
         allocator,
         io,
@@ -3994,13 +3754,6 @@ fn earlier(a: std.Io.Clock.Timestamp, b: std.Io.Clock.Timestamp) std.Io.Clock.Ti
     return if (a.compare(.lt, b)) a else b;
 }
 
-/// Read `read_fd` until every write end of the pipe is closed, keeping at most
-/// `keep_bytes`. Runs while the sandboxed program is still running, or a program
-/// that writes more than the pipe holds blocks forever on its own write.
-///
-/// `approval_wait_ns` extends the deadline live. The `error.Timeout` branch
-/// re-checks, because a read already in flight was handed its deadline when it
-/// started and cannot be moved.
 fn drainCapture(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -4018,7 +3771,6 @@ fn drainCapture(
     var timed_out = false;
     var signal_sent = false;
 
-    // `.awake` and not `.real`. A deadline must not move when NTP steps the clock.
     const base_deadline: std.Io.Clock.Timestamp = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{
         .raw = .fromNanoseconds(@intCast(timeout_ns)),
         .clock = .awake,
@@ -4063,7 +3815,6 @@ fn drainCapture(
                     if (std.Io.Clock.Timestamp.now(io, .awake).compare(.lt, fresh)) continue;
                 }
                 timed_out = true;
-                // Through the handle and never the pid.
                 if (@atomicLoad(std.posix.pid_t, &spawn_thread.middle.pid, .acquire) != 0) {
                     spawn_thread.driver.signalMiddle(spawn_thread.middle.fd, std.posix.SIG.TERM) catch {};
                     signal_sent = true;
@@ -4077,7 +3828,6 @@ fn drainCapture(
             error.EndOfStream => break, // every write end of the pipe is now closed
             else => return error.Unexpected,
         };
-        // `readStreaming` may return 0 reads without that meaning end of file.
         if (n == 0) continue;
 
         var taken: usize = 0;
@@ -4115,9 +3865,7 @@ test "a background task takes a cancel slot of its own and never clears a foregr
         running_tool_handles[foreground].load(.monotonic),
     );
 
-    // No handle takes no slot. `Sandbox.spawn` leaves the descriptor at -1.
     try std.testing.expectEqual(@as(?usize, null), takeRunningSlot(-1));
-    // Descriptor 0 is a real descriptor, unlike a process group of 0.
     const zero = takeRunningSlot(0);
     try std.testing.expect(zero != null);
     try std.testing.expectEqual(@as(std.posix.fd_t, 0), running_tool_handles[zero.?].load(.monotonic));
@@ -4205,7 +3953,6 @@ test "a tool that does not exist is a tool error and not a crash" {
 }
 
 test "the network note is offered for the boundary and for nothing else" {
-    // `ping` in a tool call answers `exit 2` and prints nothing a reader can act on.
     try std.testing.expect(namesTheNetwork("/run/chock/tool-bin/ping: socktype: SOCK_RAW\n"));
     try std.testing.expect(namesTheNetwork("ping: => missing cap_net_raw+p capability or setuid?"));
     try std.testing.expect(namesTheNetwork("curl: (6) Could not resolve host: ziglang.org"));
@@ -4822,8 +4569,6 @@ test "a tool with no argument to read is named after itself, once each" {
     inline for (@typeInfo(Tool).@"enum".fields) |f| {
         const tool: Tool = @enumFromInt(f.value);
         if (tool == .run_command) continue;
-        // Both name nothing here, and each for the same reason: the action is a
-        // property of the call's own argument, so only the gate can build it.
         if (tool == .nix_build or tool == .read_skill) {
             try std.testing.expect(tool.actionInto(&buffer, null, "", &.{}) == null);
             continue;
@@ -5045,8 +4790,6 @@ test "no two paths in a table built to confuse the encoding share a name" {
 }
 
 test "a path with a .. component is never resolved, and answers unparsed instead" {
-    // Resolving `..` correctly needs the filesystem, to follow any symlink on the
-    // way. This reads the string the model wrote and nothing else.
     const paths = [_][]const u8{ "a/../b", "../x", "a/.." };
     for (paths) |path| {
         var buffer: [Tool.max_action_bytes]u8 = undefined;
@@ -5066,14 +4809,11 @@ test "a bare name run_command would resolve on PATH is its own class, neither st
 }
 
 test "run_command with no argv element to read still gets a name, and never null for that reason" {
-    // `null` is kept for one reason only: a name that would not fit.
     var buffer: [Tool.max_action_bytes]u8 = undefined;
     try std.testing.expectEqualStrings("exec.unparsed", Tool.run_command.actionInto(&buffer, null, "", &.{}).?);
 }
 
 test "a name too long for the buffer is a refusal, and never a truncated key" {
-    // A truncated key names a different, broader action, so a name is refused
-    // rather than cut.
     var small: [8]u8 = undefined;
     try std.testing.expect(
         Tool.run_command.actionInto(&small, "/nix/store/abc-jq/bin/jq", "", &.{}) == null,
@@ -5083,8 +4823,6 @@ test "a name too long for the buffer is a refusal, and never a truncated key" {
 test "every tool has an action name, and every name reaches the table" {
     inline for (@typeInfo(Tool).@"enum".fields) |f| {
         const tool: Tool = @enumFromInt(f.value);
-        // Both of these are named per call: a build by its attribute, a skill
-        // by the layer of the one it names. `gateToolCall` builds each.
         if (tool == .nix_build or tool == .read_skill) continue;
         var buffer: [Tool.max_action_bytes]u8 = undefined;
         const action = tool.actionInto(&buffer, null, "", &.{}) orelse
@@ -5274,7 +5012,6 @@ test "valid UTF-8 output is left alone, multi byte characters included" {
 test "a lone surrogate is not text, and an embedded NUL is" {
     const allocator = std.testing.allocator;
 
-    // 0xED 0xA0 0x80 is U+D800 encoded the way UTF-8 forbids.
     const surrogate = [_]u8{ 0xED, 0xA0, 0x80 };
     const note = (try outputForModel(allocator, &surrogate)).?;
     defer allocator.free(note);
@@ -5715,8 +5452,6 @@ test "the directory a write tool stages its bytes in is under the one prefix Cho
 }
 
 test "a prepared call asks for nothing this build's own driver refuses" {
-    // A config that asks for a procfs, or for a path to appear somewhere else,
-    // answers `NoMountNamespace` on Darwin.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5870,8 +5605,6 @@ test "every landlock rule a tool call is built from names a path its own mount l
     try std.testing.expect(found_program_mount);
 }
 
-/// Fail when `config`'s mount list and its Landlock rule list disagree: a mount
-/// with no rule is present and unreachable.
 fn expectLayersAgree(config: sandbox.Config) !void {
     var buffer: [256]u8 = undefined;
     const said = if (sandbox.firstGap(config)) |gap|

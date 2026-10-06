@@ -1,55 +1,4 @@
-//! A second Linux credential driver: the freedesktop secret service,
-//! reached over the D-Bus session bus, instead of the file in
-//! `linux/secrets.zig`. Which one a build uses is a choice made above this
-//! file; this file never makes that choice itself.
-//!
-//! ## Nothing here waits without a bound
-//!
-//! The Darwin Keychain driver was rewritten because the command it used to
-//! run could hang on an authorisation dialog nobody was there to answer.
-//! The same shape of bug is possible here, so every D-Bus call this file
-//! makes goes through `callAndWait`, which dispatches the event loop in
-//! bounded slices and gives up once `call_deadline_ms` passes. Chock's
-//! session `Io` cannot start a thread to watch a call that never returns,
-//! so the bound has to be the whole answer.
-//!
-//! ## Why "plain"
-//!
-//! `Service.OpenSession` offers two algorithms. `"plain"` sends the
-//! credential unencrypted over the session bus, a local, kernel mediated
-//! socket, and needs no cryptography here. The other,
-//! `dh-ietf1024-sha256-aes128-cbc-pkcs7`, would mean implementing
-//! Diffie-Hellman and AES-CBC in this file, so it is not offered.
-//!
-//! ## The failure that matters
-//!
-//! Tried against a real gnome-keyring on a session with no desktop: the
-//! session bus exists, the service activates, and `OpenSession` succeeds.
-//! Every cheap check passes. Then the default collection turns out to be
-//! locked, and unlocking it means a prompt nobody here can answer.
-//!
-//! That observation was right and the conclusion drawn from it was too wide.
-//! This driver used to call neither `Unlock` nor `Prompt`, which refused the
-//! desktop case as well as the headless one, and the desktop case is the common
-//! one: a prompt there is the unlock dialog a person expects.
-//!
-//! So a locked collection is now **tried once**. `Unlock` is called, and if the
-//! service answers with a prompt it is shown, which is what makes the dialog
-//! appear. The wait for it is bounded like every other wait here, at
-//! `unlock_deadline_ms` rather than `call_deadline_ms`, because a person typing a
-//! password is slower than a bus. A prompt nobody answers therefore times out and
-//! the collection is reported locked with the same advice as before, which is
-//! exactly what a headless session gets.
-//!
-//! **A dismissed prompt is not retried.** A person who cancelled the dialog has
-//! answered, and asking again would be arguing with them.
-//!
-//! ## No fallback
-//!
-//! Selection between this driver and the file one is configured, and this
-//! file does not choose. Falling back to the file driver on a locked
-//! collection would put a credential somewhere the user did not ask for,
-//! which is the one thing ruled out here.
+//! A second Linux credential driver, over the freedesktop secret service.
 
 const std = @import("std");
 const dbus = @import("dbus");
@@ -57,18 +6,12 @@ const store = @import("../store.zig");
 
 const linux = std.os.linux;
 
-/// The bound every D-Bus call in this file waits under. See `callAndWait`.
 pub const call_deadline_ms: i64 = 5000;
 
-/// The bound a prompt waits under, which is a person typing a password rather
-/// than a bus answering. Long enough to find the dialog and type, short enough
-/// that a session with no prompter gives up while somebody is still watching.
 pub const unlock_deadline_ms: i64 = 120_000;
 
 const prompt_iface = "org.freedesktop.Secret.Prompt";
 
-/// The value stored under the `"service"` attribute on every item this
-/// driver writes, the way the Darwin driver names `service_name`.
 pub const service_name = "chock";
 
 const bus_name = "org.freedesktop.secrets";
@@ -82,8 +25,6 @@ const label_property = "org.freedesktop.Secret.Item.Label";
 const attributes_property = "org.freedesktop.Secret.Item.Attributes";
 const content_type = "text/plain; charset=utf8";
 
-/// What went wrong reaching the secret service. `store.Diagnostic` has no
-/// variant of its own for this driver yet: see `Driver.last_fault`.
 const faults = @import("secret_fault.zig");
 
 pub const Fault = faults.Fault;
@@ -93,25 +34,11 @@ const InternalError = error{
     NoSessionBus,
     ServiceUnavailable,
     CallFailed,
-    /// The service refused because the collection is locked. It says so in the
-    /// error name of an error reply, which is why `Waiter` keeps one.
     CollectionLocked,
     BadReply,
     ValueTooLong,
 } || std.mem.Allocator.Error;
 
-/// The error names a locked collection is refused with.
-///
-/// **Measured against gnome-keyring 2026-09-27, not read off the specification.**
-/// A locked collection answers `CreateItem` with an error reply, not with a
-/// success carrying a prompt path, so a driver that looked only at the prompt
-/// path reported "the call failed" and the advice about unlocking never reached
-/// the person who needed it.
-///
-/// `IsLocked` is the Secret Service specification's own name.
-/// `org.freedesktop.DBus.Error.AccessDenied` is what an implementation sends when
-/// it will not say more, and it means the same thing here: the collection would
-/// not take the item.
 const locked_error_names = [_][]const u8{
     "org.freedesktop.Secret.Error.IsLocked",
     "org.freedesktop.DBus.Error.AccessDenied",
@@ -124,8 +51,6 @@ fn isLockedErrorName(named: []const u8) bool {
     return false;
 }
 
-/// Turn an unmarshalling fault into `BadReply`, keeping `OutOfMemory` as
-/// itself. Every reply this file reads goes through this on its way out.
 fn badReplyOr(err: anytype) InternalError {
     if (err == error.OutOfMemory) return error.OutOfMemory;
     return error.BadReply;
@@ -140,9 +65,6 @@ const Resolved = struct {
     }
 };
 
-/// Where the session bus is. `DBUS_SESSION_BUS_ADDRESS` names it on every
-/// desktop session; the `dbus` library does not read it, so this file
-/// does. Caller owns the result.
 fn resolveSessionAddress(
     gpa: std.mem.Allocator,
     env: *const std.process.Environ.Map,
@@ -151,14 +73,9 @@ fn resolveSessionAddress(
     if (env.get("DBUS_SESSION_BUS_ADDRESS")) |value| {
         if (try parseFirstUnix(gpa, value)) |resolved| return resolved;
     }
-    // Only reached when the variable is missing or unusable: the
-    // conventional location every desktop session's variable points at.
     return .{ .path = try std.fmt.allocPrint(gpa, "/run/user/{d}/bus", .{uid}), .abstract = false };
 }
 
-/// The first `unix:` address in `value`, or null when there is none. An
-/// address this driver cannot parse falls back rather than fails: see
-/// `resolveSessionAddress`.
 fn parseFirstUnix(gpa: std.mem.Allocator, value: []const u8) std.mem.Allocator.Error!?Resolved {
     const list = dbus.address.parse(gpa, value) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -184,8 +101,6 @@ const Reply = struct {
     }
 };
 
-/// Captures a method reply. Only ever holds an owned copy of the body: the
-/// message the callback receives is invalid the moment it returns.
 const Waiter = struct {
     gpa: std.mem.Allocator,
     done: bool = false,
@@ -195,9 +110,6 @@ const Waiter = struct {
     body: []u8 = &.{},
     signature: []u8 = &.{},
     endian: std.builtin.Endian = .little,
-    /// The D-Bus error name of a reply that was not a return, owned. This is
-    /// the only thing that says WHY the service refused, and a driver that
-    /// dropped it could say no more than that a call failed.
     error_name: []u8 = &.{},
 
     fn onReply(ctx: ?*anyopaque, conn: *dbus.connection.Connection, reply: ?*const dbus.Message) void {
@@ -210,9 +122,7 @@ const Waiter = struct {
         };
         self.is_return = r.msg_type == .method_return;
         if (!self.is_return) {
-            // Copied, because the message is invalid the moment this returns.
-            // An allocation that fails here loses only the reason, so the call
-            // still fails and says less rather than failing twice.
+            // Copied here because the message is invalid the moment this returns. An allocation failure loses only the reason, so the call still fails rather than failing twice.
             if (r.error_name) |named| self.error_name = self.gpa.dupe(u8, named) catch &.{};
             return;
         }
@@ -231,11 +141,6 @@ const Waiter = struct {
     }
 };
 
-/// Send `msg` and wait for its reply, never longer than `deadline_ms`.
-///
-/// This is the only wait in this file, and every call goes through it.
-/// A wait with no bound is the fault the Darwin driver was rewritten to
-/// remove, and it must not come back on this platform.
 fn callAndWait(
     io: std.Io,
     bus: *dbus.client.Bus,
@@ -250,11 +155,6 @@ fn callAndWait(
         return error.CallFailed;
     };
 
-    // **The deadline is read off a clock and never counted in slices.**
-    // `dispatch` returns as soon as any descriptor is ready, so on a busy bus
-    // it returns at once and a slice count would run out in no time at all.
-    // `.awake` and not `.real`, so the deadline does not move when NTP steps
-    // the clock.
     const slice_ms: i32 = 50;
     const deadline = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{
         .raw = .fromNanoseconds(deadline_ms * std.time.ns_per_ms),
@@ -268,9 +168,7 @@ fn callAndWait(
     defer gpa.free(waiter.error_name);
     if (waiter.disconnected) return error.CallFailed;
     if (!waiter.is_return) {
-        // The error name is what says why. Without reading it, a locked
-        // collection and a genuine fault are the same message, and the advice
-        // about unlocking reaches nobody.
+        // The error name is read because it is what says why: without it, a locked collection and a genuine fault would be the same message, and the advice about unlocking would reach nobody.
         if (isLockedErrorName(waiter.error_name)) return error.CollectionLocked;
         return error.CallFailed;
     }
@@ -290,14 +188,9 @@ const Opened = struct {
     }
 };
 
-/// Connect to the session bus and open a `"plain"` secret service session.
-/// The event loop is heap allocated: `Bus.connectUnix` keeps a pointer to
-/// it, so its address must not move once that call is made.
 fn open(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) InternalError!Opened {
     const loop = try gpa.create(dbus.event_loop.EventLoop);
     errdefer gpa.destroy(loop);
-    // Any epoll fault means there is no reachable bus, whichever one it was,
-    // so this does not enumerate them: the library may add another.
     loop.* = dbus.event_loop.EventLoop.init(gpa) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.NoSessionBus,
@@ -387,15 +280,11 @@ fn searchItem(
     const locked = r.readValue(gpa, "ao") catch |err| return badReplyOr(err);
     defer dbus.unmarshal.freeValue(gpa, locked);
 
-    // No unlocked path and no locked path is the ordinary first run: see
-    // the file's own top comment for the locked case.
     if (unlocked.array.len > 0) return .{ .item = try gpa.dupe(u8, unlocked.array[0].object_path) };
     if (locked.array.len > 0) return .locked;
     return .none;
 }
 
-/// The attributes an item is found and stored by: this driver's own
-/// service name, paired with the instance name the caller asked for.
 fn writeAttributes(w: *dbus.Writer, name: []const u8) dbus.Writer.Error!void {
     const ctx = try w.beginArray(8);
     try w.beginStruct();
@@ -431,8 +320,7 @@ fn getSecret(
         .body = body.items,
     };
     var reply = try callAndWait(io, bus, loop, gpa, msg, call_deadline_ms);
-    // The reply carries the credential as plain bytes on the wire, so it
-    // is wiped before it is freed.
+    // The reply carries the credential as plain bytes on the wire, so it is wiped before it is freed.
     defer {
         std.crypto.secureZero(u8, reply.body);
         reply.deinit(gpa);
@@ -455,10 +343,6 @@ fn getSecret(
 
 const ItemResult = enum { ok, locked };
 
-/// Marshal the Secret struct `(oayays)`: the session, empty parameters,
-/// the value, and the content type. `w` and `body` are the same buffer;
-/// the value is appended to `body` directly because a byte array's
-/// elements need no padding between them.
 fn writeSecret(
     w: *dbus.Writer,
     body: *std.ArrayList(u8),
@@ -489,8 +373,6 @@ fn createItem(
     defer gpa.free(label);
 
     var body: std.ArrayList(u8) = .empty;
-    // The value goes straight into this buffer: wiped before it is freed,
-    // the same as every other copy of a credential in this file.
     defer {
         std.crypto.secureZero(u8, body.items);
         body.deinit(gpa);
@@ -528,13 +410,9 @@ fn createItem(
     _ = r.objectPath() catch |err| return badReplyOr(err); // the item path, unused
     const prompt_path = r.objectPath() catch |err| return badReplyOr(err);
 
-    // A prompt other than "/" means the service wants a person to answer
-    // it. Nobody here can, so this is the locked case, and not a call to
-    // Prompt: see the file's own top comment.
     return if (std.mem.eql(u8, prompt_path, "/")) .ok else .locked;
 }
 
-/// Waits for one `Prompt.Completed`, which is how a prompt says a person answered.
 const PromptWaiter = struct {
     done: bool = false,
     dismissed: bool = true,
@@ -543,18 +421,11 @@ const PromptWaiter = struct {
         _ = bus;
         const self: *PromptWaiter = @ptrCast(@alignCast(ctx.?));
         var r = dbus.Reader.init(signal.body, signal.endian);
-        // `(b dismissed, v result)`. Only the first is read: the variant holds
-        // what was unlocked, and the caller checks that by asking again.
         self.dismissed = r.boolean() catch true;
         self.done = true;
     }
 };
 
-/// Try once to unlock the default collection. True when it is now unlocked.
-///
-/// **Bounded, like every wait in this file**, but by `unlock_deadline_ms` because
-/// the thing being waited for is a person. A session with no prompter reaches the
-/// bound and gets false, which is the same answer it got before this existed.
 fn unlockDefault(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -582,13 +453,10 @@ fn unlockDefault(
     defer reply.deinit(gpa);
 
     var r = dbus.Reader.init(reply.body, reply.endian);
-    // `(ao unlocked, o prompt)`. The array is read to reach the prompt path after
-    // it, and then only counted: what was unlocked is checked by asking again.
     const unlocked = r.readValue(gpa, "ao") catch |err| return badReplyOr(err);
     defer dbus.unmarshal.freeValue(gpa, unlocked);
     const prompt_path = r.objectPath() catch |err| return badReplyOr(err);
 
-    // No prompt means it was already open, or opened without asking anybody.
     if (std.mem.eql(u8, prompt_path, "/")) return true;
 
     var waiter = PromptWaiter{};
@@ -602,8 +470,6 @@ fn unlockDefault(
         return error.CallFailed;
     };
 
-    // Showing the prompt is what makes the dialog appear. The window id is
-    // empty: Chock has no window to parent it to.
     var show: std.ArrayList(u8) = .empty;
     defer show.deinit(gpa);
     var sw = dbus.Writer.init(gpa, &show, bus.conn.endian);
@@ -620,8 +486,6 @@ fn unlockDefault(
         .body = show.items,
     }, call_deadline_ms) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        // A service that will not show a prompt is a locked collection nobody
-        // can open from here, which is the answer rather than a fault.
         else => false,
     };
     shown.deinit(gpa);
@@ -636,7 +500,6 @@ fn unlockDefault(
         if (!std.Io.Clock.Timestamp.now(io, .awake).compare(.lt, deadline)) return false;
     }
 
-    // A person who cancelled has answered. Asking again would argue with them.
     return !waiter.dismissed;
 }
 
@@ -679,15 +542,8 @@ fn mapErr(
     return fault(self, gpa, diag, name, kind, unreadable);
 }
 
-/// The driver.
 pub const Driver = struct {
-    /// Where `DBUS_SESSION_BUS_ADDRESS` is read from. Nothing in the
-    /// `dbus` library reads the process environment, and this driver has
-    /// no access of its own, so the caller supplies it, the way
-    /// `paths.zig` does.
     env: *const std.process.Environ.Map,
-    /// Why the last `get` or `put` failed. `store.Diagnostic` has no
-    /// variant of its own for this driver yet, so this is read directly.
     last_fault: ?Fault = null,
 
     pub fn secrets(self: *const Driver) store.Secrets {
@@ -711,9 +567,6 @@ pub const Driver = struct {
 
         var found = searchItem(gpa, io, opened.bus, opened.loop, name) catch |err| return mapErr(self, gpa, diag, name, err, true);
         if (found == .locked) {
-            // Tried once. A prompt nobody answers reaches its bound and this
-            // reports the collection locked, which is what a headless session
-            // got before the attempt existed.
             const opened_now = unlockDefault(gpa, io, opened.bus, opened.loop) catch |err|
                 return mapErr(self, gpa, diag, name, err, true);
             if (!opened_now) return fault(self, gpa, diag, name, .collection_locked, true);
@@ -747,8 +600,6 @@ pub const Driver = struct {
         defer opened.deinit(gpa);
 
         const result = createItem(gpa, io, opened.bus, opened.loop, opened.session_path, name, value) catch |err| {
-            // A locked collection refuses this with an error reply rather than
-            // answering with a prompt path, which is why the error name is read.
             if (err != error.CollectionLocked) return mapErr(self, gpa, diag, name, err, false);
             const opened_now = unlockDefault(gpa, io, opened.bus, opened.loop) catch |second|
                 return mapErr(self, gpa, diag, name, second, false);
@@ -884,11 +735,6 @@ test "the secret struct embeds the value bytes with no padding drift, round trip
 }
 
 test "a name this driver holds nothing for reads back as nothing, when a session bus answers" {
-    // The host's own environment is not reachable from a test, so this
-    // driver gets an empty one and relies on the fallback path. A machine
-    // with no session bus, or one whose default collection is locked, has
-    // nothing this test can prove: see the file's own top comment for why
-    // a locked collection is not this driver's failure to fix.
     const gpa = testing.allocator;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
@@ -912,16 +758,9 @@ test {
 }
 
 test "a locked collection is told from a fault by the error name it is refused with" {
-    // The bug this fixes: `CreateItem` on a locked collection is refused with an
-    // error reply, not answered with a prompt path, so the driver reported
-    // `call_failed` and the advice about unlocking never reached the person who
-    // needed it. Measured against gnome-keyring on 2026-09-27.
     try testing.expect(isLockedErrorName("org.freedesktop.Secret.Error.IsLocked"));
     try testing.expect(isLockedErrorName("org.freedesktop.DBus.Error.AccessDenied"));
 
-    // Everything else stays a fault, because guessing that an unknown refusal
-    // means locked would send a person to unlock a collection that is not the
-    // problem.
     for ([_][]const u8{
         "org.freedesktop.DBus.Error.ServiceUnknown",
         "org.freedesktop.DBus.Error.NoReply",
@@ -933,8 +772,6 @@ test "a locked collection is told from a fault by the error name it is refused w
 }
 
 test "the locked fault is the one that carries advice" {
-    // `adviceFor` already had the sentence. Nothing could reach it from a
-    // refusal, which is what made the message useless.
     try testing.expect(adviceFor(.collection_locked) != null);
     try testing.expect(adviceFor(.call_failed) == null);
 }

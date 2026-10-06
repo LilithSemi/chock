@@ -13,50 +13,32 @@ const sandbox = @import("chock-sandbox");
 pub const Error = git.Error || error{
     GitFailed,
     NotALinkedWorktree,
-    /// `session_id` goes straight into a path join for the worktree's own
-    /// path, the sandbox mount target, and the pointer file name.
+    /// `session_id` goes into a path join for the worktree path, the mount target, and the pointer file.
     InvalidSessionId,
-    /// A path `git status` named that was absolute or held a `..` component.
-    /// Joining it onto `project_root` or onto the worktree could reach outside
-    /// both, so it is refused and never followed.
+    /// A path `git status` named was absolute or held a `..` component.
     PathEscapesProject,
-    /// A refusal and not a fault: `adopt` only ever takes a checkout another
-    /// process already made. A caller that wants a new worktree calls `create`.
+    /// A refusal, not a fault: `adopt` only takes a checkout another process already made.
     NoWorktreeToAdopt,
-    /// git prunes the registration of a checkout it cannot find, and a checkout
-    /// whose registration is gone is one no git command works in. Refused here,
-    /// where the reason is still readable.
+    /// git prunes the registration of a checkout it cannot find, so no git command works in it.
     WorktreeRegistrationGone,
 };
 
 pub const Mount = sandbox.namespace.Mount;
 
-/// The prefix, meaningful only inside the sandbox, under which `mounts` puts
-/// the shared parts of `.git`. Chosen to be a path no real project uses.
+/// A path no real project uses, under which `mounts` puts the shared parts of `.git`.
 const sandbox_git_root_prefix = chock_runtime_prefix ++ "/git";
 
-/// Nothing creates `/run` or `/run/chock` on its own. `namespace.makePath`
-/// creates every parent of a mount target as a directory before the mount
-/// happens and tolerates one that already exists.
-///
-/// The kernel takes the last matching mount, not the longest prefix, so a wide
-/// mount at `/run` applied after these would shadow all three at once. Nothing
-/// in Chock mounts `/run`, and the tests below hold that.
+/// The kernel takes the last matching mount, not the longest prefix, so a
+/// wide mount at `/run` applied after these would shadow all three at once.
 const chock_runtime_prefix = sandbox.runtime_prefix;
 
-/// Deliberately not nested under `sandbox_git_root_prefix`. `namespace.buildRoot`
-/// marks a mount read only the moment it makes it, and `mkdir` for a mount
-/// point that must create something new under an already read only parent gets
-/// EROFS. `worktree_meta_target` escapes that only because it reuses a name
-/// that already exists under the real `.git`; a scratch object store has no
-/// such name, so it gets a prefix of its own.
+/// Not nested under `sandbox_git_root_prefix`: a new mount point under an
+/// already read only parent gets EROFS.
 const object_store_prefix = chock_runtime_prefix ++ "/objects";
 
 pub const ImportReport = struct {
     modified: std.ArrayList([]u8) = .empty,
-    /// A file already `git add`ed before this ran is new to HEAD, and is still
-    /// counted under `modified`: telling the two apart needs the rest of git's
-    /// status letters.
+    /// A file already `git add`ed before this ran is still counted under `modified`.
     added: std.ArrayList([]u8) = .empty,
     deleted: std.ArrayList([]u8) = .empty,
     skipped: std.ArrayList(Skip) = .empty,
@@ -99,10 +81,7 @@ pub const Uncommitted = struct {
     }
 };
 
-/// `git worktree add` checks out the commit, not the index and not the working
-/// tree, so an agent in a fresh worktree sees `HEAD` and nothing else. The
-/// fault this answers is the silence: a user who is never told believes the
-/// agent can see work it cannot.
+/// `git worktree add` checks out the commit, not the index or working tree.
 pub fn countUncommitted(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -132,8 +111,7 @@ pub fn countUncommitted(
     return counts;
 }
 
-/// The one `git status` call this file makes, spelled once. `countUncommitted`
-/// reads the same output the same way, so a second spelling could drift.
+/// The one `git status` call this file makes, spelled once.
 const status_argv = &[_][]const u8{
     "--no-optional-locks",   "status",       "--porcelain=v1", "-z",
     "--untracked-files=all", "--no-renames",
@@ -143,42 +121,29 @@ pub const Worktree = struct {
     path: []u8,
     project_root: []u8,
     layout: Layout,
-    /// This is the project root the agent is told about. `sandboxConfig` makes
-    /// it the working directory of every tool call.
+    /// Told to the agent; `sandboxConfig` makes it the working directory of every tool call.
     sandbox_root: []u8,
-    /// Read back right after `git worktree add` ran, and never assumed to equal
-    /// the project's `HEAD`: what git did is a fact, what it was asked to do is
-    /// not.
+    /// Read back right after `git worktree add` ran, never assumed to equal `HEAD`.
     base_commit: []u8,
     git_dir: []u8,
-    /// Read back from the `.git` file git wrote, never assumed to equal the
-    /// session id: git deduplicates the name when one is already registered.
+    /// Read back from the `.git` file git wrote: git deduplicates a registered name.
     worktree_id: []u8,
     sandbox_git_root: []u8,
-    /// A fresh writable directory, because the real `.git/objects` stays read
-    /// only and git still needs somewhere to write a loose object.
+    /// A fresh writable directory, since the real `.git/objects` stays read only.
     object_store_source: []u8,
     object_store_target: []u8,
     git_object_directory_env: []u8,
-    /// A variable and never a file. An `objects/info/alternates` file would
-    /// have to live inside the one directory under `.git` the sandbox can
-    /// write, which makes it a path naming file the agent can rewrite, the
-    /// same shape `commondir`, `gitdir` and `config.worktree` already have.
+    /// A variable, never a file, since the agent could rewrite a path like `commondir` or `gitdir`.
     git_alternate_object_directories_env: []u8,
-    /// Null under `Layout.remapped`, where the copy is bound at the path the
-    /// checkout's own `gitdir:` line already names, and set under
-    /// `Layout.in_place`, which can move no path.
+    /// Null under `Layout.remapped`; set under `Layout.in_place`, which moves no path.
     git_dir_env: ?[]u8,
-    /// `GIT_DIR` on its own is not enough. Against git 2.55, `GIT_DIR` with no
-    /// `GIT_WORK_TREE` makes git treat the current directory as the root of the
-    /// working tree, so a `git add` run from a subdirectory reports every file
-    /// outside that subdirectory as deleted. The two go together or neither.
+    /// `GIT_DIR` alone is not enough: with no `GIT_WORK_TREE`, `git add` from
+    /// a subdirectory reports files outside it as deleted.
     git_work_tree_env: ?[]u8,
     worktree_meta_source: []u8,
     worktree_meta_target: []u8,
     worktree_meta_bind_source: []u8,
-    /// Always true today, and kept as a field because `remove` deletes a whole
-    /// directory tree on the strength of it.
+    /// Always true today; `remove` deletes a whole directory tree on the strength of it.
     worktree_meta_is_copy: bool,
     worktree_index_source: []u8,
     worktree_index_target: []u8,
@@ -190,53 +155,21 @@ pub const Worktree = struct {
     worktree_commondir_target: []u8,
     worktree_gitdir_file_source: []u8,
     worktree_gitdir_file_target: []u8,
-    /// Always set: the project's own file when there was one at create time,
-    /// and an empty scratch file this session owns when there was not. An
-    /// optional field here left a route to host code execution open.
+    /// Always set: the project's file at create time, else an empty scratch file this session owns.
     worktree_config_worktree_source: []u8,
     worktree_config_worktree_target: []u8,
     worktree_config_worktree_is_scratch: bool,
-    /// A directory cannot be bind mounted onto a path that is currently a file,
-    /// which is ENOTDIR, so the worktree's own one line `.git` is shadowed by
-    /// this scratch file rather than nested under. The real one is untouched.
+    /// A directory cannot be bind mounted onto a path that is a file
+    /// (ENOTDIR), so this scratch file shadows the worktree's `.git` instead.
     pointer_path: []u8,
 
     pub fn sandboxRoot(self: Worktree) []const u8 {
         return self.sandbox_root;
     }
 
-    /// The mount list, in the shape `Mount` above. Every `source` and `target`
-    /// is a slice into `self`, and the caller frees only the returned array.
-    ///
-    /// Order matters and must not change, because the kernel applies mounts in
-    /// order and the last one that covers a path wins. Entry 0's target is a
-    /// prefix of the last entry's, entry 3 nests under entry 1, and entries 4
-    /// to 6 nest one level deeper again. Under `Layout.in_place` no mount is
-    /// performed, and the Darwin driver reads the list as path rules with the
-    /// same last one wins meaning.
-    ///
-    /// Entry 3's source is a copy, because the root of the metadata directory
-    /// cannot be made read only. `git add` and `git commit` create
-    /// `index.lock` and its siblings there and rename each over the file it
-    /// locks. `open` with `O_CREAT|O_EXCL` under a read only mount answers
-    /// EROFS, so pre-creating each name does not help, and a lock file bound in
-    /// from elsewhere cannot be renamed over its target, because `rename`
-    /// refuses to cross a mount point.
-    ///
-    /// Entry 3 binds the directory as a whole and does not name `index`, `HEAD`
-    /// and `logs` one at a time: `open` for write on an existing file under a
-    /// mount already marked read only fails with EROFS. `mkdir` tolerates an
-    /// existing directory with EEXIST, because the kernel can answer that
-    /// without asking for write access, which is what makes entry 3 possible.
-    ///
-    /// Entries 4 to 6 claw `commondir`, `gitdir` and `config.worktree` back to
-    /// read only. Their parent is still read write when they run, so the write
-    /// succeeds and the mark narrows that one file. Each redirects git at a
-    /// path the agent chooses, so a writable one is code execution on the next
-    /// host side git command. Entry 6 is unconditional, because git writes
-    /// `config.worktree` from inside the sandbox the first time something sets
-    /// a value with `--worktree`. Every other name under this directory is
-    /// git's own bookkeeping and names no path outside it.
+    /// Order matters: the kernel applies the last mount that covers a path.
+    /// The metadata directory is copied whole, since a lock file inside it
+    /// must rename within it; later entries claw files back to read only.
     fn metaFileSource(self: Worktree, project_file: []const u8, target: []const u8) []const u8 {
         return switch (self.layout) {
             .remapped => project_file,
@@ -251,9 +184,7 @@ pub const Worktree = struct {
         // 0: the worktree itself. Read write: the agent works here.
         try list.append(allocator, .{ .bind = .{ .source = self.path, .target = self.sandbox_root, .read_only = false } });
 
-        // 1: the whole real .git, read only, at the synthetic path the sandbox
-        // owns. Nothing narrower below overrides the object store, the refs,
-        // the hooks, or any other worktree's metadata.
+        // 1: the whole real .git, read only, at the synthetic path the sandbox owns.
         try list.append(allocator, .{ .bind = .{ .source = self.git_dir, .target = self.sandbox_git_root, .read_only = true } });
 
         // 2: this session's own scratch object store, read write.
@@ -289,9 +220,7 @@ pub const Worktree = struct {
             .read_only = true,
         } });
 
-        // last: the replacement .git file. `.in_place` needs no such entry,
-        // because nothing was moved and the pointer git wrote already names a
-        // path the sandbox can resolve.
+        // last: the replacement .git file. .in_place needs no such entry, since nothing was moved.
         if (self.layout == .remapped) {
             try list.append(allocator, .{ .bind = .{ .source = self.pointer_path, .target = self.git_dir, .read_only = true } });
         }
@@ -299,16 +228,9 @@ pub const Worktree = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    /// The environment a caller must add to `Sandbox.Config.env` for every tool
-    /// call, so `git add` and `git commit` succeed while the real object store
-    /// stays read only.
-    ///
-    /// `GIT_DIR` and `GIT_WORK_TREE` come under `Layout.in_place` alone. A
-    /// `GIT_DIR` under `.remapped` would reach every git command a tool call
-    /// makes, a repository the agent cloned for itself included.
-    ///
-    /// An agent can override any of these for a subprocess of its own, and
-    /// gains nothing: git never writes to an alternate.
+    /// `GIT_DIR` and `GIT_WORK_TREE` are set only under `Layout.in_place`;
+    /// under `.remapped` they would reach every git command a tool call
+    /// makes. An agent gains nothing by overriding these: git never writes to an alternate.
     pub fn gitEnv(self: Worktree, allocator: std.mem.Allocator) Error![]const []const u8 {
         if (self.git_dir_env) |dir_env| {
             return allocator.dupe([]const u8, &.{
@@ -324,22 +246,10 @@ pub const Worktree = struct {
         });
     }
 
-    /// Copy the project's own uncommitted work into this worktree, so a session
-    /// that starts on a dirty tree sees the codebase the user sees.
-    ///
-    /// `git status` is asked with three flags chosen on purpose.
-    /// `--untracked-files=all`, so a file the user made but never `git add`ed
-    /// is named, which is what a plain `git diff` misses. `--no-renames`, so a
-    /// rename is two entries this function already handles and not one entry
-    /// naming two paths. `--no-optional-locks`, so this never writes a
-    /// refreshed index back to the project.
-    ///
-    /// The action taken is decided by what is on disk and never by the status
-    /// letters. A path git status names twice, which `git rm --cached` does, is
-    /// imported once, and a single bad path does not abort the run.
-    ///
-    /// git never lists an empty directory, because it tracks paths to files and
-    /// links and not directories, so one is never carried across.
+    /// `git status` runs with `--untracked-files=all`, `--no-renames`, and
+    /// `--no-optional-locks`, so a new file is named, a rename is two
+    /// entries, and the index is never rewritten. A path named twice is
+    /// imported once; one bad path does not abort the run.
     pub fn importUncommitted(
         self: Worktree,
         allocator: std.mem.Allocator,
@@ -360,9 +270,7 @@ pub const Worktree = struct {
         var seen_paths: std.StringHashMapUnmanaged(void) = .empty;
         defer seen_paths.deinit(allocator);
 
-        // `-z` separates entries with NUL and turns off git's own quoting of
-        // unusual characters, so slicing off the leading "XY " gives back the
-        // exact bytes on disk.
+        // -z turns off git's own quoting, so slicing off the leading "XY " gives back the exact bytes.
         var entries = std.mem.splitScalar(u8, status_output.stdout, 0);
         while (entries.next()) |entry| {
             if (entry.len < 4) continue; // too short to hold "XY " plus a path
@@ -422,8 +330,7 @@ pub const Worktree = struct {
         }
     }
 
-    /// Tolerates the worktree not having the path either: a file staged as an
-    /// add and then deleted by hand leaves nothing to remove.
+    /// Tolerates the worktree not having the path either.
     fn removeFromWorktree(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -450,8 +357,7 @@ pub const Worktree = struct {
         is_new: bool,
         report: *ImportReport,
     ) Error!void {
-        // make_path: a brand new untracked file can sit in a directory the
-        // worktree, checked out at HEAD, has never had.
+        // make_path: an untracked file can sit in a directory HEAD never had.
         std.Io.Dir.copyFileAbsolute(source_path, target_path, io, .{ .make_path = true }) catch |err| {
             const reason = try std.fmt.allocPrint(allocator, "copying into the worktree failed: {s}", .{@errorName(err)});
             return recordSkip(report, allocator, rel_path, reason);
@@ -460,10 +366,7 @@ pub const Worktree = struct {
         try list.append(allocator, try allocator.dupe(u8, rel_path));
     }
 
-    /// This never opens `source_path` and never resolves the link.
-    /// `readLinkAbsolute` reads the target string stored in the directory
-    /// entry, so a link pointing outside the project is copied as that string
-    /// and the worktree never gets the target's content.
+    /// Never opens or resolves the link; a link outside the project is copied as that string alone.
     pub fn recreateSymlink(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -491,8 +394,7 @@ pub const Worktree = struct {
             };
         }
 
-        // Dir.symLink refuses to overwrite an existing entry, and the worktree
-        // may already hold a plain file or an older link here.
+        // Dir.symLink refuses to overwrite an existing entry.
         std.Io.Dir.deleteFileAbsolute(io, target_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => |e| {
@@ -505,8 +407,7 @@ pub const Worktree = struct {
             },
         };
 
-        // Not symLinkAbsolute: it asserts its target text is itself absolute,
-        // and an ordinary link target is very often relative.
+        // Not symLinkAbsolute: it asserts the target is absolute, and an ordinary target is often relative.
         std.Io.Dir.cwd().symLink(io, link_target_text, target_path, .{}) catch |err| {
             const reason = try std.fmt.allocPrint(allocator, "recreating the link in the worktree failed: {s}", .{@errorName(err)});
             return recordSkip(report, allocator, rel_path, reason);
@@ -528,9 +429,7 @@ pub const Worktree = struct {
         try report.skipped.append(allocator, .{ .path = path_copy, .reason = reason });
     }
 
-    /// The commit a session made is only in the scratch object store, so this
-    /// names that store as an alternate for the one read. A read of an
-    /// alternate can never write to it.
+    /// The session's commit is only in the scratch object store, named here as an alternate.
     pub fn headAfterSession(
         self: Worktree,
         allocator: std.mem.Allocator,
@@ -541,17 +440,14 @@ pub const Worktree = struct {
         var reading_env = try env.clone(allocator);
         defer reading_env.deinit();
         try reading_env.put("GIT_ALTERNATE_OBJECT_DIRECTORIES", self.object_store_source);
-        // The session's own HEAD is in the copy. The checkout's `.git` names a
-        // directory that still reads as `git worktree add` left it, so `GIT_DIR`
-        // points this one read at the copy instead.
+        // The session's own HEAD is in the copy, so GIT_DIR points this read at it instead.
         if (self.worktree_meta_is_copy) {
             try reading_env.put("GIT_DIR", self.worktree_meta_bind_source);
         }
         return readHeadWith(allocator, io, &reading_env, self.path, diag);
     }
 
-    /// An idle session answers false, so a session that changed nothing cannot
-    /// make the project dirty.
+    /// An idle session answers false; a session that changed nothing cannot make the project dirty.
     pub fn headMoved(
         self: Worktree,
         allocator: std.mem.Allocator,
@@ -567,10 +463,7 @@ pub const Worktree = struct {
         return head;
     }
 
-    /// Every deletion and every free happens whether or not `git worktree
-    /// remove` succeeded. Every path it touches belongs to the session and not
-    /// to one process, so the process that removes need not be the one that
-    /// made: the registration names two paths and no process.
+    /// Every deletion and free happens regardless of whether `git worktree remove` succeeded.
     pub fn remove(
         self: *Worktree,
         allocator: std.mem.Allocator,
@@ -588,13 +481,11 @@ pub const Worktree = struct {
         };
 
         deleteFileAbsolute(io, self.pointer_path, diag) catch {};
-        // The project's own real config.worktree, when create found one
-        // instead, is never touched here.
+        // The project's own real config.worktree is never touched here.
         if (self.worktree_config_worktree_is_scratch) {
             deleteFileAbsolute(io, self.worktree_config_worktree_source, diag) catch {};
         }
-        // Only ever the copy: under `.in_place` there is none, and the path
-        // this field holds is then the project's own.
+        // Only ever the copy; under .in_place there is none.
         if (self.worktree_meta_is_copy) {
             std.Io.Dir.cwd().deleteTree(io, self.worktree_meta_bind_source) catch {};
         }
@@ -605,10 +496,7 @@ pub const Worktree = struct {
         if (failed) return error.GitFailed;
     }
 
-    /// Free every field and leave the worktree where it is on disk. `remove`
-    /// runs on every ending, so a session that errored, was refused, reached
-    /// its budget or was interrupted used to destroy whatever it had produced:
-    /// a rate limit once took 105 changed files with the worktree.
+    /// Frees every field and leaves the worktree where it is on disk.
     pub fn keep(self: *Worktree, allocator: std.mem.Allocator) void {
         self.freeFields(allocator);
     }
@@ -659,9 +547,7 @@ fn targetPath(
     };
 }
 
-/// `targetPath` with the session's own copy in place of the project's own
-/// directory. Under `.in_place` nothing moves, so the only path the sandbox
-/// can reach the copy by is the copy's own. The caller owns the result.
+/// `targetPath` with the session's own copy in place of the project's directory.
 fn metaTarget(
     allocator: std.mem.Allocator,
     layout: Layout,
@@ -686,9 +572,7 @@ pub fn create(
     return createWithLayout(allocator, io, env, project_root, scratch_dir, session_id, Layout.forHost(), diag);
 }
 
-/// This exists so a Linux test can build the mount list macOS gets. A boundary
-/// that only one platform's continuous integration compiles is one nobody
-/// checks.
+/// Exists so a Linux test can build the mount list macOS gets.
 pub fn createWithLayout(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -712,9 +596,7 @@ pub fn createWithLayout(
         .exited => |code| if (code != 0) return error.GitFailed,
         else => return error.GitFailed,
     }
-    // From here on `git worktree add` has registered a linked worktree. Any
-    // failure below must undo that, or the session leaves a live worktree
-    // behind that nothing cleans up.
+    // From here on the worktree is registered; a failure below must undo that.
     errdefer cleanupFailedAdd(allocator, io, env, project_root, worktree_path);
 
     const dotgit_path = try std.fs.path.join(allocator, &.{ worktree_path, ".git" });
@@ -790,9 +672,7 @@ pub fn createWithLayout(
     };
     errdefer if (git_work_tree_env) |value| allocator.free(value);
 
-    // Every target below is a name under `worktree_meta_target` on both
-    // layouts. The matching `_source` strings stay the project's own paths,
-    // which is how a caller reads the untouched original after the session.
+    // The matching _source strings stay the project's own paths, readable after the session.
     const worktree_index_source = try std.fs.path.join(allocator, &.{ worktree_meta_source, "index" });
     errdefer allocator.free(worktree_index_source);
     const worktree_index_target = try std.fs.path.join(allocator, &.{ worktree_meta_target, "index" });
@@ -818,10 +698,7 @@ pub fn createWithLayout(
     const worktree_gitdir_file_target = try std.fs.path.join(allocator, &.{ worktree_meta_target, "gitdir" });
     errdefer allocator.free(worktree_gitdir_file_target);
 
-    // config.worktree exists on disk only once the project turned on
-    // extensions.worktreeConfig and something set a value with --worktree.
-    // This read decides which source `mounts` binds, never whether it binds
-    // one at all.
+    // This read decides which source mounts binds, never whether it binds one at all.
     const config_worktree_source_candidate = try std.fs.path.join(allocator, &.{ worktree_meta_source, "config.worktree" });
     const has_config_worktree = existsOnDisk(io, config_worktree_source_candidate) catch |err| {
         allocator.free(config_worktree_source_candidate);
@@ -834,9 +711,7 @@ pub fn createWithLayout(
 
     var worktree_config_worktree_source: []u8 = undefined;
     var worktree_config_worktree_is_scratch: bool = undefined;
-    // `.in_place` needs no stand-in and must not write one. Nothing is
-    // mounted there: the entry becomes a rule on the path itself, which the
-    // kernel checks when git creates the file.
+    // .in_place needs no stand-in: the entry becomes a rule on the path itself.
     if (has_config_worktree or layout == .in_place) {
         worktree_config_worktree_source = config_worktree_source_candidate;
         worktree_config_worktree_is_scratch = false;
@@ -900,20 +775,9 @@ pub fn createWithLayout(
     };
 }
 
-/// Rebuild the `Worktree` value for a checkout already on disk at
-/// `<scratch_dir>/<session_id>`, so a second process can take over. It runs no
-/// git command at all.
-///
-/// A worktree registration names two paths and no process. `<worktree>/.git` is
-/// the one line `gitdir:` file, and that directory's own `gitdir` points back
-/// at it. There is no pid, no lock file and no held descriptor.
-///
-/// So there is no `cleanupFailedAdd`: the checkout is not this call's to
-/// unmake, and the scratch object store can already hold the objects of every
-/// commit that session made. And `base_commit` comes from the caller, never
-/// read back from HEAD: a session that already committed has a HEAD that is not
-/// its base, so reading it would make `headMoved` answer false and the commit
-/// would never reach the user.
+/// Rebuilds the `Worktree` value for a checkout already on disk. Runs no
+/// git command; `base_commit` comes from the caller, never read back from
+/// HEAD, since a session that already committed has a HEAD that is not its base.
 pub fn adopt(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -963,7 +827,6 @@ pub fn adoptWithLayout(
     const worktree_id = try readWorktreeId(allocator, io, dotgit_path, diag);
     errdefer allocator.free(worktree_id);
 
-    // The caller's own string, copied. Nothing here reads HEAD.
     const base_commit_owned = try allocator.dupe(u8, base_commit);
     errdefer allocator.free(base_commit_owned);
 
@@ -1079,8 +942,7 @@ pub fn adoptWithLayout(
 
     var worktree_config_worktree_source: []u8 = undefined;
     var worktree_config_worktree_is_scratch: bool = undefined;
-    // `.in_place` needs no stand-in and must not write one. See the same
-    // decision in `create`.
+    // .in_place needs no stand-in, as in create.
     if (has_config_worktree or layout == .in_place) {
         worktree_config_worktree_source = config_worktree_source_candidate;
         worktree_config_worktree_is_scratch = false;
@@ -1230,10 +1092,7 @@ fn metaBindSource(
     return std.fs.path.join(allocator, &.{ scratch_dir, name });
 }
 
-/// Copy `source` to `destination`, then rewrite `destination`'s own
-/// `commondir`. The original holds `../..`, which is correct only against the
-/// path the copy is mounted at, so the copy gets the absolute path of the
-/// project's `.git` and reads correctly from wherever it sits.
+/// Rewrites the copy's `commondir` to an absolute path, since the original's relative `../..` only works unmoved.
 fn copyMetaDirectory(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1324,8 +1183,7 @@ fn directoryOnDisk(io: std.Io, absolute_path: []const u8) std.Io.Dir.StatFileErr
     return entry_stat.kind == .directory;
 }
 
-/// What `importPath` found at `absolute_path`, without following a link to
-/// whatever it names.
+/// What `importPath` found at `absolute_path`, without following a link.
 fn classify(io: std.Io, absolute_path: []const u8) std.Io.Dir.StatFileError!?std.Io.File.Kind {
     const entry_stat = std.Io.Dir.cwd().statFile(io, absolute_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return null,
@@ -1334,8 +1192,7 @@ fn classify(io: std.Io, absolute_path: []const u8) std.Io.Dir.StatFileError!?std
     return entry_stat.kind;
 }
 
-/// Reject a `rel_path` that is absolute or holds a `..` component, because it
-/// is joined onto both `project_root` and the worktree's own path.
+/// Rejects a `rel_path` that is absolute or holds a `..` component.
 fn validateRelativePath(rel_path: []const u8) Error!void {
     if (rel_path.len == 0) return error.PathEscapesProject;
     if (std.fs.path.isAbsolute(rel_path)) return error.PathEscapesProject;
@@ -1345,8 +1202,6 @@ fn validateRelativePath(rel_path: []const u8) Error!void {
         if (std.mem.eql(u8, component, "..")) return error.PathEscapesProject;
     }
 }
-
-// Every test below builds its own project inside a fresh std.testing.tmpDir.
 
 fn absoluteDirPath(buffer: []u8, dir: std.Io.Dir) ![:0]u8 {
     const len = dir.realPath(std.testing.io, buffer) catch return error.RealPathFailed;
@@ -1433,8 +1288,7 @@ const TestProject = struct {
     }
 };
 
-/// Find the entry in `list` that actually governs `path` once every entry has
-/// been applied in order, which is the last one whose target covers it.
+/// The entry in `list` that actually governs `path`: the last one whose target covers it.
 fn mostSpecificMount(list: []const Mount, path: []const u8) ?*const Mount.Bind {
     var found: ?*const Mount.Bind = null;
     for (list) |*mount| {
@@ -1824,8 +1678,7 @@ test "mostSpecificMount takes the last matching entry, not the longest" {
 }
 
 test "a wide mount at /run, placed last, shadows every path Chock puts under it" {
-    // The trap this project has already paid for once: a wide entry applied
-    // after a narrow one shadows it, whatever the two prefixes are.
+    // A wide entry applied after a narrow one shadows it, whatever the two prefixes are.
     const list = [_]Mount{
         .{ .bind = .{ .source = "the-real-git-dir", .target = sandbox_git_root_prefix ++ "/sess1", .read_only = true } },
         .{ .bind = .{ .source = "the-object-store", .target = object_store_prefix ++ "/sess1", .read_only = false } },
@@ -1882,8 +1735,7 @@ test "no mount Chock builds is wide enough to shadow its own runtime prefix" {
 }
 
 test "mostSpecificMount compares whole path components, not raw bytes" {
-    // /run/chock/git/sess1 must not match /run/chock/git/sess10: a different
-    // session is a different path and not a prefix of this one.
+    // /run/chock/git/sess1 must not match /run/chock/git/sess10.
     const list = [_]Mount{
         .{ .bind = .{ .source = "a", .target = sandbox_git_root_prefix ++ "/sess1", .read_only = false } },
     };
@@ -2339,8 +2191,7 @@ test "a dirty submodule is skipped, not a crash" {
     defer sub_commit.deinit(allocator);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, sub_commit.term);
 
-    // -c protocol.file.allow=always: a local plain path submodule source is
-    // refused by default since the 2022 security release.
+    // A local plain path submodule source is refused by default.
     var submodule_add = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{
         "-c", "protocol.file.allow=always", "submodule", "add", submodule_source_path, "sub",
     }, null);
@@ -2450,8 +2301,7 @@ test "a file that cannot be read is skipped, and the rest of the import still co
     var unreadable_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const unreadable_path = try std.fmt.bufPrintZ(&unreadable_buffer, "{s}/unreadable.txt", .{project.root_path});
     try writeFile(unreadable_path, "you cannot read this\n");
-    // fchmodat by path, not open-then-fchmod: opening this file for read is
-    // what the test is taking away.
+    // fchmodat by path, since opening the file for read is what the test takes away.
     try std.Io.Dir.cwd().setFilePermissions(std.testing.io, unreadable_path, .fromMode(0o000), .{});
     defer std.Io.Dir.cwd().setFilePermissions(std.testing.io, unreadable_path, .fromMode(0o644), .{}) catch {};
 
@@ -2501,8 +2351,7 @@ test "a path git rm --cached names twice is imported once, not double counted" {
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
-    // git rm --cached leaves the file on disk, untracked, and also leaves a
-    // staged deletion, so git status names the one path twice.
+    // git rm --cached leaves a staged deletion too, so git status names the path twice.
     var rm_cached = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "rm", "--cached", "second.txt" }, null);
     defer rm_cached.deinit(allocator);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, rm_cached.term);
@@ -2895,8 +2744,7 @@ fn countRegisteredWorktrees(
 }
 
 test "adopt rebuilds every field create built, and registers no second worktree" {
-    // The fact the whole handover rests on: a second process reaches the
-    // checkout through the registration alone.
+    // A second process reaches the checkout through the registration alone.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

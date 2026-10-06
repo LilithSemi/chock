@@ -1,68 +1,15 @@
-//! The `budget` block of `chock.zon`, which is what a session may spend.
-//!
-//! ```zon
-//! .{
-//!     .budget = .{
-//!         .max_cost = 5.00,
-//!         .currency = "USD",
-//!     },
-//! }
-//! ```
-//!
-//! **The cap lives in `chock.zon` and nowhere else**, and that file is already
-//! beyond the agent's reach: the workspace binds the project's
-//! own copy back over the path read only, so a tool call that tries to write
-//! it fails. The budget is therefore a control the user holds and the model
-//! cannot touch, and that property comes for free from work already done.
-//! `test/workspace/escape.zig` proves it on a running system rather than
-//! taking it on trust.
-//!
-//! An organisation can put a ceiling over that cap, in the org policy bundle
-//! `lib/chock-policy/org.zig` reads. `underCeiling` folds the two, and it is a
-//! minimum: a project may hold itself to less than its organisation allows and
-//! may never take more. **A project above the ceiling is refused and not
-//! quietly lowered**, and that decision is argued in full beside that
-//! function.
-//!
-//! This reader is lenient about the rest of the file and strict inside its
-//! own block, the same split `lib/chock-policy/table.zig` makes and for the
-//! same reason: another milestone owns the other blocks, and a misspelled
-//! field name inside this one must never become a cap that is not the cap the
-//! author meant. `.max_cst = 5.0` is refused, not read as no cap at all.
+//! The `budget` block: session cost ceiling.
 
 const std = @import("std");
 
-/// The name of the configuration file, in the project root.
-/// `lib/chock-policy/table.zig` and `lib/chock-workspace/Workspace.zig` look
-/// in the same place.
 pub const file_name = "chock.zon";
-
-/// The largest `chock.zon` this reader accepts, matching the policy reader's
-/// own bound: the file comes from the project directory, so a hostile project
-/// supplies it.
 pub const max_file_bytes = 1 << 20;
 
 pub const Budget = struct {
-    /// The ceiling, in `currency`. **Enforced before a request goes out**,
-    /// because money cannot be un-spent.
     max_cost: f64,
-    /// ISO 4217. A session whose provider reports a different currency
-    /// cannot be summed against this one, and `chock_proto.state.Spend` says
-    /// so rather than adding the two. Always owned by this `Budget`, even
-    /// when the file left it out: see `WireBudget`.
     currency: []const u8 = "USD",
 };
 
-/// The shape the file itself is parsed into, before the default is applied.
-///
-/// **`currency` is optional here and defaulted afterwards, on purpose.**
-/// `std.zon.parse` leaves a field the file did not name at its declared
-/// default, which for a slice is a string literal with no allocation behind
-/// it, and then `std.zon.parse.free` walks every slice of the result and
-/// frees it. A default of `"USD"` therefore crashes on the free path for
-/// every file that did not spell the currency out, which is most of them.
-/// An optional starts as null, frees nothing, and this file makes the owned
-/// copy itself.
 const WireBudget = struct {
     max_cost: f64,
     currency: ?[]const u8 = null,
@@ -72,81 +19,43 @@ pub const default_currency = "USD";
 
 pub const ParseError = error{
     OutOfMemory,
-    /// The file is not valid ZON, or the `budget` block does not match the
-    /// schema. Pass a `Diagnostic` to learn which line, and why.
     InvalidBudget,
-    /// `max_cost` is zero, negative, or not a number. A cap of zero would
-    /// refuse the first turn of every session, which is never what an author
-    /// meant to write, and a negative one has no meaning at all.
     InvalidMaxCost,
 };
 
 pub const LoadError = ParseError || error{
-    /// The file is larger than `max_file_bytes`.
     BudgetFileTooLarge,
-    /// The file exists and could not be read. Pass a `Diagnostic` to learn
-    /// which fault the filesystem gave.
     ReadFailed,
 };
 
-/// What can go wrong when a budget is folded under an org policy bundle's
-/// ceiling. See `underCeiling`, which argues why both of these refuse the
-/// session instead of quietly lowering the number.
 pub const CeilingError = error{
-    /// The budget is above the ceiling the org policy bundle sets.
     AboveOrgCeiling,
-    /// The budget and the ceiling name two different currencies, so no
-    /// comparison of the two numbers means anything.
     CurrencyDiffersFromCeiling,
 };
 
-/// What went wrong while the budget block was read, and the facts the error
-/// alone throws away.
-///
-/// **The two ZON variants own memory.** `std.zon.parse.Diagnostics` holds the
-/// syntax tree the message points into, which is why it can name a line and a
-/// column. A caller that receives one must call `deinit`. Every other variant
-/// holds numbers only.
 pub const Diagnostic = union(enum) {
-    /// The file is not valid ZON at all. The parser names the place.
     file_not_zon: std.zon.parse.Diagnostics,
-    /// The file is valid ZON, and its `budget` block does not match the
-    /// schema. A misspelled field name lands here.
     block_not_valid: std.zon.parse.Diagnostics,
-    /// The top level of the file is not a struct literal.
     not_a_struct_literal,
-    /// `max_cost` is not a number above zero. The value is what the file said.
     max_cost_not_positive: f64,
-    /// The file is larger than `max_file_bytes`, so it was not read.
     file_too_large: usize,
-    /// The file exists and the read failed. The fault is the filesystem's.
     read_failed: anyerror,
-    /// The budget is above the ceiling an org policy bundle sets. Both
-    /// numbers are here, because a refusal that named one of them would make
-    /// the reader open two files to learn the other.
     above_org_ceiling: Ceilinged,
-    /// The budget and the ceiling are written in two different currencies.
     currency_differs_from_ceiling: Currencies,
 
-    /// A budget that is above its ceiling, and the ceiling it is above. Both
-    /// amounts are in `currency`, because `underCeiling` refuses a pair in two
-    /// currencies before it compares two numbers.
     pub const Ceilinged = struct {
         asked: f64,
         ceiling: f64,
         currency: []const u8,
     };
 
-    /// The two currencies that do not match. **Borrowed, not owned**: the
-    /// caller of `underCeiling` holds both the budget and the ceiling, and
-    /// both outlive the diagnostic.
+    /// Borrowed, not owned: the caller's budget and ceiling outlive the
+    /// diagnostic.
     pub const Currencies = struct {
         asked: []const u8,
         ceiling: []const u8,
     };
 
-    /// Release what the diagnostic owns. Safe on every variant, so a caller
-    /// can call it without asking which one it holds.
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .file_not_zon, .block_not_valid => |*zon_diag| zon_diag.deinit(gpa),
@@ -199,14 +108,8 @@ pub const Diagnostic = union(enum) {
     }
 };
 
-/// Fill `out` when the caller asked for one, and say whether it took `value`.
-///
-/// **The first fault is kept, not the last.** A later step can only fail
-/// because an earlier one did, so the first is the one that explains the rest.
-///
-/// The answer matters because two variants own memory: a site that hands over
-/// a `std.zon.parse.Diagnostics` must release it itself when the answer is
-/// false, or the trees leak.
+/// A site that hands over a `std.zon.parse.Diagnostics` must release it
+/// itself when the answer is false, or the trees leak.
 fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     const slot = out orelse return false;
     if (slot.* != null) return false;
@@ -214,15 +117,8 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     return true;
 }
 
-/// Read the budget out of `source`, the whole content of a `chock.zon`. Null
-/// when the file names no budget, which is a project that set no cap.
-///
-/// The returned `Budget` owns its `currency` string. `free` releases it with
-/// the same allocator.
-///
-/// `diag` is optional. A caller that passes null pays nothing and learns only
-/// the error. A caller that passes a slot must call `Diagnostic.deinit` on
-/// whatever lands in it.
+/// The returned `Budget` owns its `currency` string, released by `free`.
+/// A given `diag` must be released with `Diagnostic.deinit`.
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) ParseError!?Budget {
     var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -235,9 +131,8 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
     defer if (zoir_owned) zoir.deinit(gpa);
 
     if (zoir.hasCompileErrors()) {
-        // The two trees carry the message, the line and the column, so they
-        // go to the caller whole rather than being flattened to a printed
-        // line here. `std.zon.parse.Diagnostics` owns both from this point.
+        // The two trees carry the message, line and column, and
+        // `std.zon.parse.Diagnostics` owns both from this point.
         if (note(diag, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
             ast_owned = false;
             zoir_owned = false;
@@ -248,8 +143,7 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
     const node = try findBudgetNode(zoir, diag) orelse return null;
 
     var zon_diag: std.zon.parse.Diagnostics = .{};
-    // From here the diagnostics own the two trees, the same handover
-    // `lib/chock-policy/table.zig` makes.
+    // From here the diagnostics own the two trees.
     ast_owned = false;
     zoir_owned = false;
     var zon_diag_owned = true;
@@ -283,58 +177,14 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
     };
 }
 
-/// Release a `Budget` that `parse` or `load` returned.
 pub fn free(gpa: std.mem.Allocator, budget: Budget) void {
     gpa.free(budget.currency);
 }
 
-/// This session's budget, under the ceiling an org policy bundle sets.
-///
-/// **A bound and not a rule.** `lib/chock-policy/table.zig` answers "may this
-/// happen" and takes the intersection of every layer. A ceiling answers "how
-/// much", and the fold for a number is the minimum: a project below the
-/// ceiling keeps its own number, because a project is free to hold itself to
-/// less than its organisation allows.
-///
-/// ## The branch above the ceiling refuses, and does not lower the number
-///
-/// The minimum of the two would be the ceiling, and taking it silently is the
-/// one thing this must not do. A project that wrote `max_cost = 50` and got 5
-/// believes it has a budget it does not have. Nothing tells it otherwise, and
-/// the fault arrives much later, as a session that stops in the middle of the
-/// work with no stated cause, on the one turn the difference bites. That is
-/// the exact shape `Loop.refuseForBudget` was written to remove: a cap that
-/// bites has to name itself before the money is gone. A refusal here is read
-/// by a person, once, at the start, beside the two numbers that disagree, and
-/// the fix is one line of `chock.zon`.
-///
-/// A refusal also keeps the two questions apart. "This project may spend 5"
-/// and "this project asked for 50 and may not have it" are different facts,
-/// and a clamp writes both of them as the first one.
-///
-/// ## Two currencies refuse as well
-///
-/// A ceiling of 5 USD says nothing at all about a budget of 900 JPY, so the
-/// comparison cannot be made and an exchange rate invented here would be a cap
-/// nobody wrote. Allowing the pair would also be the whole ceiling gone: a
-/// project that may name its own currency may name one its organisation did
-/// not, and then no number binds it. `src/run.zig`'s own `budgetUnderOrg`
-/// meets the same pair one layer down, between a project and the parent of a
-/// subagent, and answers it differently: there the narrower authority is the
-/// parent that divided the money, so there is always an answer that cannot
-/// widen. Here there is not.
-///
-/// Neither number can be a NaN. `parse` refuses one in `chock.zon` and
-/// `chock_policy.org.validate` refuses one in a bundle, both when the file is
-/// read, so the comparison below is over two finite numbers.
-///
-/// A null ceiling is an installation with no bundle, or a bundle that names no
-/// budget, and it changes nothing. A null budget under a ceiling takes the
-/// ceiling: an organisation that capped its projects capped the ones that
-/// wrote no cap of their own as well.
-///
-/// The answer borrows its `currency` from whichever of the two it took, so
-/// both must outlive it. Nothing here allocates.
+/// The fold for a number is the minimum, but a budget above its ceiling
+/// refuses rather than silently lowering it. Two different currencies
+/// refuse rather than compare. The answer borrows its `currency`, so both
+/// must outlive it.
 pub fn underCeiling(
     asked: ?Budget,
     ceiling: ?Budget,
@@ -361,13 +211,7 @@ pub fn underCeiling(
     return want;
 }
 
-/// Read `chock.zon` from `project_root` and take its budget. Null when the
-/// project has no such file, or has one that names no budget: both mean the
-/// same thing, which is that this project set no cap.
-///
-/// `diag` carries the same detail `parse` carries, and the same rule applies:
-/// null costs nothing, and a filled slot must be released with
-/// `Diagnostic.deinit`.
+/// A given `diag` must be released with `Diagnostic.deinit`.
 pub fn load(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -401,9 +245,6 @@ pub fn load(
     return parse(gpa, source, diag);
 }
 
-/// The node of the `budget` field at the top of the file. Null when the file
-/// has no such field. Every other top level field is skipped, because other
-/// milestones own the other blocks of this one file.
 fn findBudgetNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
     switch (root.get(zoir)) {
@@ -487,8 +328,6 @@ test "the value a bad max_cost held reaches the caller, and no longer only a ter
 }
 
 test "a misspelled field names its line and column, and the trees behind it are released" {
-    // The ZON variants own the syntax tree the message points into. The
-    // testing allocator fails this test if `deinit` misses it.
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(testing.allocator);
     try testing.expectError(
@@ -513,8 +352,6 @@ test "the first fault is kept, and a caller that wants none pays nothing" {
 }
 
 test "no two faults of this module read the same" {
-    // A reader has to be able to tell which one happened. Every variant is
-    // rendered with a payload that is legal for it.
     const cases: []const Diagnostic = &.{
         .not_a_struct_literal,
         .{ .max_cost_not_positive = 0 },
@@ -535,16 +372,12 @@ test "no two faults of this module read the same" {
 }
 
 test "a project under the org ceiling keeps its own budget" {
-    // The minimum of the two, and the project is the smaller one. Nothing is
-    // rewritten: the currency string that comes back is the project's own.
     const project = Budget{ .max_cost = 2.5, .currency = "USD" };
     const ceiling = Budget{ .max_cost = 5.0, .currency = "USD" };
     const folded = (try underCeiling(project, ceiling, null)).?;
     try testing.expectApproxEqAbs(@as(f64, 2.5), folded.max_cost, 1e-12);
     try testing.expectEqualStrings("USD", folded.currency);
 
-    // The boundary. A project that asks for exactly the ceiling is at the
-    // ceiling and not above it, so it runs.
     const at_the_line = (try underCeiling(
         .{ .max_cost = 5.0, .currency = "USD" },
         ceiling,
@@ -554,8 +387,6 @@ test "a project under the org ceiling keeps its own budget" {
 }
 
 test "a project above the org ceiling is refused, and the refusal names both numbers" {
-    // The decision this module argues beside `underCeiling`: a clamp here
-    // would leave the project believing it has 50.
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(testing.allocator);
     try testing.expectError(error.AboveOrgCeiling, underCeiling(
@@ -568,8 +399,6 @@ test "a project above the org ceiling is refused, and the refusal names both num
 
     var buffer: [512]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{f}", .{&diag.?});
-    // Both numbers are in the sentence a person reads, so nobody has to open
-    // two files to learn which one is which.
     try testing.expect(std.mem.indexOf(u8, line, "50 USD") != null);
     try testing.expect(std.mem.indexOf(u8, line, "5 USD") != null);
     try testing.expect(std.mem.indexOf(u8, line, "chock.zon") != null);
@@ -581,25 +410,16 @@ test "an org bundle with no ceiling leaves a project's own budget alone" {
     try testing.expectApproxEqAbs(@as(f64, 900.0), folded.max_cost, 1e-12);
     try testing.expectEqualStrings("JPY", folded.currency);
 
-    // Neither side named a number, so there is no cap at all. This is every
-    // installation that predates org ceilings.
     try testing.expectEqual(@as(?Budget, null), try underCeiling(null, null, null));
 }
 
 test "a project with no budget of its own takes the org ceiling" {
-    // An organisation that capped its projects capped the ones that wrote no
-    // cap as well, or the ceiling would bind only the projects that already
-    // agreed to be bound.
     const folded = (try underCeiling(null, .{ .max_cost = 5.0, .currency = "USD" }, null)).?;
     try testing.expectApproxEqAbs(@as(f64, 5.0), folded.max_cost, 1e-12);
     try testing.expectEqualStrings("USD", folded.currency);
 }
 
 test "a budget and a ceiling in two currencies refuse rather than compare" {
-    // 900 is a smaller number than no ceiling at all and a larger one than 5,
-    // and neither fact means anything across two currencies. Both orders
-    // refuse, so the answer does not depend on which number happens to be
-    // bigger.
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(testing.allocator);
     try testing.expectError(error.CurrencyDiffersFromCeiling, underCeiling(

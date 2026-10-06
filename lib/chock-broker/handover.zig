@@ -1,6 +1,5 @@
-//! The handover socket. One process asks a running session to stop at a turn
+//! The handover socket: one process asks a running session to stop at a turn
 //! boundary, so another process can take the session log's exclusive lock.
-//! This socket carries a question and an answer, and never a log write.
 
 const std = @import("std");
 
@@ -8,7 +7,6 @@ const diagnostic = @import("diagnostic.zig");
 pub const Diagnostic = diagnostic.Diagnostic;
 const socket = @import("socket.zig");
 
-/// A unix socket path is bounded at 107 bytes on Linux and 103 on Darwin.
 pub const socket_name = "h";
 
 pub const max_frame_bytes: usize = 4096;
@@ -18,7 +16,6 @@ pub const take_frame = "take";
 pub const ready_frame = "ready";
 pub const handing_over_frame = "handing over";
 pub const busy_prefix = "busy ";
-/// Sent once per exchange and never repeated.
 pub const waiting_prefix = "waiting ";
 
 pub const default_confirm_budget_ms: u64 = 5_000;
@@ -65,8 +62,7 @@ pub const Endpoint = struct {
     socket_path: []const u8,
     owner_uid: std.posix.uid_t,
     peer: ?std.posix.fd_t = null,
-    /// Two cursors, because one read brings more than one frame. A client can
-    /// send `take` together with its `ask`.
+    /// Two cursors: one read can bring more than one frame, e.g. `take` with its `ask`.
     start: usize = 0,
     filled: usize = 0,
     buffer: [max_frame_bytes]u8 = undefined,
@@ -90,8 +86,7 @@ pub const Endpoint = struct {
             },
         };
 
-        // Darwin refuses a connection when the queue is full instead of making
-        // it wait, and a refused client cannot tell that from no listener.
+        // Darwin refuses a full queue instead of waiting; a refused client can't tell that from no listener.
         const server = address.listen(io, .{ .kernel_backlog = 4 }) catch |err| {
             _ = diagnostic.note(diag, .{ .socket_not_opened = .{ .path = paths.socket, .err = err } });
             return error.SocketUnavailable;
@@ -105,8 +100,7 @@ pub const Endpoint = struct {
     }
 
     pub fn close(self: *Endpoint, io: std.Io) void {
-        // The file goes first and the peer second. A dropped peer can start the
-        // next owner, and a later remove would unlink that owner's new socket.
+        // The file goes first, or a later remove could unlink the next owner's new socket.
         std.Io.Dir.deleteFileAbsolute(io, self.socket_path) catch {};
         self.server.deinit(io);
         self.dropPeer(io);
@@ -219,8 +213,7 @@ pub const Endpoint = struct {
                 self.filled = rest.len;
                 self.start = 0;
             }
-            // Checked before the poll. Once a peer that filled the buffer stops
-            // sending, a poll never names it again.
+            // Checked before the poll: a peer that filled the buffer and stopped sending is never named again.
             if (self.filled == self.buffer.len) {
                 self.dropPeer(io);
                 return null;
@@ -257,8 +250,7 @@ pub const Endpoint = struct {
         return true;
     }
 
-    /// A held ask is the one state where nothing is read for many turns, so a
-    /// client that died would shut every other asker out.
+    /// A held ask reads nothing for many turns, so a dead client would shut every other asker out.
     fn noticeGoneWhileWaiting(self: *Endpoint, io: std.Io, handle: std.posix.fd_t) void {
         while (socket.readable(handle, 0)) {
             if (self.start != 0) {
@@ -321,8 +313,7 @@ pub const Offer = union(enum) {
     waiting: []const u8,
     busy: []const u8,
     silent,
-    /// Never fold this into `silent`. A live session reported that way told a
-    /// person to wait for a session that had already stopped.
+    /// Never fold into `silent`: that once told a person to wait for a session already stopped.
     ended,
     unreadable: []const u8,
 };
@@ -331,8 +322,7 @@ pub const Client = struct {
     handle: std.posix.fd_t,
     frames: Frames,
 
-    /// Every borrowed string in a result points into `buffer`, so it must live
-    /// as long as the results do.
+    /// Every borrowed string in a result points into `buffer`, which must outlive the results.
     pub fn over(handle: std.posix.fd_t, buffer: []u8) Client {
         return .{ .handle = handle, .frames = .{ .buffer = buffer } };
     }
@@ -356,8 +346,7 @@ pub const Client = struct {
         return socket.writeAll(self.handle, take_frame ++ "\n");
     }
 
-    /// Never assume this answer. A client that believes it owns a session which
-    /// is still running is the worst answer this file can give.
+    /// Never assume this: a client wrongly believing it owns a still-running session is the worst answer here.
     pub fn readFinal(self: *Client, patience_ms: u64) Answer {
         const said = self.frames.next(self.handle, patience_ms) orelse return .silent;
         if (std.mem.startsWith(u8, said, busy_prefix)) return .{ .busy = said[busy_prefix.len..] };
@@ -365,30 +354,26 @@ pub const Client = struct {
         return .handed_over;
     }
 
-    /// The loop releases the log's exclusive lock before the run closes this
-    /// socket, so the end of this stream happens strictly after the unlock.
+    /// The loop unlocks the log before the run closes this socket, so the stream always ends after the unlock.
     pub fn waitForEnd(self: *Client, patience_ms: u64) bool {
         while (self.frames.next(self.handle, patience_ms)) |_| {}
         return readEnded(self.handle);
     }
 };
 
-/// A closed peer leaves a socket permanently readable with a read of zero
-/// bytes, which is how it differs from a peer that has said nothing yet.
+/// A closed peer leaves the socket readable with a zero-byte read, unlike one that's merely said nothing yet.
 fn readEnded(handle: std.posix.fd_t) bool {
     if (!socket.readable(handle, 0)) return false;
     var scratch: [1]u8 = undefined;
     const read = std.posix.read(handle, &scratch) catch |err| switch (err) {
-        // A poll can say readable when nothing is there. True here would tell a
-        // client the log lock is free while the first owner still holds it.
+        // A poll can say readable when nothing is there; true here would wrongly free the log lock for a client.
         error.WouldBlock => return false,
         else => return true,
     };
     return read == 0;
 }
 
-/// `std.Io` copies the path into `sun_path` on the connect side too, and a path
-/// longer than that field ends a safety checked build on Darwin.
+/// `std.Io` copies the path into `sun_path` on connect too; too long ends a safety-checked build on Darwin.
 pub fn ask(io: std.Io, socket_path: []const u8, patience_ms: u64, buffer: []u8) Answer {
     const address = socket.addressFor(socket_path, null) catch return .not_listening;
     const stream = address.connect(io) catch return .not_listening;
@@ -488,8 +473,7 @@ fn sendFrame(stream: std.Io.net.Stream, frame: []const u8) !void {
 }
 
 test "the handover socket binds at exactly the bound and refuses one byte more" {
-    // `std.Io.net.UnixAddress.max_len` is 108 and wrong on Darwin. On Linux
-    // both halves below still pass, because `std` binds an unterminated 108.
+    // `UnixAddress.max_len` is 108 and wrong on Darwin; both halves below still pass on Linux's unterminated 108.
     const gpa = testing.allocator;
     const io = testing.io;
 

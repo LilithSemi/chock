@@ -1,6 +1,5 @@
-//! The reviewer agent, for the `agent_review` and `agent_then_human` policy
-//! decisions. A review that could not run is a refusal and never an allow,
-//! because otherwise the cheapest attack is to make the review fail.
+//! The reviewer agent, for the `agent_review`/`agent_then_human` decisions. A
+//! review that cannot run is a refusal, never an allow: failing one is the cheapest attack.
 
 const std = @import("std");
 const chock_proto = @import("chock-proto");
@@ -13,8 +12,7 @@ pub const Verdict = event.ReviewVerdict;
 
 pub const max_note_bytes: usize = 500;
 
-/// Two members, and no more: a third that named an action or a path would let
-/// a reviewer describe a case other than the one it was given.
+/// Two members only: a third naming an action or path would let a reviewer describe a different case.
 pub const result_fields = [_][]const u8{ "verdict", "why" };
 
 pub const verdict_approve = "approve";
@@ -50,9 +48,7 @@ pub const ReviewError = error{
     ReviewNotRun,
 } || std.mem.Allocator.Error;
 
-/// Two things an implementation owes, and neither is checkable from here.
-/// Give the reviewer no tools. Give the reviewer no scratchpad: a parent may
-/// read a child's scratchpad, and the parent here is the agent under review.
+/// Owes the reviewer no tools or scratchpad: a parent can read a child's, and the parent here is under review.
 pub const Reviewer = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -85,9 +81,7 @@ pub const Resolution = enum {
     not_a_review,
 };
 
-/// The policy fold bounds what a reviewer may do with its own tool calls. It
-/// says nothing about the verdict, so the rule that a review never widens is
-/// built here: a decision the table already made is never moved by a verdict.
+/// A decision the table already made is never moved by a verdict: review never widens it.
 pub fn resolve(decision: table.Decision, verdict: Verdict) Resolution {
     return switch (decision) {
         .deny, .ask, .allow => .not_a_review,

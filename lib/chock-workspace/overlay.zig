@@ -1,6 +1,5 @@
-//! The overlay backing for a project that is not a git repository, behind one
-//! driver per way of building it. The two drivers share a result and not a
-//! mechanism, and no caller needs a platform branch of its own.
+//! The overlay backing for a project that is not a git repository, behind
+//! one driver per way of building it; no caller needs a platform branch.
 
 const std = @import("std");
 
@@ -17,8 +16,6 @@ pub const Error = error{
     OutOfMemory,
     Unexpected,
     NoOverlayFilesystem,
-    /// The scratch directory and the project are on different volumes, and
-    /// neither driver can build an overlay across that line.
     ScratchOnAnotherVolume,
     ScratchAlreadyExists,
     NoOverlayToAdopt,
@@ -28,8 +25,7 @@ pub const Error = error{
 pub const ChangeKind = enum {
     added,
     modified,
-    /// The project had a file at this path, and the agent removed it, or
-    /// replaced it with something that is not a file or a link.
+    /// The agent removed the file, or replaced it with something that is not a file or a link.
     deleted,
 };
 
@@ -123,10 +119,6 @@ pub const Overlay = struct {
         self.* = undefined;
     }
 
-    /// Describe the overlay mount. This performs no mount of its own: it only
-    /// builds the one entry `chock-sandbox`'s own `buildRoot` calls `mount(2)`
-    /// for, with `userxattr` in the options, which a rootless overlay mount
-    /// requires. Building the list needs no privilege and no namespace.
     pub fn mounts(self: Overlay, allocator: std.mem.Allocator) Error![]Mount {
         const list = allocator.alloc(Mount, 1) catch return error.OutOfMemory;
         list[0] = switch (self.layout) {
@@ -136,9 +128,7 @@ pub const Overlay = struct {
                 .work = self.work,
                 .target = self.project,
             } },
-            // macOS has no overlayfs, so `darwin/overlay.zig` already made a
-            // whole copy on write clone of the project at `upper`. There is
-            // nothing to merge, so the one entry is the clone at its own path.
+            // macOS has no overlayfs; darwin/overlay.zig already cloned the project, so nothing merges.
             .in_place => .{ .bind = .{
                 .source = self.upper,
                 .target = self.upper,
@@ -157,26 +147,8 @@ pub const Overlay = struct {
         return driver.changedFiles(self, allocator, io, diag);
     }
 
-    /// Put the work of an overlay at `destination`, and answer what arrived.
-    ///
-    /// The work goes beside the project and never over it. A git project gets
-    /// its work back at a ref, with nothing of the person's moved. A project
-    /// with no git has no object store and no commit to go back to, so copying
-    /// the upper layer over the project is the one way that can destroy work,
-    /// and there is no approval here because the session has already ended. A
-    /// patch carries no binary file, no symbolic link and no file mode, and a
-    /// project with no git has no `git apply` either.
-    ///
-    /// A deletion is work, so it is carried as a name and never as an act.
-    /// Absence in `<destination>/files` says nothing, because a path the
-    /// session never touched is absent too, so every deleted path is written
-    /// to `<destination>/deleted` and not one of them is applied.
-    ///
-    /// `error.WorkAlreadyCarriedOut` when anything is at `destination`, checked
-    /// before a byte is read: merging into a directory that already holds a
-    /// carry out would write over files a person may have edited, and there is
-    /// no way to tell those apart. The upper layer is not changed, so a caller
-    /// that meets the refusal names another destination and gets everything.
+    /// A deletion is carried as a name, never applied as an act. Refuses
+    /// with `error.WorkAlreadyCarriedOut` if `destination` already exists.
     pub fn carryOut(
         self: Overlay,
         allocator: std.mem.Allocator,
@@ -184,8 +156,7 @@ pub const Overlay = struct {
         destination: []const u8,
         diag: ?*?Diagnostic,
     ) Error!CarriedOut {
-        // First, and before the upper layer is opened at all: a refusal that
-        // had already written half a directory is one a caller cannot act on.
+        // Checked before the upper layer is opened, so a refusal never leaves a half-written directory.
         const occupied = std.Io.Dir.cwd().statFile(io, destination, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => null,
             else => {
@@ -267,12 +238,7 @@ pub fn createWithLayout(
     return made;
 }
 
-/// Take over the overlay of a session whose process has ended. Neither driver
-/// makes an upper layer and neither copies anything.
-///
-/// This call never removes a thing it did not make. The upper layer holds work
-/// nothing else has a copy of, so a failure part way through leaves every file
-/// where it was.
+/// Neither driver makes an upper layer or copies anything, and never removes a thing it did not make.
 pub fn adopt(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -307,12 +273,7 @@ pub fn scratchDirOnDisk(io: std.Io, absolute_path: []const u8, diag: ?*?Diagnost
     return found.kind == .directory;
 }
 
-/// Copy one changed path out of `upper` into `files_root`. A symbolic link is
-/// copied as a link and never as what it points at, because a link the agent
-/// made can point outside the project.
-///
-/// A path that went away between `changedFiles` and this copy is recorded as a
-/// skip rather than dropped.
+/// A symbolic link is copied as a link, never as what it points at, since it can point outside the project.
 fn carryOne(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -337,8 +298,7 @@ fn carryOne(
 
     switch (found.kind) {
         .file => {
-            // `copyFile` carries the permissions of the source, so a script
-            // the agent made executable is still executable here.
+            // copyFile carries the source's permissions, so an executable script stays executable.
             std.Io.Dir.copyFileAbsolute(source, target, io, .{ .make_path = true }) catch |err| {
                 diagnostic.noteErr(diag, .carried_file_copy, err);
                 return error.Unexpected;
@@ -356,18 +316,13 @@ fn carryOne(
                 diagnostic.noteErr(diag, .carried_work_mkdir, err);
                 return error.Unexpected;
             };
-            // `cwd().symLink` and never `symLinkAbsolute`. The second asserts
-            // its target is absolute, and a link an agent makes inside a
-            // project is usually relative, so that call panics on the ordinary
-            // case in a Debug or ReleaseSafe build.
+            // symLinkAbsolute asserts its target is absolute and panics on a relative one.
             std.Io.Dir.cwd().symLink(io, buffer[0..length], target, .{}) catch |err| {
                 diagnostic.noteErr(diag, .carried_link_write, err);
                 return error.Unexpected;
             };
             return true;
         },
-        // `changedFiles` reports a path as added or modified only for a file
-        // or a link, so anything else changed kind since the walk.
         else => |other| {
             const reason = std.fmt.allocPrint(
                 allocator,
@@ -453,9 +408,7 @@ pub fn nestedMounts(
 }
 
 test "the linux driver and the darwin driver expose the same public shape" {
-    // Guarded on `builtin.os.tag`, a comptime known value, so the branch this
-    // test does not take is never imported: `linux/overlay.zig`'s own syscalls
-    // do not type check for Darwin.
+    // The branch not taken is never imported, since linux/overlay.zig's syscalls do not type check for Darwin.
     if (builtin.os.tag != .linux) return;
 
     const linux_driver = @import("linux/overlay.zig");

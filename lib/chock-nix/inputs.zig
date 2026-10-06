@@ -1,9 +1,4 @@
 //! A flake's inputs are fetched on the host, once, before anything evaluates.
-//!
-//! fix can fetch an input for itself over its own connection, which no rule of
-//! this project would see, so the evaluator is given no fetcher at all. `nix
-//! flake archive` puts every input in the host store first, and fix takes a
-//! locked input from there when the store says its path is valid.
 
 const std = @import("std");
 
@@ -12,28 +7,18 @@ const provision = @import("provision.zig");
 
 pub const Error = provision.Error;
 
-/// The longest `flake.lock` this reads.
 pub const max_lock_bytes: usize = 4 << 20;
 
-/// The most nodes one lock may hold. A real lock holds tens.
 pub const max_nodes: usize = 1024;
 
 pub const Unreadable = struct {
     input: []const u8,
-    /// What the node says it is, or its URL when it has one. Empty when the
-    /// node carries neither.
     reference: []const u8,
     why: Why,
 
     pub const Why = enum {
-        /// The node holds no `locked` object, or no `type` in it.
         not_a_node,
-        /// A type this file will not turn into a host: `indirect`, which
-        /// names a registry rather than a host, and anything nobody has
-        /// taught it. A guess would ask about a connection that never
-        /// happens while the real one goes unasked.
         type_unknown,
-        /// A node of a type that fetches, with no `url` to fetch.
         no_url,
         scheme_unknown,
         no_host,
@@ -42,16 +27,11 @@ pub const Unreadable = struct {
 };
 
 pub const Wants = union(enum) {
-    /// One entry per host and port, in the order they were found.
     hosts: []const fetch.Fetch,
-    /// The first node this file could not name. A refusal and never a skip,
-    /// because a fetch nobody can name is a fetch nobody can rule on.
     unreadable: Unreadable,
     not_a_lock: []const u8,
 };
 
-/// Every host the inputs of `lock_bytes` would be fetched from. Give it an
-/// arena.
 pub fn wantsOf(allocator: std.mem.Allocator, lock_bytes: []const u8) std.mem.Allocator.Error!Wants {
     if (lock_bytes.len > max_lock_bytes) return .{ .not_a_lock = "the lock file is too long to read" };
 
@@ -78,7 +58,6 @@ pub fn wantsOf(allocator: std.mem.Allocator, lock_bytes: []const u8) std.mem.All
     var each = nodes.iterator();
     while (each.next()) |entry| {
         const name = entry.key_ptr.*;
-        // The root node is the tree the lock lives in, so it fetches nothing.
         if (std.mem.eql(u8, name, root_name)) continue;
 
         const targets = switch (try targetsOf(allocator, name, entry.value_ptr.*)) {
@@ -98,7 +77,6 @@ pub fn wantsOf(allocator: std.mem.Allocator, lock_bytes: []const u8) std.mem.All
 
 const Targets = union(enum) {
     targets: []const fetch.Fetch,
-    /// A node that fetches nothing, which is what a `path` node is.
     nothing,
     unreadable: Unreadable,
 };
@@ -116,7 +94,6 @@ fn targetsOf(
     const kind = stringOf(locked.object, "type") orelse
         return .{ .unreadable = .{ .input = name, .reference = "", .why = .not_a_node } };
 
-    // A tree that is already a path on this machine is not fetched at all.
     if (std.mem.eql(u8, kind, "path")) return .nothing;
 
     var forge_buffer: [2][]const u8 = undefined;
@@ -138,8 +115,6 @@ fn targetsOf(
     const url = stringOf(locked.object, "url") orelse return .{
         .unreadable = .{ .input = name, .reference = try allocator.dupe(u8, kind), .why = .no_url },
     };
-    // `fetch.targetOf` takes a `git+` or `hg+` prefix off, so a lock node and
-    // a derivation read the same URL the same way.
     const target = fetch.targetOf(url) catch |err| return .{ .unreadable = .{
         .input = name,
         .reference = try allocator.dupe(u8, url),
@@ -160,9 +135,6 @@ fn targetsOf(
     return .{ .targets = one };
 }
 
-/// The hosts a forge node is fetched from, or null when `kind` is not a forge.
-/// `github` with no host of its own is fetched from the API host, which
-/// redirects to the download host, so both are named.
 fn forgeHosts(
     kind: []const u8,
     host: ?[]const u8,
@@ -201,14 +173,10 @@ fn stringOf(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
 }
 
 pub const Answer = union(enum) {
-    /// The flake's own tree and every input of it, at every depth.
     fetched: []const []const u8,
     refused: []const u8,
 };
 
-/// Fetch every input of `reference` into the host store, after the gate has
-/// answered for every host `lock_bytes` names. On the host, and give it an
-/// arena.
 pub fn fetchAll(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -218,7 +186,6 @@ pub fn fetchAll(
     lock_bytes: []const u8,
 ) Error!Answer {
     switch (try wantsOf(allocator, lock_bytes)) {
-        // One call for every host the lock names, as a build does.
         .hosts => |list| switch (try gate.permitAll(allocator, list)) {
             .permitted => {},
             .refused => |why| return .{ .refused = why },
@@ -233,8 +200,6 @@ pub fn fetchAll(
     return archive(allocator, io, runner, reference);
 }
 
-/// Run `nix flake archive` for `reference` and answer every store path it
-/// named. The caller has already put every host to the gate.
 pub fn archive(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -245,8 +210,7 @@ pub fn archive(
         "flake",
         "archive",
         "--json",
-        // The user's own lock file is theirs. A fetch that rewrote it would
-        // change what the project builds from without anybody asking.
+        // The user's own lock file is theirs: a fetch that rewrote it would change what the project builds from without anybody asking.
         "--no-write-lock-file",
         "--",
         reference,
@@ -277,7 +241,6 @@ fn lessThanPath(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
 }
 
-/// Every `path` of the tree `nix flake archive --json` writes, at every depth.
 fn collectPaths(
     allocator: std.mem.Allocator,
     value: std.json.Value,
@@ -337,8 +300,6 @@ pub fn unreadableRefusal(
     };
 }
 
-/// A refusal is written by whoever refused, so a caller that joins one to a
-/// sentence of its own cannot know how it ends.
 fn endsSentence(text: []const u8) bool {
     if (text.len == 0) return true;
     return switch (text[text.len - 1]) {
@@ -356,12 +317,6 @@ fn endSentence(
     if (!endsSentence(said)) try text.append(allocator, '.');
 }
 
-/// What a build reads when an input it needed is still not there. A session
-/// whose inputs did not arrive still starts, because a project with no flake
-/// is the ordinary case, so this is the failure somebody acts on instead.
-///
-/// It never tells the model to ask for a host: reaching here means somebody
-/// was asked and said no, or the fetch itself failed.
 pub fn missingRefusal(
     allocator: std.mem.Allocator,
     installable: []const u8,
@@ -421,7 +376,6 @@ test "two inputs from one forge are two hosts and never two questions each" {
 
     const wants = try wantsOf(arena, one_github_input);
     try testing.expect(wants == .hosts);
-    // Two hosts for the one forge, and not four.
     try testing.expectEqual(@as(usize, 2), wants.hosts.len);
     for (wants.hosts) |one| {
         try testing.expect(std.mem.endsWith(u8, one.host, ".github.com"));
@@ -478,8 +432,6 @@ test "a node nothing can name is a refusal that names the input" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // An indirect node names a registry entry, and the registry is itself a
-    // fetch, so there is no host in the lock to ask about.
     const indirect = try wantsOf(arena,
         \\{"nodes":{"dep":{"locked":{"type":"indirect","id":"nixpkgs"}},
         \\ "root":{"inputs":{"dep":"dep"}}},"root":"root","version":7}
@@ -559,8 +511,6 @@ const FakeRunner = struct {
     }
 };
 
-/// A `fetch.Gate` that answers the same way about every host and records what
-/// it was asked. Not a policy table.
 const AnsweringGate = struct {
     gpa: std.mem.Allocator,
     permitted: bool = true,
@@ -582,8 +532,6 @@ const AnsweringGate = struct {
         .permit_site = permitNoSite,
     };
 
-    /// A lock node names a host or it is refused, so nothing here reaches the
-    /// question a build with no URL puts.
     fn permitNothing(
         _: *anyopaque,
         _: std.mem.Allocator,
@@ -592,7 +540,6 @@ const AnsweringGate = struct {
         return .{ .refused = "a flake input is fetched by host and never without one" };
     }
 
-    /// A flake input names a host and never a mirror site.
     fn settlesNothing(_: *anyopaque, _: fetch.Fetch) fetch.RuleAnswer {
         return .unsettled;
     }
@@ -699,7 +646,6 @@ test "the sentence a later build reads names the input and the host, and reads a
         .{ .subject = "nixpkgs", .url = "https://api.github.com", .host = "api.github.com", .port = 443 },
     };
 
-    // A refusal that ends on an action name ran into the next sentence.
     const said = try missingRefusal(
         gpa,
         "/work#packages.default",

@@ -1,40 +1,14 @@
 //! The JSON-RPC 2.0 envelope ACP speaks, and the framing that carries it.
-//!
-//! ## The framing is the newline, and one write is what keeps it
-//!
-//! ACP's stdio transport says a message is one line: delimited by `\n`, and it
-//! **must not** hold an embedded newline. So a message and its newline go out in
-//! one `writeAll`. Two writes would let a message reach the wire with no newline
-//! behind it, which joins it to the next one and breaks every message after.
-//! `lib/chock-core/mcp_driver.zig` learned that against a real server and says
-//! so; this is the same rule on the other side of the wire.
-//!
-//! ## Nothing but a message may reach standard output
-//!
-//! The transport says the agent must not write anything to `stdout` that is not
-//! a valid ACP message. Chock's own `tty.print` already goes to standard error,
-//! which the transport permits for logging, so the rule costs nothing as long as
-//! no caller reaches for standard output.
-//!
-//! ## An id is echoed and never read
-//!
-//! JSON-RPC lets an id be a number or a string, and a response carries back the
-//! id it answers. This holds the id as the bytes it arrived as, so a client that
-//! sends a string gets that string back. A peer that renumbered ids would fail
-//! against a client that matches on them.
+//! A message is one line, so it and its newline go out in one write, or a
+//! second write could let another message land between them. An id is held as the exact bytes it arrived as, and echoed back.
 
 const std = @import("std");
 
 pub const version = "2.0";
 
-/// The largest message this reader accepts before it gives up on the line.
-///
-/// A peer that writes more than this with no newline is one this cannot frame,
-/// and reading on would grow without a bound somebody chose.
 pub const max_message_bytes: usize = 4 * 1024 * 1024;
 
-/// Predefined codes, from the ACP schema's own `ErrorCode`. The first five are
-/// JSON-RPC 2.0's; the rest are ACP's, inside the reserved range.
+/// From `ErrorCode`: the first five are JSON-RPC's, the rest ACP's.
 pub const Code = enum(i32) {
     parse_error = -32700,
     invalid_request = -32600,
@@ -59,8 +33,7 @@ pub const Code = enum(i32) {
     }
 };
 
-/// A request's identity, as the bytes it arrived as. See this file's own note on
-/// why it is not read.
+/// Held as arrived, never parsed, so it echoes back exactly.
 pub const Id = struct {
     /// The JSON token, so `7` stays `7` and `"a"` stays `"a"`.
     raw: []const u8,
@@ -72,13 +45,11 @@ pub const Id = struct {
     pub const null_id = Id{ .raw = "null" };
 };
 
-/// What arrived on the wire. A notification is a request with no id, which is
-/// the only thing that separates the two in JSON-RPC.
+/// A notification has no id; nothing else differs.
 pub const Incoming = struct {
     id: ?Id,
     method: []const u8,
-    /// The `params` member as raw JSON, for the caller that knows the method to
-    /// parse into its own type. Empty when there were none.
+    /// Raw JSON; empty when there were none.
     params: []const u8,
 
     pub fn isNotification(self: Incoming) bool {
@@ -86,13 +57,11 @@ pub const Incoming = struct {
     }
 };
 
-/// A reply to something this side asked. It carries an id and no method, which
-/// is what separates it from a request.
 pub const Reply = struct {
     id: Id,
-    /// The `result` member as raw JSON. Empty when the reply carried an error.
+    /// Raw JSON; empty when the reply carried an error.
     result: []const u8,
-    /// The `error.message` when the peer refused, and null when it did not.
+    /// `error.message` if refused, null otherwise.
     refusal: ?[]const u8 = null,
 
     pub fn failed(self: Reply) bool {
@@ -100,8 +69,7 @@ pub const Reply = struct {
     }
 };
 
-/// Either direction of traffic. A peer that both answers and asks reads every
-/// line through this, because a reply and a request arrive on the same wire.
+/// Either direction, for a peer that both asks and answers.
 pub const Any = union(enum) {
     request: Incoming,
     reply: Reply,
@@ -115,11 +83,7 @@ pub const ParseError = error{
     BadId,
 };
 
-/// Read one message, whichever direction it is going.
-///
-/// A request has a method; a reply has an id and none. Nothing else tells them
-/// apart, so a caller that only ever parsed requests would refuse every answer
-/// to its own questions.
+/// Only a method, or its absence, tells a request from a reply.
 pub fn parseAny(arena: std.mem.Allocator, line: []const u8) ParseError!Any {
     const parsed = std.json.parseFromSlice(std.json.Value, arena, line, .{}) catch
         return error.NotAnObject;
@@ -158,11 +122,7 @@ pub fn parseAny(arena: std.mem.Allocator, line: []const u8) ParseError!Any {
     return .{ .reply = .{ .id = id, .result = result } };
 }
 
-/// Read one message. `line` is one frame with its newline already removed.
-///
-/// The `jsonrpc` member is checked rather than ignored: a peer speaking another
-/// version would have every field mean something else, and answering it as
-/// though it were 2.0 would be worse than refusing it.
+/// `jsonrpc` is checked; another version could mean anything.
 pub fn parse(arena: std.mem.Allocator, line: []const u8) ParseError!Incoming {
     const parsed = std.json.parseFromSlice(std.json.Value, arena, line, .{}) catch
         return error.NotAnObject;
@@ -194,13 +154,11 @@ pub fn parse(arena: std.mem.Allocator, line: []const u8) ParseError!Incoming {
     return .{ .id = id, .method = method, .params = params };
 }
 
-/// An id as the token it arrived as. Null for a `null` id, which is a request
-/// nothing can answer.
+/// Null for a `null` id, a request nothing can answer.
 fn readId(arena: std.mem.Allocator, held: std.json.Value) ParseError!?Id {
     return switch (held) {
         .integer => |number| .{ .raw = try std.fmt.allocPrint(arena, "{d}", .{number}) },
-        // `std.json.fmt` writes the quotes itself, so the id is already a JSON
-        // string token here.
+        // `std.json.fmt` already writes the quotes: this is already a string token.
         .string => |text| .{ .raw = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(text, .{})}) },
         .null => null,
         // A float or an object is not an id at all.
@@ -210,17 +168,11 @@ fn readId(arena: std.mem.Allocator, held: std.json.Value) ParseError!?Id {
 
 pub const WriteError = error{
     OutOfMemory,
-    /// The message holds a newline, which the framing cannot carry. Raised
-    /// rather than written, because writing it would break every message after.
     EmbeddedNewline,
     WriteFailed,
 };
 
-/// One message and its newline, in one `writeAll`. See this file's own note.
-///
-/// `body` is the whole JSON object without its newline. It is checked for a
-/// newline first: JSON escapes one inside a string as `\n`, so a raw newline in
-/// a serialized message is a caller's fault and not a peer's.
+/// A raw newline here is the caller's fault; JSON would have escaped one in a string.
 pub fn writeFrame(
     arena: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -233,8 +185,7 @@ pub fn writeFrame(
     writer.flush() catch return error.WriteFailed;
 }
 
-/// A reply carrying a result. `result` is raw JSON, so the caller serializes its
-/// own payload and this only puts the envelope around it.
+/// `result` is raw JSON; this only wraps it in the envelope.
 pub fn resultBody(
     arena: std.mem.Allocator,
     id: Id,
@@ -247,8 +198,7 @@ pub fn resultBody(
     );
 }
 
-/// A reply carrying an error. The message is the peer's to read, so it says what
-/// happened and never what the code was.
+/// The message is the peer's to read: it says what happened, never the code.
 pub fn errorBody(
     arena: std.mem.Allocator,
     id: Id,
@@ -262,8 +212,7 @@ pub fn errorBody(
     );
 }
 
-/// A request this side asks the peer. The id is this side's to choose, and the
-/// peer echoes it back.
+/// The id is this side's to choose; the peer echoes it back.
 pub fn requestBody(
     arena: std.mem.Allocator,
     id: Id,
@@ -277,7 +226,6 @@ pub fn requestBody(
     );
 }
 
-/// A notification: a method and its params, with no id, so nothing answers it.
 pub fn notificationBody(
     arena: std.mem.Allocator,
     method: []const u8,
@@ -321,8 +269,7 @@ test "a message with no id is a notification, which is the only difference" {
     try testing.expect(one.isNotification());
     try testing.expectEqual(@as(?Id, null), one.id);
 
-    // A null id is nothing anything can answer, so it is read as a
-    // notification rather than as an id spelled `null`.
+    // A null id reads as a notification, never as a literal `null`.
     const nulled = try parse(arena, "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"x\"}");
     try testing.expect(nulled.isNotification());
 }
@@ -335,16 +282,12 @@ test "a string id is echoed as a string and a number as a number" {
     const named = try parse(arena, "{\"jsonrpc\":\"2.0\",\"id\":\"a-1\",\"method\":\"x\"}");
     try testing.expectEqualStrings("\"a-1\"", named.id.?.raw);
 
-    // The reply puts the id back as it arrived, so a client matching on the
-    // exact token finds its own request.
     const reply = try resultBody(arena, named.id.?, "{\"ok\":true}");
     try testing.expect(std.mem.indexOf(u8, reply, "\"id\":\"a-1\"") != null);
 
     const numbered = try parse(arena, "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"x\"}");
     const numbered_reply = try resultBody(arena, numbered.id.?, "");
     try testing.expect(std.mem.indexOf(u8, numbered_reply, "\"id\":12") != null);
-    // No result is `null` and never an absent member: a response object must
-    // hold one of result or error.
     try testing.expect(std.mem.indexOf(u8, numbered_reply, "\"result\":null") != null);
 }
 
@@ -371,8 +314,6 @@ test "a frame is one write, and a body holding a newline is refused" {
     try writeFrame(arena, &sink, "{\"a\":1}");
     try testing.expectEqualStrings("{\"a\":1}\n", sink.buffered());
 
-    // The framing cannot carry it, so it is refused where it can still be
-    // fixed rather than written where it breaks every message after.
     try testing.expectError(
         error.EmbeddedNewline,
         writeFrame(arena, &sink, "{\"a\":\"one\ntwo\"}"),
@@ -384,8 +325,6 @@ test "a newline inside a string is escaped, so a real message still frames" {
     defer state.deinit();
     const arena = arenaFor(&state);
 
-    // This is the ordinary case: an agent's message chunk holds newlines, and
-    // JSON escapes them, so the frame stays one line.
     const body = try notificationBody(
         arena,
         "session/update",
@@ -423,8 +362,6 @@ test "a quote in a message cannot end the JSON string it is in" {
     const arena = arenaFor(&state);
 
     const body = try errorBody(arena, .null_id, .invalid_params, "the tool \"gh\" is unknown");
-    // Escaped, so the object still parses. Built by hand here, so this is the
-    // test that the hand built one is still JSON.
     var reparsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
     const said = reparsed.value.object.get("error").?.object.get("message").?.string;
     try testing.expectEqualStrings("the tool \"gh\" is unknown", said);
@@ -462,12 +399,9 @@ test "a refusal carries what the peer said, and an empty result is not a refusal
     try testing.expectEqualStrings("no such method", refused.reply.refusal.?);
     try testing.expectEqualStrings("\"a\"", refused.reply.id.raw);
 
-    // A null result is a reply that succeeded and returned nothing, which is
-    // what every notification style method answers with.
     const empty = try parseAny(arena, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}");
     try testing.expect(!empty.reply.failed());
     try testing.expectEqualStrings("", empty.reply.result);
 
-    // A reply with no id is nothing this side can match to a question it asked.
     try testing.expectError(error.BadId, parseAny(arena, "{\"jsonrpc\":\"2.0\",\"result\":1}"));
 }

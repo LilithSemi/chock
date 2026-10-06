@@ -1,8 +1,5 @@
-//! `chock doctor`: ask, before a session starts, whether this machine can
-//! contain one, with no session, no workspace and no provider call. It is the
-//! one producer of `src/ui.zig`'s `Layer.State.unavailable`, which a running
-//! session never has because the Linux driver refuses to spawn rather than
-//! degrade.
+//! `chock doctor`: ask, before a session starts, whether this machine can contain one.
+//! It runs with no session, no workspace, and no provider call.
 
 const std = @import("std");
 const chock_auth = @import("chock-auth");
@@ -247,9 +244,7 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
                     m.user_namespace.why(),
                 }),
             .why = "this process can make one, so a tool call runs as a user id of its own",
-            .fix = if (m.user_namespace == .ok) "" else
-            // The one setting an administrator can change, named exactly.
-            "Every other layer is built on this one. Set kernel.unprivileged_userns_clone to 1, " ++
+            .fix = if (m.user_namespace == .ok) "" else "Every other layer is built on this one. Set kernel.unprivileged_userns_clone to 1, " ++
                 "or remove the container or policy that turns it off.",
             .blocks = true,
         });
@@ -1144,8 +1139,6 @@ fn measure(
     project_root: []const u8,
 ) Measured {
     var m = Measured{};
-    // Comptime, so a branch this build's driver never takes is never analysed:
-    // the two measure functions name mechanisms of different targets.
     switch (comptime LayerFamily.forDriver(sandbox.Sandbox.guarantees)) {
         .none => {},
         .namespaces => measureLayers(arena, io, env, project_root, &m),
@@ -1478,8 +1471,6 @@ fn measureDevShell(
     const dir = session_paths.devShellDir(arena, env, project_root) catch return .no_flake;
     session_paths.createDevShellDir(io, dir) catch return .no_flake;
 
-    // The same attribute `chock run` reads. A doctor that reads `default`
-    // while the session reads another one answers about a shell nobody runs.
     const block = chock_policy.nix.load(arena, io, project_root, null) catch
         chock_policy.nix.Nix{};
 
@@ -1552,9 +1543,6 @@ fn measureToolchain(
             .unreachable_runtime => |text| return .{ .image_unusable = text },
         };
 
-        // The resolved path and never the bare name. `proc.run` asserts that
-        // `argv[0]` is absolute, and a bare name aborted the whole command in a
-        // debug build against a real podman.
         var host = chock_container.Runtime.Host{
             .program = ready.program,
             .env = env,
@@ -1719,8 +1707,7 @@ fn removeDeadProbeRoots(
         if (!std.mem.startsWith(u8, entry.name, probe_dir_prefix ++ "-")) continue;
         const digits = entry.name[probe_dir_prefix.len + 1 ..];
         const pid = std.fmt.parseInt(std.posix.pid_t, digits, 10) catch continue;
-        // Signal 0 is not a member of `std.posix.SIG` and the enum is open, so
-        // it is written this way.
+        // Signal 0 is not a member of std.posix.SIG and the enum is open, so it is written this way.
         std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
             error.ProcessNotFound => {
                 const path = std.fs.path.join(arena, &.{ project_dir, entry.name }) catch continue;
@@ -1796,9 +1783,6 @@ fn measureSeatbelt(
     project_root: []const u8,
     m: *Measured,
 ) void {
-    // Not `probeRoot`: `removeProbeRoot` chmods a work directory the kernel
-    // leaves behind with mode 0, through a Linux only call. Nothing here mounts
-    // anything, so the tree is one directory.
     const root = seatbeltProbeRoot(arena, io, env, project_root) orelse {
         m.seatbelt = .{ .refused = "no directory could be made to measure it in" };
         m.rlimits = .{ .refused = "no directory could be made to measure it in" };
@@ -1841,8 +1825,6 @@ fn measureSeatbelt(
     };
     defer quiet.close(io);
 
-    // Null is never a refusal, on either call. A program the system killed says
-    // nothing about the boundary.
     const permitted = seatbeltProbeRan(arena, &mounts, &rules, inside_dir, inside, quiet.handle) orelse {
         m.seatbelt = .{ .refused = "a sandboxed program could not be started at all" };
         m.rlimits = .{ .refused = "a sandboxed program could not be started at all" };
@@ -1901,8 +1883,7 @@ fn seatbeltProbeRan(
     }, &argv, null, null) catch return null;
     return switch (term) {
         .exited => |code| code == 0,
-        // Killed by a signal says nothing about the boundary, and must never be
-        // read as a refusal the sandbox made.
+        // Killed by a signal says nothing about the boundary, and must never be read as a refusal the sandbox made.
         else => null,
     };
 }
@@ -2085,8 +2066,6 @@ fn probePidfd() Probe {
 
 fn probeCgroup() CgroupSupport {
     const limits = sandbox.Sandbox.Limits{};
-    // `create` asserts that at least one bound is asked for, so the defaults are
-    // read from the same type a session uses.
     var made = sandbox.cgroup.Cgroup.create(
         limits.memory_bytes orelse probe_tmpfs_bytes,
         limits.processes orelse 1,
@@ -2151,9 +2130,7 @@ fn runChild(plan: Plan, probe_root: ?[]const u8, filter: ?[]sandbox.bpf.Insn) Ch
     if (fork_rc == 0) {
         _ = linux.close(fds[0]);
         runProbes(plan, fds[1], probe_root, filter);
-        // Never a return: this is a forked child of a program with an arena,
-        // open files and a terminal, and none of that is this process's to
-        // unwind.
+        // Never a return: this is a forked child of a program with an arena, open files and a terminal, none of which is this process's to unwind.
         std.process.exit(0);
     }
 
@@ -2187,8 +2164,6 @@ fn readReport(read_fd: i32) ChildReport {
 
     var index: usize = 0;
     while (index + record_bytes <= held) : (index += record_bytes) {
-        // The bytes came over a pipe, so they are read with `fromInt` and never
-        // with `@enumFromInt`, which is undefined behaviour on an invalid tag.
         const step = std.enums.fromInt(Step, buffer[index]) orelse continue;
         const answer = std.enums.fromInt(Answer, buffer[index + 1]) orelse continue;
         switch (step) {
@@ -2222,7 +2197,6 @@ fn runProbes(plan: Plan, write_fd: i32, probe_root: ?[]const u8, filter: ?[]sand
         return;
     }
 
-    // Before the mounts, so a mount fault cannot hide a network fault.
     if (plan.router) probeNetwork(write_fd);
 
     if (plan.filesystems and plan.mount) {
@@ -2319,7 +2293,6 @@ fn probeMounts(write_fd: i32, root: []const u8) void {
 
 fn mountAnswer(err: sandbox.namespace.MountError) Answer {
     return switch (err) {
-        // The two the kernel answers when the filesystem is not there at all.
         error.OverlayNotSupported, error.KernelTooOld => .absent,
         error.NotPermitted,
         error.SourceMissing,

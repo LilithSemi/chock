@@ -1,16 +1,5 @@
-//! What a project says about the image it wants, read from its own
-//! `chock.zon`.
-//!
-//! ```zon
-//! .{
-//!     .container = .{ .image = "debian:stable-slim" },
-//! }
-//! ```
-//!
-//! **Never from the model.** The reference decides which files every tool call
-//! of the session can reach, so an agent that could name one could name its
-//! own toolchain. `chock-container/reference.zig` states the same rule for the
-//! value itself.
+//! What a project's own `chock.zon` says about the image it wants. Never
+//! from the model.
 
 const std = @import("std");
 
@@ -18,45 +7,29 @@ const ref = @import("reference.zig");
 
 pub const file_name = "chock.zon";
 
-/// The largest `chock.zon` this reader accepts. The same bound every other
-/// reader of the same file carries, so one file has one size limit.
 pub const max_file_bytes: usize = 256 * 1024;
 
 pub const Error = std.mem.Allocator.Error || error{
-    /// The file is there and could not be read.
     ReadFailed,
-    /// The file is larger than `max_file_bytes`.
     FileTooLarge,
 };
 
-/// What one `load` produced.
 pub const Answer = union(enum) {
-    /// The project names no image. **The ordinary answer**, and the one every
-    /// project gave before this block existed.
     none,
-    /// The reference this project names. Owned by the allocator `load` was
-    /// given.
+    /// Owned by `load`'s allocator.
     named: []const u8,
-    /// One sentence saying what is wrong with the block. Owned by the
-    /// allocator `load` was given.
+    /// Owned by `load`'s allocator.
     refused: []const u8,
 };
 
-/// The block this file reads. Every other top level field is skipped, because
-/// other parts of Chock own the other blocks of the same file.
 const block_name = "container";
 
-/// The shape of the block. `ignore_unknown_fields` is not used: a field
-/// nobody here knows is a mistake worth naming, because a person who wrote
-/// `.imagee` should hear about it rather than get a session with no image.
+/// `ignore_unknown_fields` is not used.
 const Block = struct {
     image: []const u8,
 };
 
-/// Read `chock.zon` from `project_root` and take its `container` block.
-///
-/// A project with no such file names no image, which is the same answer a file
-/// with no such block gets.
+/// No file names no image, same as no block.
 pub fn load(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -83,15 +56,12 @@ pub fn load(
     return parse(gpa, source);
 }
 
-/// Read the `container` block out of `source`, the whole content of a
-/// `chock.zon`. The result borrows nothing from `source`.
+/// The result borrows nothing from `source`.
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Error!Answer {
     var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    // **`std.zon.parse.Diagnostics` takes both trees over**, so the two flags
-    // are what stop this file freeing them twice. The same handover
-    // `lib/chock-core/mcp.zig` makes, and for the same reason.
+    // `std.zon.parse.Diagnostics` takes both trees over.
     var ast_owned = true;
     defer if (ast_owned) ast.deinit(gpa);
 
@@ -136,9 +106,6 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Err
     };
     defer std.zon.parse.free(gpa, block);
 
-    // The same rule the reference itself carries, applied where a person can
-    // still act on it: at the start, over the project's own file, and never
-    // during a session.
     ref.check(block.image) catch |err| {
         return .{ .refused = try ref.refusalText(gpa, block.image, err) };
     };
@@ -146,11 +113,7 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Err
     return .{ .named = try gpa.dupe(u8, block.image) };
 }
 
-/// Where the `container` field is, or why there is no answer.
-///
-/// The union carries a refusal because a top level that is not a struct
-/// literal is a broken file rather than a project with no block, and the two
-/// must not read the same.
+/// Not a struct literal: a broken file, not an absent block.
 const Located = union(enum) {
     none,
     refused: []const u8,
@@ -193,9 +156,6 @@ test "a project that names an image gives that reference" {
 }
 
 test "a file with other blocks and no container block names no image" {
-    // The one file holds every project rule, so a project that named a
-    // language server and no image must read as a project with no image, and
-    // never as a broken file.
     const source =
         \\.{
         \\    .language_servers = .{},
@@ -215,9 +175,6 @@ test "an empty file and a file with no block both name no image" {
 }
 
 test "a block that is not usable is a refusal a person can act on" {
-    // A misspelled field is the case this exists for. Ignoring it would give a
-    // session with no image and no reason, which is the shape of fault that
-    // costs an hour.
     const source =
         \\.{
         \\    .container = .{ .imagee = "debian:stable-slim" },

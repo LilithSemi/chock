@@ -30,8 +30,6 @@ const retry = chock_provider.retry;
 const subagents = chock_policy.subagents;
 const ratchet = chock_policy.ratchet;
 
-/// What `ToolRunner.dispatch` can fail with. A command that exited 1, or a
-/// tool name that does not exist, is an `is_error` `ToolResult` and not this.
 pub const DispatchError = tools.Error;
 
 pub const ToolRunner = struct {
@@ -39,10 +37,6 @@ pub const ToolRunner = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// `action` is the name this call was gated under, and it is passed
-        /// rather than recomputed: a grant checked against a second reading of
-        /// the same call could be checked against a different answer, and
-        /// nothing would say so.
         dispatch: *const fn (
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
@@ -82,16 +76,12 @@ pub const SandboxToolRunner = struct {
         action: []const u8,
     ) DispatchError!event.ToolResult {
         const self: *SandboxToolRunner = @ptrCast(@alignCast(ptr));
-        // The context is copied so the action belongs to this call and not to
-        // the session, which is the whole point of passing it.
         var per_call = self.context;
         per_call.action = action;
         return tools.Registry.dispatchWith(allocator, io, self.env, self.sandbox_config, call, per_call);
     }
 };
 
-/// Hands over the session's own locked handle, once, right after `run` takes
-/// it. The caller that stores the pointer must never call `unlock` on it.
 pub const GiveLocked = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -105,8 +95,6 @@ pub const GiveLocked = struct {
     }
 };
 
-/// Told about each event as `Loop.run` appends it, and about each piece of a
-/// reply as it arrives. An observer watches and never decides.
 pub const Observer = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -125,8 +113,6 @@ pub const Observer = struct {
         self.vtable.onNotice(self.ptr, text);
     }
 
-    /// What this shows is not yet in the log. A turn the provider cuts off part
-    /// way is never appended, so a person can see words that no replay produces.
     pub fn onPiece(self: Observer, piece: Piece) void {
         self.vtable.onPiece(self.ptr, piece);
     }
@@ -154,27 +140,12 @@ const PieceWatcher = struct {
     }
 };
 
-/// How many times the model may ask for the same tool, with the same
-/// arguments, before the session ends with `no_progress`. Three, because a
-/// tool call can fail for a reason that is gone a moment later.
 pub const no_progress_repeats: usize = 3;
 
-/// How many of the most recent tool calls `Progress` weighs. Five, the
-/// smallest window an A B A B A cycle fits in.
 pub const no_progress_window: usize = 5;
 
-/// How many different calls the window may hold and still count as a loop.
-/// Two, because build, edit, build, edit, build is three identical builds
-/// inside five and is healthy work. A longer cycle still gets through.
 pub const no_progress_distinct: usize = 2;
 
-/// How many dispatch failures in a row with the same reason mean the sandbox will
-/// not recover, so the session ends instead of asking a model to try again.
-///
-/// **Separate from `no_progress`, which keys on the call.** A sandbox that cannot
-/// be built refuses every call alike, so the calls differ and only the reason
-/// repeats: a guest whose filesystem wedged failed ten calls in a row, each one a
-/// model turn, and the loop went on because no two of them were the same call.
 pub const same_failure_repeats: usize = 3;
 
 pub const InFlight = struct {
@@ -190,86 +161,35 @@ pub const Deps = struct {
     tool_definitions: []const message.ToolDefinition,
     model: []const u8,
     model_alias: []const u8,
-    /// The agent kind that selects the policy. This loop never evaluates the
-    /// policy table, which stays the broker's job.
     agent_kind: []const u8,
-    /// What kind of agent this is. The loop reads it because some tool calls never
-    /// reach the tool runner, so a gate in `tools.Registry.dispatchWith` alone
-    /// would leave an arbitrator able to start a subagent.
     role: tools.Role = .worker,
-    /// Every parent between the root of the spawn tree and this agent. Every
-    /// parent, and not the nearest one: one link would report depth 2 at every
-    /// depth and `max_depth` would bound nothing.
     spawn_chain: []const event.SpawnLink = &.{},
-    /// What a person put on the command line, and the hash of the file the
-    /// policy came from. Written once, beside `session_start`, so a session
-    /// that resumes does not write it twice. Null for a caller that records
-    /// nothing, which is every test that does not ask about it.
     config: ?event.SessionConfig = null,
     parent_session: []const u8 = "",
     spawner: ?subagent.Spawner = null,
-    /// The children this session started and did not wait for. Null is the wait
-    /// shape, and a spawn that asks to carry on is then refused and says so.
     children: ?*subagent.Table = null,
     subagents: subagents.Limits = .{},
     system_prompt: []const u8,
     max_turns: ?usize = null,
     observer: ?Observer = null,
-    /// Asked at every safe point whether this session should stop now. It must be
-    /// safe to call from anywhere and must not fail: it is read while `run` holds
-    /// the exclusive lock, so a call that takes a lock of its own can deadlock.
     canceled: ?*const fn () bool = null,
-    /// Asked at every turn boundary, and nowhere else, whether another process
-    /// should take this session. The turn boundary alone, because a session
-    /// stopped between two tool calls leaves an assistant message whose `tool_use`
-    /// parts have no result, which a provider refuses.
     handover: ?*const fn (io: std.Io, in_flight: InFlight) bool = null,
     tasks: ?*task_table.Table = null,
-    /// What this session may spend, read from `chock.zon` by the caller. That
-    /// file stays beyond the agent's reach, so the model cannot raise its own cap.
     budget: ?chock_cost.budget.Budget = null,
     billing: chock_cost.prices.Billing = .billed,
     compaction: compaction.Policy = .{},
     retry: retry.Policy = .{},
-    /// What the harness tells the agent that the agent cannot work out for
-    /// itself. This never touches `system_prompt`: a value that changes every
-    /// turn, put at the front of a request, loses the provider's cache.
     notices: notices.Policy = .{},
     uncommitted_files: usize = 0,
     sleeper: ?retry.Sleeper = null,
-    /// Who decides an act this loop may not decide for itself. Null answers
-    /// `arbiter.not_asked`, so a session with no arbiter runs no sandboxed tool,
-    /// and the model is told nobody could be asked.
     arbiter: ?arbiter_mod.Arbiter = null,
-    /// Every skill this session found. The gate reads it to turn the name a
-    /// call gives into the layer that names the action, and `Context.skills`
-    /// carries the same list to the tool that answers.
     skills: []const skills_mod.Skill = &.{},
-    /// The workspace's own absolute root, handed to `tools.Tool.actionInto`.
-    /// Empty is safe: the path is then read as written, which still names a real
-    /// if less specific action, and nothing falls back to `allow`.
     project_root: []const u8 = "",
-    /// The store paths this session mounted when it started, and never the list as
-    /// it stands now, so a program the session put in the store keeps asking.
-    /// Empty is safe: every store path then names `exec.nix.store.*`, which is `ask`.
     store_closure: []const []const u8 = &.{},
-    /// What reads a URL for the agent. Null refuses and says so, because a tool
-    /// that answered with an empty page would have a model reason about it.
     fetcher: ?fetch_mod.Fetcher = null,
-    /// What answers a search query for the agent. Null refuses and says so, the
-    /// same rule `fetcher` follows. Unlike `fetcher`, the call this answers is
-    /// gated live at `gateToolCall` under `"web.search"` before it ever reaches
-    /// here, so this seam is only ever asked for a call already permitted.
     searcher: ?search_mod.Searcher = null,
-    /// What puts a question to the person. This is not the arbiter and must never
-    /// become it: it asks for a fact and grants nothing, whatever the person types.
     asker: ?ask_mod.Asker = null,
-    /// What carries the session's own work back into the user's repository. One
-    /// act reaches it, `handback.apply_action`, and the tool refuses every other name.
     handback: ?handback_mod.Handback = null,
-    /// What must not reach the provider. Read `lib/chock-core/redact.zig` first:
-    /// it is protection against an accident and it is not a boundary. The default
-    /// is inert, so a project that declared nothing sends the same bytes as before.
     redact: redact.Policy = .{},
 };
 
@@ -280,17 +200,8 @@ pub const budget_action = "budget.raise";
 pub const Error =
     std.mem.Allocator.Error ||
     chock_provider.Client.SendError ||
-    // ReplayError and not StorageError alone: `foldExisting` reads the log back
-    // before the first append, where a line that does not parse is a real fault.
     chock_proto.storage.ReplayError;
 
-/// Run a session to completion: repeat a turn until the model answers with no
-/// tool call.
-///
-/// Appends `session.start` only when the fold found none, and `session.end`
-/// before returning in every case. A signal runs no deferred append, which is
-/// why `deps.canceled` is read at the top of each turn and between two tool
-/// calls of one turn.
 pub fn run(allocator: std.mem.Allocator, io: std.Io, deps: Deps) Error!void {
     var locked = try deps.storage.lock(io);
     defer locked.unlock(io) catch {};
@@ -306,8 +217,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, deps: Deps) Error!void {
     try foldExisting(allocator, io, deps.storage, &session, &telling);
     if (telling.started_ms == null) telling.started_ms = nowMs(io, deps);
 
-    // `session_start` is the only event that sets `agent_kind`, so an empty one
-    // here means the fold found no start.
     if (session.agent_kind.len == 0) {
         _ = try appendAndApply(allocator, io, &locked, &session, deps, .{
             .session_start = .{
@@ -319,9 +228,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, deps: Deps) Error!void {
         });
     }
 
-    // On every run and not only the first, because a session that resumes can
-    // be given different flags, and those decide what it may do for the rest
-    // of it. The same reason `sandbox.open` is written every run.
     if (deps.config) |config| {
         _ = try appendAndApply(allocator, io, &locked, &session, deps, .{
             .session_config = config,
@@ -354,10 +260,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, deps: Deps) Error!void {
     try recordAtTheEnd(allocator, io, &locked, &session, deps);
 }
 
-/// The last thing a session writes, whichever way the session stopped. A child
-/// is waited for and a background command is not: `subagent.Table.deinit` has
-/// to wait in any case, because a child writes into a directory the caller is
-/// about to remove.
 fn recordAtTheEnd(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -384,8 +286,6 @@ const Observation = struct {
     }
 };
 
-/// The reason the last dispatch failed, and how many times in a row it has been
-/// that reason. A dispatch that returned anything clears it.
 const Failing = struct {
     last: ?[]u8 = null,
     repeats: usize = 0,
@@ -437,8 +337,6 @@ const Progress = struct {
         tool: []const u8,
         arguments: []const u8,
     ) std.mem.Allocator.Error!Observation {
-        // Joined with a byte no tool name holds, so "read" with arguments "x" and
-        // "read x" with no arguments cannot be mistaken for each other.
         const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ tool, arguments });
         if (self.calls[self.next]) |leaving| allocator.free(leaving);
         self.calls[self.next] = key;
@@ -480,17 +378,12 @@ fn runTurn(
 
     if (try endIfCanceled(allocator, io, locked, session, deps)) return true;
 
-    // At the top of a turn, and never between two tool calls of one: a provider
-    // requires an exact shape between an assistant turn and its own tool results.
     try recordFinishedTasks(allocator, io, locked, session, deps, .tell_the_agent);
 
     try recordFinishedChildren(allocator, io, locked, session, deps, .tell_the_agent);
 
-    // After both drains, so work that already finished refuses no handover, and
-    // before the request, so a session about to change hands pays for no turn.
     if (try endIfHandedOver(allocator, io, locked, session, deps)) return true;
 
-    // Before the request, because money cannot be un-spent.
     if (try refuseForBudget(allocator, io, locked, session, deps)) return true;
 
     try watchContext(allocator, io, locked, session, deps, watch, telling);
@@ -585,8 +478,6 @@ fn runTurn(
             } });
             telling.observeEvent(nowMs(io, deps), true);
 
-            // Before the empty check: a refusal and an absence arrive looking alike, and
-            // the advice is opposite. Nothing retries, switches model, or rewords this.
             if (reply.stop().isRefusal()) {
                 const detail = try refusalDetail(allocator, reply.stop(), whichTurn(turn_index));
                 defer allocator.free(detail);
@@ -661,8 +552,6 @@ fn runTurn(
     }
 }
 
-/// Whether one model turn carried anything the session can use. A reply of
-/// reasoning alone, or of whitespace alone, carries nothing.
 fn saidSomething(reply: chock_provider.message.Message) bool {
     for (reply.content) |part| switch (part) {
         .tool_use => return true,
@@ -696,8 +585,6 @@ fn stopWords(
     return allocator.dupe(u8, "");
 }
 
-/// What the log says about something the provider refused. Caller owns the
-/// result. Nothing here or anywhere else works around the refusal.
 fn refusalDetail(
     allocator: std.mem.Allocator,
     stop: chock_provider.Client.Stop,
@@ -734,10 +621,6 @@ fn emptyReplyDetail(
     );
 }
 
-/// Hand one request to the provider, once. The only place in `chock-core` that
-/// calls a `chock_provider.Client`, which makes it the only place redaction
-/// has to be: a second call to `Client.sendAndAssemble` in this library would
-/// be a way past `deps.redact`.
 fn sendOnce(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -765,8 +648,6 @@ fn sendWithRetry(
     while (true) {
         attempts += 1;
         const answer = try sendOnce(allocator, arena, deps, request, watcher);
-        // This iteration owns `answer` until it hands it back or frees it. The flag
-        // keeps a fault in between from leaking a refusal body of several kilobytes.
         var held = true;
         errdefer if (held) freeReply(allocator, answer);
 
@@ -850,8 +731,6 @@ fn givingUpDetail(
                 refusal.body,
             },
         ),
-        // The caller answers this class itself, so `decide` never reaches here with
-        // a wait or a give up of its own.
         .not_retryable => unreachable,
     };
 }
@@ -895,9 +774,6 @@ fn endIfCanceled(
     return true;
 }
 
-/// Give this session to another process. The reason on the event is what makes
-/// this a handover and not a stop: `canceled_by_user` would tell the next
-/// reader that a person said no.
 fn endIfHandedOver(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -924,9 +800,6 @@ const TaskDelivery = enum {
     record_only,
 };
 
-/// Record every background task that finished since the last turn. Two events,
-/// because only a `message` re-enters the model's context. Neither carries the
-/// output, because a build writes megabytes.
 fn recordFinishedTasks(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -999,9 +872,6 @@ fn taskFinishedText(
     return text.toOwnedSlice(allocator);
 }
 
-/// Record every subagent that finished since the last turn, and tell the agent
-/// about it. The parent appends both events, because the child cannot write
-/// the parent's log.
 fn recordFinishedChildren(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1058,9 +928,6 @@ fn childFinishedText(
     return text.toOwnedSlice(allocator);
 }
 
-/// Append the `usage` event for one turn. A provider that reported nothing at
-/// all still gets one, with every count zero, which is the log saying the
-/// session cannot be priced rather than saying it was free.
 fn appendUsage(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1074,8 +941,6 @@ fn appendUsage(
     usage.model_alias = deps.model_alias;
 
     const cost = chock_cost.prices.costFor(deps.model, reported, deps.billing);
-    // Stamped only on a number this table produced. A cost the provider reported
-    // is the provider's.
     if (cost == .known and reported.cost == .unknown) {
         usage.price_table_version = chock_cost.prices.version;
     }
@@ -1084,9 +949,6 @@ fn appendUsage(
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .usage = usage });
 }
 
-/// Check the cap before a request goes out, and stop the session when this turn
-/// would pass it. Nothing answers the `approval.request` this writes, and an
-/// unanswered request is a refusal, which is the safe direction for a budget.
 fn refuseForBudget(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1100,9 +962,6 @@ fn refuseForBudget(
     if (spend.turns == 0) return false;
     if (spend.currency.len != 0 and !std.mem.eql(u8, spend.currency, cap.currency)) return false;
 
-    // The mean of the turns so far. A turn's cost grows with the context it
-    // carries, so the mean under estimates the next turn and the cap can be passed
-    // by that much.
     const projected = spend.amount / @as(f64, @floatFromInt(spend.turns));
     if (spend.amount + projected <= cap.max_cost) return false;
 
@@ -1126,8 +985,6 @@ fn refuseForBudget(
             .tool_call_id = "",
         },
     });
-    // An `Envelope.id` of zero means an event not yet written, so a zero here
-    // would leave the answer naming no question.
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .approval_response = .{
         .request_id = request_id,
         .decision = .expired,
@@ -1145,9 +1002,6 @@ fn refuseForBudget(
     return true;
 }
 
-/// Look at how full the context is, and either tell the agent a compaction is
-/// coming or do one. Does nothing when the context limit is unknown, because a
-/// guessed limit would compact a session that had room.
 fn watchContext(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1158,7 +1012,6 @@ fn watchContext(
     telling: *notices.State,
 ) Error!void {
     const used = session.last_input_tokens;
-    // Zero is "nobody has counted this yet", never "the context is empty".
     if (used == 0) return;
 
     if (compaction.shouldCompact(deps.compaction, used)) {
@@ -1181,8 +1034,6 @@ fn watchContext(
     watch.warned = true;
 }
 
-/// Whether this session offers the tool that writes a note. A tool that is not
-/// offered is never named: naming one costs the agent a turn to find out.
 fn offersMemory(deps: Deps) bool {
     for (deps.tool_definitions) |definition| {
         if (std.mem.eql(u8, definition.name, @tagName(tools.Tool.write_memory))) return true;
@@ -1190,9 +1041,6 @@ fn offersMemory(deps: Deps) bool {
     return false;
 }
 
-/// Fold the middle of the context into one summary and append the `compaction`
-/// event. The log loses nothing, and `model_alias` is empty when the harness
-/// wrote the summary instead of the model.
 fn compactNow(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1205,8 +1053,6 @@ fn compactNow(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // `folding.folded` borrows `session.context`, so both texts are built from it
-    // before anything appends an event that would fold the context again.
     const folding = try compaction.plan(arena, session, deps.compaction) orelse return false;
     const rendered = try compaction.transcript(arena, folding.folded, deps.compaction);
 
@@ -1235,16 +1081,11 @@ fn compactNow(
     return true;
 }
 
-/// What one compaction call came back with. Exactly one of the two is ever set.
 const CompactionAnswer = struct {
     text: []const u8 = "",
     stand_in_reason: []const u8 = "",
 };
 
-/// Ask the model for the summary. The request carries one user message and no
-/// tools: the folded span cannot be replayed as real messages, because a `tool`
-/// role message needs the `tool_use` part it answers beside it and a span cut
-/// anywhere breaks that pairing.
 fn askForSummary(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -1263,8 +1104,6 @@ fn askForSummary(
         .messages = &messages,
     };
 
-    // Through `sendOnce`, and never through `Client.sendAndAssemble`: a compaction
-    // sends the context itself, so a second road out would be past the redactor.
     const reply = sendOnce(allocator, arena, deps, request, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .stand_in_reason = try std.fmt.allocPrint(
@@ -1295,8 +1134,6 @@ fn askForSummary(
         },
         .message => |reply_message| {
             defer chock_provider.Client.freeAssembledMessage(allocator, reply_message);
-            // Before the text is read: a classifier fires part way through, so a refused
-            // call can carry half a summary.
             if (reply.stop().isRefusal()) {
                 const said = try refusalDetail(arena, reply.stop(), "the compaction call");
                 return .{ .stand_in_reason = said };
@@ -1317,26 +1154,17 @@ fn askForSummary(
     }
 }
 
-/// The policy gate a call bound for `deps.tool_runner` passes through. Null
-/// means the call may run. A session with no arbiter can run none of these,
-/// because null answers `arbiter_mod.not_asked`. A name this enum cannot spell
-/// is gated at its own door instead, in `chock_core.mcp.Session.dispatch`.
 fn gateToolCall(
     allocator: std.mem.Allocator,
     io: std.Io,
     locked: anytype,
     deps: Deps,
     call: event.ToolCall,
-    /// Written with the name this call was gated under, so the runner acts on
-    /// the same answer the gate did rather than reading the call again.
     action_buffer: []u8,
     action_out: *[]const u8,
 ) Error!?event.ToolResult {
     const tool = std.meta.stringToEnum(tools.Tool, call.tool) orelse return null;
 
-    // The seven names `runTool` answers itself already carry their own gate,
-    // scoped to the privileged act. Gating the coarse name here as well would ask
-    // twice, and for `restrict_self` a null arbiter must refuse only a widening.
     switch (tool) {
         .spawn_agent,
         .update_plan,
@@ -1353,9 +1181,6 @@ fn gateToolCall(
     defer if (argv0_owned) |owned| allocator.free(owned);
     if (tool == .run_command) argv0_owned = try tools.firstArgvIn(allocator, call.arguments);
 
-    // The one call named after what it asks for, and the one that can ask twice.
-    // Both questions must pass, so a rule a project wrote for its own attribute
-    // does not authorise the same attribute of anybody else's flake.
     if (tool == .nix_build) {
         var flake_buffer: [gate_action_bytes]u8 = undefined;
         const actions = try nix_action.buildActionsFor(
@@ -1383,10 +1208,6 @@ fn gateToolCall(
         );
     }
 
-    // The action names the layer of the skill this call asks for, so the name
-    // has to be resolved before anybody is asked. A name that is not there is
-    // refused without a question: there is nothing to decide about a skill that
-    // does not exist, and the refusal says what does.
     if (tool == .read_skill) {
         const named = try skills_mod.namedIn(allocator, deps.skills, call.arguments);
         const one = switch (named) {
@@ -1422,8 +1243,6 @@ fn gateToolCall(
     const answer = try decideAction(allocator, io, locked, deps, call, action);
     if (answer.permitted) return null;
 
-    // The refusal carries the rule and the alternative and never the reason: a
-    // model told why a wall exists is a model handed a map.
     return try gateRefusal(allocator, call, try arbiter_mod.refusalText(allocator, call.tool, answer));
 }
 
@@ -1448,8 +1267,6 @@ fn decideAction(
     });
 }
 
-/// `text` copied into `buffer`, or null when it does not fit. A name that was
-/// cut would be a different, broader action.
 fn writeInto(buffer: []u8, text: []const u8) ?[]const u8 {
     if (text.len > buffer.len) return null;
     @memcpy(buffer[0..text.len], text);
@@ -1458,9 +1275,6 @@ fn writeInto(buffer: []u8, text: []const u8) ?[]const u8 {
 
 const gate_action_bytes = @max(tools.Tool.max_action_bytes, nix_action.max_action_bytes);
 
-/// What `gateToolCall` answers when `Tool.actionInto` could not name the call.
-/// The sized buffers make this unreachable, so a caller that shrinks one fails
-/// safely.
 const gate_unnamed_detail = "nothing ran: this call could not be named for a policy check, " ++
     "so it was not run. Try something else.";
 
@@ -1494,9 +1308,6 @@ fn runTool(
     };
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .tool_call = call });
 
-    // An arbitrator holds no tools, enforced here for the calls the tool runner
-    // never sees. The policy gate comes second, once an arbitrator is ruled out,
-    // so no `approval.response` is spent on a call that cannot run either way.
     var gated_action_buffer: [gate_action_bytes]u8 = undefined;
     var gated_action: []const u8 = "";
 
@@ -1526,15 +1337,10 @@ fn runTool(
     else if (std.mem.eql(u8, call.tool, request_tool_name))
         try runRequestAction(allocator, io, locked, deps, call)
     else if (deps.tool_runner.dispatch(allocator, io, call, gated_action)) |ran| good: {
-        // A dispatch that answered at all means the sandbox is still there.
         failing.clear(allocator);
         break :good ran;
     } else |err| blk: {
-        // The driver's own words when it has any. A name alone says a path
-        // could not be placed and never says which path.
         const said = tools.driverNow().whyLast();
-        // The reason and not the call, because a sandbox that cannot be built
-        // refuses every call alike. See `same_failure_repeats`.
         _ = try failing.observe(allocator, said orelse @errorName(err));
         break :blk event.ToolResult{
             .call_id = try allocator.dupe(u8, call.call_id),
@@ -1559,9 +1365,6 @@ fn runTool(
         allocator.free(image.data);
     };
 
-    // Bytes that are not valid UTF-8 serialize as a JSON array and not a JSON
-    // string, which ends the session with a provider 400 and cannot be parsed back
-    // by a replay. After the runner, because `ToolRunner` is an interface.
     const note = try tools.outputForModel(allocator, dispatched.output);
     defer if (note) |owned| allocator.free(owned);
     var result = dispatched;
@@ -1571,8 +1374,6 @@ fn runTool(
 
     try noteRead(allocator, telling, result, call);
 
-    // Only these three fields become a content part, so `result.note`, which is
-    // written for the person, never reaches the model.
     var feedback: [2]event.ContentPart = undefined;
     var parts: usize = 1;
     feedback[0] = .{ .tool_result = .{
@@ -1581,9 +1382,6 @@ fn runTool(
         .is_error = result.is_error,
     } };
 
-    // The one copy of the picture the log keeps: the fold reads `message` events
-    // alone. After the tool result and never before it, because the Anthropic wire
-    // refuses a `tool_result` block that follows anything else in the same turn.
     if (result.image) |image| {
         feedback[parts] = .{ .image = .{
             .call_id = result.call_id,
@@ -1612,9 +1410,6 @@ pub const spawn_no_budget_detail = "no subagent was started: this session has sp
     "the whole budget in chock.zon, so there is nothing left to give a subagent. Do the work " ++
     "yourself, or stop and say what is left.";
 
-/// Answer a `spawn_agent` call, in place of the tool runner. The width comes
-/// from the folded log and never from a counter of this call's own, so a
-/// resumed session counts the children it really has.
 fn runSpawn(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1678,8 +1473,6 @@ fn runSpawn(
         .budget = slice,
     };
 
-    // A caller with no table cannot run a child beside the parent's own work, and
-    // a spawn that asked to carry on is told so rather than quietly waiting.
     const mode: subagent.Mode = if (parsed.value.background orelse false) .carry_on else .wait;
     if (mode == .carry_on and deps.children == null) {
         return spawnRefusal(allocator, call, try allocator.dupe(u8, spawn_cannot_carry_on_detail));
@@ -1703,8 +1496,6 @@ fn runSpawn(
         .budget_currency = if (slice) |one| one.currency else "",
     } });
 
-    // No `agent.complete` now: the child has not finished, and the log never
-    // writes an event for an act that has not happened.
     if (mode == .carry_on) {
         try deps.children.?.start(io, request, prepared);
         return .{
@@ -1761,9 +1552,6 @@ pub const max_plan_id_bytes: usize = 32;
 pub const max_plan_subject_bytes: usize = 200;
 pub const max_plan_blocked_by_bytes: usize = 200;
 
-/// Answer an `update_plan` call, in place of the tool runner. Nothing here is
-/// enforced against the agent: the list is its own statement of intent, so this
-/// refuses a call it cannot record and never a plan it disagrees with.
 fn runPlanUpdate(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1796,8 +1584,6 @@ fn runPlanUpdate(
         ));
     }
 
-    // Every step is checked before any is written: a call half applied would
-    // leave a list the agent did not ask for.
     var changed: std.ArrayList(event.PlanStep) = .empty;
     var added: usize = 0;
     for (given) |step| {
@@ -1856,8 +1642,6 @@ fn runPlanUpdate(
     };
 }
 
-/// Why this step cannot be recorded, or null when it can. The bounds are here
-/// and not in the fold, because the fold reads logs that are already written.
 fn planFieldRefusal(step: tools.PlanStepArgs) ?[]const u8 {
     if (step.id.len == 0) {
         return "the task list was not changed: every step needs an \"id\", which is the short " ++
@@ -1875,8 +1659,6 @@ fn planFieldRefusal(step: tools.PlanStepArgs) ?[]const u8 {
     if (blocked_by.len > max_plan_blocked_by_bytes) {
         return "the task list was not changed: \"blocked_by\" is a few words.";
     }
-    // A step is read one to a line, so a line break in one would make the next
-    // reader take the second half for a step of its own.
     if (hasALineBreak(step.id) or hasALineBreak(step.subject) or hasALineBreak(blocked_by)) {
         return "the task list was not changed: a step is read one to a line, so no part of one " ++
             "may hold a line break. Say the detail in your answer instead.";
@@ -1888,8 +1670,6 @@ fn hasALineBreak(text: []const u8) bool {
     return std.mem.indexOfAny(u8, text, "\n\r") != null;
 }
 
-/// Whether this step says anything the folded plan does not hold. An empty
-/// subject is not a change: `Plan.apply` reads it as "keep the words you have".
 fn planStepMoved(
     known: ?*chock_proto.state.Plan.Step,
     subject: []const u8,
@@ -1942,10 +1722,6 @@ fn planText(
 
 pub const restrict_tool_name = @tagName(tools.Tool.restrict_self);
 
-/// Answer a `restrict_self` call, in place of the tool runner. Narrowing is
-/// free and widening needs authorisation. This never reads the policy table and
-/// enforces no promise: the record binds and the broker reads it. A widening
-/// nobody permits writes no `policy.self` event at all.
 fn runRestrictSelf(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1998,8 +1774,6 @@ fn runRestrictSelf(
     const held = try self_policy.restrictionsFrom(arena, session.self_policy.restrictions.items);
     switch (ratchet.classify(ratchet.ceilingFor(held, proposal.action), ceiling)) {
         .narrows => {},
-        // A ceiling of `allow` promises nothing, so a call that reaches here with one
-        // was asking to be let out rather than to give something up.
         .no_change => if (ceiling == .allow) return restrictRefusal(
             allocator,
             call,
@@ -2055,11 +1829,6 @@ fn runRestrictSelf(
     };
 }
 
-/// A `restrict_self` call that asks to be let out of a promise it made. The
-/// proposal has to name exactly a promise this session holds, or
-/// `ratchet.ceilingFor` would hold a wider one against it afterwards and an
-/// authorised yes would change nothing. An authorised widening writes the one
-/// `policy.self` event with `authorised` set, which alone can lift a promise.
 fn runWiden(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2133,7 +1902,6 @@ fn runWiden(
 
     _ = try appendAndApply(allocator, io, locked, session, deps, .{
         .policy_self = .{
-            // The one place this flag is ever set.
             .authorised = true,
             .restrictions = &.{.{
                 .action = proposal.action,
@@ -2162,9 +1930,6 @@ fn runWiden(
     };
 }
 
-/// Whether this session holds a promise written under exactly this name. Exact
-/// and never a pattern, the rule `ratchet.ceilingFor` and `SelfPolicy.apply`
-/// also keep. The three have to agree, or a lift is recorded and changes nothing.
 fn promisedExactly(session: *const chock_proto.state.Session, action: []const u8) bool {
     for (session.self_policy.restrictions.items) |one| {
         if (std.mem.eql(u8, one.action, action)) return true;
@@ -2187,9 +1952,6 @@ fn restrictRefusal(
 
 pub const fetch_tool_name = @tagName(tools.Tool.fetch_url);
 
-/// Answer a `fetch_url` call, in place of the tool runner. Answered here
-/// because a promise binds it, and the promises of a session live in the fold
-/// of its log. This loop still decides nothing: `deps.fetcher` does.
 fn runFetch(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2218,9 +1980,6 @@ fn runFetch(
         try allocator.dupe(u8, fetch_mod.has_no_fetcher),
     );
 
-    // Puts the host the agent named to a person, live. The fetch seam calls
-    // back into this because an approval is two log events and only the loop
-    // holds the lock that writes them.
     const HostAsker = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -2287,11 +2046,6 @@ fn fetchRefusal(
 
 pub const search_tool_name = @tagName(tools.Tool.web_search);
 
-/// Answer a `web_search` call, in place of the tool runner. Answered here for
-/// the same reason `fetch_url` is: a promise binds it, and the promises of a
-/// session live in the fold of its log. The call has already passed
-/// `gateToolCall`'s live "web.search" question by the time this runs; this
-/// loop decides nothing further, and `deps.searcher` does.
 fn runSearch(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2336,9 +2090,6 @@ fn runSearch(
 
 pub const ask_tool_name = @tagName(tools.Tool.ask_user);
 
-/// Answer an `ask_user` call, in place of the tool runner. This is not an
-/// approval and writes no `approval.request`: it grants nothing, whatever the
-/// person types.
 fn runAskUser(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2404,10 +2155,6 @@ pub const title_tool_name = @tagName(tools.Tool.set_title);
 
 pub const max_title_bytes: usize = 120;
 
-/// Answer a `set_title` call, in place of the tool runner. The log is append
-/// only, so a second call appends a second event and the fold takes the last.
-/// A reader must not rely on what this refuses: a log is a file a person with
-/// an editor can write, so `src/sessions.zig` filters what it prints as well.
 fn runSetTitle(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2460,18 +2207,12 @@ pub fn titleRefusalText(title: []const u8) ?[]const u8 {
         max_title_text ++ " bytes. It is read at the end of a row beside the session's " ++
         "identifier and its time, so name the work in a few words and say the detail in your " ++
         "answer.";
-    // A title is shown on a terminal, so an escape sequence in one would drive
-    // the terminal of whoever ran `chock sessions`.
     for (title) |byte| {
-        // Checking ASCII control characters byte by byte is safe over UTF-8: every
-        // byte of a multi byte character is 0x80 or above.
         if (byte == '\n' or byte == '\r') return "this session was not named: a title is one " ++
             "line, and this one has a line break in it. Put the whole name on one line.";
         if (byte < 0x20 or byte == 0x7F) return "this session was not named: a title is plain " ++
             "text, and this one has a control character in it. Send the words alone.";
     }
-    // Bytes that are not valid UTF-8 serialize as an array of integers and not a
-    // string, which is a log line no replay of this build can read back.
     if (!std.unicode.utf8ValidateSlice(title)) return "this session was not named: a title has " ++
         "to be text, and these bytes are not valid UTF-8. Send the words alone.";
     return null;
@@ -2494,9 +2235,6 @@ fn titleRefusal(
 
 pub const request_tool_name = @tagName(tools.Tool.request_action);
 
-/// Answer a `request_action` call, in place of the tool runner. One action name
-/// is offered and every other is refused before anybody is asked. Nothing here
-/// decides: a reason is an argument rather than an answer.
 fn runRequestAction(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2630,10 +2368,6 @@ fn nowMs(io: std.Io, deps: Deps) i64 {
     return clock.now();
 }
 
-/// The messages this turn sends, with this turn's notice on the end so the
-/// provider's cache keeps the prefix it had. The role is `user` and not
-/// `system` because `chock_provider.anthropic.buildRequest` folds a `system`
-/// role message into the top level `system` field.
 fn withNotice(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -2666,9 +2400,6 @@ fn withNotice(
     return grown;
 }
 
-/// The steps of the agent's own task list that are neither done nor abandoned.
-/// An unrecognized status counts as unfinished, so a step a newer writer named
-/// something else does not vanish in silence.
 fn unfinishedPlan(
     arena: std.mem.Allocator,
     session: *const chock_proto.state.Session,
@@ -2702,9 +2433,6 @@ fn firstUserText(session: *const chock_proto.state.Session) []const u8 {
     return "";
 }
 
-/// How much of the budget is spent, in whole percent, or null wherever
-/// `refuseForBudget` also refuses to enforce: a percentage of a number Chock
-/// cannot price is a made up number.
 fn spentPercent(session: *const chock_proto.state.Session, deps: Deps) ?u8 {
     const cap = deps.budget orelse return null;
     if (cap.max_cost <= 0) return null;
@@ -2714,8 +2442,6 @@ fn spentPercent(session: *const chock_proto.state.Session, deps: Deps) ?u8 {
     if (spend.currency.len != 0 and !std.mem.eql(u8, spend.currency, cap.currency)) return null;
 
     const fraction = spend.amount / cap.max_cost * 100;
-    // A total that is not a number is one Chock cannot price, and it is the value
-    // `@intFromFloat` below has no defined answer for.
     if (std.math.isNan(fraction)) return null;
     if (fraction <= 0) return 0;
     if (fraction >= 100) return 100;
@@ -2738,11 +2464,6 @@ fn noteRead(
     try telling.observeRead(allocator, path, hash);
 }
 
-/// Append `ev` to the log through `locked`, then fold it into `session`.
-/// `locked` is `anytype` because `chock_proto.storage.Locked` is not `pub`, and
-/// a runtime generation check is what proves a caller holds a real lock. The
-/// redaction happens before `Locked.append`, so the chain runs over the bytes
-/// the file holds and a credential cannot be taken out later.
 fn appendAndApply(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2780,9 +2501,6 @@ fn foldExisting(
     }
 }
 
-// Zig 0.16 refuses a relative `@import` outside a module's own root, so the one
-// test that needs `test/core/fake_provider.zig` lives in `test/core/loop.zig`.
-
 const testing = std.testing;
 
 const FakeTurn = struct {
@@ -2797,7 +2515,6 @@ const FakeTurn = struct {
     };
 };
 
-/// The refusal a llama.cpp server really sent, word for word.
 const measured_overflow_body =
     \\{"error":{"code":400,"message":"request (77857 tokens) exceeds the available context size (65536 tokens)","type":"exceed_context_size_error"}}
 ;
@@ -2805,9 +2522,6 @@ const measured_overflow_body =
 const FakeClient = struct {
     turns: []const FakeTurn,
     calls: usize = 0,
-    /// When true, `send` keeps the serialized bytes of the last request. The
-    /// bytes, and not the `message.Request` value: a `[]const u8` that is valid
-    /// UTF-8 and one that is not are the same Zig type.
     record_requests: bool = false,
     last_request_json: ?[]u8 = null,
     seen: ?*SeenRequests = null,
@@ -3020,20 +2734,15 @@ test "the same dispatch failure three times in a row ends the session" {
     var failing = Failing{};
     defer failing.deinit(allocator);
 
-    // **The reason repeats where the call does not.** A sandbox that cannot be
-    // built refuses every call alike, so `Progress` never sees a loop and ten
-    // model turns went into a guest that could not answer one.
     const wedged = "the sandbox could not be built: MountTreeFailed";
     try std.testing.expectEqual(@as(usize, 1), try failing.observe(allocator, wedged));
     try std.testing.expectEqual(@as(usize, 2), try failing.observe(allocator, wedged));
     try std.testing.expectEqual(@as(usize, 3), try failing.observe(allocator, wedged));
     try std.testing.expect(failing.repeats >= same_failure_repeats);
 
-    // A different reason is a different fault, and starts again.
     try std.testing.expectEqual(@as(usize, 1), try failing.observe(allocator, "GuestCannotPlacePath"));
     try std.testing.expect(failing.repeats < same_failure_repeats);
 
-    // A dispatch that answered means the sandbox is still there.
     _ = try failing.observe(allocator, wedged);
     failing.clear(allocator);
     try std.testing.expectEqual(@as(usize, 0), failing.repeats);
@@ -5732,8 +5441,6 @@ test "a compaction folds the middle and leaves the task and the recent turns wor
     const text = try contextText(allocator, &session);
     defer allocator.free(text);
 
-    // Nothing writes to the terminal on a pass: `zig build` reads a run step that
-    // wrote to standard error as a failure.
     const task_at = std.mem.indexOf(u8, text, "TASK: make the parser accept tabs") orelse {
         try testing.expectEqualStrings("TASK: make the parser accept tabs", text);
         return error.TheUsersOwnTaskWasFoldedAway;
@@ -6898,9 +6605,6 @@ test "the child's session.start names the parent, and the kinds above it" {
     try testing.expect(found);
 }
 
-/// Holds a subagent inside its own `run` until a test lets it out. Plain
-/// atomics and a yield, because `std.Io.Mutex` needs an `Io`. The bound is a
-/// count of yields, so a build that never lets the child out fails, not hangs.
 const ChildGate = struct {
     open: std.atomic.Value(bool) = .init(false),
 
@@ -8630,9 +8334,6 @@ const FakeSearcher = struct {
     }
 };
 
-// Unlike `fetch_url`, whose `net.fetch` question is read early and never
-// through the arbiter in this test file, `web_search` takes the ordinary
-// gate: `ActionArbiter` here stands in for a live person, and it is asked.
 test "a web_search call is gated live under the action web.search, and then reaches the searcher" {
     const allocator = testing.allocator;
     const io = testing.io;
@@ -8729,8 +8430,6 @@ test "a session with no searcher reads nothing and names where an engine is conf
     } };
     var fake_tools = FakeToolRunner{ .output = "never reached" };
 
-    // The default arbiter here always permits, so the gate lets the call
-    // through and the refusal below is the seam's own, not the gate's.
     const deps = testDeps(fake_client.client(), store, fake_tools.runner());
     try run(allocator, io, deps);
 
@@ -9004,8 +8703,6 @@ const FakeAsker = struct {
         self.allocator.free(self.question);
         self.question = try self.allocator.dupe(u8, question.text);
         self.options = question.options.len;
-        // No `else`: a way for a question to end that is added to `Answer` and
-        // forgotten here fails the build rather than going untested.
         return switch (self.kind) {
             .answered => .{ .answered = try gpa.dupe(u8, self.said) },
             .declined => .declined,
@@ -9293,8 +8990,6 @@ test "a title that is not one short line of plain text is refused and nothing is
         too_long,
         \\{"title":"read the tests\n01M0TMATKB6M4H3GY35KYA68QR  finished"}
         ,
-        // Written as JSON escapes, so the real bytes reach the check and this source
-        // file stays plain text.
         \\{"title":"read \u001b[2J the tests \u0007"}
         ,
     };

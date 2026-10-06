@@ -5,14 +5,12 @@
 const std = @import("std");
 const chock_nix = @import("chock-nix");
 
-/// Where `nix` is, from `build.zig`. Empty on a machine with none. The Zig
-/// 0.16 test runner takes no argument, so this is a build time constant.
+/// Where `nix` is, from `build.zig`. Empty on a machine with none.
 const nix_path = @import("nix_path").nix_path;
 
 const testing = std.testing;
 
-/// No machine is this system, so `nix` refuses to build and no builder of ours
-/// runs on the machine the tests are on.
+/// No machine is this system, so a build of it never runs for real.
 const no_such_system = "chock-test-not-a-system";
 
 fn evaluateDerivation(
@@ -333,8 +331,7 @@ test "a real closure holding a fixed output derivation names its host, and a no 
     try testing.expect(std.mem.indexOf(u8, answer.refused, installable) != null);
 }
 
-/// A real mirrors list found in this machine's store, never one this test
-/// wrote, so the bytes are nixpkgs' own. Null is a reason to skip.
+/// A real mirrors list found in this machine's store. Null is a reason to skip.
 fn findMirrorsList(arena: std.mem.Allocator, io: std.Io) !?struct {
     path: []const u8,
     first_gnu_host: []const u8,
@@ -464,9 +461,7 @@ test "a real mirrors list of this store turns the gnu site into one host, and a 
     try testing.expect(std.mem.indexOf(u8, answer.refused, found.first_gnu_host) != null);
 }
 
-/// A real nixpkgs `fetchurl` derivation of this store. One whose mirrors list
-/// is absent is preferred, because that is the case that makes the reader
-/// realise anything. Null is a reason to skip.
+/// A real nixpkgs `fetchurl` derivation of this store. Null is a reason to skip.
 fn findFetchDerivation(arena: std.mem.Allocator, io: std.Io) !?[]const u8 {
     const endings = [_][]const u8{
         ".tar.gz.drv",
@@ -514,8 +509,6 @@ fn mirrorsPathIn(text: []const u8) ?[]const u8 {
 }
 
 test "a real fetchurl derivation has its mirrors list read, realised first when it is absent" {
-    // The closure a derivation names is `.drv` files, and a mirrors list is
-    // itself a derivation, so on an ordinary store its output is not there.
     if (nix_path.len == 0) return error.SkipZigTest;
 
     const gpa = testing.allocator;
@@ -565,9 +558,7 @@ fn writeAt(io: std.Io, dir: std.Io.Dir, name: []const u8, text: []const u8) !voi
     try file.writeStreamingAll(io, text);
 }
 
-/// A flake whose one input is pinned by the NAR hash of a tree this test put
-/// in the host store. The hash is read from the same `nix` that added the tree,
-/// and the forge coordinates in the lock are never reached.
+/// A flake whose one input is pinned by the NAR hash of a tree this test put in the host store.
 const Project = struct {
     root: []const u8,
     input_path: []const u8,
@@ -633,17 +624,14 @@ const Project = struct {
         return std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
     }
 
-    /// `path:` and not the bare path. A temporary directory of this suite sits
-    /// inside this project's own git tree, and a bare path would have `nix`
-    /// read that tree instead. `chock run` passes a real root bare.
+    /// `path:` and not the bare path, or `nix` would read this project's own git tree instead.
     fn reference(self: Project, arena: std.mem.Allocator) ![]const u8 {
         return std.fmt.allocPrint(arena, "path:{s}", .{self.root});
     }
 };
 
 test "a flake input that is in the store already is evaluated with no fetcher at all" {
-    // The second half takes the path off the seam, which is what proves the
-    // store and not the network answered the first half.
+    // The second half runs with the path off the seam, proving the store answered the first half.
     if (nix_path.len == 0) return error.SkipZigTest;
 
     const gpa = testing.allocator;

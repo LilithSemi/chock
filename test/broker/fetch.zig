@@ -1,13 +1,6 @@
-//! The fetch tool against a real HTTP server on the loopback interface. Every
-//! test drives `Session.fetch` through `std.http.Client` against a real socket
-//! and asserts on what the server was asked for.
-//!
-//! `127.0.0.1` and `127.0.0.2` are two policy keys, which is what a refused
-//! redirect needs. All of `127.0.0.0/8` is on `lo` on Linux, so build.zig
-//! registers this suite there. `actions.perform` refuses that range before it
-//! opens anything, so a test about policy, redirects or `robots.txt` uses
-//! `Harness.initWithNames` to say a loopback host answers an internet address,
-//! while a test about the guard itself uses `Harness.init` and fakes no lookup.
+//! The fetch tool against a real HTTP server on the loopback interface, driving
+//! `Session.fetch` through `std.http.Client`. A test about the address guard itself
+//! uses `Harness.init`. Every other test uses `Harness.initWithNames`.
 
 const std = @import("std");
 const chock_broker = @import("chock-broker");
@@ -23,8 +16,7 @@ const Route = struct {
     raw: []const u8,
 };
 
-/// A real HTTP/1.1 server on one loopback address. Each hop of a fetch is its
-/// own connection, because the broker builds a fresh client per request.
+/// A real HTTP/1.1 server on one loopback address.
 const TestServer = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -36,8 +28,7 @@ const TestServer = struct {
     thread: std.Thread,
     stopping: std.atomic.Value(bool) = .init(false),
 
-    /// Written only by the serving thread and read only after `stop`, which is
-    /// what makes it safe with no lock at all.
+    /// Written only by the serving thread and read only after `stop`, so it needs no lock.
     seen: std.ArrayList([]u8) = .empty,
 
     heads: std.ArrayList([]u8) = .empty,
@@ -51,8 +42,7 @@ const TestServer = struct {
         return startOnPort(gpa, io, host, 0, routes);
     }
 
-    /// Two servers on one port and two addresses is what the rebinding tests
-    /// need: only the address can tell the two apart.
+    /// Two servers on one port and two addresses, so only the address tells them apart.
     fn startOnPort(
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -85,8 +75,7 @@ const TestServer = struct {
         return std.fmt.bufPrint(buffer, "http://{s}:{d}", .{ self.host, self.port }) catch unreachable;
     }
 
-    /// End the serving thread and wait for it. The thread is blocked in
-    /// `accept`, so a test where no request arrives must send the connection.
+    /// Ends the serving thread, which is blocked in `accept`, so this sends it a connection.
     fn stop(self: *TestServer) void {
         self.stopping.store(true, .release);
         if (self.address.connect(self.io, .{ .mode = .stream })) |stream| {
@@ -189,8 +178,7 @@ fn okReply(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
     );
 }
 
-/// `body`, deflated inside a gzip container, the way a real site answers a
-/// client that offered gzip. Every other server here answers in plain text.
+/// `body`, deflated inside a gzip container, the way a real site answers a client that offered gzip.
 fn gzipped(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 1024);
     errdefer out.deinit();
@@ -216,9 +204,7 @@ fn gzipReply(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
     );
 }
 
-/// A 200 whose body is gzip, sent in two chunks with no length. nginx gzips on
-/// the fly, so it cannot know the length and chunks instead, and std reads a
-/// chunked body through a different path from a counted one.
+/// A 200 whose body is gzip, sent in two chunks with no length, the way nginx answers.
 fn gzipChunkedReply(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
     const packed_body = try gzipped(gpa, body);
     defer gpa.free(packed_body);
@@ -271,9 +257,7 @@ const allows_both_hosts: [:0]const u8 =
     \\}
 ;
 
-/// A resolver that answers a few names from a table, and lets every other name
-/// answer itself. It exists because `actions.perform` refuses the loopback
-/// interface, and every server in this file listens on it.
+/// A resolver that answers a few names from a table, and lets every other name answer itself.
 const NamedAddresses = struct {
     entries: []const Entry,
     lookups: usize = 0,
@@ -314,9 +298,7 @@ const loopback_on_the_internet = [_]NamedAddresses.Entry{
     .{ .host = "127.0.0.2", .address = "93.184.216.35" },
 };
 
-/// A reachability check that counts the loopback interface as reachable. A
-/// test that must prove where a connection went needs the checked address and
-/// the dialled address to be the same one.
+/// A reachability check that counts the loopback interface as reachable.
 fn loopbackCounts(address: actions.Resolver.Address) bool {
     switch (address) {
         .ip4 => |ip4| if (ip4.bytes[0] == 127) return true,
@@ -612,8 +594,7 @@ test "an encoding Chock never offered reads nothing, and says so" {
 }
 
 test "an encoding std cannot name at all still reads nothing" {
-    // `brotli` is not in `std.http.ContentEncoding`, so `Head.parse` refuses the
-    // whole head and the cause is lost. This refusal is the general one.
+    // `brotli` is not in `std.http.ContentEncoding`, so `Head.parse` refuses the whole head.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -720,8 +701,7 @@ test "a redirect is followed only when the host it names is permitted in its own
 
     try testing.expectEqual(@as(usize, 2), allowed.served());
     try testing.expect(allowed.sawPath("/old"));
-    // An HTTP client that followed the redirect for us would have asked the
-    // denied host for the page, and every check above would still have passed.
+    // A client that followed the redirect for us would have asked the denied host for the page.
     try testing.expectEqual(@as(usize, 0), denied.served());
 }
 
@@ -1060,8 +1040,6 @@ test "a permitted name that answers this machine reads nothing, and no socket op
 
 test "the address check applies to a redirect hop, not only to the first request" {
     // A redirect is how a name that looked fine reaches the metadata address.
-    // The first host is said to answer an internet address, and the second is
-    // not in that table, so it answers itself.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1113,14 +1091,10 @@ test "the address check applies to a redirect hop, not only to the first request
     try testing.expectEqual(@as(usize, 0), denied.served());
 }
 
-// `actions.perform` checked the address a name answered with, and then handed
-// the URL to `std.http.Client`, which resolved the same name a second time.
-// `localhost` is a name, and RFC 6761 makes every resolver answer it with
-// `127.0.0.1`, so a client that resolved again lands there while the checked
-// address is `127.0.0.2`. Two servers on one port say which lookup won.
+// `std.http.Client` resolves the URL's host a second time, so a name like `localhost`
+// can land at a different address than the one the guard checked.
 
-/// The machine's own resolver answers `127.0.0.1` for `localhost` whatever
-/// this says, which is the disagreement these tests are about.
+/// The machine's own resolver answers `127.0.0.1` for `localhost` regardless of this table.
 const localhost_answers_the_second_host = [_]NamedAddresses.Entry{
     .{ .host = "localhost", .address = "127.0.0.2" },
 };
@@ -1242,9 +1216,7 @@ const allows_the_docs_name: [:0]const u8 =
 ;
 
 test "a name that answers IPv6 addresses only is read rather than refused" {
-    // The URL names `localhost`, so the client's own second lookup lands on
-    // this machine and the server really answers. The first answer here is an
-    // IPv6 address on the internet.
+    // The URL names `localhost`, so the client's own second lookup lands on this machine.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1280,8 +1252,6 @@ test "a name that answers IPv6 addresses only is read rather than refused" {
 }
 
 test "an IPv6 address the guard refuses stops the fetch, pinned or not" {
-    // An IPv6 answer is no longer held to an address, so the address guard is
-    // the only thing left. Both addresses below are IPv6.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1322,14 +1292,9 @@ test "an IPv6 address the guard refuses stops the fetch, pinned or not" {
 }
 
 // `64:ff9b::/96` is the well-known prefix of RFC 6052, and a translator turns
-// `64:ff9b::a9fe:a9fe` into `169.254.169.254`. `Ip4Address.fromIp6` knows
-// `::ffff:/96` and no other prefix. The three tests below name `localhost` on
-// purpose: the address is IPv6, so no connection is held to it and the second
-// lookup lands on this machine, where a permitted address would serve the page.
+// `64:ff9b::a9fe:a9fe` into `169.254.169.254`.
 
 test "an IPv4 address behind the NAT64 prefix is refused, and nothing opens" {
-    // The second address is `127.0.0.1` behind the same prefix, so the unwrap
-    // runs the whole of `ip4BytesAreReachable`.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1392,8 +1357,7 @@ test "the EC2 metadata address over IPv6 is refused, and nothing opens" {
 }
 
 test "an ordinary unique local address is still read" {
-    // Unique local addressing is the IPv6 form of `10.0.0.0/8`, and a company's
-    // own API on its own network is the main reason anybody permits a host.
+    // Unique local addressing is the IPv6 form of `10.0.0.0/8`.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1424,9 +1388,7 @@ test "an ordinary unique local address is still read" {
     try testing.expectEqual(@as(usize, 2), server.served());
 }
 
-/// A resolver that answers this machine for the first lookup of a session, and
-/// an internet address after it. The first request of a hop is the site's own
-/// rules, so that one meets the address guard.
+/// A resolver that answers this machine for the first lookup of a session, and an internet address after it.
 const RefusesTheFirstLookup = struct {
     lookups: usize = 0,
 
@@ -1454,9 +1416,7 @@ const RefusesTheFirstLookup = struct {
 };
 
 test "a robots.txt the address guard refused is not read as a site with no rules" {
-    // `robotsFor` used to read every fault as "this site stated no rules",
-    // which is right for a 404 and wrong for the guard. The host is written out
-    // as an address, so the page request really reaches the server.
+    // `robotsFor` must not read the address guard's refusal as "this site stated no rules".
     const gpa = testing.allocator;
     const io = testing.io;
 

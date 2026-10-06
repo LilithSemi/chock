@@ -1,26 +1,19 @@
-//! Two terminals, one project, one image cache. The sessions are real child
-//! processes because flock locks an open file description. A test skips with no
-//! container runtime or no image on the disk, and nothing here fetches.
+//! Two terminals, one project, one image cache, as real child processes.
 
 const std = @import("std");
 
-// The default test runner panics on argv it does not know, so the helper path is
-// a build time constant.
+// The default test runner panics on argv it does not know, so this is a build time constant.
 const helper_path = @import("load_helper_path").load_helper_path;
 
 const test_image = "alpine:3.20";
 
-/// A cache directory is named after the reference, so two digests reach one when
-/// a tag moves or the other runtime is used.
 const other_image = "python:3.12-alpine";
 
-/// The helper's exit statuses, kept in step with `test/container/load_helper.zig`.
 const from_cache = 0;
 const extracted = 1;
 const refused = 2;
 const no_runtime = 5;
 
-/// A `hold_ms` of zero loads and leaves at once.
 fn startHolding(
     io: std.Io,
     cache_dir: []const u8,
@@ -84,8 +77,7 @@ fn otherRunnableOrSkip(io: std.Io) !void {
     }
 }
 
-/// The stamp is the signal, because a session takes the use lock before it
-/// starts to extract.
+/// The stamp signals that a session has taken its use lock and begun extracting.
 fn heldOrTimeout(io: std.Io, dir: std.Io.Dir) !void {
     var waited_ms: u64 = 0;
     while (waited_ms < start_bound_ms) : (waited_ms += poll_ms) {

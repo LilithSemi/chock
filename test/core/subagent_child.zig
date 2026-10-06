@@ -1,13 +1,6 @@
 //! A stand-in subagent process. Not `chock run`: only the parent and child
 //! boundary is real here, which is the command line, the child's own log, and
 //! the policy table. The first word of the task picks the mode.
-//!
-//! * `FINISH` writes two turns and ends `finished`.
-//! * `SCHEMA` answers with the JSON object the task asked for.
-//! * `WRONG` answers with prose when the task asked for JSON.
-//! * `POLICY` writes what the table answers for its own kind and for the chain.
-//! * `DIE` writes one turn and aborts, leaving a log with no `session.end`.
-//! * `WAIT` ends only after its parent puts a file called `go` in the project.
 
 const std = @import("std");
 const chock_core = @import("chock-core");
@@ -131,8 +124,7 @@ fn waitForGo(io: std.Io, project: []const u8) bool {
     return false;
 }
 
-/// The chain comes from the command line and from nowhere else. The answer that
-/// binds this process is the intersection over every kind above it.
+/// The chain comes from the command line, and binds this process to the intersection over every kind above it.
 fn policyAnswer(
     arena: std.mem.Allocator,
     io: std.Io,

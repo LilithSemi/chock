@@ -16,8 +16,7 @@ fn catalogueHead(comptime body: []const u8) []const u8 {
 }
 
 test "the check asks for the bytes as they are, so a compressed catalogue cannot be counted as none" {
-    // `std.http.Client` offers "gzip, deflate" by itself, and the reader here
-    // gives back what arrived, so a compressed catalogue holds no `data` array.
+    // The reader gives back what arrived, so a compressed body holds no `data` array.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 

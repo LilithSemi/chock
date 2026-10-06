@@ -1,6 +1,4 @@
-//! The udev client, against the real kernel. It shows the dependency can open a
-//! netlink monitor and enumerate devices with no daemon and no privilege. It
-//! builds no naming and no policy.
+//! The udev client, against the real kernel.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -9,9 +7,7 @@ const udev = @import("udev");
 const testing = std.testing;
 
 test "a kernel monitor opens with no privilege and no udevd" {
-    // Binding NETLINK_KOBJECT_UEVENT group 1 works as an unprivileged user with
-    // an empty capability set, so a failure here is a real fault and not a
-    // machine that has no udevd.
+    // Binding NETLINK_KOBJECT_UEVENT works unprivileged, so a failure is a real fault.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var ctx = udev.Context.init(testing.allocator, testing.io);
     defer ctx.deinit();
@@ -20,8 +16,7 @@ test "a kernel monitor opens with no privilege and no udevd" {
 }
 
 test "enumerating one subsystem is far cheaper than enumerating all of them" {
-    // This asserts the filter is applied, not the timing, because a timing
-    // assertion on a shared machine is a flake.
+    // This checks the filter is applied, not timing, since timing flakes on a shared machine.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var ctx = udev.Context.init(testing.allocator, testing.io);
     defer ctx.deinit();
@@ -34,8 +29,7 @@ test "enumerating one subsystem is far cheaper than enumerating all of them" {
     try all.scanDevices();
     const usb_count = countDevices(&usb);
     const all_count = countDevices(&all);
-    // A machine with no USB cannot tell a working filter from one that matches
-    // nothing, so that is a skip and never a pass.
+    // A machine with no USB cannot tell a working filter from a broken one, so skip.
     if (usb_count == 0) return error.SkipZigTest;
     try testing.expect(usb_count < all_count);
 }

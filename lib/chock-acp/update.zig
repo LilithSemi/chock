@@ -1,30 +1,6 @@
-//! What Chock has to say during a turn, and how each protocol version says it.
-//!
-//! ## One model, two encodings
-//!
-//! A session's own events are Chock's, and neither protocol version is shaped
-//! like them. So a caller builds one of these and asks for the `session/update`
-//! parameters in the version it negotiated. Version 2 rebuilt this stream, and
-//! the differences are real rather than cosmetic:
-//!
-//! * A tool call opens as `tool_call` in version 1. Version 2 has no such
-//!   variant and opens it as `tool_call_update`, whose shape is identical.
-//! * A plan is `plan` in version 1 and `plan_update` in version 2.
-//! * An abandoned plan step is `cancelled` in version 2. Version 1 cannot say
-//!   it, so the step is left out of the plan rather than reported as finished.
-//!
-//! ## What this does not know
-//!
-//! It imports no other Chock library, so it holds no event type and no session.
-//! The command that speaks ACP is the one place that knows both a log event and
-//! one of these, which keeps the translation in one file that can be read.
-//!
-//! ## A plan is sent whole
-//!
-//! ACP's plan entries carry no identifier, so a client cannot merge one entry
-//! into a plan it already has. Chock's own plan updates are a delta keyed by
-//! identifier. The caller therefore holds the merged plan and passes all of it,
-//! every time.
+//! What Chock has to say during a turn, encoded for whichever ACP version
+//! negotiated. It holds no event type or session; the command that speaks ACP
+//! is the only place that knows both, and sends each plan whole, since ACP's own plan entries carry no identifier to merge by.
 
 const std = @import("std");
 
@@ -33,12 +9,11 @@ const common = @import("common.zig");
 pub const Version = common.Version;
 pub const ToolKind = common.ToolKind;
 
-/// Where a plan step has got to, in Chock's own terms.
 pub const StepStatus = enum {
     pending,
     in_progress,
     done,
-    /// Given up rather than finished, which version 1 has no word for.
+    /// Given up, not finished; version 1 has no word for it.
     abandoned,
 };
 
@@ -47,56 +22,44 @@ pub const PlanStep = struct {
     status: StepStatus,
 };
 
-/// What a tool call is doing. Split from the protocol's own status because
-/// `started` has to become a different variant in each version.
+/// Split out: `started` becomes a different variant per version.
 pub const ToolPhase = enum { started, finished, failed };
 
 pub const Chunk = struct { text: []const u8 };
 
 pub const Tool = struct {
     id: []const u8,
-    /// What a person reads. Required by both versions when a call opens.
+    /// Required by both versions when a call opens.
     title: []const u8,
-    /// The tool's own name, which stays the same for the life of the call.
     name: []const u8 = "",
     kind: ToolKind = .other,
     phase: ToolPhase,
-    /// What the call produced, for a call that has finished. Empty otherwise.
+    /// Empty until the call finishes.
     output: []const u8 = "",
 };
 
-/// A context window gauge, which is what ACP's `usage_update` carries. It is not
-/// a billing record: `used` is how much of the window is full and `size` is how
-/// big it is, and both are required.
+/// ACP's `usage_update` gauge, not a bill: `used`/`size` show window fullness.
 pub const Usage = struct {
-    /// Tokens in the context now.
     used: u64,
-    /// How many the window holds.
     size: u64,
-    /// Null when the cost is unknown, which is not the same as free. See
-    /// `lib/chock-cost`.
+    /// Null when unknown, not the same as free. See `lib/chock-cost`.
     cost: ?f64 = null,
     currency: []const u8 = "USD",
 };
 
-/// One thing to tell the client.
 pub const Update = union(enum) {
     agent_message: Chunk,
     agent_thought: Chunk,
     user_message: Chunk,
     tool: Tool,
-    /// The whole plan, not a change to it. See this file's own note.
+    /// The whole plan, not a change to it.
     plan: []const PlanStep,
     usage: Usage,
-    /// What this session is about, in one line. Untrusted text: a client cuts it
-    /// to length and takes out whatever drives a terminal.
+    /// Untrusted: a client cuts it to length and strips terminal-driving bytes.
     title: []const u8,
 };
 
-/// The `params` of a `session/update` notification, in `version`'s spelling.
-///
-/// Null when this version cannot carry this update at all. A caller that treats
-/// null as an error would refuse a turn over something the client never needed.
+/// Null when this version can't carry it, never an error.
 pub fn encode(
     arena: std.mem.Allocator,
     version: Version,
@@ -122,8 +85,6 @@ fn chunk(
     one: Chunk,
 ) std.mem.Allocator.Error![]u8 {
     _ = version;
-    // Both versions spell a chunk the same way, and both carry it as a content
-    // block rather than a bare string.
     return std.json.Stringify.valueAlloc(arena, .{
         .sessionId = session_id,
         .update = .{
@@ -145,8 +106,7 @@ fn tool(
         .failed => "failed",
     };
 
-    // Version 1 opens a call with `tool_call`; version 2 has no such variant and
-    // opens it with the update, whose fields are the same in both.
+    // Version 1 opens a call with `tool_call`; version 2 has no such variant.
     const kind: []const u8 = switch (one.phase) {
         .started => switch (version) {
             .v1 => "tool_call",
@@ -169,9 +129,7 @@ fn tool(
         }, .{});
     }
 
-    // An update carries only what changed, so the title and the kind are not
-    // repeated. The output goes in a content block, which is where a client
-    // looks for what a call produced.
+    // An update carries only what changed: no repeated title or kind.
     if (one.output.len == 0) {
         return std.json.Stringify.valueAlloc(arena, .{
             .sessionId = session_id,
@@ -205,8 +163,7 @@ fn plan(
 ) std.mem.Allocator.Error![]u8 {
     const Entry = struct {
         content: []const u8,
-        /// Chock's plan has no priority and ACP requires one, so every step is
-        /// the middle value. Inventing an order nobody wrote would be worse.
+        /// No priority in Chock's plan; every step gets ACP's required middle value.
         priority: []const u8 = "medium",
         status: []const u8,
     };
@@ -217,9 +174,7 @@ fn plan(
             .pending => "pending",
             .in_progress => "in_progress",
             .done => "completed",
-            // Version 1 has no word for a step that was given up. Leaving it out
-            // says it is no longer in the plan, which is true; calling it
-            // completed would not be.
+            // Left out here, not called completed.
             .abandoned => switch (version) {
                 .v1 => continue,
                 .v2 => "cancelled",
@@ -247,8 +202,7 @@ fn usage(
     one: Usage,
 ) std.mem.Allocator.Error![]u8 {
     _ = version;
-    // `cost` is an object with an amount and a currency, and null when nobody
-    // priced it. A zero would say free, which is a different fact.
+    // Null when nobody priced it; a zero would say free, a different fact.
     const Money = struct { amount: f64, currency: []const u8 };
     return std.json.Stringify.valueAlloc(arena, .{
         .sessionId = session_id,
@@ -271,7 +225,6 @@ fn title(
     text: []const u8,
 ) std.mem.Allocator.Error![]u8 {
     _ = version;
-    // Both versions spell this the same, and every member of it is optional.
     return std.json.Stringify.valueAlloc(arena, .{
         .sessionId = session_id,
         .update = .{
@@ -314,8 +267,6 @@ test "a message chunk is the same in both versions, and carries a content block"
         try testing.expectEqualStrings("hello", try field(arena, body, &.{ "update", "content", "text" }));
     }
 
-    // A thought is its own variant, so a client can hide reasoning without
-    // hiding the answer.
     const thought = try encoded(arena, .v1, .{ .agent_thought = .{ .text = "thinking" } });
     try testing.expectEqualStrings(
         "agent_thought_chunk",
@@ -342,8 +293,6 @@ test "a tool call opens as tool_call in version 1 and as an update in version 2"
     try testing.expectEqualStrings("execute", try field(arena, one, &.{ "update", "kind" }));
     try testing.expectEqualStrings("in_progress", try field(arena, one, &.{ "update", "status" }));
 
-    // Version 2 has no `tool_call` variant at all, so sending one would be a
-    // variant no client reads.
     const two = try encoded(arena, .v2, started);
     try testing.expectEqualStrings("tool_call_update", try field(arena, two, &.{ "update", "sessionUpdate" }));
     try testing.expectEqualStrings("run gh issue list", try field(arena, two, &.{ "update", "title" }));
@@ -380,8 +329,7 @@ test "a finished call reports its output as content, and a failed one says so" {
     } });
     try testing.expectEqualStrings("failed", try field(arena, failed, &.{ "update", "status" }));
 
-    // A call that produced nothing carries no content member rather than an
-    // empty one, which a client would draw as an empty result.
+    // Omits content, rather than an empty array a client would read as a result.
     const quiet = try encoded(arena, .v1, .{ .tool = .{ .id = "c", .title = "", .phase = .finished } });
     var quiet_parsed = try std.json.parseFromSlice(std.json.Value, arena, quiet, .{});
     try testing.expect(quiet_parsed.value.object.get("update").?.object.get("content") == null);
@@ -403,14 +351,10 @@ test "an abandoned step is cancelled in version 2 and absent from version 1" {
     try testing.expectEqualStrings("plan", try field(arena, one, &.{ "update", "sessionUpdate" }));
     var one_parsed = try std.json.parseFromSlice(std.json.Value, arena, one, .{});
     const one_entries = one_parsed.value.object.get("update").?.object.get("entries").?.array;
-    // Three, not four: version 1 cannot say a step was given up, so it is left
-    // out rather than reported as finished.
     try testing.expectEqual(@as(usize, 3), one_entries.items.len);
     try testing.expectEqualStrings("completed", one_entries.items[0].object.get("status").?.string);
     for (one_entries.items) |entry| {
         try testing.expect(!std.mem.eql(u8, entry.object.get("content").?.string, "ask the vendor"));
-        // Every entry carries a priority, which ACP requires and Chock has no
-        // word for.
         try testing.expectEqualStrings("medium", entry.object.get("priority").?.string);
     }
 
@@ -433,14 +377,11 @@ test "usage is a context gauge, and an unknown cost is null rather than zero" {
         .cost = 0.0021,
     } });
     try testing.expectEqualStrings("usage_update", try field(arena, known, &.{ "update", "sessionUpdate" }));
-    // `used` and `size`, which the schema requires. This is not a token bill:
-    // the first draft sent input and output tokens and a real client refused it.
+    // Not a token bill: a draft doing that was refused by a real client.
     try testing.expectEqualStrings("12000", try field(arena, known, &.{ "update", "used" }));
     try testing.expectEqualStrings("65536", try field(arena, known, &.{ "update", "size" }));
     try testing.expectEqualStrings("USD", try field(arena, known, &.{ "update", "cost", "currency" }));
 
-    // Free and unknown are different, and `lib/chock-cost` exists because
-    // collapsing them is wrong in both directions. Null is what carries that.
     const unknown = try encoded(arena, .v1, .{ .usage = .{ .used = 1, .size = 2 } });
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, unknown, .{});
     try testing.expectEqual(std.json.Value.null, parsed.value.object.get("update").?.object.get("cost").?);
@@ -467,12 +408,10 @@ test "every update is something both versions can be asked for" {
         seen.insert(std.meta.activeTag(one));
         for ([_]Version{ .v1, .v2 }) |version| {
             const body = (try encode(arena, version, "s", one)) orelse continue;
-            // Every one is a whole JSON object with the two members the
-            // notification requires.
             var parsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
             try testing.expect(parsed.value.object.get("sessionId") != null);
             try testing.expect(parsed.value.object.get("update").?.object.get("sessionUpdate") != null);
-            // And it frames: the transport cannot carry an embedded newline.
+            // The transport cannot carry an embedded newline.
             try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, body, '\n'));
         }
     }

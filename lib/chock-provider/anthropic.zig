@@ -1,103 +1,24 @@
-//! The Anthropic native adapter. Chock has two wire formats, and this is the
-//! second one. It exists rather than translating through the OpenAI shape
-//! because **a thinking block with its signature, and cache control, do not
-//! survive that conversion**, and a lossy conversion is permanent: `chockd`
-//! re-serves the session log to other clients, so what is lost here is lost
-//! for everyone.
-//!
-//! `openai.zig` is the model this file follows, field for field where the two
-//! wires agree, because the parallel shape is what lets a reader compare them.
-//! Four differences break a naive port, and each one has a test below:
-//!
-//! 1. **`system` is a top level field, not a message with a system role.**
-//! 2. **`max_tokens` is required.** See `default_max_tokens`.
-//! 3. **A tool result is a content block inside a `user` message. There is no
-//!    `tool` role at all.** This is the difference most likely to be got
-//!    wrong, because the neutral type has a `tool` role and the OpenAI wire
-//!    has one too.
-//! 4. **A thinking block goes back with its `signature` intact.** Dropping it
-//!    makes the provider treat the block as forged on the next turn, and it
-//!    is the whole reason this adapter exists.
-//!
-//! The adapter never sees a credential, the same as `openai.zig`: `Request`
-//! has no field that could hold one, and the comptime block at the end of
-//! this file fails the build if anyone adds one. The key travels in the
-//! `x-api-key` header, which is the second difference from the OpenAI wire's
-//! `Authorization: Bearer`, and `Client.zig` is the file that sets it.
-//!
-//! ## The stream
-//!
-//! ```
-//! message_start
-//!   content_block_start
-//!   content_block_delta   (repeats)
-//!   content_block_stop
-//!   ... one group per content block ...
-//! message_delta
-//! message_stop
-//! ```
-//!
-//! `ping` may arrive at any point and means nothing. **An `error` event may
-//! arrive inside the stream**, for example `overloaded_error`, which is a 529
-//! in a non-streaming call: a reader that only checks the HTTP status misses
-//! it entirely, because the status was 200 and stayed 200.
-//!
-//! `Decoder` reads one event's JSON body at a time and answers with one
-//! `Piece`. It does not frame the stream: `sse.zig` already does that, and
-//! this file writes no second parser. `sse.ToolCallAssembler` already
-//! assembles a tool call from fragments keyed by index, and this adapter
-//! feeds it the same neutral `message.ToolCallFragment` the OpenAI path does,
-//! so nothing above either adapter has to know which wire it came off.
-//!
-//! ## The usage trap
-//!
-//! `message_start` carries the initial `usage`, and `message_delta` carries
-//! `usage` again. **Those counts are cumulative, not incremental.** A parser
-//! that adds them up over counts, and adding them up is what a reasonable
-//! implementation does. `Decoder` replaces each field it is told about and
-//! never adds, so the last value wins. See the test named for it.
+//! The Anthropic native adapter, one of the two wire formats Chock speaks.
 
 const std = @import("std");
 const message = @import("message.zig");
 const sse = @import("sse.zig");
 
-/// See `message.ToolDefinition`: the canonical definition is neutral and
-/// lives there, so `Client`'s interface never imports a wire format to name a
-/// tool's shape. Aliased, not copied, the same as `openai.zig` does it.
 pub const ToolDefinition = message.ToolDefinition;
 
-/// What a turn cost. See `message.Usage`.
 pub const Usage = message.Usage;
 
-/// The path this adapter appends to a provider's base URL. The OpenAI
-/// compatible adapter uses `/chat/completions`; ai& serves both on one host.
 pub const path = "/messages";
 
-/// The header the key travels in. **Not `Authorization: Bearer`**, which is
-/// what the OpenAI compatible wire uses.
 pub const key_header = "x-api-key";
 
-/// The version header every request must carry, and its one value Chock
-/// sends. Anthropic dates its wire format instead of numbering it.
 pub const version_header = "anthropic-version";
 pub const version = "2023-06-01";
 
-/// `max_tokens` is required on this wire, and the OpenAI wire treats it as
-/// optional, so a caller that never set one still needs a number here. 8192
-/// is generous for a coding turn's answer and small enough that a runaway
-/// generation stops rather than filling a context window. A caller that wants
-/// a different ceiling sets `Request.max_tokens` itself.
 pub const default_max_tokens: u32 = 8192;
 
-/// Everything one call to the model needs, in the shape `buildRequest` reads.
-/// `Client.HttpClient` is the only caller that builds one: it converts from
-/// `message.Request`, the neutral shape, adding the two fields that only
-/// matter once a request is about to become wire bytes.
 pub const Request = struct {
     model: []const u8,
-    /// The top level `system` field. **Not a message.** A message in
-    /// `messages` that carries the system role is folded in here instead when
-    /// this is empty, and dropped when it is not: see `buildRequest`.
     system: []const u8,
     messages: []const message.Message,
     tools: []const ToolDefinition = &.{},
@@ -105,64 +26,42 @@ pub const Request = struct {
     stream: bool = false,
 };
 
-/// One content block on the wire. Anthropic's content is always an array of
-/// typed blocks, in both directions, unlike the OpenAI wire where a message's
-/// content is usually one string.
 pub const WireBlock = union(enum) {
     text: Text,
     thinking: Thinking,
     tool_use: ToolUse,
     tool_result: ToolResult,
     image: Image,
-    /// A block type this reader has no case for, kept whole so it can be
-    /// written back out unchanged. Mirrors `message.ContentPart.unknown`.
     unknown: Unknown,
 
     pub const Text = struct {
         text: []const u8,
     };
 
-    /// `signature` is opaque bytes the provider signs over. Keep it exactly
-    /// as given: see `chock_proto.event.Reasoning`.
     pub const Thinking = struct {
         thinking: []const u8,
         signature: []const u8,
     };
 
-    /// `input` is a JSON **object**, not a string. The OpenAI wire carries a
-    /// tool call's arguments as a JSON string; this one nests them.
     pub const ToolUse = struct {
         id: []const u8,
         name: []const u8,
         input: std.json.Value,
     };
 
-    /// Lives in a `user` message. There is no `tool` role.
     pub const ToolResult = struct {
         tool_use_id: []const u8,
         content: []const u8,
         is_error: bool,
     };
 
-    /// An image, always base64 on this wire. **It is a block of its own and
-    /// never a field of a `tool_result` block**: a tool's picture rides in
-    /// the same `user` message as the result that describes it, after the
-    /// result blocks, which is where `toWireMessages` puts it. See
-    /// `chock_proto.event.ImagePart`.
-    ///
-    /// The wire nests both fields under `source`, and the source `type` is
-    /// always "base64" here. This adapter never sends a URL source: the
-    /// bytes are read out of the workspace, so there is no URL to send, and
-    /// a URL would ask the provider to fetch something Chock never saw.
     pub const Image = struct {
         media_type: []const u8,
         data: []const u8,
     };
 
     pub const Unknown = struct {
-        /// The `type` this reader did not recognize.
         name: []const u8,
-        /// The whole block, kept verbatim.
         raw: std.json.Value,
     };
 
@@ -194,9 +93,6 @@ pub const WireBlock = union(enum) {
                     .data = block.data,
                 },
             }),
-            // The raw value already carries its own `type`, because it is the
-            // block exactly as it arrived. Writing it verbatim is what makes
-            // the round trip exact.
             .unknown => |block| try jw.write(block.raw),
         }
     }
@@ -210,9 +106,6 @@ pub const WireBlock = union(enum) {
         return fromValue(allocator, value);
     }
 
-    /// Read one block out of an already parsed JSON value. `Decoder` needs
-    /// this too, because a `content_block_start` event carries the block
-    /// nested inside an event body it has already parsed.
     pub fn fromValue(
         allocator: std.mem.Allocator,
         value: std.json.Value,
@@ -248,9 +141,6 @@ pub const WireBlock = union(enum) {
         }
         if (std.mem.eql(u8, kind.string, "image")) {
             const source = object.get("source") orelse return unknownBlock(allocator, kind.string, value);
-            // A URL source has no `data`, so it reads back with an empty one
-            // rather than as an image this reader could carry. Keeping the
-            // whole block instead would need a second shape nothing writes.
             if (source != .object) return unknownBlock(allocator, kind.string, value);
             return .{ .image = .{
                 .media_type = stringField(source.object, "media_type"),
@@ -270,20 +160,11 @@ pub const WireBlock = union(enum) {
     }
 };
 
-/// The value of `object[name]` when it is a string, and an empty string
-/// otherwise. Every caller is reading bytes off a wire it does not control,
-/// so a field of the wrong type is a runtime fault to absorb, not a reason to
-/// refuse a whole message.
 fn stringField(object: std.json.ObjectMap, name: []const u8) []const u8 {
     const value = object.get(name) orelse return "";
     return if (value == .string) value.string else "";
 }
 
-/// A `tool_result` block's `content` is either a plain string or an array of
-/// content blocks. Chock's neutral `ToolResultPart.output` is one string, so
-/// the array shape takes the first text block it finds. Chock itself always
-/// writes the string shape, so this only ever runs on a history some other
-/// client wrote.
 fn toolResultText(content: ?std.json.Value) []const u8 {
     const value = content orelse return "";
     switch (value) {
@@ -301,7 +182,6 @@ fn toolResultText(content: ?std.json.Value) []const u8 {
     }
 }
 
-/// One message on the wire. **The role is only ever `user` or `assistant`.**
 pub const WireMessage = struct {
     role: []const u8,
     content: []const WireBlock,
@@ -322,18 +202,8 @@ const WireRequest = struct {
     stream: ?bool = null,
 };
 
-/// `buildRequest` only allocates. `std.json.Stringify.valueAlloc` writes into
-/// memory it owns, so no other error can reach the caller.
 pub const BuildError = std.mem.Allocator.Error;
 
-/// Parse a neutral tool call's `arguments`, which is JSON text, into the
-/// object this wire nests under `input`.
-///
-/// **Arguments that are not valid JSON cannot be represented on this wire at
-/// all**, because `input` is an object and not a string. An empty object goes
-/// out instead of malformed text, which is the same answer the provider would
-/// give: it refuses the request rather than guessing. A call whose arguments
-/// never parsed was already broken before it reached this function.
 fn parseArguments(
     arena: std.mem.Allocator,
     arguments: []const u8,
@@ -349,16 +219,6 @@ fn parseArguments(
     return if (parsed == .object) parsed else empty;
 }
 
-/// Convert one neutral message into the wire message or messages that
-/// represent it. See difference 3 in this file's own top comment: a tool
-/// result never rides in a message of its own with a `tool` role, because
-/// this wire has no such role. It becomes a `tool_result` block inside a
-/// `user` message, and those blocks come first in that message, which is the
-/// order the provider expects.
-///
-/// A neutral assistant message that also carries tool results, which nothing
-/// in Chock builds but a foreign history could, becomes two wire messages:
-/// the assistant turn, then the user turn holding the results.
 fn toWireMessages(
     arena: std.mem.Allocator,
     msg: message.Message,
@@ -369,8 +229,6 @@ fn toWireMessages(
     for (msg.content) |part| {
         switch (part) {
             .text => |text| {
-                // An empty text block is refused by the provider, and a
-                // neutral message can hold one after a truncated stream.
                 if (text.len != 0) try own.append(arena, .{ .text = .{ .text = text } });
             },
             .reasoning => |reasoning| try own.append(arena, .{ .thinking = .{
@@ -387,10 +245,6 @@ fn toWireMessages(
                 .content = tool_result.output,
                 .is_error = tool_result.is_error,
             } }),
-            // Into `own` and not into `results`, so it lands after every
-            // `tool_result` block of the same turn: this wire refuses a
-            // result block that comes after anything else, and the tail of
-            // this function is what puts the results first.
             .image => |image| try own.append(arena, .{ .image = .{
                 .media_type = image.media_type,
                 .data = image.data,
@@ -414,8 +268,6 @@ fn toWireMessages(
         return out.toOwnedSlice(arena);
     }
 
-    // Everything else, user and tool alike, is a user turn. The results come
-    // first: a `tool_result` block after ordinary text is refused.
     try results.appendSlice(arena, own.items);
     if (results.items.len != 0) {
         try out.append(arena, .{ .role = "user", .content = results.items });
@@ -423,8 +275,6 @@ fn toWireMessages(
     return out.toOwnedSlice(arena);
 }
 
-/// The text of a neutral message, joined with newlines. Used only to fold a
-/// system role message into the top level `system` field.
 fn joinText(arena: std.mem.Allocator, msg: message.Message) BuildError![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     for (msg.content) |part| {
@@ -435,9 +285,6 @@ fn joinText(arena: std.mem.Allocator, msg: message.Message) BuildError![]const u
     return out.toOwnedSlice(arena);
 }
 
-/// True when this wire message carries a tool result. See `buildRequest`: a
-/// message with one keeps its own turn, because the blocks of one turn put
-/// every result before any text.
 fn holdsToolResult(wire_message: WireMessage) bool {
     for (wire_message.content) |block| {
         if (block == .tool_result) return true;
@@ -445,9 +292,6 @@ fn holdsToolResult(wire_message: WireMessage) bool {
     return false;
 }
 
-/// Build the JSON body for a `/messages` request. The key never enters this
-/// text: `Request` has no field that could hold one, and the caller puts the
-/// key in the `x-api-key` header, outside anything a session log will hold.
 pub fn buildRequest(allocator: std.mem.Allocator, request: Request) BuildError![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -457,25 +301,10 @@ pub fn buildRequest(allocator: std.mem.Allocator, request: Request) BuildError![
     var messages: std.ArrayList(WireMessage) = .empty;
     for (request.messages) |msg| {
         if (std.meta.activeTag(msg.role) == .system) {
-            // Difference 1: there is no system message on this wire. A
-            // history that carries one, for example a session started
-            // against an OpenAI compatible provider and continued here,
-            // folds into the top level field rather than being dropped.
             if (system.len == 0) system = try joinText(arena, msg);
             continue;
         }
         for (try toWireMessages(arena, msg)) |wire_message| {
-            // Difference 5, and the one a trailing harness notice runs into.
-            // This wire has no `tool` role, so a tool result is already a
-            // `user` turn: see `toWireMessages`. A `user` message after one,
-            // which is what `chock_core.Loop`'s notice is, would be two
-            // `user` turns in a row, and this wire wants alternating roles.
-            // Joining them says the same thing in the shape the wire takes.
-            //
-            // **Only a message with no tool result in it is joined on.** A
-            // `tool_result` block after ordinary text is refused, so a message
-            // that carries one keeps its own turn, where its results are
-            // already first.
             if (messages.items.len != 0 and !holdsToolResult(wire_message)) {
                 const last = &messages.items[messages.items.len - 1];
                 if (std.mem.eql(u8, last.role, wire_message.role)) {
@@ -502,8 +331,6 @@ pub fn buildRequest(allocator: std.mem.Allocator, request: Request) BuildError![
 
     const wire = WireRequest{
         .model = request.model,
-        // Difference 2: always written, never omitted, because the provider
-        // refuses a request without it.
         .max_tokens = request.max_tokens,
         .messages = messages.items,
         .system = if (system.len == 0) null else system,
@@ -513,9 +340,6 @@ pub fn buildRequest(allocator: std.mem.Allocator, request: Request) BuildError![
     return std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
 }
 
-/// The usage object, in both the non-streaming response and the streaming
-/// `message_start` and `message_delta` events. Every field is optional
-/// because the provider sends only the ones that changed: see `applyUsage`.
 pub const WireUsage = struct {
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,
@@ -523,8 +347,6 @@ pub const WireUsage = struct {
     cache_read_input_tokens: ?u64 = null,
 };
 
-/// A whole non-streaming reply. Real servers add more fields; `ignore_unknown_fields`
-/// on `parseResponse` is what lets that be true without a parse error.
 pub const Response = struct {
     role: []const u8 = "assistant",
     content: []const WireBlock = &.{},
@@ -535,7 +357,6 @@ pub const Response = struct {
 
 pub const ParseError = std.json.ParseError(std.json.Scanner);
 
-/// Parse a `/messages` response body.
 pub fn parseResponse(
     allocator: std.mem.Allocator,
     text: []const u8,
@@ -546,16 +367,9 @@ pub fn parseResponse(
 fn roleFromWire(text: []const u8) message.Role {
     if (std.mem.eql(u8, text, "assistant")) return .assistant;
     if (std.mem.eql(u8, text, "user")) return .user;
-    // A role a future provider adds. Keep the name rather than refusing the
-    // message: the escape hatch argument for an unknown name.
     return .{ .unknown = text };
 }
 
-/// Convert wire blocks into the neutral content parts. Every string is a
-/// slice into whatever `std.json.Parsed` value produced `blocks`, except a
-/// tool call's `arguments`, which is serialized fresh because this wire
-/// carries the input as an object and the neutral type carries it as text.
-/// The caller frees the returned slice, and each `arguments` string in it.
 pub fn toContent(
     allocator: std.mem.Allocator,
     blocks: []const WireBlock,
@@ -569,7 +383,6 @@ pub fn toContent(
             .thinking => |thinking| try parts.append(allocator, .{
                 .reasoning = .{
                     .text = thinking.thinking,
-                    // Difference 4: byte for byte, never regenerated.
                     .signature = thinking.signature,
                 },
             }),
@@ -597,8 +410,6 @@ pub fn toContent(
     return parts.toOwnedSlice(allocator);
 }
 
-/// Convert a whole non-streaming response into the neutral message type. See
-/// `toContent` for what the caller owns.
 pub fn toMessage(
     allocator: std.mem.Allocator,
     response: Response,
@@ -610,92 +421,38 @@ pub fn toMessage(
     };
 }
 
-/// An `error` event that arrived inside a 200 stream. See this file's own top
-/// comment: a reader that only checks the HTTP status never sees this.
 pub const StreamError = struct {
-    /// For example "overloaded_error", which is a 529 in a non-streaming call.
     kind: []const u8,
     text: []const u8,
 };
 
-/// One event's worth of meaning. `Decoder.feed` answers with exactly one of
-/// these per server sent event, so a caller drives it in a plain loop.
 pub const Piece = union(enum) {
-    /// A `ping`, a `content_block_stop`, a `message_stop`, or an event this
-    /// reader has no case for. Nothing to do.
     none,
     text: []const u8,
     reasoning: []const u8,
-    /// A `signature_delta`: the thinking block's signature, which arrives
-    /// after its text and must be kept with it.
     reasoning_signature: []const u8,
     tool_call: message.ToolCallFragment,
-    /// The counts so far, **cumulative and not incremental**. A caller keeps
-    /// the last one it was given and never adds them up.
     usage: Usage,
     stream_error: StreamError,
 };
 
-/// What one content block index is carrying, so a `content_block_delta` for
-/// that index knows which kind of delta it is reading. The delta's own `type`
-/// says this too, and `Decoder` reads that first; this is the fallback for a
-/// delta whose type a future provider spells differently.
 const BlockKind = enum { text, thinking, tool_use, other };
 
 pub const DecodeError = std.mem.Allocator.Error || std.json.ParseError(std.json.Scanner) || error{
-    /// The event body parsed but was not a JSON object.
     BodyNotObject,
-    /// The event body carried no `type` field, or one that was not a string.
-    /// Every real event on this wire has one.
     MissingEventType,
-    /// A `content_block_start` or `content_block_delta` with no usable
-    /// `index`. Every real one carries a non negative integer.
     BlockIndexInvalid,
 };
 
-/// What the `stop_details` beside a `stop_reason` said. **This wire sends
-/// `stop_details` for one stop reason only, `refusal`, and sends null for
-/// every other one.**
-///
-/// **Both fields can be null even on a real refusal**, so an empty one here
-/// means the provider said nothing, and a reader that fills that gap with a
-/// reason of its own throws away the only explanation anybody has and puts an
-/// invented one in its place. A refusal with neither field is a different fact
-/// from a refusal with them, and whatever reports this must keep the two
-/// different.
 pub const StopDetails = struct {
-    /// A short token naming the class of the refusal, for example
-    /// `cyber`. Empty when the provider sent none.
     category: []const u8 = "",
-    /// The provider's own sentence about the refusal, for example "This
-    /// request was declined because it could enable cyber harm." Empty when
-    /// the provider sent none.
     explanation: []const u8 = "",
 };
 
-/// The longest `category` this reader keeps. It is one short token, the same
-/// shape a stop reason is, so it gets the length `Client.max_stop_reason`
-/// gives that one, and for the same reason: a cut token still names the class
-/// of the refusal, and an empty one names nothing at all. Written out here
-/// rather than read from there, because an adapter that imported `Client.zig`
-/// would close an import cycle.
 pub const max_stop_category: usize = 64;
 
-/// The longest `explanation` this reader keeps. This one is prose and not a
-/// token, so it needs a bound of its own: the longest the platform documents
-/// is 61 bytes, "This request was declined because it could enable cyber
-/// harm.", and this holds several sentences of that size. It is a fixed buffer
-/// in every `Decoder` and in every `Client.AssembledReply`, both of which are
-/// passed by value, which is what makes a bound necessary at all: the provider
-/// chooses this length, and Chock does not let it choose how big those structs
-/// get. A longer explanation is cut and not dropped, for the same reason a
-/// stop reason is.
 pub const max_stop_explanation: usize = 512;
 
-/// Read the `stop_details` object beside a `stop_reason`. An absent one, a
-/// null one, and one of the wrong type all read as "the provider said
-/// nothing", which is what an empty field means everywhere else in this
-/// reader.
 fn stopDetailsOf(delta: std.json.ObjectMap) StopDetails {
     const value = delta.get("stop_details") orelse return .{};
     if (value != .object) return .{};
@@ -705,56 +462,23 @@ fn stopDetailsOf(delta: std.json.ObjectMap) StopDetails {
     };
 }
 
-/// Copy as much of `text` as `buffer` holds, and answer how much that was.
 fn keepCut(buffer: []u8, text: []const u8) usize {
     const kept = @min(text.len, buffer.len);
     @memcpy(buffer[0..kept], text[0..kept]);
     return kept;
 }
 
-/// Reads the events of one `/messages` stream. Holds the small amount of
-/// state the wire forces a reader to keep: which content block index is
-/// carrying what, and the running usage counts.
-///
-/// It does not frame the stream. `sse.Parser` does that, and this file writes
-/// no second parser: see this file's own top comment.
 pub const Decoder = struct {
     allocator: std.mem.Allocator,
-    /// Holds one event's parsed JSON tree, and nothing older. Reset at the
-    /// top of every `feed`, which is what makes the lifetime rule in `feed`'s
-    /// own doc comment true: a `Piece` is a view of the event it came from.
     arena: std.heap.ArenaAllocator,
-    /// Keyed by content block index. A hash map for the same reason
-    /// `sse.ToolCallAssembler` uses one: the provider chooses how many blocks
-    /// a reply has, and a scan per event is quadratic in that count.
     kinds: std.AutoArrayHashMapUnmanaged(usize, BlockKind) = .empty,
-    /// The counts so far. **Replaced field by field, never added to.** See
-    /// the usage trap in this file's own top comment.
     usage: Usage = .{},
-    /// Whether any event carried usage at all. A provider that reports none
-    /// leaves this false, and a caller then knows the zeros are absence and
-    /// not a free turn.
     saw_usage: bool = false,
-    /// The `stop_reason` from `message_delta`, for example "tool_use" or
-    /// "end_turn". A copy, not a slice into `arena`, because it outlives the
-    /// event it arrived on: read it with `stopReason`.
     stop_reason_text: std.ArrayList(u8) = .empty,
-    /// What the `stop_details` beside that `stop_reason` said, cut to
-    /// `max_stop_category` and `max_stop_explanation`. Copies, not slices into
-    /// `arena`, for the reason `stop_reason_text` gives, and fixed buffers
-    /// rather than a second and third `std.ArrayList` because the explanation
-    /// is prose whose length the provider chooses. Read them with
-    /// `stopDetails`.
     stop_category_buffer: [max_stop_category]u8 = @splat(0),
-    /// How much of `stop_category_buffer` the provider filled.
     stop_category_len: usize = 0,
     stop_explanation_buffer: [max_stop_explanation]u8 = @splat(0),
-    /// How much of `stop_explanation_buffer` the provider filled.
     stop_explanation_len: usize = 0,
-    /// Whether `message_stop` has arrived. **This wire never sends the
-    /// `[DONE]` line the OpenAI compatible wire ends with**, so a caller that
-    /// waits for one calls every complete reply truncated. This is the fact
-    /// to check instead.
     saw_message_stop: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Decoder {
@@ -767,17 +491,10 @@ pub const Decoder = struct {
         self.arena.deinit();
     }
 
-    /// Why the model stopped, for example "tool_use" or "end_turn". Empty
-    /// until a `message_delta` says.
     pub fn stopReason(self: *const Decoder) []const u8 {
         return self.stop_reason_text.items;
     }
 
-    /// What the provider said about the reason `stopReason` names. Both
-    /// fields stay empty until a `message_delta` carries a `stop_details` that
-    /// fills them, which this wire does for a refusal and for nothing else.
-    /// See `StopDetails`: empty means the provider said nothing, and never
-    /// that it said there was no reason.
     pub fn stopDetails(self: *const Decoder) StopDetails {
         return .{
             .category = self.stop_category_buffer[0..self.stop_category_len],
@@ -785,16 +502,6 @@ pub const Decoder = struct {
         };
     }
 
-    /// Read one event's JSON body. **Every string in the returned `Piece` is
-    /// a view of that one event and is valid only until the next `feed`**,
-    /// the same rule `Client.Delta` already states: a caller that wants to
-    /// keep the bytes copies them before it asks for the next event.
-    ///
-    /// The body is untrusted: a provider can be compromised and a proxy can
-    /// sit in the way. A field of the wrong type is skipped rather than
-    /// asserted on, and only a body with no event type at all, or a content
-    /// block with no index, is refused outright, because neither can be
-    /// attributed to anything.
     pub fn feed(self: *Decoder, json_text: []const u8) DecodeError!Piece {
         _ = self.arena.reset(.retain_capacity);
         const value = try std.json.parseFromSliceLeaky(
@@ -806,8 +513,6 @@ pub const Decoder = struct {
         return self.feedValue(value);
     }
 
-    /// The body of `feed`, split out so a test can hand it an already parsed
-    /// value. **Every slice in the answer points into `value`.**
     fn feedValue(self: *Decoder, value: std.json.Value) DecodeError!Piece {
         if (value != .object) return error.BodyNotObject;
         const body = value.object;
@@ -843,12 +548,6 @@ pub const Decoder = struct {
                     if (reason.len != 0) {
                         self.stop_reason_text.clearRetainingCapacity();
                         try self.stop_reason_text.appendSlice(self.allocator, reason);
-                        // **Replaced with the reason they belong to, always,
-                        // even when the event carried none.** The details of
-                        // an earlier stop reason describe that word and not
-                        // this one, and keeping them would report a refusal's
-                        // explanation beside the reason that replaced it. See
-                        // `StopDetails`.
                         const details = stopDetailsOf(delta.object);
                         self.stop_category_len = keepCut(
                             &self.stop_category_buffer,
@@ -879,18 +578,11 @@ pub const Decoder = struct {
                 else => .other,
             });
             switch (block) {
-                // The tool call's id and name arrive here, once, and every
-                // fragment after this carries only a piece of the arguments.
-                // That is the same shape the OpenAI wire has, which is why
-                // one `sse.ToolCallAssembler` serves both.
                 .tool_use => |tool_use| return .{ .tool_call = .{
                     .index = index,
                     .id = tool_use.id,
                     .name = tool_use.name,
                 } },
-                // A block can open with text already in it. Every capture
-                // this adapter has read opens empty, but nothing on the wire
-                // promises that, and dropping it would lose a whole answer.
                 .text => |text| return if (text.text.len == 0) .none else .{ .text = text.text },
                 .thinking => |thinking| return if (thinking.thinking.len == 0)
                     .none
@@ -922,9 +614,6 @@ pub const Decoder = struct {
                     .arguments = stringField(delta, "partial_json"),
                 } };
             }
-            // A delta type this reader has no case for. The block's own kind
-            // is the fallback, so a renamed delta on a known block still
-            // reaches the right buffer rather than being dropped.
             const block_kind = self.kinds.get(index) orelse return .none;
             return switch (block_kind) {
                 .text => .{ .text = stringField(delta, "text") },
@@ -942,15 +631,9 @@ pub const Decoder = struct {
             return .none;
         }
 
-        // ping, content_block_stop, and anything a later version of this
-        // wire adds.
         return .none;
     }
 
-    /// **Replace, never add.** The counts on this wire are cumulative: an
-    /// implementation that adds each `message_delta` to the running total
-    /// over counts, and adding is the reasonable looking thing to do. A
-    /// field the event does not carry keeps whatever `message_start` set.
     fn applyUsage(self: *Decoder, value: std.json.Value) void {
         if (value != .object) return;
         const object = value.object;
@@ -980,15 +663,8 @@ pub const Decoder = struct {
 };
 
 comptime {
-    // The same guard `openai.Request` carries: a caller cannot pass a
-    // credential into `buildRequest` even by mistake, because `Request` has
-    // nowhere to put one. The key belongs in the `x-api-key` header, set
-    // outside this file, never in the body `chockd` logs.
+    // Request has nowhere to put a credential, so this guard stops a caller from passing one into buildRequest by mistake. The key goes in the x-api-key header instead, set outside this file and never logged.
     for (@typeInfo(Request).@"struct".fields) |field| {
-        // `max_tokens` is this wire's required output ceiling, not a
-        // credential, and it is the one field name here that contains
-        // "token". Named exactly rather than loosening the substring list,
-        // so `refresh_token` or `token_file` would still fail the build.
         if (std.mem.eql(u8, field.name, "max_tokens")) continue;
         const suspect = std.mem.indexOf(u8, field.name, "key") != null or
             std.mem.indexOf(u8, field.name, "token") != null or
@@ -1006,8 +682,6 @@ fn parseBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(st
 }
 
 test "the system prompt is a top level field and never a message" {
-    // Difference 1. A port from openai.zig writes a message with role
-    // "system" here, which this wire refuses outright.
     const allocator = testing.allocator;
     const user_content = [_]message.ContentPart{.{ .text = "list the files" }};
     const messages = [_]message.Message{.{ .role = .user, .content = &user_content }};
@@ -1053,10 +727,6 @@ test "a system role message folds into the top level field instead of being drop
 }
 
 test "a harness notice after a tool result joins that turn, and never makes two user turns" {
-    // Difference 5. `chock_core.Loop` puts what the harness knows at the end
-    // of the context, as a `user` message, and the message before it is the
-    // tool's own answer, which this wire already carries as a `user` turn. Two
-    // `user` turns in a row is what this wire will not take.
     const allocator = testing.allocator;
     const asked = [_]message.ContentPart{.{ .tool_use = .{
         .call_id = "call_1",
@@ -1085,14 +755,11 @@ test "a harness notice after a tool result joins that turn, and never makes two 
     try testing.expectEqualStrings("assistant", wire_messages[0].object.get("role").?.string);
     try testing.expectEqualStrings("user", wire_messages[1].object.get("role").?.string);
 
-    // The result first and the notice after it: a `tool_result` block that
-    // follows ordinary text is refused, which is why the order is not free.
     const blocks = wire_messages[1].object.get("content").?.array.items;
     try testing.expectEqual(@as(usize, 2), blocks.len);
     try testing.expectEqualStrings("tool_result", blocks[0].object.get("type").?.string);
     try testing.expectEqualStrings("text", blocks[1].object.get("type").?.string);
 
-    // And the roles really do alternate now, which is the fact this pins.
     var previous: []const u8 = "";
     for (wire_messages) |wire_message| {
         const role = wire_message.object.get("role").?.string;
@@ -1102,9 +769,6 @@ test "a harness notice after a tool result joins that turn, and never makes two 
 }
 
 test "two turns that both carry a tool result keep their own turns" {
-    // The negative half of the join above. Joining these would put a
-    // `tool_result` block after another turn's text, which this provider
-    // refuses, so a message holding one is never joined on.
     const allocator = testing.allocator;
     const first_result = [_]message.ContentPart{.{ .tool_result = .{
         .call_id = "call_1",
@@ -1130,20 +794,11 @@ test "two turns that both carry a tool result keep their own turns" {
 
     const wire_messages = parsed.value.object.get("messages").?.array.items;
     try testing.expectEqual(@as(usize, 2), wire_messages.len);
-    // The first two joined; the third kept its own turn because it holds a
-    // result.
     try testing.expectEqual(@as(usize, 2), wire_messages[0].object.get("content").?.array.items.len);
     try testing.expectEqual(@as(usize, 1), wire_messages[1].object.get("content").?.array.items.len);
 }
 
 test "a tool's image rides after its result, in the same user turn" {
-    // What `image_results` means on this wire. The picture is a block of its
-    // own, never a field of the result block, and the result comes first: a
-    // `tool_result` block after anything else in the same turn is refused by
-    // the provider.
-    //
-    // **Mutation check:** put the image into `results` instead of `own` in
-    // `toWireMessages`. The order flips and the second assertion fails.
     const allocator = testing.allocator;
     const data = "iVBORw0KGgoAAAANSUhEUg==";
     const content = [_]message.ContentPart{
@@ -1159,7 +814,6 @@ test "a tool's image rides after its result, in the same user turn" {
 
     const wire_messages = parsed.value.object.get("messages").?.array.items;
     try testing.expectEqual(@as(usize, 1), wire_messages.len);
-    // There is no `tool` role on this wire: the whole turn is a user turn.
     try testing.expectEqualStrings("user", wire_messages[0].object.get("role").?.string);
 
     const blocks = wire_messages[0].object.get("content").?.array.items;
@@ -1172,12 +826,6 @@ test "a tool's image rides after its result, in the same user turn" {
     try testing.expectEqualStrings("image/png", source.get("media_type").?.string);
     try testing.expectEqualStrings(data, source.get("data").?.string);
 
-    // **And the order is imposed here, not merely copied from the neutral
-    // message.** A foreign history can hold the picture first, and this wire
-    // still refuses a `tool_result` block that comes after anything else, so
-    // the result has to be moved back in front of it. Chock's own loop always
-    // builds the pair the other way round, which is why a test that only used
-    // that order would pass whether this reordering worked or not.
     const reversed = [_]message.ContentPart{
         .{ .image = .{ .call_id = "toolu_1", .media_type = "image/png", .data = data } },
         .{ .tool_result = .{ .call_id = "toolu_1", .output = "read it", .is_error = false } },
@@ -1200,9 +848,6 @@ test "a tool's image rides after its result, in the same user turn" {
 }
 
 test "an image block read off this wire keeps its media type and its bytes" {
-    // A history some other client wrote, replayed through this reader. The
-    // block has to survive as an image and not fall into `unknown`, or a
-    // replay would send a picture the model can no longer see.
     const allocator = testing.allocator;
     const body =
         \\{"role":"user","content":[{"type":"image","source":
@@ -1221,8 +866,6 @@ test "an image block read off this wire keeps its media type and its bytes" {
 }
 
 test "max_tokens is always on the wire, because this provider requires it" {
-    // Difference 2. openai.zig omits it entirely, and a request without it is
-    // refused here.
     const allocator = testing.allocator;
     const content = [_]message.ContentPart{.{ .text = "hi" }};
     const messages = [_]message.Message{.{ .role = .user, .content = &content }};
@@ -1246,8 +889,6 @@ test "max_tokens is always on the wire, because this provider requires it" {
 }
 
 test "a tool result is a content block in a user message, and no message carries a tool role" {
-    // Difference 3, and the one most likely to be got wrong: the neutral type
-    // has a `tool` role and the OpenAI wire has one, and this wire has none.
     const allocator = testing.allocator;
     const content = [_]message.ContentPart{
         .{ .tool_result = .{ .call_id = "toolu_1", .output = "FILE BODY", .is_error = false } },
@@ -1270,14 +911,10 @@ test "a tool result is a content block in a user message, and no message carries
     try testing.expectEqualStrings("toolu_1", blocks.items[0].object.get("tool_use_id").?.string);
     try testing.expectEqualStrings("FILE BODY", blocks.items[0].object.get("content").?.string);
 
-    // Not "the role happened to be user this time": no message anywhere in
-    // the body names the role this wire does not have.
     try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\"") == null);
 }
 
 test "a tool result block comes before the text of the same user turn" {
-    // The provider refuses a user turn whose tool_result blocks are not
-    // first, so the order here is a wire rule and not a preference.
     const allocator = testing.allocator;
     const content = [_]message.ContentPart{
         .{ .text = "and here is what I found" },
@@ -1297,10 +934,6 @@ test "a tool result block comes before the text of the same user turn" {
 }
 
 test "a thinking block returns with the same signature it arrived with" {
-    // Difference 4, and the reason this adapter exists rather than a
-    // translation through the OpenAI shape. A signature that changes is
-    // worthless, so this is byte for byte, through the public functions a
-    // caller actually uses.
     const allocator = testing.allocator;
     const signature = "EqoBCkYIARgCIkAy9f3KX+j2rAStub8vQ==";
     const content = [_]message.ContentPart{
@@ -1317,8 +950,6 @@ test "a thinking block returns with the same signature it arrived with" {
     try testing.expectEqualStrings("thinking", block.object.get("type").?.string);
     try testing.expectEqualStrings(signature, block.object.get("signature").?.string);
 
-    // And back the other way: a reply that carries a thinking block gives the
-    // same signature to the neutral type.
     const reply_text =
         \\{"role":"assistant","content":[
         \\{"type":"thinking","thinking":"considering the approach","signature":"EqoBCkYIARgCIkAy9f3KX+j2rAStub8vQ=="}
@@ -1334,9 +965,6 @@ test "a thinking block returns with the same signature it arrived with" {
 }
 
 test "a tool call's arguments nest as an object here and come back as JSON text" {
-    // The OpenAI wire carries arguments as a JSON string; this one nests
-    // them. A port that writes the string straight into `input` sends a
-    // string where an object belongs.
     const allocator = testing.allocator;
     const content = [_]message.ContentPart{
         .{ .tool_use = .{
@@ -1354,7 +982,6 @@ test "a tool call's arguments nest as an object here and come back as JSON text"
     defer parsed.deinit();
     const block = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.array.items[0];
     try testing.expectEqualStrings("tool_use", block.object.get("type").?.string);
-    // An object, not a string: this is the assertion a naive port fails.
     try testing.expectEqual(std.json.Value.object, std.meta.activeTag(block.object.get("input").?));
     try testing.expectEqualStrings("README.md", block.object.get("input").?.object.get("path").?.string);
 
@@ -1366,9 +993,6 @@ test "a tool call's arguments nest as an object here and come back as JSON text"
     const reply = try parseResponse(allocator, reply_text);
     defer reply.deinit();
     const neutral = try toMessage(allocator, reply.value);
-    // The slice last, the string it points into first: a defer runs in
-    // reverse, so freeing `content` before reading a field of it would read
-    // memory this test just returned.
     defer allocator.free(neutral.content);
     defer allocator.free(neutral.content[0].tool_use.arguments);
     try testing.expectEqualStrings("toolu_1", neutral.content[0].tool_use.call_id);
@@ -1395,9 +1019,6 @@ test "arguments that are not valid JSON become an empty object rather than malfo
 }
 
 test "the request never holds the API key" {
-    // The body is what a session log holds, and chockd re-serves that log.
-    // The comptime block above proves Request has nowhere to put a key; this
-    // proves the text that leaves this file has no room for one either.
     const allocator = testing.allocator;
     const content = [_]message.ContentPart{.{ .text = "hello" }};
     const messages = [_]message.Message{.{ .role = .user, .content = &content }};
@@ -1441,8 +1062,6 @@ test "a content block type this reader does not know survives the round trip who
     try testing.expect(std.mem.indexOf(u8, body, "srvtoolu_1") != null);
 }
 
-/// Feed one event body to `decoder` and give back the piece. Only the tests
-/// below use this.
 fn feedEvent(decoder: *Decoder, json_text: []const u8) !Piece {
     return decoder.feed(json_text);
 }
@@ -1494,9 +1113,6 @@ test "the pieces of a streamed reply come out as text, reasoning, a signature, a
 }
 
 test "a tool call's partial JSON assembles through the one assembler both adapters share" {
-    // sse.ToolCallAssembler is not re-implemented here: the fragments this
-    // decoder produces are the same neutral shape the OpenAI path produces,
-    // which is what lets one assembler serve both wires.
     const allocator = testing.allocator;
     var decoder = Decoder.init(allocator);
     defer decoder.deinit();
@@ -1528,10 +1144,7 @@ test "a tool call's partial JSON assembles through the one assembler both adapte
 }
 
 test "cumulative message_delta usage gives the last value and not the sum" {
-    // The trap this whole decoder is careful about. The counts rise, so a
-    // parser that adds them reports 1 + 40 + 90 + 150 = 281 output tokens
-    // where the truth is 150. Rising counts are what tells the two apart: a
-    // single message_delta cannot.
+    // The counts in message_delta events are cumulative, not incremental: summing them instead of keeping the latest value overcounts every turn with more than one delta.
     const allocator = testing.allocator;
     var decoder = Decoder.init(allocator);
     defer decoder.deinit();
@@ -1553,25 +1166,16 @@ test "cumulative message_delta usage gives the last value and not the sum" {
     for (rising) |body| _ = try feedEvent(&decoder, body);
 
     try testing.expectEqual(@as(u64, 150), decoder.usage.output_tokens);
-    // The input count came from message_start and no message_delta repeated
-    // it, so it must still be there: replacing a field the event did not
-    // carry would zero it.
     try testing.expectEqual(@as(u64, 1200), decoder.usage.input_tokens);
     try testing.expectEqual(@as(u64, 800), decoder.usage.cache_read_input_tokens);
     try testing.expectEqualStrings("tool_use", decoder.stopReason());
     try testing.expect(decoder.saw_usage);
-    // 1200 + 150 + 800, once each. A summing parser reports more.
     try testing.expectEqual(@as(u64, 2150), decoder.usage.totalTokens());
-    // A stop reason that is not a refusal comes with `stop_details: null`, so
-    // there is nothing to keep beside the word. See `StopDetails`.
     try testing.expectEqualStrings("", decoder.stopDetails().category);
     try testing.expectEqualStrings("", decoder.stopDetails().explanation);
 }
 
 test "a refusal keeps the category and the explanation the wire sent with it" {
-    // The whole reason `stop_details` is read. "It stopped because of refusal"
-    // says nothing a person can act on, and the sentence that does say
-    // something arrives in the same event.
     const allocator = testing.allocator;
     var decoder = Decoder.init(allocator);
     defer decoder.deinit();
@@ -1589,9 +1193,6 @@ test "a refusal keeps the category and the explanation the wire sent with it" {
 }
 
 test "a refusal with both details null keeps neither, and invents neither" {
-    // **A real shape, not a defensive one.** Both fields are nullable even on
-    // a refusal, and a reader that filled the gap here would put an invented
-    // reason in the log of the one turn nobody can explain any other way.
     const allocator = testing.allocator;
     var decoder = Decoder.init(allocator);
     defer decoder.deinit();
@@ -1620,15 +1221,10 @@ test "a refusal with one detail null keeps the other one" {
         \\{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":null}},"usage":{"output_tokens":4}}
     );
     try testing.expectEqualStrings("cyber", decoder.stopDetails().category);
-    // **Cleared with the reason it belonged to.** The explanation above
-    // described the first refusal, and reporting it beside the second one
-    // would attach a reason to a word that never carried it.
     try testing.expectEqualStrings("", decoder.stopDetails().explanation);
 }
 
 test "an explanation longer than the bound is cut, and never dropped" {
-    // A cut sentence still says why. An empty one says nothing at all, which
-    // is the fault this reader exists to fix. See `max_stop_explanation`.
     const allocator = testing.allocator;
     var decoder = Decoder.init(allocator);
     defer decoder.deinit();
@@ -1667,9 +1263,6 @@ test "a provider that reports no usage leaves saw_usage false, so zero is not re
 }
 
 test "an error event inside the stream is a stream error and not another delta" {
-    // The HTTP status was 200 and stays 200. A reader that only checks the
-    // status reports a short, successful answer for a request the provider
-    // refused.
     const allocator = testing.allocator;
     var decoder = Decoder.init(allocator);
     defer decoder.deinit();

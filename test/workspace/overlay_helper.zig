@@ -1,35 +1,6 @@
-//! Enters a user and mount namespace, mounts a real overlay, and performs
-//! file operations against the merged view. A rootless overlay mount needs its
-//! own mount namespace, and entering a user namespace needs a single threaded
-//! caller, so this cannot run inside the zig test binary. build.zig gives this
-//! binary's path to the test that starts it.
-//!
-//! Every file operation past the mount uses a raw syscall, because `std.Io.Dir`
-//! needs a threaded `Io` this program cannot carry.
-//!
-//! Command line: <project> <upper> <work> <merged> [op ...]
-//!
-//! Each op is one of, split on ':':
-//!   W:<relpath>:<content>   write <content> to merged/<relpath>, replacing it
-//!   D:<relpath>              delete merged/<relpath>
-//!   L:<relpath>:<target>    make merged/<relpath> a symbolic link to <target>
-//!   M:<relpath>              make merged/<relpath> a directory
-//!   F:<relpath>              make merged/<relpath> a named pipe
-//!   R:<relpath>              remove the (already empty) directory merged/<relpath>
-//!
-//! `<content>` and `<target>` run to the end of the op string, so they may
-//! hold a further ':' of their own. Only `<relpath>` may not.
-//!
-//! Exit codes:
-//!   0 - every step succeeded.
-//!   1 - too few arguments.
-//!   3 - this kernel does not support a rootless overlay mount.
-//!   4 - the overlay mount failed for another reason.
-//!   5 - a component of the overlay's own paths could not be read.
-//!   6 - an op failed, or named an operation this program does not know.
-//!  63 - this machine would not give a user namespace, so nothing ran. Not a
-//!       pass and not a failure: the caller skips and says why. See
-//!       `namespace.nothing_measured_exit_status`.
+//! Enters a user and mount namespace, mounts a real overlay, and performs file
+//! operations against the merged view. A separate binary, since entering a user
+//! namespace needs a single threaded caller, unlike the zig test binary.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -48,7 +19,6 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return 1;
     }
 
-    // Borrowed from argv and never freed. `Overlay.mounts` only reads them.
     const ov = Overlay{
         .project = @constCast(args[1]),
         .upper = @constCast(args[2]),
@@ -56,8 +26,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .merged = @constCast(args[4]),
     };
 
-    // Nothing is printed here. `build.zig`'s `failOnTestStderr` fails the
-    // build on any byte a test binary writes to standard error.
+    // `build.zig`'s `failOnTestStderr` fails the build on any byte a test binary writes to standard error.
     sandbox.namespace.enter(.{}, null) catch {
         return sandbox.namespace.nothing_measured_exit_status;
     };
@@ -115,7 +84,6 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
 const OpError = error{ UnknownOp, MissingField, OutOfMemory, OpFailed };
 
-/// Apply one op string, documented at the top of this file, against `merged`.
 fn applyOp(allocator: std.mem.Allocator, merged: []const u8, op: []const u8) OpError!void {
     var parts = std.mem.splitScalar(u8, op, ':');
     const kind = parts.next() orelse return error.UnknownOp;

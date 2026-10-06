@@ -1,5 +1,4 @@
-//! The Darwin driver for `../overlay.zig`, for a project that has no git of its
-//! own. Not a port of `linux/overlay.zig`: this clones the project with
+//! The Darwin driver for `../overlay.zig`: clones the project with
 //! `clonefile(2)` and compares the clone against it entry by entry.
 
 const std = @import("std");
@@ -24,8 +23,7 @@ extern "c" fn mkfifo(path: [*:0]const u8, mode: c_uint) c_int;
 
 extern "c" fn lstat(path: [*:0]const u8, out: *DeviceStat) c_int;
 
-/// Darwin's own `struct stat`, with only the first field named. `st_dev` sits
-/// first, and the rest is never read.
+/// Darwin's own `struct stat`, with only `st_dev` named; the rest is never read.
 const DeviceStat = extern struct {
     device: i32,
     rest: [260]u8 align(8),
@@ -33,14 +31,8 @@ const DeviceStat = extern struct {
 
 const compare_chunk_bytes: usize = 64 * 1024;
 
-/// Clone `project` into a fresh directory under `scratch`, and describe the
-/// result the way `../overlay.zig` expects.
-/// `clonefile` refuses two ways. The two paths must be on the same volume, and
-/// another volume gives `EXDEV`, reported as `error.ScratchOnAnotherVolume`
-/// rather than moving the scratch directory into the user's project. The
-/// destination must not exist, and `EEXIST` becomes
-/// `error.ScratchAlreadyExists`. A volume with no copy on write clone at all,
-/// such as HFS+, gives `ENOTSUP`.
+/// `clonefile` refuses a different volume, an existing destination, and a
+/// filesystem with no copy-on-write clone such as HFS+.
 pub fn create(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -58,8 +50,7 @@ pub fn create(
     const merged = std.fs.path.join(allocator, &.{ scratch, "merged" }) catch return error.OutOfMemory;
     errdefer allocator.free(merged);
 
-    // The clone comes first, and nothing makes `upper` beforehand: clonefile
-    // refuses a destination that already exists.
+    // clonefile refuses a destination that already exists, so nothing makes `upper` first.
     try cloneTree(allocator, project_owned, upper, diag);
     errdefer removeScratchTree(io, upper);
 
@@ -70,8 +61,7 @@ pub fn create(
     return .{ .project = project_owned, .upper = upper, .work = work, .merged = merged };
 }
 
-/// Rebuild the scratch layout of an overlay already on disk. Copies nothing, so
-/// a failure leaves every file where it was.
+/// Rebuilds the scratch layout of an overlay already on disk. Copies nothing.
 pub fn adopt(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -141,15 +131,8 @@ const PendingDir = struct {
     in_project: bool,
 };
 
-/// Compare the clone against the project and report every path that changed.
-/// Two passes: the clone's own entries, then everything the project holds that
-/// the clone no longer does.
-/// A timestamp cannot recover the changed set. `clonefile` copies each file's
-/// `mtime` from the original and gives every cloned file a fresh `ctime`, so
-/// this reads content where the two agree on size.
-///
-/// One deliberate difference from `linux/overlay.zig` follows: a file the agent
-/// changed and then changed back is reported here as unchanged.
+/// `clonefile` copies each file's `mtime`, so a timestamp cannot tell
+/// changed from unchanged; this reads content instead where sizes agree.
 pub fn changedFiles(
     self: Overlay,
     allocator: std.mem.Allocator,
@@ -221,8 +204,7 @@ pub fn changedFiles(
                 return error.OutOfMemory;
             };
 
-            // The kind comes from a stat of the clone, never from the
-            // directory listing's own d_type.
+            // The kind comes from a stat of the clone, never from d_type.
             const clone_stat = (try statNoFollow(io, clone_dir, name, diag)) orelse continue;
             const project_stat = if (project_dir) |d| try statNoFollow(io, d, name, diag) else null;
 
@@ -274,8 +256,7 @@ pub fn changedFiles(
             }
         }
 
-        // The second pass: everything the project holds here that the clone
-        // does not.
+        // The second pass: everything the project holds here that the clone does not.
         if (project_dir) |d| {
             var project_it = d.iterate();
             while (true) {
@@ -347,8 +328,6 @@ fn sameLinkTarget(
     return std.mem.eql(u8, left_buffer[0..left_len], right_buffer[0..right_len]);
 }
 
-/// Whether the two files of the same name hold the same bytes. Both are read,
-/// because a timestamp cannot answer this after a clone.
 fn sameContent(
     io: std.Io,
     left_dir: std.Io.Dir,
@@ -439,8 +418,7 @@ fn recordSkip(
     skipped.append(allocator, .{ .path = path_copy, .reason = reason_copy }) catch return error.OutOfMemory;
 }
 
-/// Find every directory under `project` that is itself the mount point of a
-/// separate filesystem.
+/// Every directory under `project` that is itself the mount point of a separate filesystem.
 pub fn nestedMounts(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -520,8 +498,6 @@ fn deviceOf(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?Di
     return stat.device;
 }
 
-/// A project and a scratch directory side by side under one `tmpDir`, so both
-/// are on the same volume.
 const TestProject = struct {
     allocator: std.mem.Allocator,
     root_path: []u8,
@@ -645,7 +621,6 @@ test "a file the agent changed is reported as modified" {
     try std.testing.expectEqual(@as(usize, 1), report.changed.len);
     try std.testing.expectEqual(ChangeKind.modified, changeFor(report, "changed.txt").?);
 
-    // The project's own copy is untouched: the clone is where the write went.
     const original = try readUnder(allocator, project.root_path, "changed.txt");
     defer allocator.free(original);
     try std.testing.expectEqualStrings("before\n", original);
@@ -672,8 +647,7 @@ test "a file the agent deleted is reported as deleted" {
 
 test "a file nobody touched is reported as unchanged, though clonefile copies its timestamps" {
     if (builtin.os.tag != .macos) return;
-    // The case a timestamp comparison gets wrong. clonefile copies each file's
-    // mtime from the original.
+    // clonefile copies each file's mtime, which a timestamp comparison would get wrong.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -718,8 +692,6 @@ test "a file changed and then changed back to its own bytes is reported as uncha
 
 test "a file of the same length with different bytes is still reported as modified" {
     if (builtin.os.tag != .macos) return;
-    // The size check is a shortcut for files of different lengths, never the
-    // whole answer.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -792,7 +764,6 @@ test "a symbolic link the agent made is reported as added, and the project keeps
 
     var ov = try create(allocator, std.testing.io, project.root_path, project.scratch_path, null);
     defer ov.deinit(allocator);
-    // A relative target, so the link means the same thing in the clone.
     var clone_dir = try std.Io.Dir.cwd().openDir(std.testing.io, ov.upper, .{});
     defer clone_dir.close(std.testing.io);
     try clone_dir.symLink(std.testing.io, "target.txt", "link", .{});
@@ -883,8 +854,7 @@ test "create refuses a scratch directory that already holds a clone, and names t
 
 test "create refuses a scratch directory on another volume, and names the volume problem" {
     if (builtin.os.tag != .macos) return;
-    // clonefile cannot clone across a volume. This needs a second writable
-    // volume, so it is skipped where there is none.
+    // Needs a second writable volume; skipped where there is none.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -1,19 +1,6 @@
-//! A real language server in a real sandbox, and the harness half that drives
-//! it. One program, two operations, so both ends of the pipe are the same binary
-//! and the test needs nothing installed on the machine.
-//!
-//! The `serve` operation is not a real `zls`. It answers exactly what the driver
-//! expects, because it was written to, so it cannot catch a real server that does
-//! something reasonable the driver did not anticipate.
-//! `test/core/lsp_zls_probe.zig` covers that class.
-//!
-//! Exit codes:
-//!   0 - the operation did what the test expects.
-//!   1 - it ran and the answer was wrong. The reason is on standard error.
-//!   2 - the operation name on the command line is unknown.
-//!   3 - the setup itself failed before anything was proven.
-//!  63 - this machine would not give the sandbox its namespaces, so the caller
-//!       skips. See `namespace.nothing_measured_exit_status`.
+//! A real language server in a real sandbox, and the harness that drives it.
+//! One program, two operations, so both ends of the pipe are the same binary.
+//! `serve` is not a real zls. It only answers what the driver expects.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -23,14 +10,12 @@ const chock_core = @import("chock-core");
 /// No character in it needs JSON escaping, so `serve` needs no decoder.
 const source_text = "const x = 1";
 
-/// A real server resolves the path, so the driver builds its URI from the
-/// sandbox side of the mount.
+/// The driver builds its URI from the sandbox side of the mount.
 const sandbox_project = "/srv/project";
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     return runOperation(init) catch |err| {
-        // Nothing is printed here. `build.zig` fails the build on a byte a test
-        // binary writes to standard error, and these descriptors are its own.
+        // Nothing is printed: build.zig fails the build on a byte a test binary writes to stderr.
         if (err == error.NamespaceFailed) return sandbox.namespace.nothing_measured_exit_status;
         return err;
     };
@@ -60,8 +45,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     return 2;
 }
 
-/// Raw reads and writes, no `std.Io` and no JSON parser. This runs inside the
-/// sandbox, so a failure here has to be the sandbox or the pipe.
+/// Raw reads and writes, no `std.Io` and no JSON parser.
 fn serve() u8 {
     var inbox: [64 * 1024]u8 = undefined;
     var filled: usize = 0;
@@ -174,10 +158,7 @@ fn writeFramed(body: []const u8) bool {
 
 /// `work` is the host side of the workspace, which nothing inside ever sees.
 fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8) !u8 {
-    // The session carries on when a server does not start, so a machine with no
-    // namespace would otherwise read as a server that said nothing. Asked in a
-    // child, which is the only way to ask without spending this process's one
-    // namespace.
+    // Asked in a child, the only way to ask without spending this process's own namespace.
     if (!sandbox.namespace.probeAvailability().available()) {
         return sandbox.namespace.nothing_measured_exit_status;
     }
@@ -208,8 +189,7 @@ fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8) !u8 {
 
     var env = std.process.Environ.Map.init(arena);
 
-    // `/probe` holds a slash, so `prepare` reads it as a program already inside
-    // the sandbox and binds nothing for it. The two extras below put it there.
+    // `/probe` holds a slash, so `prepare` reads it as already inside the sandbox.
     const prepared = try chock_core.tools.prepare(
         arena,
         io,

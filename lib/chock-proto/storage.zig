@@ -33,28 +33,24 @@ pub const Replay = struct {
         self.vtable.deinit(self.ptr);
     }
 
-    /// A torn tail and a clean end of log both give null from `next`. Only this
-    /// tells them apart, and only for the most recent call.
+    /// Torn tail and clean end both give null from `next`; only this tells them apart, for the last call.
     pub fn truncated(self: *Replay) bool {
         return self.vtable.truncated(self.ptr);
     }
 
-    /// A verifier hashes these bytes rather than encoding the parsed envelope
-    /// again. A fresh encoding makes a sound log read as tampered with.
+    /// A verifier hashes these bytes; re-encoding the envelope would read a sound log as tampered.
     pub fn line(self: *Replay) []const u8 {
         return self.vtable.line(self.ptr);
     }
 
-    /// Read this before a `next`, to name the line that call is about to read.
-    /// A failed `next` has already moved past the line it choked on.
+    /// Read this before a `next`: a failed `next` has already moved past the
+    /// line it choked on.
     pub fn at(self: *Replay) u64 {
         return self.vtable.at(self.ptr);
     }
 };
 
-/// This type is not `pub`, but Zig still lets a caller reach the same unnamed
-/// type through reflection and build one. `generation` refuses such a handle at
-/// run time: it must still match the backend's own lock counter.
+/// Not `pub`, but Zig lets a caller reach this unnamed type via reflection; `generation` refuses a forged handle.
 const Locked = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -111,8 +107,7 @@ pub const Storage = struct {
         return self.vtable.headerDigest(self.ptr, io);
     }
 
-    /// A copy of a log must hold the very header bytes the original holds, or a
-    /// verifier at the far end compares its own spelling against the writer's.
+    /// A copy of a log must hold the very header bytes the original holds.
     pub fn headerLine(
         self: Storage,
         io: std.Io,
@@ -122,8 +117,7 @@ pub const Storage = struct {
     }
 };
 
-/// A torn tail, a line that will not decode, and a log with no chain at all are
-/// answers, not errors. Only a fault that stopped the reading is an error.
+/// A torn tail, bad JSON, or no chain are answers, not errors; only a fault that stops reading is one.
 pub fn verify(store: Storage, allocator: std.mem.Allocator, io: std.Io) StorageError!chain.Report {
     var reader = try store.verifier(io);
     var replay = try store.replay(allocator, io, 0);
@@ -160,8 +154,7 @@ pub const JsonLines = struct {
 
     fn replayFn(ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io, offset: u64) StorageError!Replay {
         const self: *JsonLines = @ptrCast(@alignCast(ptr));
-        // A stable address distinct from `self`: more than one replay can run
-        // at once against the same log.
+        // Stable, distinct from `self`, so more than one replay can run against the log.
         const inner = try allocator.create(log.Replay);
         errdefer allocator.destroy(inner);
         inner.* = try self.log.replayFrom(allocator, io, offset);
@@ -211,8 +204,7 @@ pub const JsonLines = struct {
 
     fn lockFn(ptr: *anyopaque, io: std.Io) StorageError!Locked {
         const self: *JsonLines = @ptrCast(@alignCast(ptr));
-        // The kernel lock is re-entrant on one open file description, so it
-        // cannot tell a genuine second owner from this backend locking twice.
+        // The kernel lock is re-entrant per open file description, so it cannot catch a double lock.
         if (self.held) return error.Busy;
         _ = try self.log.lock(io);
         self.held = true;
@@ -264,16 +256,14 @@ const json_lines_replay_vtable = Replay.VTable{
     .at = JsonLines.replayAtFn,
 };
 
-/// Keeps every event in memory. It mirrors `log.Log`'s wire shape, but not its
-/// durability or its crash recovery: no sync, and no torn tail to find.
+/// Mirrors `log.Log`'s wire shape, not its durability: no sync, no torn tail.
 pub const Memory = struct {
     allocator: std.mem.Allocator,
     session: []const u8,
     bytes: std.ArrayList(u8) = .empty,
     held: bool = false,
     lock_generation: u64 = 0,
-    /// `std.ArrayList.deinit` leaves the list undefined and not empty, so a
-    /// second `deinit` without this guard frees the same allocation twice.
+    /// `std.ArrayList.deinit` leaves the list undefined; without this guard, a second `deinit` double-frees.
     deinited: bool = false,
 
     const header = "{\"chock_log\":1}\n";
@@ -367,8 +357,7 @@ pub const Memory = struct {
     ) StorageError![]const u8 {
         _ = io;
         _ = ptr;
-        // Copied and not borrowed from the literal, so a caller cannot rely on
-        // the answer outliving its buffer.
+        // Copied into the buffer, not borrowed from the literal, so it is only as long-lived as the buffer.
         const line = header[0 .. header.len - 1];
         @memcpy(buffer[0..line.len], line);
         return buffer[0..line.len];
@@ -445,7 +434,7 @@ const MemoryReplay = struct {
         self.allocator.destroy(self);
     }
 
-    /// Always false. An in memory buffer has no crash to leave a tear behind.
+    /// Always false: an in-memory buffer has no crash to tear.
     fn truncatedFn(ptr: *anyopaque) bool {
         _ = ptr;
         return false;
@@ -575,8 +564,7 @@ test "regression: a caller using only the Storage interface can tell a torn tail
 }
 
 test "regression: a Locked handle whose generation does not match the backend's own is refused, on both backends" {
-    // Zig lets a caller build a value of a type it cannot name, so a forged
-    // handle can reach `append` with no lock ever taken.
+    // Zig lets a caller build an unnamed type's value, so a forged handle could reach `append` with no lock taken.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -842,7 +830,6 @@ test "a log edited in the middle and torn at the end is reported as edited, not 
 }
 
 test "a log with no chain at all is read rather than refused" {
-    // `unchained` is not a pass: nothing can say whether such a log was edited.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -876,8 +863,7 @@ test "a log with no chain at all is read rather than refused" {
 }
 
 test "an old log a new build carried on verifies over the part that is chained" {
-    // The first chained event's `prev` is the hash of the unchained line in
-    // front of it, because `append` reads the file and does not remember.
+    // The first chained event's `prev` hashes the unchained line before it, since `append` reads the file rather than remembering.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -924,8 +910,7 @@ test "an old log a new build carried on verifies over the part that is chained" 
 }
 
 test "a compacted session still verifies, and the log still holds every event the fold covered" {
-    // A chain cannot survive an event taken out of the middle of the file. A
-    // compaction that rewrote the file would fail the second half of this test.
+    // A compaction that rewrote the file would fail the second half of this test.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -999,8 +984,7 @@ test "a compacted session still verifies, and the log still holds every event th
 }
 
 test "the chain is over the bytes on disk, never over a fresh encoding of what was parsed" {
-    // A verifier that encoded each parsed envelope again would call a sound log
-    // tampered with. No test over Chock's own writer can see that.
+    // No test over Chock's own writer can see a re-encoding bug; this writes the wire bytes by hand.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1065,8 +1049,7 @@ test "a complete line that will not decode is its own answer, and never a tear" 
 }
 
 test "a log nothing can open is never reported as verified" {
-    // A `Report` nobody could fill in carries `unreadable`, so a caller that
-    // forgot to check the error does not get a pass.
+    // A `Report` nobody could fill in carries `unreadable`, never a pass.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 

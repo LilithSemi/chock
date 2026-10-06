@@ -11,26 +11,13 @@ pub const file_name = "chock.zon";
 
 pub const block_name = "deny_read";
 
-/// Every entry costs a `statx` and a mount inside every tool call, so this is a
-/// real bound. A project that wants more is asking for a directory, which this
-/// design refuses on purpose.
+/// Each entry costs a `statx` and a mount per tool call.
 pub const max_paths: usize = 64;
 
-/// Not the cap the other two readers of this file use, which is `1 << 20`, so a
-/// `chock.zon` between the two is refused here and accepted there. This reader
-/// runs first, and widening a bound on a file the project supplies is a decision
-/// of its own.
+/// Smaller than the `1 << 20` the other readers of `chock.zon` use, since this reader runs first.
 pub const max_file_bytes: usize = 64 * 1024;
 
-/// A `chock.zon` this file cannot read is refused and never read as an empty
-/// block, and that takes two errors and not one: the owner once wrote a policy
-/// rule with a stray comma and was told `DenyBlockNotValid` when they had
-/// written no `deny_read` block at all. This file has to parse the whole file
-/// before it can find the block, so a file level fault must not be blamed on
-/// the block.
-///
-/// The offending entry is not in any of these, because `diagnostic.zig` owns no
-/// memory and has no slot to put it in. Each path error names the rule instead.
+/// `ChockZonNotValid` (file level) is distinct from `DenyBlockNotValid` (block level).
 pub const Error = error{
     OutOfMemory,
     ChockZonNotValid,
@@ -45,16 +32,8 @@ pub const Error = error{
     ReadFailed,
 };
 
-/// Read the `deny_read` block and give back one absolute path per entry, joined
-/// onto `project_root`, which is where a denied file lands inside the sandbox as
-/// well as on the host.
-///
-/// An empty slice for a project with no `chock.zon` and for one whose
-/// `chock.zon` names no `deny_read`. Those two are the same answer on purpose.
-///
-/// A path this cannot find on the host is accepted, and is the case
-/// `chock-sandbox`'s own `Mount.Deny` covers by making an empty file to bind
-/// over. The caller owns the returned slice and every string in it.
+/// Empty for a project with no `chock.zon` or none naming `deny_read`. A
+/// path need not exist on the host.
 pub fn load(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -76,9 +55,7 @@ pub fn loadFor(
     return joinOnto(gpa, entries, sandbox_root);
 }
 
-/// Split from the join so a caller can refuse a bad block before it builds
-/// anything: `Workspace.openWithLayout` cannot know where the sandbox will see
-/// the project until the backing exists.
+/// Split from the join so a caller can refuse a bad block before it builds anything.
 pub fn loadEntries(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -158,9 +135,7 @@ pub fn parseEntries(
     project_root: []const u8,
     diag: ?*?Diagnostic,
 ) Error![]const []u8 {
-    // `trees_owned` is the handover flag. The type check below can be given
-    // the two trees, and a `std.zon.parse.Diagnostics` that holds them frees
-    // them itself. Only one of the two may free them.
+    // trees_owned tracks whether this function or the diagnostics frees ast and zoir.
     var trees_owned = true;
     var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -239,17 +214,14 @@ pub fn check(entry: []const u8) Error!void {
     var last: []const u8 = "";
     while (parts.next()) |part| {
         if (std.mem.eql(u8, part, ".")) continue;
-        // A `..` anywhere leaves, whatever came before it: `a/../../b` climbs
-        // out as surely as `../b` does.
+        // A `..` anywhere leaves the project, even mid path like `a/../../b`.
         if (std.mem.eql(u8, part, "..")) return error.DenyPathLeavesProject;
         named += 1;
         last = part;
     }
-    // "." and "./" and "" all name the project root, which is a directory.
     if (named == 0) return error.DenyPathIsDirectory;
 
-    // The project's own policy file and only that one. A `chock.zon` in a
-    // subdirectory belongs to some nested project and is an ordinary file here.
+    // Only the project's own chock.zon; one in a subdirectory belongs to a nested project.
     if (named == 1 and std.mem.eql(u8, last, file_name)) return error.DenyPathIsChockZon;
 }
 
@@ -265,9 +237,6 @@ fn findBlockNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) Error!?std.zig.Zoir.No
             return null;
         },
         .empty_literal => return null,
-        // A fault of the file and not of this block. A top level that is a
-        // tuple holds no block of any name. Zoir reports no error for this, so
-        // the words are this file's own.
         else => {
             diagnostic.note(diag, .{
                 .chock_zon_not_valid = .ofText("the file must hold a struct literal"),
@@ -282,10 +251,7 @@ fn saidOf(ast: std.zig.Ast, zoir: std.zig.Zoir) Diagnostic.Said {
     return .of(&zon_diag);
 }
 
-/// Whether `absolute_path` is a directory on the host today. False for a path
-/// that is not there, and false for any other failure: this only improves the
-/// message, and `applyDenyMounts` refuses a directory again with the sandbox in
-/// front of it.
+/// False for a missing path or any other failure; this only improves the error message.
 fn isDirectory(io: std.Io, absolute_path: []const u8) Error!bool {
     const stat = std.Io.Dir.cwd().statFile(io, absolute_path, .{}) catch return false;
     return stat.kind == .directory;
@@ -491,8 +457,6 @@ test "every refused shape of path has its own error" {
 }
 
 test "a directory in the project is refused by name" {
-    // A directory cannot be covered with a file, and covering it with an empty
-    // directory would teach the model that the project keeps nothing there.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -513,7 +477,6 @@ test "a directory in the project is refused by name" {
 }
 
 test "a path the project does not hold yet is accepted" {
-    // A `.env` in `.gitignore` is not in a checkout at all.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -545,8 +508,6 @@ test "a list longer than max_paths is refused" {
 }
 
 test "a refusal in the middle of a list frees every path already built" {
-    // The testing allocator is the check: a refusal on the second entry must
-    // free the first.
     try testing.expectError(error.DenyPathNotRelative, parse(
         testing.allocator,
         testing.io,

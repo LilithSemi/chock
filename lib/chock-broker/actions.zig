@@ -1,5 +1,5 @@
 //! The eight acts the broker can do, and the one way to ask for one. An
-//! approval lets the broker do one act. It does not widen the sandbox.
+//! approval does one act; it does not widen the sandbox.
 
 const std = @import("std");
 const chock_policy = @import("chock-policy");
@@ -145,9 +145,7 @@ pub const WorkspaceApply = struct {
     diff: []const u8,
     /// No default: `chock_policy.apply.Settings` decides where work lands.
     integration: integrate.Plan,
-    /// The `workspace` block's copies which land on the user's own files when
-    /// this applies. A line of this prompt and never a second question: the
-    /// answer given here is the answer to both.
+    /// The `workspace` block's copies onto the user's files when this applies; one answer covers both.
     copies: []const []const u8 = &.{},
 
     pub fn describing(
@@ -164,16 +162,14 @@ pub const WorkspaceApply = struct {
         },
         diag: ?*?Diagnostic,
     ) DescribeError!WorkspaceApply {
-        // Read from git: `.git/objects` is wrong for a worktree, a bare
-        // repository, and a separate git directory.
+        // Read from git: `.git/objects` is wrong for a worktree or bare repo.
         const project_object_store = try describeGit(arena, io, ctx.env, params.repository, &.{
             "rev-parse", "--path-format=absolute", "--git-path", "objects",
         }, diag);
 
         const old_id = readRef(arena, io, ctx.env, params.repository, params.ref) catch |err| return err;
 
-        // Before the object list is read. A merge, a rebase or a squash builds
-        // new commits in the scratch store, and the list below must hold them.
+        // Before the object list: a merge/rebase/squash builds new commits the list must hold.
         const integration = try integrate.planning(arena, io, ctx.env, .{
             .repository = params.repository,
             .scratch_object_store = params.scratch_object_store,
@@ -255,8 +251,7 @@ fn readRef(
     };
 }
 
-/// A pack file refuses the whole description. Only `git gc` writes one, and
-/// Chock never runs it, so the loose half is less than the whole of the work.
+/// A pack file refuses the description; only `git gc` writes one, and Chock never runs it.
 fn looseObjects(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -306,8 +301,7 @@ fn lessThanBytes(_: void, a: []const u8, b: []const u8) bool {
 }
 
 fn objectIdOfPath(arena: std.mem.Allocator, entry_path: []const u8) (std.mem.Allocator.Error || error{NotAnObject})![]const u8 {
-    // Two characters, a separator, and the rest of the id: 41 for a SHA-1
-    // name and 65 for a SHA-256 one.
+    // Two chars, a separator, the rest: 41 bytes for SHA-1, 65 for SHA-256.
     if (entry_path.len != 41 and entry_path.len != 65) return error.NotAnObject;
     if (entry_path[2] != std.fs.path.sep) return error.NotAnObject;
 
@@ -331,8 +325,7 @@ pub const default_fetch_bytes: usize = 8 * 1024 * 1024;
 
 pub const default_nix_daemon_socket = "/nix/var/nix/daemon-socket/socket";
 
-/// The name a `robots.txt` group is written for. It carries no version, and it
-/// never may: a token that moved with a release stops matching such a group.
+/// The name a `robots.txt` group is written for; no version, or a release would stop matching.
 pub const product_token = "chock";
 
 pub const user_agent = product_token ++ "/" ++ chock_version.text;
@@ -383,8 +376,7 @@ pub const Action = union(Kind) {
                 "put {d} bytes at {s}, outside the workspace",
                 .{ a.contents.len, a.path },
             ),
-            // A park must say in words that no branch moves. The answer to a
-            // merge and to a park is the same "y".
+            // A park must say in words that no branch moves: merge and park share the same "y".
             .workspace_apply => |a| switch (a.integration) {
                 .move => |m| std.fmt.allocPrint(
                     gpa,
@@ -579,8 +571,7 @@ fn branchText(gpa: std.mem.Allocator, a: WorkspaceApply) std.mem.Allocator.Error
     };
 }
 
-/// Empty for a session with no copies, so the prompt gains nothing when the
-/// `workspace` block carries no copying bind.
+/// Empty when the `workspace` block carries no copying bind.
 fn copiesText(gpa: std.mem.Allocator, copies: []const []const u8) std.mem.Allocator.Error![]u8 {
     if (copies.len == 0) return gpa.dupe(u8, "");
     const listed = try indentedList(gpa, copies);
@@ -627,8 +618,7 @@ pub const Result = union(Kind) {
         objects_moved: usize,
         ref: []u8,
         new_id: []u8,
-        /// The outcome and not the plan. A plan that said `merge` can end at
-        /// `park`: the repository is read again before the branch moves.
+        /// The outcome, not the plan: a `merge` plan can still end at `park` on reread.
         integration: integrate.Outcome,
     },
     model_select: struct { alias: []u8 },
@@ -658,8 +648,7 @@ pub const Result = union(Kind) {
     }
 };
 
-/// Every address is wanted, not the first: `std.http.Client` resolves the name
-/// again and dials whichever answer it likes.
+/// Every address wanted, not the first: `std.http.Client` re-resolves and dials any of them.
 pub const Resolver = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -670,8 +659,8 @@ pub const Resolver = struct {
 
     pub const LookupError = error{
         NotResolved,
-        /// A refusal and not a truncation. The addresses past the bound would
-        /// stay unchecked, and that is where a hostile zone puts the loopback.
+        /// A refusal, not a truncation: addresses past the bound stay
+        /// unchecked, where a hostile zone hides the loopback.
         TooManyAddresses,
     };
 
@@ -743,10 +732,8 @@ fn systemLookup(
 pub const Context = struct {
     env: *const std.process.Environ.Map,
     roster: []const []const u8 = &.{},
-    /// The default is the real resolver, so saying nothing keeps the guard.
     resolver: Resolver = .system,
-    /// Only a test sets this, because its servers listen on the loopback
-    /// interface. No project file can name a value here.
+    /// Only a test sets this, for a loopback server; no project file can name one.
     reachable: *const fn (address: Resolver.Address) bool = network.addressIsReachable,
 };
 
@@ -774,15 +761,13 @@ pub const Attempt = union(enum) {
 
 /// A refusal is not in here. A refusal is an `Attempt.refused`.
 pub const PerformError = error{
-    /// A ref that moved makes git exit nonzero, which is how the compare and
-    /// swap refusals arrive.
+    /// A moved ref makes git exit nonzero: that's the compare-and-swap refusal.
     GitFailed,
     HostNotApproved,
     UrlNotUsable,
     AddressNotPermitted,
     FetchFailed,
-    /// The bound applies to decoded bytes, so a compressed body that grows
-    /// past it ends here as well.
+    /// Applies to decoded bytes, so a compressed body growing past it ends here too.
     ResponseTooLarge,
     ResponseEncodingNotReadable,
     NixDaemonUnavailable,
@@ -802,8 +787,7 @@ pub const DescribeError = git.Error || error{
 
 pub const Error = Broker.Error || PerformError;
 
-/// The approval is written to the log whichever way it went, so an act that
-/// failed while running is still recorded as approved.
+/// Logged whichever way it went: a failed act is still recorded as approved.
 pub fn run(
     broker: *const Broker,
     gpa: std.mem.Allocator,
@@ -940,8 +924,7 @@ fn performGitBranchDelete(
     const branch_ref = try std.fmt.allocPrint(gpa, "refs/heads/{s}", .{a.branch});
     defer gpa.free(branch_ref);
 
-    // git has no compare and swap for a branch delete, so this reads the
-    // branch and compares it here.
+    // git has no compare-and-swap for a branch delete, so this checks it by hand.
     const at = try runGit(gpa, io, ctx, a.repository, &.{ "rev-parse", "--verify", branch_ref }, diag);
     defer gpa.free(at);
     if (!std.mem.eql(u8, at, a.points_at)) {
@@ -975,8 +958,7 @@ fn performNetFetch(
     }
 
     const host_component = uri.host orelse return error.UrlNotUsable;
-    // `toRawMaybeAlloc` allocates only when it must, so its result is never
-    // freed on its own. It wants an arena.
+    // `toRawMaybeAlloc` allocates only when it must; its result wants an arena, never a lone free.
     var host_arena_state = std.heap.ArenaAllocator.init(gpa);
     defer host_arena_state.deinit();
     const host = try host_component.toRawMaybeAlloc(host_arena_state.allocator());
@@ -990,8 +972,7 @@ fn performNetFetch(
         return error.HostNotApproved;
     }
 
-    // Whoever runs the permitted zone decides what the name answers. A rule
-    // about a host must not become a handle on 127.0.0.1 or 169.254.169.254.
+    // A rule about a host must not become a handle on 127.0.0.1 or 169.254.169.254.
     const port = uriPort(uri);
     var addresses: [Resolver.max_addresses]Resolver.Address = undefined;
     const found = ctx.resolver.lookup(io, host, &addresses) catch |err| {
@@ -1034,13 +1015,11 @@ fn performNetFetch(
         .connection = pinned,
         .headers = .{
             .user_agent = .{ .override = user_agent },
-            // `std.http.Client` turns user information in a URL into an
-            // `Authorization` header.
+            // `std.http.Client` turns URL user info into an `Authorization` header.
             .authorization = .omit,
         },
     }) catch {
-        // `Client.deinit` asserts that no connection is still out, and there
-        // is no `Request.deinit` here to give this one back.
+        // `Client.deinit` asserts no connection is out; there's no `Request.deinit` to return it.
         if (pinned) |connection| client.connection_pool.release(connection, io);
         return error.FetchFailed;
     };
@@ -1058,19 +1037,15 @@ fn performNetFetch(
     const location = try gpa.dupe(u8, response.head.location orelse "");
     errdefer gpa.free(location);
 
-    // `std.http.Client` advertises gzip and deflate on every request, and
-    // `Response.reader` gives those bytes back compressed. Read this before
-    // either reader is taken: both invalidate the head strings.
+    // Read before either reader is taken: both invalidate the head strings.
     const encoding = response.head.content_encoding;
-    // A HEAD answer carries no body whatever its head says about encoding, and
-    // `readerDecompressing` would wait for one.
+    // A HEAD answer carries no body regardless of its encoding header.
     const has_body = a.method != .head;
 
     const decompress_buffer: []u8 = if (!has_body) &.{} else switch (encoding) {
         .identity => &.{},
         .gzip, .deflate => try gpa.alloc(u8, std.compress.flate.max_window_len),
-        // Answered again so that a build which starts to offer one of these
-        // finds a refusal and not the `unreachable` in `Decompress.init`.
+        // Refused here so a future zstd/compress reply hits this, not `Decompress.init`'s `unreachable`.
         .zstd, .compress => return error.ResponseEncodingNotReadable,
     };
     defer gpa.free(decompress_buffer);
@@ -1098,15 +1073,10 @@ const max_ip4_text = "255.255.255.255".len;
 
 const not_pinned: ?*std.http.Client.Connection = null;
 
-/// A connection already open to a checked address. This closes the DNS
-/// rebinding window: `std.http.Client` resolves the name a second time, and a
-/// zone can answer differently.
+/// Pins the checked address, closing the DNS rebinding window a second resolve would open.
 ///
-/// Only IPv4 can be pinned. `HostName.validate` refuses a colon on Zig 0.16,
-/// so an IPv6 address cannot go into the name `connectTcpOptions` takes. A
-/// name that answers with IPv6 only is not pinned, and the rebinding window is
-/// open for it. Refusing it would stop Chock reading anything on an IPv6 only
-/// or NAT64 network.
+/// Only IPv4 can be pinned: `HostName.validate` refuses a colon, so an
+/// IPv6-only answer stays unpinned rather than refuse an IPv6/NAT64 network.
 fn pinnedConnection(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1125,8 +1095,7 @@ fn pinnedConnection(
     }) catch return error.FetchFailed;
 
     if (protocol == .tls) {
-        // `Connection.Tls.create` reads the bundle and asserts the time is
-        // set, and the connection is made before `Client.request` here.
+        // `Connection.Tls.create` asserts the time is set, so the bundle is made before `Client.request`.
         var bundle: std.crypto.Certificate.Bundle = .empty;
         const now = std.Io.Clock.real.now(io);
         bundle.rescan(gpa, io, now) catch {
@@ -1238,8 +1207,7 @@ fn performWorkspaceApply(
 
         std.Io.Dir.copyFileAbsolute(source, target, io, .{ .make_path = true }) catch |err| switch (err) {
             error.FileNotFound => {
-                // git writes no object it can read through the alternate, so
-                // an earlier apply left this one in the project.
+                // git skips an object it can read through the alternate; an earlier apply left this one.
                 std.Io.Dir.accessAbsolute(io, target, .{}) catch {
                     _ = diagnostic.note(diag, .{ .object_missing = id });
                     return error.ObjectMissing;
@@ -1256,8 +1224,7 @@ fn performWorkspaceApply(
     // git reads an empty old value as "this ref must not exist".
     gpa.free(try runGit(gpa, io, ctx, a.repository, &.{ "update-ref", a.ref, a.new_id, a.old_id }, diag));
 
-    // The ref is set first, so a failure below leaves the work where a
-    // `git merge` still reaches it.
+    // Ref set first, so a failure below still leaves it reachable by `git merge`.
     const integration = switch (a.integration) {
         .park => |p| integrate.Outcome{ .park = p },
         .move => |m| try integrate.moving(gpa, io, ctx.env, a.repository, m, diag),
@@ -1390,8 +1357,7 @@ fn gitOk(
 ) ![]u8 {
     var output = try git.run(gpa, testing.io, env, cwd, argv, null);
     defer output.deinit(gpa);
-    // `zig build` reads a run step that wrote to standard error as a failure,
-    // so the failure carries what git said and nothing is printed.
+    // `zig build` treats stderr output as failure, so the error carries what git said.
     if (output.term != .exited or output.term.exited != 0) {
         try testing.expectEqualStrings("", output.stderr);
     }
@@ -1420,8 +1386,7 @@ const TestProject = struct {
 
         var env = try std.testing.environ.createMap(gpa);
         errdefer env.deinit();
-        // This tree sits inside Chock's own checkout, which git's upward
-        // search reaches without a ceiling.
+        // Sits inside Chock's own checkout, which git's upward search reaches with no ceiling.
         try env.put("GIT_CEILING_DIRECTORIES", tmp_path);
 
         gpa.free(try gitOk(gpa, &env, root_path, &.{ "init", "-b", "main" }));
@@ -1661,8 +1626,7 @@ test "an approved workspace.apply moves the objects and updates the ref" {
 }
 
 test "a refused workspace.apply leaves the user's repository byte for byte unchanged" {
-    // Objects and refs both: a broker that moved the objects and refused the
-    // ref leaves the refs identical and the object list longer.
+    // Objects and refs both: a refused ref leaves refs identical and the object list longer.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1715,9 +1679,7 @@ test "a refused workspace.apply leaves the user's repository byte for byte uncha
 }
 
 test "a workspace.apply nobody can answer expires at once, and the repository is unchanged" {
-    // `chock run` holds the exclusive lock on the session log while the
-    // question is open, so nothing else can append an answer and the timeout
-    // is zero.
+    // `chock run` holds the log's exclusive lock, so nothing else can answer; timeout is zero.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -2401,8 +2363,7 @@ test "model.select refuses an alias the roster does not name" {
 }
 
 test "a refusal is not an error, and the act it refused never runs" {
-    // An alias off the roster makes `perform` fail, so a `run` that performed
-    // a refused act comes back as an error and not as a refusal.
+    // An off-roster alias makes `perform` fail: a performed refusal surfaces as an error, not a refusal.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -2522,9 +2483,7 @@ test "a write outside the workspace names the path it could not open" {
 }
 
 test "the user agent names the build, and opens with the token a robots.txt group is written for" {
-    // A header with no version leaves a site operator unable to say which
-    // Chock hit them, and a versioned token stops matching a `robots.txt`
-    // group written for `chock`.
+    // A versioned token would stop matching a `robots.txt` group written for `chock`.
     try testing.expect(std.mem.startsWith(u8, user_agent, product_token ++ "/"));
     try testing.expectEqualStrings("chock", product_token);
 

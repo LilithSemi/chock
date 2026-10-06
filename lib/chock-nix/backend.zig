@@ -1,6 +1,4 @@
 //! A Nix store for an evaluation that may not have one. Every question fix
-//! asks a store backend goes to a seam the caller supplies, so the caller and
-//! not the expression decides what an evaluation may do.
 
 const std = @import("std");
 const expr = @import("expr");
@@ -12,55 +10,34 @@ pub const BuildSink = store.backend.BuildSink;
 pub const MissingPlan = store.backend.MissingPlan;
 
 pub const Error = error{
-    /// The seam has no answer for this operation.
     OperationRefused,
-    /// A build named a path this driver did not produce, or the seam
-    /// authorises no build at all.
     BuildRefused,
     ObjectTooLarge,
 };
 
-/// The most bytes one store object may carry. A source file or a derivation
-/// text is a few kilobytes, and the whole object is held while it is added.
 pub const default_max_object_bytes: usize = 16 << 20;
 
-/// Where a store operation really happens. Every function pointer is optional
-/// and every absent one refuses, so a caller that sets nothing gets an
-/// evaluation that can compute a derivation path and do nothing else.
 pub const Seam = struct {
     context: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         is_valid_path: ?*const fn (context: *anyopaque, path: []const u8) anyerror!bool = null,
-        /// Returns the path the store computed, owned by `allocator`. The
-        /// driver records it and a later build may name it.
         add_object: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator, object: AddObject) anyerror![]u8 = null,
         read_file: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator, path: []const u8) anyerror![]u8 = null,
-        /// Asked only after the driver has checked that this evaluation
-        /// produced every path in the request. Import from derivation
-        /// arrives here too, so a seam that sets this runs the model's code.
         build_paths: ?*const fn (context: *anyopaque, paths: []const []const u8, sink: ?BuildSink, mode: BuildMode) anyerror!void = null,
         query_missing: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator, paths: []const []const u8) anyerror!MissingPlan = null,
         add_indirect_root: ?*const fn (context: *anyopaque, link_path: []const u8, target: []const u8) anyerror!void = null,
     };
 
-    /// The seam of a session that authorises nothing.
     pub const refusing: Seam = .{ .context = @constCast(&no_context), .vtable = &.{} };
 };
 
 const no_context: u8 = 0;
 
-/// A `store.backend.Driver` over a `Seam`. Hand `backend()` to
-/// `expr.Engine.setStoreBackend` and keep it alive as long as the engine is.
-///
-/// One engine, and one worker in it. `run` and `submit` execute on the thread
-/// that asked and nothing here is locked.
 pub const Driver = struct {
     allocator: std.mem.Allocator,
     seam: Seam = Seam.refusing,
-    /// A bound and not a rule. Whether an object may be added is the seam's
-    /// answer.
     max_object_bytes: usize = default_max_object_bytes,
 
     paths: std.StringHashMapUnmanaged(void) = .empty,
@@ -78,29 +55,18 @@ pub const Driver = struct {
         self.* = undefined;
     }
 
-    /// What an engine is given. Borrows this driver, so it may not outlive it.
     pub fn backend(self: *Driver) store.backend.Driver {
         return .{ .ptr = self, .vtable = &driver_vtable };
     }
 
-    /// True when `add_object` on this driver produced `path`. A build may name
-    /// nothing else.
     pub fn produced(self: *Driver, path: []const u8) bool {
         return self.paths.contains(path);
     }
 
-    /// Borrowed until the next operation on this driver.
     pub fn lastError(self: *Driver) ?[]const u8 {
         return self.message;
     }
 
-    /// Build `paths`, if this driver produced every one of them.
-    ///
-    /// A hand written derivation can name any builder, so a build of a path
-    /// this evaluation did not produce is host code execution with a hash in
-    /// front of it. The refusal names the path, because a model that reads
-    /// "refused" with no subject retries. The engine's own build goes
-    /// through here too, so a second check cannot answer differently.
     pub fn build(self: *Driver, paths: []const []const u8, mode: BuildMode) anyerror!void {
         return buildPaths(self, paths, null, mode);
     }
@@ -126,8 +92,6 @@ pub const Driver = struct {
         return @ptrCast(@alignCast(raw));
     }
 
-    /// The driver, with the last refusal dropped, so an operation that starts
-    /// ends the loan on `last_error`.
     fn begin(raw: *anyopaque) *Driver {
         const self = from(raw);
         if (self.message) |old| {
@@ -139,8 +103,6 @@ pub const Driver = struct {
 
     fn start(_: *anyopaque) !void {}
 
-    /// On the calling thread. A tool call runs inside a sandbox whose io
-    /// cannot start a thread.
     fn run(raw: *anyopaque, work: store.backend.WorkFn, context: *anyopaque) !void {
         work(raw, context);
     }
@@ -248,8 +210,6 @@ pub const Driver = struct {
         try self.paths.put(self.allocator, owned, {});
     }
 
-    /// A driver that cannot allocate the text still refuses: the error is the
-    /// answer, and the words are the detail.
     fn refuse(self: *Driver, comptime format: []const u8, args: anytype) void {
         const text = std.fmt.allocPrint(self.allocator, format, args) catch return;
         if (self.message) |old| self.allocator.free(old);
@@ -259,7 +219,6 @@ pub const Driver = struct {
 
 const testing = std.testing;
 
-/// A store that keeps its objects in memory.
 const FakeStore = struct {
     allocator: std.mem.Allocator,
     objects: std.StringHashMapUnmanaged([]u8) = .empty,
@@ -279,7 +238,6 @@ const FakeStore = struct {
         return .{ .context = self, .vtable = &vtable };
     }
 
-    /// The same store, with no build in it.
     fn noBuildSeam(self: *FakeStore) Seam {
         return .{ .context = self, .vtable = &no_build_vtable };
     }
@@ -354,7 +312,6 @@ test "an object the driver added may then be built" {
     } });
     defer testing.allocator.free(written);
 
-    // Drop the `record` call in `addObject` and the build below is refused.
     try testing.expect(driver.produced(example_path));
     try connection.buildPaths(&.{example_path}, null, .normal);
     try testing.expectEqual(@as(usize, 1), fake.builds);
@@ -371,9 +328,6 @@ test "a build of a path this evaluation did not produce is refused by name" {
     try testing.expectError(Error.BuildRefused, connection.buildPaths(&.{other}, null, .normal));
     try testing.expectEqual(@as(usize, 0), fake.builds);
 
-    // The seam has a build function here, so only the produced set refuses.
-    // The path has to be in the words, because a model that reads a refusal
-    // with no subject tries the same expression again.
     const said = connection.lastError().?;
     try testing.expect(std.mem.indexOf(u8, said, other) != null);
 }
@@ -386,7 +340,6 @@ test "a build is refused when the session authorises none, and the refusal names
     var driver = Driver.init(testing.allocator, seam);
     defer driver.deinit();
 
-    // Import from derivation reaches this operation.
     const connection = try connectionOf(driver.backend());
     const written = try connection.addObject(testing.allocator, .{ .text = .{
         .expected_path = example_path,
@@ -415,7 +368,6 @@ test "an object over the cap is refused before the store sees it" {
         .references = &.{},
     } }));
 
-    // Move the cap check after the `add` call and both assertions fail.
     try testing.expectEqual(@as(usize, 0), fake.objects.count());
     try testing.expect(!driver.produced(example_path));
 
@@ -434,8 +386,6 @@ test "an empty seam refuses every operation rather than answering a wrong one" {
     defer driver.deinit();
 
     const connection = try connectionOf(driver.backend());
-    // `is_valid_path` shows why an absent function may not answer: false is
-    // plausible and it is not this driver's to give.
     try testing.expectError(Error.OperationRefused, connection.isValidPath(example_path));
     try testing.expectError(Error.OperationRefused, connection.addObject(testing.allocator, .{ .text = .{
         .expected_path = example_path,
@@ -468,8 +418,6 @@ test "a real engine with this driver installed writes its derivation through the
     const path = (try engine.derivationDrvPath(value)).?;
     try engine.ensureDerivationClosure(path);
 
-    // The derivation text went to the seam and not to the host store, so the
-    // produced set now authorises a build of it.
     try testing.expect(fake.objects.contains(path));
     try testing.expect(driver.produced(path));
 }
@@ -494,8 +442,6 @@ test "import from derivation through a real engine is refused by name" {
     ;
     try testing.expectError(Error.BuildRefused, engine.evaluate(source));
 
-    // fix reports the store error text and nothing else about why the import
-    // stopped, so the refusal has to name the derivation.
     const said = driver.lastError().?;
     try testing.expect(std.mem.indexOf(u8, said, ".drv") != null);
     try testing.expect(std.mem.startsWith(u8, said, "a build of "));

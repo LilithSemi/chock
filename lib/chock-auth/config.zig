@@ -1,9 +1,4 @@
 //! The configuration file, and the separate token file beside it. Both live
-//! in the configuration directory, and **Chock reads them and never writes
-//! them**.
-//!
-//! `token` is allowed, and `paths.requirePrivate` is what makes it safe: see
-//! `lib/chock-auth/lookup.zig`, which applies the mode rule to every source.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -11,30 +6,15 @@ const paths = @import("paths.zig");
 
 pub const file_name = "config.zon";
 
-/// The separate token file, source 2 of the lookup order, inside the same
-/// configuration directory. **A person maintains this file and
-/// Chock never rewrites it**, which is why it is not the file `chock login`
-/// writes.
 pub const token_file_name = "tokens.zon";
 
-/// The largest configuration file this reader accepts. A roster of providers
-/// is a small file. This bounds a mistake, such as a path that names a disk
-/// image, rather than a hostile author: the configuration directory belongs
-/// to the user already.
 pub const max_file_bytes: usize = 256 * 1024;
 
-/// The provider kinds Chock knows. An enum and not a free string: a reader
-/// must act on this value, and a free string cannot be told apart from a
-/// typo.
 pub const Kind = enum {
     anthropic,
     aiand,
     openai_compat,
 
-    /// The one spelling a user writes, in the configuration file and on the
-    /// `chock login` command line alike. `openai_compat` cannot carry the
-    /// hyphen a Zig enum field name forbids, so the two spellings are joined
-    /// here, once, rather than in each reader.
     pub fn wireName(self: Kind) []const u8 {
         return switch (self) {
             .anthropic => "anthropic",
@@ -53,9 +33,6 @@ pub const Kind = enum {
 
     pub const all_wire_names = "anthropic, aiand, openai-compat";
 
-    /// Where this kind talks, when the instance names no base URL of its
-    /// own. Empty for `openai-compat`, which is the escape hatch for an
-    /// endpoint Chock has never heard of and therefore has no default for.
     pub fn defaultBaseUrl(self: Kind) []const u8 {
         return switch (self) {
             .anthropic => "https://api.anthropic.com/v1",
@@ -64,18 +41,6 @@ pub const Kind = enum {
         };
     }
 
-    /// Whether the address `defaultBaseUrl` gives refuses every request that
-    /// carries no credential.
-    ///
-    /// **This is a fact about that one address, and not about the kind.** Two
-    /// of the three kinds have a commercial hosted API for their default, and
-    /// a request to one of those without a key is a 401 every time.
-    /// `openai-compat` has no address of its own at all, so it answers false:
-    /// a local llama.cpp server is the case that kind exists for, and it needs
-    /// nothing.
-    ///
-    /// See `chock_auth.lookup.credentialIsMissing`, which is the one caller
-    /// and the place the rule is explained.
     pub fn hostedEndpointNeedsCredential(self: Kind) bool {
         return switch (self) {
             .anthropic, .aiand => true,
@@ -84,35 +49,10 @@ pub const Kind = enum {
     }
 };
 
-/// What this provider instance can do, beyond answering with words. The second
-/// of the two gates a tool passes before Chock offers it to a model: the first
-/// is whether the adapter's own wire format can express the thing at all, and
-/// that one lives in `chock_provider.Client.Adapter.carries`.
-///
-/// **Every field defaults to false, and absence is never permissive.** Two
-/// instances of one kind are not alike here: ai& has a file endpoint and a
-/// local llama.cpp server does not, and `glm4.7-flash:A3B` is text only. A
-/// user who says nothing gets the smaller tool list, which costs a
-/// capability, and a user who says yes wrongly gets a model that spends a
-/// turn on a call that cannot work. The first mistake is the cheaper one.
-///
-/// Not an enum set or a free string: a boolean per named thing, so a file
-/// written for a newer Chock that names a capability this one has never
-/// heard of is refused by the strict parse of a provider entry, the same way
-/// a typo in `.token` is. See `parse`.
 pub const Capabilities = struct {
-    /// The instance can take an image in a request. **This is the second of
-    /// the two gates `read_image` passes**, and it is the one that decides:
-    /// every adapter can encode an image, so what is written here is what
-    /// says whether the session is offered the tool at all. False, the
-    /// default, means the model never hears the name, which is the right
-    /// answer for a model that cannot see. See
-    /// `chock_core.tools.Support.offers`.
     images: bool = false,
 };
 
-/// One provider instance, exactly as the file spells it. `parse` turns this
-/// into an `Instance`, which is the checked shape every caller uses.
 const FileInstance = struct {
     name: ?[]const u8 = null,
     kind: []const u8,
@@ -132,27 +72,12 @@ const FileCredentials = struct {
     store: ?[]const u8 = null,
 };
 
-/// Where Chock keeps the credentials it is given.
-///
-/// **Chosen in the file and never guessed.** A keystore can look reachable and
-/// still be unusable, so a build that picked one by probing would put a
-/// credential somewhere the user did not ask for. Naming it means an
-/// unreachable store is an error a person can read.
 pub const CredentialStore = enum {
-    /// A file in the data directory, mode 0600. Works anywhere, including a
-    /// machine reached only over ssh.
     file,
-    /// The freedesktop secret service, over the session bus. Linux only.
     secret_service,
-    /// The macOS Keychain. Darwin only.
     keychain,
-    /// SecretSpec, asked over its own protocol. It fronts many stores of its
-    /// own, so Chock maintains none of them. Works on every platform, because
-    /// it is a program Chock talks to and not a system service.
     secretspec,
 
-    /// What this platform uses when the file names nothing. A keystore, so the
-    /// safer place is the one a user gets without asking for it.
     pub fn default() CredentialStore {
         return switch (builtin.os.tag) {
             .macos => .keychain,
@@ -160,7 +85,6 @@ pub const CredentialStore = enum {
         };
     }
 
-    /// Whether this platform has this store at all.
     pub fn availableHere(self: CredentialStore) bool {
         if (self == .secretspec) return true;
         return switch (builtin.os.tag) {
@@ -169,7 +93,6 @@ pub const CredentialStore = enum {
         };
     }
 
-    /// Every store this platform has, for a message that lists them.
     pub fn hereText() []const u8 {
         return switch (builtin.os.tag) {
             .macos => "keychain or secretspec",
@@ -178,129 +101,56 @@ pub const CredentialStore = enum {
     }
 };
 
-/// One provider instance, checked. Every string is owned by the `Config` it
-/// came from.
 pub const Instance = struct {
-    /// The user's chosen name, or the kind's own spelling when the file gave
-    /// none. This is the key everything else selects by.
     name: []const u8,
     kind: Kind,
-    /// Where this instance talks. Never empty: `parse` fills in the kind's
-    /// own default when the file gave none, and refuses a kind that has no
-    /// default and was given no URL.
     base_url: []const u8,
-    /// The credential this instance names for itself, source 1 of section
-    /// 11.4's lookup order. `.absent` is the common case.
     credential: Credential,
-    /// How many tokens the model behind this instance can hold, request and
-    /// reply together. **Null means nobody said, and null is never a guess**:
-    /// a session against an instance that gives no number compacts only when
-    /// the provider itself refuses a request as too large. See
-    /// `chock_core.compaction.Policy`.
-    ///
-    /// It sits on the instance and not in `Capabilities`, because it is a
-    /// number and every field there is a yes or no about a thing the endpoint
-    /// can do. The local llama.cpp server this project develops against is
-    /// started with a fixed context size, which is exactly the case this
-    /// field is for.
     context_tokens: ?u64,
-    /// What this instance can do beyond words. See `Capabilities`: an
-    /// instance that names none gets the all-false record, never a guess
-    /// from its kind. Two instances of one kind can differ here.
     capabilities: Capabilities,
 };
 
-/// How an instance names its credential.
 pub const Credential = union(enum) {
-    /// Look it up in the other two sources, and if nothing is there, send
-    /// none.
     absent,
-    /// The value, written in the configuration file itself.
     token: []const u8,
-    /// A path to read at run time, which is how sops-nix and agenix work.
     token_file: []const u8,
 };
 
-/// One line of the separate token file, source 2.
 pub const TokenEntry = struct {
     name: []const u8,
     token: []const u8,
 };
 
 pub const ParseError = std.mem.Allocator.Error || error{
-    /// The file is not valid ZON, or a field has the wrong type. Pass a
-    /// `Diagnostic` to learn which line, and why.
     InvalidConfig,
-    /// An instance names a `kind` Chock does not know. The message names
-    /// every kind that is valid.
     UnknownProviderKind,
-    /// Two instances resolve to one name. The message says which name, and,
-    /// when neither gave one, that a name is needed.
     DuplicateInstanceName,
-    /// An instance gave both `token` and `token_file`, so which one Chock
-    /// should read is not decided. Refused rather than guessed.
     TwoCredentialSpellings,
-    /// A field that is present holds nothing: `.name = ""`, `.token = ""`,
-    /// or `.token_file = ""`. Absence already means "look it up", so an
-    /// empty value is a second spelling of a meaning that already has one.
     EmptyField,
-    /// A kind with no default base URL, which is `openai-compat`, was given
-    /// none.
     NoBaseUrl,
 };
 
 pub const LoadError = ParseError || error{
-    /// There is no configuration file. The caller decides what to do: `chock
-    /// login` names the file to create, and `chock run` reports that no
-    /// provider is configured.
     NoConfigFile,
-    /// The file is larger than `max_file_bytes`.
     ConfigTooLarge,
-    /// The file exists and could not be read. Pass a `Diagnostic` to learn
-    /// which fault the filesystem gave.
     ReadFailed,
 };
 
-/// Why a configuration file was refused, in the words its author needs.
-///
-/// **Some variants own memory, and `deinit` releases all of them.** The two
-/// ZON variants hold the syntax tree their message points into, which is how
-/// they can name a line and a column. The variants that name a provider hold
-/// a copy of the name, because the `providers` block those names live in is
-/// released the moment the parse fails.
 pub const Diagnostic = union(enum) {
     file_not_zon: std.zon.parse.Diagnostics,
-    /// One top level block does not match the schema. `field` names the
-    /// block, and it is always a literal of this file.
     block_not_valid: BlockNotValid,
     not_a_struct_literal,
-    /// The separate token file does not match its schema.
     token_file_not_valid: std.zon.parse.Diagnostics,
-    /// The separate token file can be read by somebody other than its
-    /// owner. A wrong mode is a fault, never a warning.
     token_file_readable_by_others: ReadableByOthers,
-    /// A field of `.defaults` is present and holds nothing. `field` is a
-    /// literal of this file.
     empty_default: []const u8,
-    /// A provider names a kind Chock does not know. The kind is owned.
     unknown_provider_kind: []const u8,
     empty_provider_name,
-    /// A provider gives both `.token` and `.token_file`. The name is owned.
     two_credential_spellings: []const u8,
-    /// A provider gives a field that is present and holds nothing. The name
-    /// is owned, and `field` is a literal of this file.
     empty_provider_field: EmptyProviderField,
-    /// A provider is of a kind with no address of its own and gives no
-    /// `.base_url`. Both names are owned.
     no_base_url: NoBaseUrl,
-    /// Two providers resolve to one name. The name is owned, and `kind` is
-    /// set when both are of the same kind, which needs the other message.
     duplicate_instance_name: DuplicateInstanceName,
-    /// A file exists and the read failed. The path is owned.
     read_failed: ReadFailed,
-    /// The credentials block named a store this reader does not know.
     unknown_credential_store: UnknownCredentialStore,
-    /// The credentials block named a store this platform does not have.
     credential_store_not_here: CredentialStoreNotHere,
 
     pub const BlockNotValid = struct {
@@ -320,13 +170,10 @@ pub const Diagnostic = union(enum) {
 
     pub const DuplicateInstanceName = struct {
         name: []const u8,
-        /// The wire name of the kind both providers hold, or null when the
-        /// two are of different kinds.
         shared_kind: ?[]const u8,
     };
 
     pub const UnknownCredentialStore = struct {
-        /// What the file said, copied.
         spelled: []const u8,
     };
 
@@ -344,15 +191,6 @@ pub const Diagnostic = union(enum) {
         mode: u32,
     };
 
-    /// Release what the diagnostic owns, with the allocator that filled it.
-    /// Safe on every variant, so a caller can call it without asking which
-    /// one it holds.
-    ///
-    /// **Every variant is named here, and there is no `else`.** A variant
-    /// added later must say whether it owns memory before this file compiles
-    /// again. An `else` took that question away, and a borrowed path that
-    /// slipped through one in `lookup.zig` reached a person as a `chmod` over
-    /// freed memory.
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .file_not_zon, .token_file_not_valid => |*zon_diag| zon_diag.deinit(gpa),
@@ -364,7 +202,6 @@ pub const Diagnostic = union(enum) {
             .read_failed => |failure| gpa.free(failure.path),
             .token_file_readable_by_others => |failure| gpa.free(failure.path),
             .unknown_credential_store => |named| gpa.free(named.spelled),
-            // These carry nothing, or carry a literal of this file.
             .not_a_struct_literal, .empty_provider_name, .empty_default, .credential_store_not_here => {},
         }
         self.* = undefined;
@@ -451,9 +288,6 @@ pub const Diagnostic = union(enum) {
     }
 };
 
-/// The sentence that follows an empty provider field. Only `.token` earns
-/// one, because absence of a token already has a meaning and an empty string
-/// is a second spelling of it.
 fn emptyFieldAdvice(field: []const u8) []const u8 {
     if (std.mem.eql(u8, field, "token")) {
         return " Leave the field out: absence already means look the credential up, " ++
@@ -463,14 +297,6 @@ fn emptyFieldAdvice(field: []const u8) []const u8 {
     return "";
 }
 
-/// Fill `out` when the caller asked for one, and say whether it took `value`.
-///
-/// **The first fault is kept, not the last.** A provider can only be checked
-/// after the file parsed, so the first fault is the one that explains the
-/// rest.
-///
-/// The answer matters because several variants own memory: a site that hands
-/// one over must release it itself when the answer is false.
 fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     const slot = out orelse return false;
     if (slot.* != null) return false;
@@ -478,31 +304,18 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     return true;
 }
 
-/// Whether a diagnostic is wanted and still empty, which is the one case in
-/// which a site should copy a name for it. A caller that passes null must pay
-/// no allocation at all.
 fn wantsDiagnostic(out: ?*?Diagnostic) bool {
     const slot = out orelse return false;
     return slot.* == null;
 }
 
-/// The parsed configuration. `deinit` releases everything it owns.
 pub const Config = struct {
     gpa: std.mem.Allocator,
-    /// The `providers` block exactly as the file spelled it, which owns every
-    /// string the instances below point into.
     providers: []const FileInstance,
-    /// Where credentials are kept. The file's own choice, or this platform's
-    /// default when it names none.
     credential_store: CredentialStore,
-    /// The `defaults` block, which owns its own two strings.
     defaults: FileDefaults,
     instances: []Instance,
-    /// The instance a session uses when the command line names none. Null
-    /// when the file names none, and then a caller with exactly one instance
-    /// may use that one.
     default_provider: ?[]const u8,
-    /// The model a session uses when the command line names none.
     default_model: ?[]const u8,
 
     pub fn deinit(self: *Config) void {
@@ -519,10 +332,6 @@ pub const Config = struct {
         return null;
     }
 
-    /// The instance a caller that named none should use: the file's own
-    /// default when it names one, or the only instance when there is exactly
-    /// one. Null when neither holds, because guessing between two providers
-    /// is guessing which account the user is billed on.
     pub fn defaultInstance(self: *const Config) ?Instance {
         if (self.default_provider) |name| return self.find(name);
         if (self.instances.len == 1) return self.instances[0];
@@ -530,25 +339,8 @@ pub const Config = struct {
     }
 };
 
-/// Read `source`, which must be the whole content of a configuration file.
-/// The result owns a copy of every string in it, so the caller may release
-/// `source` at once.
-///
-/// `diag` is optional. A caller that passes null pays nothing, allocates
-/// nothing extra, and learns only the error. A caller that passes a slot must
-/// call `Diagnostic.deinit` on whatever lands in it.
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) ParseError!Config {
-    // Each top level block is parsed on its own, and **strictly**: a field
-    // name with a typo inside a provider must never quietly become an
-    // instance that means something the author did not write, which is the
-    // same rule `lib/chock-policy/table.zig` keeps for a policy rule. A top
-    // level field this build does not know is ignored instead, because a
-    // later milestone writes the model roster and the cost caps into this
-    // same file and an older Chock must still read the providers out of it.
-    //
-    // `std.zon.parse`'s own `ignore_unknown_fields` cannot express that: it
-    // is one setting for the whole tree. Reading one named block at a time is
-    // what keeps the two answers apart.
+    // Each top level block is parsed on its own and strictly: a typo in a field name inside a provider must not quietly become a different instance. A top level field this build does not know is ignored instead, because a later milestone writes more into this same file, and std.zon.parse's own ignore_unknown_fields is one setting for the whole tree and cannot tell the two cases apart.
     const providers = try parseBlock([]const FileInstance, gpa, source, "providers", diag) orelse &.{};
     errdefer std.zon.parse.free(gpa, providers);
     const defaults = try parseBlock(FileDefaults, gpa, source, "defaults", diag) orelse FileDefaults{};
@@ -589,30 +381,12 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
     };
 }
 
-/// The top level field `field_name`, parsed strictly into `T`, or null when
-/// the file has no such field. Each call reads `source` again: a
-/// configuration file is small, and two reads of it cost less than the
-/// bookkeeping of sharing one parse tree across two calls that each want to
-/// take ownership of it.
-/// Which store the operator's own file names, or this platform's default when
-/// that file cannot be read.
-///
-/// **A configuration that cannot be read is not a reason to refuse.** The
-/// configuration and the credentials are separate files with separate owners,
-/// so a caller that only needs to know where a credential lives should not fail
-/// because the other file is absent or broken. The default is what the reader
-/// would have got from a file that named nothing.
 pub fn credentialStore(gpa: std.mem.Allocator, io: std.Io, config_dir: []const u8) CredentialStore {
     var loaded = load(gpa, io, config_dir, null) catch return CredentialStore.default();
     defer loaded.deinit();
     return loaded.credential_store;
 }
 
-/// Which store the file named, held to what this platform has.
-///
-/// **An unavailable store is refused here and never at the first read.** A
-/// person who wrote the wrong name learns at once, rather than after a session
-/// has started and asked for a credential.
 fn readCredentialStore(
     gpa: std.mem.Allocator,
     block: FileCredentials,
@@ -645,17 +419,10 @@ fn parseBlock(
     var ast_owned = true;
     defer if (ast_owned) ast.deinit(gpa);
 
-    // `parse_str_lits = false` matches what `std.zon.parse.fromSliceAlloc`
-    // itself does: the parse call below reads the string literals off the
-    // `Ast`, and this function only reads field names, which are always
-    // there.
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
     var zoir_owned = true;
     defer if (zoir_owned) zoir.deinit(gpa);
 
-    // A syntax error arrives here too: `ZonGen.generate` lowers the `Ast`'s
-    // own errors into its own, and leaves a `Zoir` with no nodes, so nothing
-    // may walk it.
     if (zoir.hasCompileErrors()) {
         if (note(diag, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
             ast_owned = false;
@@ -666,8 +433,6 @@ fn parseBlock(
 
     const node = try findField(zoir, field_name, diag) orelse return null;
 
-    // From here the diagnostics own both trees, the same handover
-    // `lib/chock-policy/table.zig`'s own `Trees` type manages.
     var diagnostics: std.zon.parse.Diagnostics = .{};
     ast_owned = false;
     zoir_owned = false;
@@ -685,7 +450,6 @@ fn parseBlock(
     };
 }
 
-/// The node of one top level field, or null when the file has no such field.
 fn findField(
     zoir: std.zig.Zoir,
     field_name: []const u8,
@@ -707,8 +471,6 @@ fn findField(
     }
 }
 
-/// Every name a fault here carries is copied. `parse` releases the
-/// `providers` block those names point into the moment this returns an error.
 fn checkInstance(gpa: std.mem.Allocator, entry: FileInstance, diag: ?*?Diagnostic) ParseError!Instance {
     const kind = Kind.fromWireName(entry.kind) orelse {
         if (wantsDiagnostic(diag)) {
@@ -779,10 +541,6 @@ fn checkInstance(gpa: std.mem.Allocator, entry: FileInstance, diag: ?*?Diagnosti
     };
 }
 
-/// Refuse two instances that resolve to one name. A store keyed on the kind
-/// cannot hold the second instance of a kind, and
-/// that fault only appears after somebody has already stored it. This is the
-/// same fault one step earlier, in the file.
 fn refuseDuplicateNames(
     gpa: std.mem.Allocator,
     instances: []const Instance,
@@ -805,9 +563,6 @@ fn refuseDuplicateNames(
     }
 }
 
-/// Note a provider field that is present and holds nothing. `field` is always
-/// a literal of this file; the provider's own name is copied, for the reason
-/// `checkInstance` gives.
 fn noteEmptyProviderField(
     gpa: std.mem.Allocator,
     diag: ?*?Diagnostic,
@@ -821,7 +576,6 @@ fn noteEmptyProviderField(
     } });
 }
 
-/// Read the configuration file out of `config_dir` and parse it.
 pub fn load(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -835,7 +589,6 @@ pub fn load(
     return parse(gpa, source, diag);
 }
 
-/// The separate token file, source 2. `deinit` releases it.
 pub const Tokens = struct {
     gpa: std.mem.Allocator,
     entries: []const TokenEntry,
@@ -853,14 +606,6 @@ pub const Tokens = struct {
     }
 };
 
-/// Read and parse the separate token file out of `config_dir`. The file is a
-/// plain list, so a person can read and edit it:
-///
-/// ```zon
-/// .{
-///     .{ .name = "work", .token = "sk-..." },
-/// }
-/// ```
 pub fn loadTokens(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -870,13 +615,9 @@ pub fn loadTokens(
     const path = try std.fs.path.join(gpa, &.{ config_dir, token_file_name });
     defer gpa.free(path);
 
-    // The mode rule covers every source, not only the store Chock writes: a
-    // token file others can read is a leaked credential whoever wrote it.
+    // The mode rule covers every source, including a file Chock never wrote itself: a token file anyone else can read is a leaked credential however it got there.
     var mode_fault: ?paths.Diagnostic = null;
     paths.requirePrivate(io, path, &mode_fault) catch |err| switch (err) {
-        // A missing file is not a fault here. `readWholeFile` below reports
-        // it as `NoConfigFile`, which is the caller's own "there is nothing
-        // in this source" answer.
         error.CredentialFileMissing => {},
         error.StatFailed => {
             if (wantsDiagnostic(diag)) {
@@ -932,8 +673,6 @@ fn readWholeFile(
         error.StreamTooLong => return error.ConfigTooLarge,
         error.FileNotFound, error.NotDir => return error.NoConfigFile,
         else => {
-            // The path is joined into a buffer this function releases, so
-            // the diagnostic keeps its own copy of it.
             if (wantsDiagnostic(diag)) {
                 _ = note(diag, .{ .read_failed = .{
                     .path = try gpa.dupe(u8, path),
@@ -979,8 +718,6 @@ test "a second instance of a kind with no name is refused, never silently replac
         \\}
     , null));
 
-    // Two different kinds under one name is the same fault: a name selects
-    // one provider.
     try testing.expectError(error.DuplicateInstanceName, parse(gpa,
         \\.{
         \\    .providers = .{
@@ -1147,7 +884,6 @@ test "the separate token file is read, and one that others can read is refused" 
         try testing.expect(tokens.find("personal") == null);
     }
 
-    // The same file, widened. The mode rule covers this source too.
     {
         var file = try std.Io.Dir.openFileAbsolute(testing.io, path, .{});
         defer file.close(testing.io);
@@ -1209,9 +945,6 @@ test "the provider a refused entry names reaches the caller, and no longer only 
 }
 
 test "a name in a refused entry is a copy, because the providers block is released" {
-    // `parse` frees the `providers` block on every error path, so a
-    // diagnostic that borrowed a name from it would dangle. The testing
-    // allocator fails this test if `deinit` misses the copy.
     const gpa = testing.allocator;
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
@@ -1248,9 +981,6 @@ test "a typo inside a provider names its block, its line and its column" {
 }
 
 test "a caller that wants no diagnostic allocates nothing extra for one" {
-    // The outer optional is what lets a caller opt out. The testing allocator
-    // fails this test if a refused parse leaks the copy it would have made
-    // for a diagnostic that nobody asked for.
     const gpa = testing.allocator;
     try testing.expectError(error.UnknownProviderKind, parse(gpa,
         \\.{ .providers = .{ .{ .kind = "openai" } } }
@@ -1269,9 +999,6 @@ test "the first fault is kept, and a caller that wants none pays nothing" {
 }
 
 test "no two faults of this module read the same" {
-    // A reader has to be able to tell which one happened. The three ZON
-    // variants are left out, because each renders a syntax tree that no
-    // literal here can build; the test above pins one of them.
     const cases: []const Diagnostic = &.{
         .not_a_struct_literal,
         .empty_provider_name,
@@ -1302,14 +1029,10 @@ test "no two faults of this module read the same" {
 test "the credentials block names where a credential is kept" {
     const gpa = testing.allocator;
 
-    // `secretspec` rather than `file`, because it is the one store every
-    // platform has, and naming one this platform lacks is refused.
     var named = try parse(gpa, ".{ .credentials = .{ .store = \"secretspec\" } }", null);
     defer named.deinit();
     try testing.expectEqual(CredentialStore.secretspec, named.credential_store);
 
-    // A file that names none gets this platform's keystore, so the safer place
-    // is what a user gets without asking for it.
     var silent = try parse(gpa, ".{}", null);
     defer silent.deinit();
     try testing.expectEqual(CredentialStore.default(), silent.credential_store);
@@ -1339,7 +1062,6 @@ test "a store this platform does not have is refused when the file is read" {
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
 
-    // Named for the other platform, so this asserts on whichever one this is.
     const absent = if (builtin.os.tag == .macos) "secret_service" else "keychain";
     const source = ".{ .credentials = .{ .store = \"" ++ absent ++ "\" } }";
 
@@ -1352,8 +1074,6 @@ test "a store this platform does not have is refused when the file is read" {
 }
 
 test "every store this platform has is one this platform accepts" {
-    // Binds `availableHere` to `hereText`, so a fourth store cannot be added to
-    // one and forgotten in the other.
     inline for (@typeInfo(CredentialStore).@"enum".fields) |field| {
         const one: CredentialStore = @enumFromInt(field.value);
         const listed = std.mem.indexOf(u8, CredentialStore.hereText(), field.name) != null;

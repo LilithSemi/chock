@@ -1,21 +1,16 @@
-//! What a plugin tool is handed and what it answers.
-//!
-//! A tool body never touches the host directly. It receives a `Context` and
-//! its own arguments, and it answers a `Result`. Everything that crosses the
-//! sandbox boundary is the host's job, which is what keeps a tool body plain
-//! Zig that a test can call without a wasm engine anywhere near it.
+//! What a plugin tool is handed and what it answers. A tool body never
+//! touches the host directly, which is what keeps it plain Zig that a test
+//! can call without a wasm engine nearby.
 
 const std = @import("std");
 
-/// Whether a tool did the thing it was asked to do. Two states and no third:
-/// a tool that is unsure has failed, because the caller of a tool is an agent
-/// and an agent reads an unclear answer as a success.
+/// Two states and no third: a tool that is unsure has failed, since an
+/// agent reads an unclear answer as a success.
 pub const Outcome = enum(u8) {
     success,
     failure,
 };
 
-/// What a tool answers. `text` is what the agent reads, in either outcome.
 pub const Result = struct {
     outcome: Outcome,
     text: []const u8,
@@ -25,41 +20,24 @@ pub const Result = struct {
     }
 };
 
-/// What a tool is handed.
-///
-/// `tool` is the name of the tool the host called, so one body that serves
-/// several tools can tell them apart.
-///
-/// `arguments` is the argument record the host wrote, and **a tool body has no
-/// reason to read it.** The generated thunk reads it into the tool's own
-/// argument type and hands the body that value instead, which is the whole
-/// point of declaring one: see `lib/chock-plugin-sdk/exports.zig`. It is left
-/// here because the thunk is what reads it, and a body that looks is told what
-/// it is holding rather than finding a field that is not documented.
-///
-/// **It is not the model's own JSON.** The host parses that, checks it against
-/// the schema this plugin advertised, and writes the values as a record in the
-/// order the tool declared its fields. See `lib/chock-plugin-core/args.zig` for
-/// the layout and for the measurement that put the parse on the host.
+/// `tool` names which tool the host called. `arguments` is the host's own
+/// record, not the model's JSON: a generated thunk decodes it, so a tool
+/// body rarely reads it directly.
 pub const Context = struct {
     tool: []const u8 = "",
     arguments: []const u8 = "",
 
-    /// The tool did what it was asked to do. `text` is the answer.
     pub fn successResult(_: Context, text: []const u8) Result {
         return .{ .outcome = .success, .text = text };
     }
 
-    /// The tool did not do what it was asked to do. `text` says why, because
-    /// an agent that reads only "failed" repeats the call.
+    /// `text` says why: an agent that reads only "failed" repeats the call.
     pub fn errorResult(_: Context, text: []const u8) Result {
         return .{ .outcome = .failure, .text = text };
     }
 };
 
 test "successResult and errorResult differ in outcome and keep their text" {
-    // A failure that answered `.success` would let a plugin report a refusal
-    // as work done, which the agent then builds on.
     const ctx: Context = .{ .tool = "hello" };
     const good = ctx.successResult("done");
     const bad = ctx.errorResult("no such file");

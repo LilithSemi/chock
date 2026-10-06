@@ -1,6 +1,5 @@
 //! How many subagents a project allows, from the `subagents` block of
-//! `chock.zon`. The workspace binds the project's own copy back over that path
-//! read only, so the model cannot raise its own limit.
+//! `chock.zon`, bound read only so the model cannot raise its own limit.
 
 const std = @import("std");
 
@@ -11,25 +10,17 @@ pub const max_file_bytes = 1 << 20;
 pub const default_max_depth: u16 = 6;
 pub const default_max_width: u16 = 6;
 
-/// `chock.zon` comes from the project directory, so a hostile project writes
-/// it, and a limit of sixty thousand is a request for a tree no machine runs.
+/// A hostile project can write `chock.zon`, so this is not a generous bound.
 pub const max_settable: u16 = 64;
 
 pub const Limits = struct {
     max_depth: u16 = default_max_depth,
     max_width: u16 = default_max_width,
-    /// Only `explain` reads this. A refusal that blamed `chock.zon` for a
-    /// number an organisation set would send the author to edit a file that
-    /// does not hold it.
+    /// Only `explain` reads this, so a refusal does not blame `chock.zon`
+    /// for a number an organisation set.
     depth_from_org: bool = false,
-    /// Separate from `depth_from_org`, because a bundle may cap one and say
-    /// nothing about the other.
     width_from_org: bool = false,
 
-    /// Saturating, because a file names both numbers and the count grows with
-    /// the power of the depth. Nothing enforces this number: it exists so a
-    /// person can see what a pair of limits adds up to. The defaults of 6 and 6
-    /// are called "36 agents", and the tree they describe holds 9331.
     pub fn largestTree(self: Limits) u64 {
         var total: u64 = 0;
         var level: u64 = 1;
@@ -47,9 +38,6 @@ pub const Standing = struct {
     width: usize = 0,
 };
 
-/// A field and not a rule, and a minimum and not a decision. This lives here
-/// and not in `org.zig` so that `org.zig` imports this file and this file
-/// imports nothing but `std`.
 pub const Ceiling = struct {
     max_depth: ?u16 = null,
     /// Zero is a real answer here: it turns subagents off across the
@@ -57,13 +45,7 @@ pub const Ceiling = struct {
     max_width: ?u16 = null,
 };
 
-/// A minimum, and never a refusal. A budget above its org ceiling refuses the
-/// session, because a budget quietly lowered ends a session in the middle of
-/// the work. A spawn refused by one of these limits says so where it happens,
-/// so the narrowing is silent here and loud where it lands.
-///
-/// Whichever side wins sets the matching flag, so the sentence a refused agent
-/// reads names the file or the bundle correctly.
+/// A minimum, never a refusal: a budget lowered mid-session must not end it.
 pub fn underCeiling(limits: Limits, ceiling: ?Ceiling) Limits {
     const bound = ceiling orelse return limits;
     var held = limits;
@@ -94,12 +76,8 @@ pub const Refusal = enum {
     }
 };
 
-/// Whether `limits` allow the agent at `standing` to start one more subagent.
-/// Null permits it.
-///
-/// Depth is answered before width, because depth is a property of the whole
-/// chain and width of this one agent. A depth of zero names no agent, and no
-/// caller can reach this with one.
+/// Null permits it. Depth is answered before width, since depth is a
+/// property of the whole chain.
 pub fn check(limits: Limits, standing: Standing) ?Refusal {
     std.debug.assert(standing.depth >= 1);
     if (standing.depth >= limits.max_depth) return .depth;
@@ -159,8 +137,7 @@ pub const LoadError = ParseError || error{
     ReadFailed,
 };
 
-/// The two ZON variants own memory, because they hold the syntax tree their
-/// message points into. A caller that receives one must call `deinit`.
+/// The two ZON variants own memory: a caller must call `deinit`.
 pub const Diagnostic = union(enum) {
     file_not_zon: std.zon.parse.Diagnostics,
     block_not_valid: std.zon.parse.Diagnostics,
@@ -212,9 +189,7 @@ pub const Diagnostic = union(enum) {
     }
 };
 
-/// The first fault is kept and not the last. The answer matters because two
-/// variants own memory: a site that hands over a `std.zon.parse.Diagnostics`
-/// must release it itself when the answer is false.
+/// The first fault is kept, not the last.
 fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     const slot = out orelse return false;
     if (slot.* != null) return false;
@@ -222,8 +197,6 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     return true;
 }
 
-/// A file that names no `subagents` block gets the defaults above, which is a
-/// real answer and not a missing one.
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) ParseError!Limits {
     var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

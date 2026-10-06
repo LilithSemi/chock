@@ -97,8 +97,7 @@ test "one changed byte anywhere in the leaf stops it binding" {
 }
 
 test "a changed root name or root key stops the chain, and its own signature is not read" {
-    // A trust anchor is trusted by fiat, so nobody reads its own signature. Only
-    // its subject name and its key take part in a chain.
+    // A trust anchor is trusted by fiat: only its subject name and key take part in a chain.
     const key = try leafKey();
     const chain = [_][]const u8{ &fixtures.leaf_der, &fixtures.intermediate_der };
     var root = fixtures.root_der;
@@ -126,9 +125,7 @@ test "a changed root name or root key stops the chain, and its own signature is 
 }
 
 test "no truncation of a certificate ends the process, and none of them binds" {
-    // `std.crypto.Certificate` reads DER with no bounds check of its own, so a
-    // certificate that stops inside an element aborts the program instead of
-    // returning an error. `attestation.safeToParse` is the guard.
+    // `std.crypto.Certificate` has no bounds check, so a truncated certificate aborts rather than erroring.
     const key = try leafKey();
 
     var length: usize = 0;
@@ -150,8 +147,7 @@ test "no truncation of a certificate ends the process, and none of them binds" {
 }
 
 test "no single byte change to a certificate ends the process" {
-    // A changed byte can put a length field anywhere, which reaches further past
-    // the end than a truncation can.
+    // A changed byte can put a length field anywhere, reaching further past the end than a truncation can.
     const key = try leafKey();
     var leaf = fixtures.leaf_der;
 

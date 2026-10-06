@@ -15,8 +15,6 @@ pub const redacted_marker = "[redacted]";
 pub const handle_open = "{{secret:";
 pub const handle_close = "}}";
 
-/// Nothing in `src/` fills this today, so every function here runs over an
-/// empty set. A live session redacts at `chock_core.Loop.appendAndApply`.
 pub const Store = struct {
     entries: []const Entry = &.{},
 
@@ -98,13 +96,11 @@ pub fn freeEnv(gpa: std.mem.Allocator, env: [][]u8) void {
     gpa.free(env);
 }
 
-/// A value can end one piece and start the next, so a scan of each piece on its
-/// own finds nothing.
+/// A value can end one piece and start the next, so each piece scanned alone finds nothing.
 pub const Redactor = struct {
     /// Empty values are left out: an empty needle matches everywhere.
     values: []const []const u8,
-    /// One less than the longest value, the longest run that can still grow
-    /// into one when the next piece arrives.
+    /// One less than the longest value: the longest run that could still grow into one.
     hold_bytes: usize,
     pending: std.ArrayList(u8) = .empty,
     out: std.ArrayList(u8) = .empty,
@@ -116,7 +112,6 @@ pub const Redactor = struct {
         return initValues(gpa, values);
     }
 
-    /// The same, for a credential that has no name.
     pub fn initValues(
         gpa: std.mem.Allocator,
         values: []const []const u8,
@@ -195,8 +190,7 @@ pub fn redact(store: Store, gpa: std.mem.Allocator, text: []const u8) std.mem.Al
 
 pub const AppendError = std.mem.Allocator.Error || chock_proto.storage.StorageError;
 
-/// Redact first: `chockd` serves the log to every attached client, and the log
-/// is append only, so no later pass can take a value back.
+/// Redact first: the log is append only, so no later pass can take a value back.
 pub fn appendToolResult(
     store: Store,
     gpa: std.mem.Allocator,

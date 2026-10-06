@@ -1,7 +1,5 @@
-//! The guest side, driven against `plugins/hello.zig`, which arrives here as
-//! the module `chock-plugin`. The instantiation below is by hand because the
-//! root of a `zig test` binary is the test runner, so the SDK's automatic path
-//! cannot see the plugin.
+//! The guest side, driven against `plugins/hello.zig`. Instantiation here is by
+//! hand, since the SDK's automatic path cannot see a plugin inside a test binary.
 
 const std = @import("std");
 const core = @import("chock-plugin-core");
@@ -17,8 +15,7 @@ comptime {
 const testing = std.testing;
 
 test "no tool is bound until chock_plugin_init runs" {
-    // Runs first on purpose. Zig runs the tests of a file in written order,
-    // and this is the only moment before the init call below.
+    // Must run first: Zig runs a file's tests in written order.
     try testing.expectEqual(@as(usize, 0), plugin.boundTools().len);
 }
 

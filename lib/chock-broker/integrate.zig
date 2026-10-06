@@ -1,7 +1,5 @@
-//! Carry the session's work onto the branch the user has checked out. No merge
-//! and no rebase ever runs in the user's repository: the result is built in the
-//! session's scratch object store, and the only write to the project is one
-//! fast forward.
+//! Carry the session's work onto the user's checked-out branch. No merge or
+//! rebase runs there: the result is built in the scratch store, and the only write is a fast forward.
 
 const std = @import("std");
 const chock_policy = @import("chock-policy");
@@ -13,8 +11,7 @@ const git = chock_workspace.git;
 
 pub const Landing = chock_policy.apply.Landing;
 
-/// Ask git where these are. Do not join them onto `.git`: a worktree and a
-/// bare repository each put the git directory somewhere else.
+/// Ask git where these are; a worktree or bare repo puts the git directory somewhere else.
 const unfinished_markers = [_][]const u8{
     "MERGE_HEAD",
     "CHERRY_PICK_HEAD",
@@ -145,8 +142,7 @@ pub const Error = git.Error || error{
     GitFailed,
 };
 
-/// Nothing here writes to the user's repository. Every object goes into
-/// `scratch_object_store`, and every string comes out of `arena`.
+/// Nothing here writes to the user's repository: objects go into `scratch_object_store`, strings come from `arena`.
 pub fn planning(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -314,8 +310,7 @@ fn midOperation(
     var lines = std.mem.tokenizeScalar(u8, printed, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        // `access` and not a stat of a kind: `rebase-merge` is a directory and
-        // `MERGE_HEAD` is a file.
+        // `access`, not a stat of a kind: `rebase-merge` is a directory, `MERGE_HEAD` a file.
         std.Io.Dir.accessAbsolute(io, line, .{}) catch continue;
         return true;
     }
@@ -334,8 +329,7 @@ fn isAncestor(
         "merge-base", "--is-ancestor", ancestor, descendant,
     }, null);
     defer output.deinit(arena);
-    // Exit 0 is yes, exit 1 is no, and anything else is git saying it could
-    // not tell. Read "could not tell" as no.
+    // Exit 0 is yes, exit 1 is no, anything else is "could not tell", read as no.
     return output.term == .exited and output.term.exited == 0;
 }
 
@@ -458,8 +452,7 @@ fn replay(
     return .{ .commit = current };
 }
 
-/// `--merge-base` names the base explicitly, which is what turns a merge into
-/// a cherry pick.
+/// `--merge-base` names the base explicitly: that's what turns a merge into a cherry pick.
 fn mergedTree(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -503,9 +496,7 @@ fn mergedTree(
     return .{ .commit = try arena.dupe(u8, first) };
 }
 
-/// `lib/chock-workspace/git.zig` forces the global and system git config to
-/// `/dev/null`, so a person's own `~/.gitconfig` cannot be the identity of a
-/// commit this file writes. Do not reach around that.
+/// `git.zig` forces git config to `/dev/null`, so `~/.gitconfig` is never the identity here.
 fn identityOf(
     arena: std.mem.Allocator,
     io: std.Io,

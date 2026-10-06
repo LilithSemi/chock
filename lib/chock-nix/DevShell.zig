@@ -1,69 +1,8 @@
 //! What a project's Nix dev shell states: the environment every tool call
-//! runs with, and the store paths the sandbox mounts for it.
-//!
-//! If the project has a `flake.nix` with a dev shell, every tool call runs
-//! with the environment of that dev shell, which removes toolchain drift.
-//! Before this existed, that only worked by accident.
-//! `lib/chock-core/tools.zig` resolves a tool call's `argv[0]` against the
-//! host's own `PATH`, so a `chock run` typed inside `nix develop` inherited
-//! the toolchain and one typed outside it did not, and neither one ever got a
-//! variable a flake's `shellHook` sets.
-//!
-//! ## One evaluation answers both questions
-//!
-//! The environment and the mount set come from the same `nix print-dev-env`,
-//! and that is the point rather than an economy. Red team finding 1 of
-//! 2026-08-21 asked for the store mount to be narrowed and the project owner
-//! decided the shape: **do not filter the store by guessing what to exclude,
-//! read the dev shell and provide what the dev shell says.** A mount set
-//! derived from the same evaluation as the environment cannot drift from it.
-//! A hand written list would be correct on the day it was written and wrong
-//! for the next project.
-//!
-//! ## A project with no dev shell, decided rather than left to happen
-//!
-//! **A project with no `flake.nix` gets the whole store, read only, exactly
-//! as before, and `chock run` says so out loud.** `load` answers null, and
-//! `lib/chock-core/tools.zig`'s own `Context.store_paths` default is the
-//! whole store.
-//!
-//! That is a decision and not a fallback nobody chose. The alternative on
-//! the table was the host toolchain's own closure, and it was measured
-//! before it was refused: on a NixOS machine the host's `PATH` reaches the
-//! system profile, whose closure is most of the store **and includes the
-//! home-manager generated files the finding names**. It would cost a Nix
-//! query on every session of every project that has no flake, and it would
-//! not close the finding for those projects. Narrowing is a property of a
-//! project that states its toolchain. A project that states nothing gets no
-//! derived answer, and the honest thing is to say that where the user can
-//! see it.
-//!
-//! ## The cache, and what invalidates it
-//!
-//! Chock caches the environment, and rebuilds it when `flake.nix` or
-//! `flake.lock` changes. The mount set is a property of the same evaluation,
-//! so it caches with it. `stamp` is a hash of those two files.
-//!
-//! **A dev shell defined in another file that `flake.nix` imports is not
-//! seen by that stamp.** This project's own shell is one: it lives in
-//! `pkgs/chock/default.nix`. Editing such a file and keeping `flake.nix`
-//! byte for byte the same leaves a stale cache, and the way out is to touch
-//! `flake.nix` or remove the cache directory. The honest alternative is a
-//! full evaluation on every session, which is the cost the cache exists to
-//! avoid.
-//!
-//! A cache hit still checks that every path it names is still on disk. The
-//! garbage collector root makes that hard to break, and "hard" is not
-//! "cannot": a user who removes Chock's state directory releases the root,
-//! and the next `nix-collect-garbage` takes the toolchain. Finding that at
-//! mount time, one tool call into a session, is the confusing failure the
-//! root exists to prevent.
 
 const std = @import("std");
 
 const diagnostic = @import("diagnostic.zig");
-/// Why a `nix` call did not give an answer. One type for the whole module:
-/// see `chock-nix/diagnostic.zig`.
 pub const Diagnostic = diagnostic.Diagnostic;
 const dev_env = @import("dev_env.zig");
 const proc = @import("proc.zig");
@@ -72,23 +11,12 @@ const store = @import("store.zig");
 const DevShell = @This();
 
 pub const Error = dev_env.Error || store.Error || error{
-    /// The cache directory could not be read or written. The session can
-    /// still run: `load`'s caller reports this and takes the fallback.
     CacheUnusable,
 };
 
-/// Owns every string in `variables` and `store_paths`.
 arena: *std.heap.ArenaAllocator,
-/// The variables the dev shell states, as `KEY=VALUE`, sorted by name.
-/// **`PATH` is one of them**, and it is the one a tool call's `argv[0]` is
-/// resolved against.
 variables: []const []const u8,
-/// Every store path the mount set covers: what the dev shell refers to, and
-/// what those refer to, transitively. Sorted.
 store_paths: []const []const u8,
-/// True when this load evaluated the flake, false when it read the cache.
-/// A caller says so on screen, because an evaluation is slow enough that a
-/// user deserves to know it is happening.
 evaluated: bool,
 
 pub fn deinit(self: *DevShell) void {
@@ -99,53 +27,19 @@ pub fn deinit(self: *DevShell) void {
 }
 
 pub const Options = struct {
-    /// The project. `flake.nix` is looked for directly inside it.
     project_root: []const u8,
-    /// Chock's own directory for this project's dev shell: the cache and
-    /// the garbage collector root links. **It must already exist**, the
-    /// same requirement every other directory a session needs already
-    /// carries, and `src/session.zig` makes it.
     cache_dir: []const u8,
-    /// The attribute under `devShells.<system>` to read. Null takes what
-    /// `nix develop` takes, which is `default`. A name no flake carries fails
-    /// the load with Nix's own message.
     shell_name: ?[]const u8 = null,
-    /// The environment `nix` itself runs with, and where `dev_env`'s own
-    /// small base comes from. This process's own.
     host_env: *const std.process.Environ.Map,
-    /// Called once, before a slow evaluation starts, and never on a cache
-    /// hit.
     on_evaluate: ?*const fn (project_root: []const u8) void = null,
-    /// The `TMPDIR` the evaluation runs with, which is where the dev
-    /// environment makes its own temporary directory. **It must already
-    /// exist.** See `dev_env.Params.staging_dir`.
     staging_dir: ?[]const u8 = null,
-    /// Where a fault past what `Error` can say is left, **and where the
-    /// notices go**: a toolchain that could not be rooted, a cache that could
-    /// not be written, and store paths left out of the mount set all leave a
-    /// session that runs, so they land here and `load` still answers. A
-    /// caller that reads its slot after a `load` that succeeded finds one of
-    /// those three, or nothing.
-    ///
-    /// **What it points at is held by `load`'s own `gpa` argument, and the
-    /// caller releases it with the same one.** Never by the arena `load`
-    /// works in: that arena is destroyed the moment `load` fails, and the
-    /// message is read after that. See `chock-nix/diagnostic.zig`.
     diag: ?*?Diagnostic = null,
 };
 
-/// Read this project's dev shell, from the cache when it is current and
-/// from Nix when it is not. Answers null when the project has no
-/// `flake.nix`, which is the case `load`'s caller reports and takes the
-/// fallback for.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, options: Options) Error!?DevShell {
     if (!try hasFlake(io, options.project_root)) return null;
 
-    // **The message is held by `gpa`, and the answer by the arena below.**
-    // The two allocators are not interchangeable here. A `load` that fails
-    // destroys the arena on the way out, and its caller formats the message
-    // after that, so a message in the arena is a read of freed memory. That
-    // is what this sink exists to state.
+    // The message is held by gpa and the answer by the arena below: load destroys the arena on the way out when it fails, so a message living in the arena would be a read of freed memory after that.
     const sink = diagnostic.sinkOf(gpa, options.diag);
 
     const stamp = try stampOf(gpa, io, options.project_root, options.shell_name, options.staging_dir);
@@ -182,8 +76,6 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: Options) Error!?DevShel
     const script_path = try std.fs.path.join(allocator, &.{ options.cache_dir, script_name });
     try writeFile(io, script_path, script);
 
-    // After the script and not before it, because the script says which bash
-    // can read it. See `dev_env.bashFor`.
     const bash_program = try dev_env.bashFor(allocator, io, script, options.host_env);
 
     const variables = try dev_env.read(allocator, io, .{
@@ -199,17 +91,10 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: Options) Error!?DevShel
     const roots = try store.pathsIn(allocator, io, variables);
     const store_paths = try store.closureOf(allocator, io, nix_program, options.host_env, roots, sink);
 
-    // Before the cache is written, so a cache that exists is a cache whose
-    // paths are held. A failure here is said out loud and is not fatal: a
-    // session without a root still works, and only a `nix-collect-garbage`
-    // during that session would find it out.
     rootPaths(allocator, io, options, roots) catch |err| {
         _ = diagnostic.note(sink, .{ .toolchain_not_rooted = err });
     };
 
-    // Not fatal: the evaluation in hand is correct whether or not it can be
-    // written down. A session that cannot cache pays for the evaluation
-    // again next time, and it still gets its own toolchain now.
     writeCache(allocator, io, options.cache_dir, &stamp, variables, store_paths) catch |err| {
         diagnostic.noteNamed(sink, .cache_not_written, options.cache_dir, err) catch {};
     };
@@ -224,22 +109,6 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: Options) Error!?DevShel
     };
 }
 
-/// Take off the temporary directories earlier evaluations of this project left
-/// in the staging directory, keeping the one this evaluation named.
-///
-/// **Nothing else ever removes them.** A dev environment ends in `mktemp -d -t
-/// nix-shell.XXXXXX`, so each evaluation makes one, and they used to land in
-/// `/tmp` and go at a reboot. They now sit in the state directory, which nothing
-/// empties, so they are taken off where they are made. Best effort, like the
-/// roots below: one that will not come off costs disk and breaks nothing.
-///
-/// The one the new environment names is kept, because the cached environment
-/// every later session reads back is the thing that names it.
-///
-/// **It takes off a directory another session may still name.** That session read
-/// its own name from the cache and is not re-evaluating, so only a re-evaluation
-/// under a running older session meets it, and what goes is scratch space a tool
-/// call cannot reach anyway.
 fn removeOldStaging(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -269,15 +138,11 @@ fn removeOldStaging(
         };
     }
 
-    // Removed after the walk, never during it, for the reason `removeOldRoots`
-    // gives.
     for (names.items) |name| dir.deleteTree(io, name) catch continue;
 }
 
-/// What `mktemp -d -t nix-shell.XXXXXX` calls what it makes.
 const staging_prefix = "nix-shell.";
 
-/// The value of one `KEY=VALUE` record, or null when the set holds no such key.
 fn valueOf(variables: []const []const u8, key: []const u8) ?[]const u8 {
     for (variables) |record| {
         const split = std.mem.indexOfScalar(u8, record, '=') orelse continue;
@@ -287,10 +152,6 @@ fn valueOf(variables: []const []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Make the garbage collector roots, replacing whatever an earlier
-/// evaluation of this project left. The old links are removed first: a link
-/// left behind holds a toolchain nothing uses any more, and an indirect root
-/// stops being a root as soon as its link is gone.
 fn rootPaths(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -302,15 +163,9 @@ fn rootPaths(
 
     removeOldRoots(allocator, io, options.cache_dir);
 
-    // No diagnostic here: `load` turns a fault of this whole function into
-    // the `toolchain_not_rooted` notice, which is the one a person acts on.
     try store.addRoots(allocator, io, nix_store_program, options.host_env, link_prefix, roots, null);
 }
 
-/// Take off every garbage collector root link this project's cache
-/// directory holds. Best effort by design: a link that will not come off is
-/// a link that still holds a store path, which costs disk and breaks
-/// nothing.
 fn removeOldRoots(allocator: std.mem.Allocator, io: std.Io, cache_dir: []const u8) void {
     var dir = std.Io.Dir.openDirAbsolute(io, cache_dir, .{ .iterate = true }) catch return;
     defer dir.close(io);
@@ -331,23 +186,12 @@ fn removeOldRoots(allocator: std.mem.Allocator, io: std.Io, cache_dir: []const u
         };
     }
 
-    // Removed after the walk, never during it: a directory iterator that
-    // outlives an entry it deleted is reading a tree that changed under it.
+    // Removed after the walk, never during it: a directory iterator that outlives an entry it deleted is reading a tree that changed under it.
     for (names.items) |name| dir.deleteFile(io, name) catch continue;
 }
 
 const script_name = "dev-env.sh";
 
-/// What every garbage collector root link in this directory is called, or
-/// starts with.
-///
-/// **Public because a second writer puts links here.** A provisioned program
-/// is held against the collector too, and its links go beside these.
-/// `removeOldRoots` takes off everything that starts with this word, so a
-/// provisioned program is released by the same thing that releases the dev
-/// shell, which is a new evaluation of the flake or a user who removes this
-/// directory. A second spelling of the word in the other writer would quietly
-/// stop that from happening.
 pub const root_link_name = "gcroot";
 const stamp_name = "stamp";
 const variables_name = "env";
@@ -355,11 +199,6 @@ const paths_name = "store-paths";
 
 const stamp_hex_length = 2 * std.crypto.hash.sha2.Sha256.digest_length;
 
-/// Whether this project has a `flake.nix` at all.
-///
-/// **Public because `chock daemon` asks the same question.** A guest's grant
-/// holds the staging directory of a dev shell, and a project with no flake
-/// stages nothing there, so the two ask it through one function.
 pub fn hasFlake(io: std.Io, project_root: []const u8) Error!bool {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&buffer, "{s}/flake.nix", .{project_root}) catch return false;
@@ -367,8 +206,6 @@ pub fn hasFlake(io: std.Io, project_root: []const u8) Error!bool {
     return true;
 }
 
-/// A hash of the two files above, length prefixed so that moving a byte from
-/// one file to the other changes the answer.
 fn stampOf(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -377,21 +214,11 @@ fn stampOf(
     staging_dir: ?[]const u8,
 ) Error![stamp_hex_length]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    // A version of this file's own format. A stamp written by an older
-    // Chock, whose cache holds fields this one does not read, must not
-    // read as current.
     hash.update("chock dev shell 3\n");
 
-    // The attribute belongs in the stamp. Two names over one flake are two
-    // different environments, and without this the second one reads the
-    // first one's cache.
     hash.update(shell_name orelse "");
     hash.update("\n");
 
-    // **So does the staging directory.** It is what the evaluation's own
-    // `TMPDIR` is set to, and the environment it answers names a directory
-    // under it, so a cache written with a different one hands a session five
-    // variables naming a directory that is gone. See `Options.staging_dir`.
     hash.update(staging_dir orelse "");
     hash.update("\n");
 
@@ -401,9 +228,6 @@ fn stampOf(
 
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_flake_bytes)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            // A missing `flake.lock` is ordinary: a flake with no inputs
-            // never gets one. It is hashed as a file of no bytes, which is
-            // a different stamp from the same flake once it has a lock.
             else => "",
         };
         defer if (bytes.len != 0) gpa.free(bytes);
@@ -420,8 +244,6 @@ fn stampOf(
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-/// The largest `flake.nix` or `flake.lock` this hashes. A lock file for a
-/// flake with many inputs is a few hundred kilobytes.
 const max_flake_bytes: usize = 16 * 1024 * 1024;
 
 const Cached = struct {
@@ -429,8 +251,6 @@ const Cached = struct {
     store_paths: []const []const u8,
 };
 
-/// The cached evaluation, when the stamp matches and every path it names is
-/// still on disk. Anything else answers null, and the caller evaluates.
 fn readCache(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -479,9 +299,6 @@ fn splitBlob(arena: std.mem.Allocator, blob: []const u8, separator: u8) Error![]
     return list.toOwnedSlice(arena);
 }
 
-/// Write the evaluation down, the stamp last. A reader takes the stamp as
-/// its proof that the other two files are whole, so a crash halfway through
-/// leaves a cache that reads as missing rather than as current.
 fn writeCache(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -491,8 +308,7 @@ fn writeCache(
     store_paths: []const []const u8,
 ) Error!void {
     const stamp_path = try std.fs.path.join(allocator, &.{ cache_dir, stamp_name });
-    // Removed first, so a failure to write either of the two files below
-    // cannot leave the old stamp standing over new contents.
+    // Removed first, so a failure to write either of the two files below cannot leave the old stamp standing over new contents.
     std.Io.Dir.deleteFileAbsolute(io, stamp_path) catch {};
 
     try writeJoined(allocator, io, cache_dir, variables_name, variables, 0);
@@ -539,9 +355,6 @@ test "a project with no flake has no dev shell to read" {
     var host_env = try std.testing.environ.createMap(allocator);
     defer host_env.deinit();
 
-    // Null, and no `nix` was run to find that out: the answer is a fact
-    // about the project, and Chock only claims a dev shell for a project that
-    // has a flake.
     const loaded = try load(allocator, std.testing.io, .{
         .project_root = dir_path,
         .cache_dir = dir_path,
@@ -551,17 +364,6 @@ test "a project with no flake has no dev shell to read" {
 }
 
 test "a fault outlives the arena that load throws away" {
-    // **This is the shape that made `chock doctor` segfault.** `load` builds
-    // its answer in an arena and destroys that arena the moment it fails.
-    // Its caller reads the message after that. A message that pointed into
-    // the arena was a read of freed memory, and the first project with a
-    // flake that does not evaluate found it.
-    //
-    // The debug allocator underneath is what makes this a test and not a
-    // hope. A message the arena held is released by the arena and then given
-    // to `deinit` below, and this allocator refuses that free instead of
-    // taking it. `chock-nix/diagnostic.zig` pins the other half, the read of
-    // a string the caller never owned.
     var debug: std.heap.DebugAllocator(.{ .safety = true }) = .init;
     defer std.testing.expect(debug.deinit() == .ok) catch @panic("this test leaked");
     const gpa = debug.allocator();
@@ -579,9 +381,6 @@ test "a fault outlives the arena that load throws away" {
         try file.writeStreamingAll(std.testing.io, "{ outputs = _: {}; }\n");
     }
 
-    // A `nix` that refuses, so this test needs no Nix daemon and no network
-    // at all. The line it writes is the one the message must still hold
-    // after the arena is gone.
     try tmp.dir.createDir(std.testing.io, "bin", .default_dir);
     var bin = try tmp.dir.openDir(std.testing.io, "bin", .{});
     defer bin.close(std.testing.io);
@@ -598,8 +397,6 @@ test "a fault outlives the arena that load throws away" {
 
     var host_env = try std.testing.environ.createMap(gpa);
     defer host_env.deinit();
-    // The fake `nix` first, and the host's own path after it, because `load`
-    // resolves `env` before it runs anything.
     const path = try std.fmt.allocPrint(gpa, "{s}/bin:{s}", .{
         dir_path,
         host_env.get("PATH") orelse "",
@@ -620,17 +417,12 @@ test "a fault outlives the arena that load throws away" {
             var owned = shell;
             owned.deinit();
         }
-        // A host that ran the fake `nix` and still succeeded has no fault
-        // here to pin.
         return error.SkipZigTest;
     } else |err| {
-        // A host with no `env` never reaches the fake `nix`.
         if (err == error.ProgramNotFound) return error.SkipZigTest;
         try std.testing.expectEqual(@as(anyerror, error.EvalFailed), err);
     }
 
-    // Read only now, which is the whole point: the arena `load` worked in
-    // is already gone.
     var line: [512]u8 = undefined;
     const text = try std.fmt.bufPrint(&line, "{f}", .{&diag.?});
     try std.testing.expect(std.mem.indexOf(u8, text, "nix print-dev-env failed") != null);
@@ -654,12 +446,9 @@ test "the stamp follows both flake files" {
     }
     const first = try stampOf(allocator, std.testing.io, dir_path, null, null);
 
-    // The same tree hashes the same, or a cache would never hit at all.
     const again = try stampOf(allocator, std.testing.io, dir_path, null, null);
     try std.testing.expectEqualStrings(&first, &again);
 
-    // A lock file that appears is a different dev shell: it pins different
-    // inputs, and the stamp names it for exactly this reason.
     {
         var file = try tmp.dir.createFile(std.testing.io, "flake.lock", .{});
         defer file.close(std.testing.io);
@@ -703,9 +492,6 @@ test "the dev shell name is part of the stamp, so two names never share a cache"
     const again = try stampOf(allocator, std.testing.io, dir_path, "ci", null);
     try std.testing.expectEqualStrings(&named, &again);
 
-    // The staging directory is an input to the evaluation, so it is an input to
-    // the stamp. A cache read back under a different one would hand a session
-    // variables naming a directory another one owns.
     const staged = try stampOf(allocator, std.testing.io, dir_path, "ci", "/var/chock/tmp");
     try std.testing.expect(!std.mem.eql(u8, &named, &staged));
 }
@@ -724,9 +510,6 @@ test "a cache is read back whole, and a stamp that does not match is not read at
     const len = try tmp.dir.realPath(std.testing.io, &buffer);
     const dir_path = buffer[0..len];
 
-    // A variable holding a newline, which is why the environment is stored
-    // separated by a zero byte and the paths by a newline: a `shellHook`
-    // that exports a multi line value is ordinary.
     const variables = [_][]const u8{ "MULTI=one\ntwo", "PATH=/usr/bin" };
     const paths = [_][]const u8{dir_path};
 
@@ -760,10 +543,6 @@ test "a cache whose paths are gone is not used" {
     const len = try tmp.dir.realPath(std.testing.io, &buffer);
     const dir_path = buffer[0..len];
 
-    // The `nix-collect-garbage` case: the stamp still matches, because the
-    // flake did not change, and the toolchain the cache names is not there
-    // any more. Reading it would build a sandbox whose mounts fail one tool
-    // call into the session.
     const variables = [_][]const u8{"PATH=/usr/bin"};
     const paths = [_][]const u8{"/nix/store/00000000000000000000000000000000-not-here"};
 
@@ -795,7 +574,6 @@ test "an evaluation takes off the staging directories the ones before it left" {
     try tmp.dir.createDirPath(io, "nix-shell.old111");
     try tmp.dir.createDirPath(io, "nix-shell.old222/inside");
     try tmp.dir.createDirPath(io, "nix-shell.new333");
-    // Nothing an evaluation made, so nothing this takes off.
     try tmp.dir.createDirPath(io, "stamp.d");
 
     const kept = try std.fs.path.join(arena, &.{ staging, "nix-shell.new333" });

@@ -21,8 +21,7 @@ const container_contents =
 const container = [_]u8{ 0x53, 0x82 } ++ beU16(container_contents.len) ++ container_contents;
 
 comptime {
-    // A card sends at most 256 bytes an exchange. A fixture change that moved this
-    // boundary would stop testing the `GET RESPONSE` loop without saying so.
+    // A card sends at most 256 bytes an exchange, so this length also tests the `GET RESPONSE` loop.
     if (container.len != 515) @compileError("the recorded container is no longer three exchanges long");
 }
 
@@ -53,8 +52,7 @@ pub const select_exchange = chock_pcsc.Exchange{
     .receive = &select_answer,
 };
 
-/// Three exchanges, because a card answers at most 256 bytes. Shared with
-/// `verify.zig`.
+/// Three exchanges, because a card answers at most 256 bytes. Shared with `verify.zig`.
 pub const certificate_exchanges = [_]chock_pcsc.Exchange{
     .{ .send = &get_certificate, .receive = container[0..256] ++ [_]u8{ 0x61, 0x00 } },
     .{ .send = &get_response_256, .receive = container[256..512] ++ [_]u8{ 0x61, 0x03 } },

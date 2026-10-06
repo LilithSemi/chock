@@ -1,49 +1,15 @@
-//! Guidance: the engineering process the harness carries so the model does
-//! not have to hold it.
-//!
-//! ## Not a longer prompt
-//!
-//! This is **progressive disclosure**, the same mechanism `index.zig`
-//! gives the knowledgebase and the subtree instruction files:
-//!
-//! * The prompt names what exists, in one line each.
-//! * `read_guidance` fetches the whole of one when the model decides it
-//!   applies.
-//!
-//! The prompt grows by about one line per piece, not one paragraph, and a
-//! piece the model never reads costs its one line and nothing else.
-//!
-//! ## Guidance is data, not code
-//!
-//! Every piece here is a compiled in string. There is no path from a piece
-//! of guidance to a decision Chock makes, for the same reason a policy that
-//! must be executed to be understood is refused.
-//!
-//! **A tool call cannot write guidance**, and there is nothing to write: the
-//! shelf is in the binary.
-//!
-//! **Known gap: a project cannot yet add guidance of its own.** That needs a
-//! read only path into the project the way `chock.zon` has one, and it is
-//! not built.
+//! Guidance: the engineering process the harness carries so the model
+//! does not have to hold it.
 
 const std = @import("std");
 const index = @import("index.zig");
 
-/// One piece of guidance. The description is the line in the prompt, and the
-/// body is what `read_guidance` returns.
 pub const Piece = struct {
     name: []const u8,
     description: []const u8,
     body: []const u8,
 };
 
-/// The shelf. **Kept short on purpose**: each entry costs a line of every
-/// prompt, so a piece earns its place or it goes.
-///
-/// No piece tells the agent when to use a subagent. A tree of agents is proven
-/// at one child, and guidance that pushed an agent towards a shape nobody has
-/// measured would be advice ahead of evidence. The tool's own description says
-/// what the two shapes are, which is where a caller reads it anyway.
 pub const pieces = [_]Piece{
     .{
         .name = "plan-before-acting",
@@ -174,7 +140,6 @@ pub const pieces = [_]Piece{
     },
 };
 
-/// The index the prompt carries: one line per piece.
 pub fn indexEntries(allocator: std.mem.Allocator) std.mem.Allocator.Error![]index.Entry {
     const out = try allocator.alloc(index.Entry, pieces.len);
     for (&pieces, out) |piece, *line| {
@@ -183,7 +148,6 @@ pub fn indexEntries(allocator: std.mem.Allocator) std.mem.Allocator.Error![]inde
     return out;
 }
 
-/// The whole of one piece, or null for a name that is not on the shelf.
 pub fn find(name: []const u8) ?Piece {
     for (&pieces) |piece| {
         if (std.mem.eql(u8, piece.name, name)) return piece;
@@ -191,9 +155,6 @@ pub fn find(name: []const u8) ?Piece {
     return null;
 }
 
-/// Every name on the shelf, joined, for the message a `read_guidance` call
-/// with an unknown name gets back. Built at comptime from the shelf itself,
-/// so a piece that is added cannot be missing from the message.
 pub const names_text = blk: {
     var text: []const u8 = "";
     for (pieces) |piece| {
@@ -211,8 +172,6 @@ test "every piece has a name, a one line description, and a body" {
         try testing.expect(piece.name.len != 0);
         try testing.expect(piece.body.len != 0);
 
-        // The description is the whole cost of a piece nobody reads, so it
-        // has to be one line and it has to be short.
         try testing.expect(std.mem.indexOfScalar(u8, piece.description, '\n') == null);
         const flat = try index.oneLine(allocator, piece.description);
         defer allocator.free(flat);
@@ -253,29 +212,18 @@ test "a name on the shelf is found, and one that is not is null rather than a cr
 }
 
 test "the shelf names no tool this build does not offer" {
-    // A piece that told the agent to use a subagent, or to fetch a URL,
-    // would cost a turn to find out the tool is not there. The tool list is
-    // read from `tools.zig` itself so this cannot drift.
     const core_tools = @import("tools.zig");
     const forbidden = [_][]const u8{ "spawn_subagent", "web_fetch", "read_image" };
 
     for (&pieces) |piece| {
         for (forbidden) |name| {
             if (std.mem.indexOf(u8, piece.body, name) != null) {
-                // **The failure names the piece and prints its body.**
-                // `expectEqualStrings` shows both sides, so a reader sees
-                // where the word that is not a tool actually sits. A write to
-                // the terminal would put a `failed command:` line in the
-                // build log of every passing run of this suite.
                 try std.testing.expectEqualStrings(piece.name, piece.body);
                 return error.GuidanceNamesSomethingThatIsNotATool;
             }
         }
     }
 
-    // And every tool a piece does name is real. Checked by the enum, so a
-    // tool that is renamed leaves a piece of guidance naming the old one and
-    // this notices.
     const named = [_][]const u8{ "read_file", "edit_file", "write_file", "write_memory" };
     for (named) |name| {
         try testing.expect(std.meta.stringToEnum(core_tools.Tool, name) != null);

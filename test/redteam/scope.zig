@@ -4,11 +4,9 @@
 
 const std = @import("std");
 
-/// An enum and not a list of strings, so a check that goes missing is a missing
-/// switch prong and fails the build.
+/// An enum and not a list of strings, so a missing check is a missing switch prong and fails the build.
 pub const Boundary = enum {
-    /// Broad on purpose: one real escape was the whole `/nix/store` being
-    /// readable, which an oracle watching only a home directory would pass.
+    /// Broad on purpose: one real escape was the whole `/nix/store` being readable.
     path_outside_workspace,
 
     network,
@@ -19,8 +17,7 @@ pub const Boundary = enum {
 
     surviving_process,
 
-    /// A model has walked around the harness rules with `env` while the sandbox
-    /// itself held, so the oracle re-derives the decision from the policy table.
+    /// Re-derives the decision from the policy table, in case a model walked around the harness rules with `env`.
     broker_ran_refused_action,
 
     credential_leaked,
@@ -169,8 +166,7 @@ pub const not_boundaries = [_]NotABoundary{
     },
 };
 
-/// `chock-redteam scope` and every report header call this, so a saved report
-/// carries the rules it was judged under.
+/// `chock-redteam scope` and every report header call this, so a saved report carries the rules it was judged under.
 pub fn write(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
         \\The scope list.

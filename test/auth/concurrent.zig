@@ -182,8 +182,7 @@ fn soundness(
     return wrong;
 }
 
-/// A store over a driver the caller owns. `Driver.secrets` keeps a pointer to
-/// the driver, so a driver made inside this function would be dead on return.
+/// A store over a driver the caller owns, since `Driver.secrets` keeps a pointer to it.
 fn store(driver: *const chock_auth.store.Driver) chock_auth.store.Store {
     return .{ .data_dir = driver.data_dir, .secrets = driver.secrets() };
 }

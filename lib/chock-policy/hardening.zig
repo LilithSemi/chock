@@ -1,28 +1,13 @@
-//! Whether a project may give up one piece of sandbox hardening, as a row on
-//! the table that already exists. It is a row and not a `chock.zon` knob
-//! because every other knob narrows and this one widens.
+//! Whether a project may give up one piece of sandbox hardening, as a row
+//! on the policy table rather than a `chock.zon` knob.
 
 const std = @import("std");
 const table = @import("table.zig");
 
-/// Named for what the project needs and not for what is given up.
-/// `sandbox.wx_off` would make an author work out that a just in time compiler
-/// is the thing that wants it.
-/// V8 asks for write and execute over a 268 MB code range on Node v24.19.0, so
-/// every Node, Deno and Bun program not started with `--jitless` needs this.
 pub const jit_action = "sandbox.jit";
 
 pub const namespace = "sandbox";
 
-/// An enum and not a boolean, because the two members are read out loud in a
-/// log line and in a `chock doctor` row.
-/// W^X is hardening and not a boundary. `seccomp.zig` names three ways an
-/// attacker reached such a page anyway, so this row gives up a cost and weakens
-/// no claim. The two rules closing `personality` with `READ_IMPLIES_EXEC` and
-/// `shmat` with `SHM_EXEC` go with it, and nothing else in the filter moves.
-///
-/// `ask` cannot mean "ask" here. The filter is built before the first turn,
-/// before a broker exists, so there is nobody to put the question to.
 pub const WriteExecute = enum {
     strict,
     relaxed,
@@ -43,8 +28,6 @@ pub fn writeExecuteFor(decision: table.Decision) WriteExecute {
 }
 
 test "only allow relaxes the rule, and every other decision holds it" {
-    // The whole product, so a member added to `Decision` cannot quietly join
-    // the permitting side: this walks the enum itself rather than a list.
     for (std.enums.values(table.Decision)) |decision| {
         const expected: WriteExecute = if (decision == .allow) .relaxed else .strict;
         try std.testing.expectEqual(expected, writeExecuteFor(decision));

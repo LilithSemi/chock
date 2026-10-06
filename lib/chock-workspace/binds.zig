@@ -15,12 +15,10 @@ pub const Report = worktree_mod.ImportReport;
 
 pub const Error = worktree_mod.Error;
 
-/// One bind, with the path the sandbox sees it at. The strings belong to this
-/// value, so a `Workspace` that holds one outlives whatever resolved it.
+/// One bind, with the path the sandbox sees it at. The strings belong to this value.
 pub const Attached = struct {
     bind: Resolved,
-    /// Under the sandbox root, and under the work directory, at the same
-    /// relative path the project keeps it at.
+    /// Under the sandbox root and the work directory, at the same relative path.
     target: []u8,
     work_path: []u8,
 
@@ -37,15 +35,8 @@ pub fn free(gpa: std.mem.Allocator, list: []Attached) void {
     gpa.free(list);
 }
 
-/// Copy the two copying modes into the workspace, and work out where every
-/// bind lands. Nothing is mounted here: `Workspace.sandboxConfig` builds the
-/// mount list and `chock-sandbox` performs it.
-///
-/// `copy_in` is false for a workspace another session already filled. The
-/// copies are in it, and copying again would write over what its agent did.
-///
-/// A path that cannot be copied is recorded in `report` and does not stop the
-/// session, the same answer `importUncommitted` gives.
+/// `copy_in` is false for a workspace another session already filled, so
+/// copying again does not overwrite its agent's work.
 pub fn attach(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -87,9 +78,7 @@ pub fn attach(
     return out.toOwnedSlice(gpa);
 }
 
-/// The mounts for the two modes that bind, in the order the caller appends
-/// them. Read only is the kernel's own refusal, so a `read_only` bind cannot
-/// be written to whatever the agent does.
+/// `read_only` relies on the kernel's own refusal to write.
 pub fn appendMounts(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(Mount),
@@ -112,10 +101,7 @@ pub const WriteBack = struct {
     binds: usize = 0,
 };
 
-/// Copy every `copy` bind the caller permitted back over the user's own file.
-///
-/// This writes files back and never removes one, so a file the agent deleted
-/// inside the workspace stays on the user's disk.
+/// Never removes a file, so a file the agent deleted stays on the user's disk.
 pub fn writeBack(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -163,9 +149,7 @@ fn copyOut(gpa: std.mem.Allocator, io: std.Io, one: Attached, report: *Report) E
     return copyTree(gpa, io, one.work_path, one.bind.host_path, one.bind.relative, report);
 }
 
-/// A directory, file by file, with `copyRegularFile` and `recreateSymlink`
-/// doing each one. A directory this cannot open is one skip and not a failed
-/// session.
+/// A directory this cannot open is one skip, not a failed session.
 fn copyTree(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -191,12 +175,7 @@ fn copyTree(
     };
     defer walker.deinit();
 
-    // **A walk that fails is said out loud, never read as the end of the tree.**
-    // `catch null` here made any error look like "there is nothing more": the
-    // copy stopped partway and the bind reported success. A git repository bound
-    // this way arrived with some of its objects missing, and the agent inside met
-    // `fatal: bad object HEAD` with nothing anywhere saying the copy was cut
-    // short. One skip naming the fault is what a person can act on.
+    // A walk that fails must be reported, not read as the end of the tree.
     while (true) {
         const next = walker.next(io) catch |err| {
             const reason = try std.fmt.allocPrint(
@@ -356,7 +335,6 @@ test "a copy bind lands in the workspace, and a temp_copy does too" {
     defer gpa.free(temp);
     try testing.expectEqualStrings("a=1\n", temp);
 
-    // Neither copying mode is a mount.
     var list: std.ArrayList(Mount) = .empty;
     defer list.deinit(gpa);
     try appendMounts(gpa, &list, attached);
@@ -505,10 +483,6 @@ test "a copy that stops partway says so, and does not report an incomplete tree 
     var work = testing.tmpDir(.{});
     defer work.cleanup();
 
-    // A tree holding a readable file and a directory the walk cannot read. The
-    // real case was a git repository of several gigabytes where the walk stopped
-    // partway and the bind reported success, so the agent met `fatal: bad object
-    // HEAD` with nothing saying the copy had been cut short.
     try project.dir.createDirPath(testing.io, "tree/readable");
     {
         var file = try project.dir.createFile(testing.io, "tree/readable/kept.txt", .{});
@@ -521,22 +495,13 @@ test "a copy that stops partway says so, and does not report an incomplete tree 
         defer file.close(testing.io);
         try file.writeStreamingAll(testing.io, "unreachable\n");
     }
-    // No read and no search, so iterating it fails rather than answering empty.
-    // The handle is kept open, because a directory with no search permission
-    // cannot be opened again to put its permissions back.
-    //
-    // **`iterate` is what makes the handle a real descriptor.** Without it
-    // Linux opens the directory with `O_PATH`, and `fchmod` on such a
-    // descriptor answers `EBADF`, which the standard library treats as a
-    // programmer bug and panics on in a debug build.
+    // `iterate` is required: without it Linux opens with O_PATH, and fchmod
+    // on that descriptor answers EBADF, which panics in a debug build.
     var closed = try project.dir.openDir(testing.io, "tree/closed", .{ .iterate = true });
     defer closed.close(testing.io);
     closed.setPermissions(testing.io, .fromMode(0o000)) catch return error.SkipZigTest;
-    // Put it back whatever happens, or the temporary directory cannot be removed.
     defer closed.setPermissions(testing.io, .fromMode(0o755)) catch {};
 
-    // A process that overrides the permission bits reads the directory anyway,
-    // so there is nothing here to prove and the test says so.
     if (project.dir.openDir(testing.io, "tree/closed", .{ .iterate = true })) |*open| {
         @constCast(open).close(testing.io);
         return error.SkipZigTest;
@@ -566,8 +531,6 @@ test "a copy that stops partway says so, and does not report an incomplete tree 
         gpa.free(attached);
     }
 
-    // The point of the test: something was recorded. A silent partial copy is
-    // the bug, and an empty report is what that looked like.
     try testing.expect(report.skipped.items.len > 0);
 
     var said_partway = false;

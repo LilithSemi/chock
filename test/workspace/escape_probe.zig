@@ -1,60 +1,6 @@
-//! Runs one operation inside a real `Sandbox.spawn` sandbox, built from a
-//! config that `test/workspace/escape.zig` serializes. Its own process because
-//! `Sandbox.spawn` calls `fork`, which carries only the calling thread into the
-//! child, and the zig test runner is not a single threaded caller. Nothing here
-//! touches `std.Io`: every path arrives through argv.
-//!
-//! Command line, for the outer invocation:
-//!   escape-probe <op> <root> <cwd> <mounts-blob> <rules-blob> <env-blob> <target-or-git-path>
-//!
-//! `<op>` is one of:
-//!   write             create <target-or-git-path> for write
-//!   delete            unlink <target-or-git-path>
-//!   read              read it whole, and report the project's own bytes or
-//!                     the deny notice
-//!   connect           open TCP to it, written "<dotted quad>:<port>"
-//!   git-status        bind git at its host path and run "git status"
-//!   git-commit        same bind, then "git add", "git commit", "git cat-file
-//!                     -e" on the parent commit, "git log", "git show", each
-//!                     its own spawn. Every one must succeed
-//!   git-alternate-tamper   git-commit with GIT_ALTERNATE_OBJECT_DIRECTORIES
-//!                     replaced by a bogus path. The commit must still succeed
-//!                     and the cat-file read must now fail
-//!   git-push          it is "<git host path>\x01<url>". Runs the real git with
-//!                     no shim: "git --version", which must exit 0, then
-//!                     "git push <url> HEAD", which must not
-//!
-//! `<mounts-blob>` is zero or more lines, one per mount, fields separated by
-//! 0x01, the first field always the kind:
-//!   "bind\x01<source>\x01<target>\x01<read_only, 0 or 1>"
-//!   "overlay\x01<lower>\x01<upper>\x01<work>\x01<target>"
-//!   "proc\x01<target>"
-//!   "deny\x01<target>"
-//! `<rules-blob>` is the same shape for Landlock rules, each
-//!   "<path>\x01<access bits, decimal>"
-//! `<env-blob>` is one complete "KEY=VALUE" string per line. Lines are
-//! separated by "\n" and an empty blob is the empty string.
-//!
-//! This program always adds `/nix/store` read only, so the dynamic linker can
-//! resolve shared libraries, and the binary it is about to exec.
-//!
-//! "write" and "delete" exec this same binary again inside the sandbox with a
-//! "spawned-" operation, which does no setup of its own, so whatever it hits is
-//! entirely the doing of `Sandbox.spawn`.
-//!
-//! Exit status:
-//!   0   the operation succeeded, or every step of a git flow exited 0
-//!   1   refused with the errno the design predicts: EROFS for "write", EBUSY
-//!       for "delete", ENETUNREACH for "connect", and for "read" the file held
-//!       exactly `namespace.deny_notice`
-//!   2   the command line is wrong, or the operation is unknown
-//!   3   the setup or the spawn failed before the operation ran. Never reused
-//!       by 0 or 1: a setup failure returning a passing code has shipped twice
-//!   4   (read only) the file read as empty. Its own code, because an agent
-//!       that reads an empty `.env` concludes the project has no configuration
-//!   5   the operation failed, but not for the reason the design predicts
-//!  63   this machine would not give the sandbox its namespaces, so the
-//!       operation never ran. Not a pass and not a failure: the caller skips
+//! Runs one operation inside a real `Sandbox.spawn` sandbox, built from a config
+//! that `test/workspace/escape.zig` serializes. Its own process because
+//! `Sandbox.spawn` calls `fork` and the zig test runner is not single threaded.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -63,12 +9,8 @@ const sandbox = @import("chock-sandbox");
 const self_target = "/probe";
 const git_target = "/probe-git";
 
-/// git never writes an object it can already find, so `escape.zig` fills this
-/// file with content that was never committed before.
 const commit_test_file = "chock-object-store-test.txt";
 
-/// Nothing is printed: `build.zig`'s `failOnTestStderr` fails the build on a
-/// byte written to standard error.
 fn endIfNothingMeasured(err: anyerror) void {
     if (err != error.NamespaceFailed) return;
     std.process.exit(sandbox.namespace.nothing_measured_exit_status);
@@ -159,8 +101,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         addGitRuntimeMounts(arena, &mounts, &rules, target_or_git) catch return 3;
 
         argv = arena.dupe([]const u8, &.{ git_target, "status" }) catch return 3;
-        // Neither config path exists inside the sandbox. git reads a config
-        // file that is not there as empty, not as an error.
+        // Neither config path exists inside the sandbox. Git reads a missing config file as empty.
         env = &.{
             "GIT_CONFIG_GLOBAL=/nonexistent-chock-global-gitconfig",
             "GIT_CONFIG_SYSTEM=/nonexistent-chock-system-gitconfig",
@@ -208,13 +149,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     return reportTerm(term);
 }
 
-/// git opens `/dev/null` directly, and without it a git command fails with
-/// "could not open '/dev/null' for reading and writing".
-///
-/// That mount is not read only, because `markReadOnly` also sets `NODEV`, which
-/// then refuses to open the device node at all with `EPERM`. Its rule is not
-/// `AccessFs.read_write` either: that set carries directory only rights, and
-/// Landlock refuses those for a path that is not a directory with `EINVAL`.
+/// Not read only: `markReadOnly` also sets `NODEV`, which then refuses to open the device node at all.
 fn addGitRuntimeMounts(
     arena: std.mem.Allocator,
     mounts: *std.ArrayList(sandbox.namespace.Mount),
@@ -247,9 +182,8 @@ fn buildGitCommitEnv(
     return list.toOwnedSlice(arena);
 }
 
-/// Each spawn rebuilds its own mount tree under the same `root`. That is safe:
-/// a mount lives in the mount namespace the exiting child already tore down,
-/// and `buildRoot` accepts a target directory left from the step before.
+/// Each spawn rebuilds its own mount tree under the same `root`, which is safe
+/// since a mount lives in the mount namespace the exiting child already tore down.
 fn runGitStep(
     arena: std.mem.Allocator,
     root: []const u8,
@@ -277,9 +211,8 @@ fn runGitStep(
     };
 }
 
-/// Naming the real binary skips the shim, and the push still fails because the
-/// sandbox has no route out. `git --version` runs first so the push's failure
-/// means something: a git that could not start would also exit nonzero.
+/// `git --version` runs first so the push's failure means something: a git that
+/// could not start would also exit nonzero.
 fn runGitPushFlow(
     arena: std.mem.Allocator,
     root: []const u8,
@@ -310,9 +243,8 @@ fn exitedZero(term: std.process.Child.Term) bool {
     };
 }
 
-/// The add and the commit must succeed either way: neither reads the alternate
-/// to write a new object. `tampered_env` is used for the cat-file step alone,
-/// and it shows that renaming an alternate loses that one command its history.
+/// The add and the commit must succeed either way, since neither reads the
+/// alternate. `tampered_env` applies to the cat-file step alone.
 fn runGitCommitFlow(
     arena: std.mem.Allocator,
     root: []const u8,
@@ -379,8 +311,7 @@ fn spawnedWrite(target: []const u8) u8 {
     return if (open_errno == .ROFS) 1 else 5;
 }
 
-/// The notice string comes from `chock-sandbox` itself. A copy written here
-/// would go on matching after somebody changed the real one.
+/// The notice string comes from `chock-sandbox` itself, not a copy that could drift.
 fn spawnedRead(target: []const u8) u8 {
     const target_z = std.heap.page_allocator.dupeZ(u8, target) catch return 5;
     defer std.heap.page_allocator.free(target_z);
@@ -418,8 +349,7 @@ fn spawnedDelete(target: []const u8) u8 {
     return if (unlink_errno == .BUSY) 1 else 5;
 }
 
-/// ENETUNREACH is the errno a network namespace with no route and a loopback
-/// that is down gives. ECONNREFUSED instead would mean the packet left.
+/// ENETUNREACH is the errno a network namespace with no route gives. ECONNREFUSED would mean the packet left.
 fn spawnedConnect(address: []const u8) u8 {
     const colon = std.mem.lastIndexOfScalar(u8, address, ':') orelse {
         std.debug.print("spawned-connect: expected <dotted quad>:<port>, got {s}\n", .{address});

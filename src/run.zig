@@ -1,6 +1,5 @@
-//! `chock run`: one agent session against the project in the current
-//! directory, from the command line, with no interface. The run is three
-//! phases, each with the `std.Io` its own job needs, one at a time.
+//! `chock run`: one agent session against the project in the current directory, from the command line, with no interface.
+//! The run has three phases, each using the `std.Io` its own job needs.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -104,18 +103,12 @@ const Options = struct {
     session: ?[]const u8 = null,
     agent_kind: []const u8 = "main",
     org_bundle: ?[]const u8 = null,
-    /// Every file `--instructions` named, in the order given.
     instructions: []const []const u8 = &.{},
     max_turns: ?usize = null,
-    /// Overrides `.nix.dev_shell` for one run.
     dev_shell: ?[]const u8 = null,
-    /// Every rule `--policy-rule` named, in the order given.
     policy_rules: []const chock_policy.table.Rule = &.{},
     continue_newest: bool = false,
     adopt: bool = false,
-    /// Where this session's microVM guest is listening. Given by `chock daemon`,
-    /// which owns the guest: a person never types it. Null for a session whose
-    /// operator chose the native driver.
     guest: ?[]const u8 = null,
     allow_dirty: bool = false,
     no_notices: bool = false,
@@ -194,9 +187,6 @@ fn mainWith(
 
     var env = try environ.createMap(arena);
 
-    // `Workspace.open` spawns a bare `git`, and without `.environ` `Threaded`
-    // resolves it against a compiled in `PATH` that holds no `git` on a Nix
-    // machine.
     var setup_threaded = std.Io.Threaded.init(arena, .{ .environ = environ });
     const setup_io = setup_threaded.io();
 
@@ -212,10 +202,7 @@ fn mainWith(
     };
     setup_threaded.deinit();
 
-    // `fork` carries only the calling thread, so phase 2 runs on an `Io` whose
-    // allocator is `failing`: `Threaded` uses that allocator to start threads
-    // and for little else, and a thread here gives a forked child that
-    // deadlocks.
+    // `fork` carries only the calling thread, so this `Io` uses a failing allocator: a thread here would deadlock the forked child.
     var take_up: ?[]const u8 = null;
     var shipped: ShippingReport = .{};
 
@@ -269,14 +256,10 @@ fn mainWith(
 
     if (started.dev_shell) |*shell| shell.deinit();
     if (started.device_source) |source| source.deinit();
-    // Lets go here of the shared lock on the extracted tree, which stops
-    // another session removing it while a tool call still binds it. This is
-    // the last point at which a tool call of this session can be running.
     if (started.image) |*one| one.deinit(teardown_io);
 
     const result = outcome catch |err| {
-        // `Busy` is a second owner and not a fault: the kernel refused the
-        // second asker for the log's exclusive lock.
+        // `Busy` means another process already holds the log's lock, not a fault here.
         if (err == error.Busy) {
             tty.print(.err, "chock run: {s}\n", .{busy_detail});
             return Exit.usage.code();
@@ -293,9 +276,6 @@ fn mainWith(
     return exitWithApply(result, applied, &shipped).code();
 }
 
-/// Take up another session of this project, in place of this one. A child and
-/// not an `execve`: Zig 0.16 exposes no portable `execve` and this program does
-/// not link libc.
 fn takeUp(
     io: std.Io,
     env: *const std.process.Environ.Map,
@@ -303,8 +283,6 @@ fn takeUp(
     project_root: []const u8,
     id: []const u8,
 ) !u8 {
-    // `--project` and not the working directory, which the child inherits from
-    // this process and which may be anywhere.
     const argv = [_][]const u8{
         exe_path,
         "run",
@@ -357,8 +335,6 @@ fn cleanupFor(session_exit: ?Exit, applied: Applied) Cleanup {
     };
 }
 
-/// A process that adopted a workspace never removes it: the checkout
-/// `Workspace.close` would force away holds another owner's work.
 fn releaseOnFailure(adopted: bool) Cleanup {
     return if (adopted) .keep else .remove;
 }
@@ -368,7 +344,6 @@ fn handedOver(outcome: anyerror!Exit) bool {
     return ended == .handed_over;
 }
 
-/// `workspace` is not valid after this call returns, either way.
 fn takeDownWorkspace(
     workspace: *chock_workspace.Workspace,
     cleanup: Cleanup,
@@ -393,8 +368,6 @@ fn takeDownWorkspace(
             }
         },
         .keep => {
-            // Named before the value is freed: `workPath` borrows from the
-            // workspace, and `keep` ends it.
             reportKeptWorkspace(workspace.workPath());
             workspace.keep(arena);
         },
@@ -427,9 +400,6 @@ fn exitWithApply(session_exit: Exit, applied: Applied, shipped: *const ShippingR
     return exitWithAudit(landed, shipped);
 }
 
-/// A required audit sink never stops a session and never refuses to start one.
-/// A sink that went down and came back leaves no gap: the log on disk is the
-/// queue.
 fn exitWithAudit(session_exit: Exit, report: *const ShippingReport) Exit {
     if (session_exit != .finished) return session_exit;
     return if (report.requiredGap()) .audit_gap else .finished;
@@ -444,38 +414,20 @@ const Started = struct {
     policy: *const chock_policy.table.Table,
     sandbox_config: sandbox.Config,
     dev_shell: ?chock_nix.DevShell,
-    /// Owns strings `toolchain`, `sandbox_config.env` and `tool_env` borrow. A
-    /// session has one of this and `dev_shell`, never both.
     image: ?chock_container.Image,
     toolchain: Toolchain,
-    /// What the operator's own `config.zon` says about sandboxing. Owned by the
-    /// session's arena.
     sandbox_choice: chock_policy.sandbox.Block,
-    /// Chock's own state directory. Short, which is what a unix socket path needs.
     state_dir: []const u8,
-    /// This session's own guest, forked before the credential was read and waiting
-    /// for the directories it may serve. Null for a session the daemon handed a
-    /// guest to, and for one whose tool calls run natively.
     own_guest: ?*OwnGuest,
-    /// The toolchain's own read only binds, plus one for each operator skill.
     read_only_mounts: []const chock_core.tools.ToolchainMount,
-    /// Every skill this session found, bodies and all. The prompt carries one
-    /// line each and `read_skill` answers out of this.
     skills: chock_core.skills.Found,
     tool_env: *std.process.Environ.Map,
     provisioning: ?Provisioning,
     nix_build: ?NixBuild,
     nix_caps: chock_policy.nix.Resolved,
     search: chock_policy.search.Search,
-    /// Which secret a tool call may be given, out of the project's own file.
-    /// Empty for a project that named none.
     secrets: chock_policy.secrets.Block,
-    /// Where a granted secret is read from. Never mounted into a sandbox: see
-    /// `lib/chock-auth/store.zig`.
     store: chock_auth.store.Store,
-    /// The key itself, read out of the credential store, and not the name the
-    /// `search` block gives. Null when the block names none, or when the store
-    /// holds nothing under that name yet.
     search_credential: ?[]const u8,
     backing: *chock_proto.storage.JsonLines,
     storage: chock_proto.storage.Storage,
@@ -486,8 +438,6 @@ const Started = struct {
     subagents: chock_policy.subagents.Limits,
     apply_mode: ApplyMode,
     language_server: ?chock_core.lsp_driver.Settings,
-    /// Owns the signal pipe, and `sandbox_config.device_source` borrows this
-    /// pointer until phase 3.
     device_source: ?*chock_core.devices.HostSource,
     mcp_servers: ?[]const chock_core.mcp.Settings,
     plugins: ?[]const chock_core.plugin.Settings,
@@ -508,9 +458,6 @@ const Started = struct {
     tasks_dir: ?[]const u8,
     context_tokens: ?u64,
     uncommitted_files: usize,
-    /// A pointer, because a `Waiter` holds one and `start` returns by value. Null
-    /// when the socket could not be made, and a question nobody can be asked is
-    /// refused.
     approvals: ?*chock_broker.socket.Endpoint,
     handovers: ?*chock_broker.handover.Endpoint,
     attempt: []const u8,
@@ -521,10 +468,6 @@ const Started = struct {
 
 const StartError = error{Reported} || std.mem.Allocator.Error;
 
-/// An installed bundle that has expired still binds, in full: a bundle can only
-/// narrow, so dropping one can only widen, and at the moment nobody can be
-/// reached. `--org-bundle` is somebody handing Chock a file now, so an expired
-/// one is refused there and a path that names nothing is a fault.
 fn loadOrgBundle(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -533,9 +476,6 @@ fn loadOrgBundle(
 ) StartError!?*const chock_policy.org.Bundle {
     const named = options.org_bundle;
 
-    // A subagent reads the installed bundle and never a named one. A parent
-    // writes its child's command line and carries no bundle, so a child given a
-    // path here would run under a wider org policy than its parent.
     if (named != null and options.parent_chain.len != 0) {
         tty.print(
             .err,
@@ -621,12 +561,6 @@ fn daysIn(span_ms: i64) i64 {
     return @divFloor(span_ms, std.time.ms_per_day);
 }
 
-/// A rule given on the command line is not in a file anybody can read back, so
-/// the session says every one of them. They reach no subagent: a child reads
-/// the project's file and the org bundle alone.
-/// What a person gave this run, and the content of the file the policy came
-/// from. Only what is there: a reader of the log sees what the session had,
-/// and every field it does not carry is one nobody set.
 fn sessionConfig(
     arena: std.mem.Allocator,
     options: Options,
@@ -777,8 +711,6 @@ fn start(
 
     const org_bundle = try loadOrgBundle(arena, io, data_dir, options);
 
-    // Copied into the arena: `chock_proto.log.Log` borrows the session string
-    // and stamps it onto every envelope for as long as the log is open.
     const stack_id = try chooseSessionId(arena, io, env, project_root, options);
     const id = try arena.dupe(u8, &stack_id);
 
@@ -791,16 +723,10 @@ fn start(
 
     session_paths.create(io, paths) catch return error.Reported;
 
-    // **Forked here, above the provider configuration and below the sandbox
-    // block.** A forked process keeps a copy of this one's memory, so a guest
-    // started after the credential was read would hold the token for as long as
-    // the session runs. The directories it serves are not known yet: they cross
-    // the control channel later, which is what lets the fork come first.
+    // The guest is forked here, before the credential is read, so its copied memory never holds the token.
     var own_guest: ?*OwnGuest = null;
     errdefer if (own_guest) |one| one.stop(io);
     if (sandbox_choice.chosen() == .microvm) {
-        // Before the fork, and before a socket a daemon gave this run is used,
-        // because either way a guest ends up holding a grant over the project.
         try refuseGuestOverChockOwn(arena, io, env, project_root);
         if (options.guest == null) {
             own_guest = try forkOwnGuest(arena, io, state_dir, sandbox_choice, paths.dir, id);
@@ -873,11 +799,6 @@ fn start(
         return error.Reported;
     };
 
-    // The `credentials` block of the same file the providers came from, read
-    // above. A store this platform does not have was refused when the file was
-    // read, so nothing here has to check it again.
-    // In the arena and not on this frame: a `Secrets` points at its own driver,
-    // and phase 3 reads a secret long after this function has returned.
     const driver = try arena.create(chock_auth.store.Driver);
     driver.* = .{
         .data_dir = data_dir,
@@ -932,13 +853,10 @@ fn start(
         return error.Reported;
     }
 
-    // Before the redaction, because the search key is one of the values that
-    // must never reach the log.
+    // Both resolved before the redaction below, because that step must know every value to keep out of the log.
     const search = try resolveSearch(arena, io, config_dir, org_bundle);
     const search_credential = try loadSearchCredential(arena, io, store, search);
 
-    // Before the redaction too, because the block says how many secrets this
-    // session may have to keep out of the log, and a slot cannot be added later.
     const project_secrets = try resolveSecrets(arena, io, project_root);
 
     const redaction = try redactionFor(
@@ -953,8 +871,6 @@ fn start(
     const resuming = options.adopt or options.continue_newest or options.session != null;
     const taken = if (resuming) takenOver(gpa, io, arena, paths.log, paths.work) else null;
 
-    // Before the workspace, because the `workspace` block's binds are decided
-    // against this table and the mount list is built from that decision.
     const policy = try loadPolicyUnder(arena, io, project_root, org_bundle, options.policy_rules);
     reportGivenRules(options.policy_rules);
 
@@ -968,12 +884,7 @@ fn start(
         project_root,
     );
 
-    // Fresh on every invocation, and never the session identifier: a
-    // continued session would otherwise ask `git worktree add` for a path
-    // the previous run already used.
     const attempt = if (taken) |one| one.attempt else session_paths.newId(io);
-    // The arena, not the general purpose allocator: `close` has to be given
-    // the same allocator `open` was.
     var open_diag: ?chock_workspace.Diagnostic = null;
     var workspace = if (taken) |one| chock_workspace.Workspace.adopt(
         arena,
@@ -1086,10 +997,6 @@ fn start(
         credential.source.describe(),
     });
 
-    // Before the two control sockets, because this is what proves this process
-    // owns the session. `Endpoint.open` removes whatever file is at the path, so
-    // a second run against a live session unlinked that session's approval and
-    // handover sockets and left it listening on an inode nothing could reach.
     recordWorkspace(gpa, io, storage, &workspace, &attempt) catch |err| {
         if (err == error.Busy) {
             tty.print(.err, "chock run: {s}\n", .{busy_detail});
@@ -1110,14 +1017,8 @@ fn start(
 
     const dev_shell_dir = devShellDirFor(arena, io, env, project_root);
 
-    // **Where the dev shell's own temporary directory goes, named rather than
-    // left to `nix`.** An evaluation ends in `mktemp -d -t nix-shell.XXXXXX`, so
-    // left alone it leaves a directory under `/tmp` that nothing can find again
-    // and nothing takes off. See `session_paths.devShellStagingDir`.
     const staging_dir = devShellStagingDirFor(arena, io, env, project_root);
 
-    // Before the dev shell, because the `nix` block names the attribute it
-    // reads. `--dev-shell` wins over the file for this one run.
     const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
     const dev_shell_name = options.dev_shell orelse nix_caps.dev_shell;
 
@@ -1160,9 +1061,6 @@ fn start(
         sandbox_config.mounts,
     );
 
-    // A workspace this process took over imports nothing. `--allow-dirty` copies
-    // every path `git status` names over the same path in the workspace, and on
-    // an adopted one those may be files the last owner's agent wrote.
     if (taken != null and options.allow_dirty) {
         tty.print(
             .err,
@@ -1191,9 +1089,6 @@ fn start(
 
     if (try resolveLimits(arena, io, project_root, config_dir, org_bundle)) |resolved| {
         applyLimits(&sandbox_config, resolved);
-        // The program these numbers bound cannot read them: `/sys/fs/cgroup` is
-        // hidden inside the sandbox and `/proc/meminfo` reports the whole
-        // machine.
         if (resolved.processes_from_org) {
             tty.print(
                 .warn,
@@ -1342,8 +1237,6 @@ fn start(
     else
         null;
 
-    // Here, because the scratchpad it sits beside is made just above and nothing
-    // between reads this variable. A guest is offered what this names.
     if (try toolStagingDir(arena, scratch_dir)) |dir| {
         try tool_env.put("TMPDIR", dir);
     }
@@ -1391,8 +1284,6 @@ fn start(
         .provisioning = provisioning != null,
         .nix_build = nix_build != null,
         .skills = found_skills.skills.len != 0,
-        // An evaluation runs in this process, so it needs no `nix` binary,
-        // no daemon and no store.
         .nix_eval = true,
         .role = agentRole(options),
     };
@@ -1456,9 +1347,6 @@ fn start(
         prompt_sources,
     ) catch return error.OutOfMemory;
 
-    // An adoption appends nothing and reads no standard input: a read would
-    // block a daemon's child for ever on a pipe nothing writes to. A display
-    // appends none either, and asks for every message it sends.
     if (!options.adopt and options.display == null) {
         const message_text = try readMessage(arena, io, options);
         if (message_text.len == 0) {
@@ -1540,19 +1428,12 @@ fn start(
     };
 }
 
-/// What this session keeps out of its own log and out of a provider request. A
-/// credential shorter than `chock_core.redact.min_secret_bytes` is skipped and
-/// said out loud by name, because a short value appears inside ordinary words,
-/// hashes and base64.
 fn redactionFor(
     arena: std.mem.Allocator,
     instance_name: []const u8,
     token: []const u8,
     instances: []const chock_auth.config.Instance,
     search_key: ?[]const u8,
-    /// One slot for every entry of the project's `secrets` block, for a secret
-    /// given to something that holds it for a whole session rather than for one
-    /// call. An MCP server is the one that does.
     session_slots: usize,
 ) std.mem.Allocator.Error!chock_core.redact.Policy {
     const Named = struct { name: []const u8, value: []const u8 };
@@ -1560,8 +1441,6 @@ fn redactionFor(
     var named: std.ArrayList(Named) = .empty;
     if (token.len != 0) try named.append(arena, .{ .name = instance_name, .value = token });
 
-    // A search key reaches no provider, and it still goes in the log the moment
-    // a request that carries it is written down.
     if (search_key) |key_value| {
         if (key_value.len != 0) try named.append(arena, .{ .name = "the search engine", .value = key_value });
     }
@@ -1580,14 +1459,6 @@ fn redactionFor(
         try named.append(arena, .{ .name = one.name, .value = inline_token });
     }
 
-    // **Slots past the credentials, all of them empty, and an empty value is
-    // inert.** A session long secret comes first, then the tool call's own, then
-    // the git password last, because the git path names its slot as the final
-    // one. Every kind is filled before the value can reach anything, which is
-    // what makes the window zero rather than short.
-    //
-    // Reserved here because a `Policy` is built once and read on every turn,
-    // and a value that arrives later has nowhere to go if no slot was kept.
     const reserved = session_slots + tool_secret_slots + 1;
     const secrets = try arena.alloc(chock_core.redact.Secret, named.items.len + reserved);
     for (named.items, secrets[0..named.items.len]) |one, *slot| {
@@ -1610,20 +1481,8 @@ fn redactionFor(
     return .{ .secrets = secrets };
 }
 
-/// How many secrets one tool call may be granted at once.
-///
-/// **A bound on the redaction slots and therefore on the grant.** A secret with
-/// no slot could not be kept out of the log, so a call wanting more than this
-/// is refused rather than served unprotected. A grant names one or two secrets
-/// in practice.
 pub const tool_secret_slots: usize = 8;
 
-/// The slots a tool call's own secrets go in: every one past the credentials,
-/// and stopping short of the git password's own slot at the end.
-///
-/// `@constCast` is sound here for the reason the git path gives where it takes
-/// the last slot: the slice was allocated mutable in phase 1's arena, and one
-/// owner writes it, from one thread.
 fn toolSecretSlots(policy: chock_core.redact.Policy) []chock_core.redact.Secret {
     const total = policy.secrets.len;
     if (total < tool_secret_slots + 1) return &.{};
@@ -1631,11 +1490,6 @@ fn toolSecretSlots(policy: chock_core.redact.Policy) []chock_core.redact.Secret 
     return @constCast(policy.secrets)[first .. total - 1];
 }
 
-/// The slots a session long secret goes in: the ones before the tool call's own.
-/// `count` is the number `redactionFor` was given, which is the length of the
-/// project's `secrets` block.
-///
-/// `@constCast` is sound for the reason `toolSecretSlots` gives.
 fn sessionSecretSlots(policy: chock_core.redact.Policy, count: usize) []chock_core.redact.Secret {
     const reserved = count + tool_secret_slots + 1;
     if (count == 0 or policy.secrets.len < reserved) return &.{};
@@ -1643,8 +1497,6 @@ fn sessionSecretSlots(policy: chock_core.redact.Policy, count: usize) []chock_co
     return @constCast(policy.secrets)[first .. first + count];
 }
 
-/// `chock-broker` imports no `chock-core`, so a `chock_core.redact.Policy`
-/// cannot travel there. The values can, and they travel with no name attached.
 fn brokerRedaction(
     arena: std.mem.Allocator,
     policy: chock_core.redact.Policy,
@@ -1663,9 +1515,6 @@ const PlannedSink = struct {
     required: bool = false,
 };
 
-/// The union of `--export-dir`, `--export-syslog` and the org policy bundle: a
-/// project may add a sink and cannot drop one the installation named. A sink
-/// named twice is opened once, and the required entry is the one kept.
 fn auditSinks(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -1688,11 +1537,6 @@ fn auditSinks(
 
     if (options.export_dir) |dir| try addPlannedSink(arena, &planned, .{
         .kind = .directory,
-        // Resolved against the working directory, because a person typed it and
-        // a relative path is what they meant. The org bundle refuses one instead,
-        // and the difference is who chose it: a bundle's sink is a control over
-        // the person being observed, so it must not land where they decide. See
-        // `chock_policy.org.RequiredSink`.
         .path = try dropPathIn(arena, io, try absoluteDir(arena, io, dir), session_id),
     });
     if (options.export_syslog) |path| try addPlannedSink(arena, &planned, .{
@@ -1716,10 +1560,6 @@ fn addPlannedSink(
 
 fn makeDirAll(io: std.Io, path: []const u8) !void {
     if (path.len == 0) return;
-    // `createDirAbsolute` asserts this, and an assert is `unreachable` in a
-    // release build, so a relative path reached here aborted the process before
-    // the session log existed to say why. `dropPathIn` catches an error and
-    // carries on; it cannot catch a panic.
     if (!std.fs.path.isAbsolute(path)) return error.NotAbsolute;
     std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => return,
@@ -1735,11 +1575,6 @@ fn makeDirAll(io: std.Io, path: []const u8) !void {
     };
 }
 
-/// `dir` as an absolute path, whether or not it exists yet.
-///
-/// Not `realPath`, which needs the directory to be there: this runs before the
-/// directory is made. So the working directory is resolved and `dir` is joined
-/// to it, which also takes out any `..` and `.` on the way.
 fn absoluteDir(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -1761,18 +1596,10 @@ fn dropPathIn(
     dir: []const u8,
     session_id: []const u8,
 ) std.mem.Allocator.Error![]const u8 {
-    // Not `createDirPath`, which can loop for ever: it answers a `mkdir` of
-    // `ENOENT` by walking back to a component it can make and forward again, so
-    // a component whose parent exists and still cannot be made sends it between
-    // the same two names without end. A path under `/proc` is that shape.
     makeDirAll(io, dir) catch {};
     return try std.fmt.allocPrint(arena, "{s}/{s}.jsonl", .{ dir, session_id });
 }
 
-/// The workspace a session that handed over left behind, or null. Only one opened
-/// before the ending that handed it over counts: a fold never clears
-/// `end_reason`, so a session that handed over once reads as `handed_over` for
-/// ever, and adopting that checkout lets the live owner's teardown remove it.
 fn takenOver(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1793,8 +1620,6 @@ fn takenOver(
     var ended_at: u64 = 0;
     var opened_at: ?u64 = null;
     var attempt: [session_paths.id_length]u8 = undefined;
-    // A git object identifier is 40 hexadecimal characters for SHA-1 and 64 for
-    // SHA-256.
     var base_buffer: [128]u8 = undefined;
     var base_len: usize = 0;
 
@@ -1806,8 +1631,6 @@ fn takenOver(
                 ended_at = parsed.value.id;
             },
             .workspace_open => |opened| {
-                // Copied now, because the replay owns these bytes only until
-                // the next line is read.
                 if (opened.kind != .worktree) {
                     opened_at = null;
                     continue;
@@ -1897,9 +1720,6 @@ fn reportSandboxRecord(err: anyerror) StartError {
     return error.Reported;
 }
 
-/// `enforced` reads `chock_sandbox.expresses.device_passthrough` and not only
-/// `decision`, because a build that applies neither `Config.device_tree` nor
-/// `Config.device_source` grants nothing whatever policy answers.
 fn recordDevices(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -2061,9 +1881,6 @@ fn resolveLimits(
     return chock_policy.limits.foldLayers(project, operator, ceiling, machine);
 }
 
-/// Assigned, and not folded through `rlimits.Limits.narrow`: that ratchet is
-/// for a caller which may only ask for less, and a large machine has to reach
-/// above `rlimits.default_processes`.
 fn applyLimits(config: *sandbox.Config, resolved: chock_policy.limits.Resolved) void {
     config.limits.processes = resolved.processes;
     config.limits.memory_bytes = resolved.memory_bytes;
@@ -2113,13 +1930,6 @@ fn reportLimits(err: anyerror, diag: *?chock_policy.limits.Diagnostic) StartErro
     return error.Reported;
 }
 
-/// The key of the configured search engine, read out of the credential store.
-///
-/// **A named credential the store has nothing under is a warning and not a
-/// refusal.** A session that never searches must still start, and the tool
-/// itself refuses the call with the command that puts the key there. Ending the
-/// session instead would make one unconfigured engine cost every other thing the
-/// agent was going to do.
 fn loadSearchCredential(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2151,9 +1961,6 @@ fn loadSearchCredential(
     return held;
 }
 
-/// The `secrets` block is the project's alone. An operator layer would let
-/// somebody else decide what a project's tools may hold, and an org bundle is a
-/// ceiling that narrows, so neither one can add an entry here.
 fn resolveSecrets(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2173,10 +1980,6 @@ fn resolveSecrets(
     };
 }
 
-/// There is no project layer for `search`: it names the operator's own
-/// infrastructure, the same way a model provider does. An org bundle is a
-/// ceiling over it and can only narrow, so a bundle may pin a kind or forbid
-/// one and a user's own file cannot climb back out.
 fn resolveSearch(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2339,8 +2142,6 @@ fn testConfig() sandbox.Config {
     };
 }
 
-/// A session above the org ceiling is refused here and not lowered, because
-/// lowering it quietly leaves a project believing it has money it does not have.
 fn budgetUnderOrg(
     gpa: std.mem.Allocator,
     from_file: ?chock_cost.budget.Budget,
@@ -2357,8 +2158,6 @@ fn budgetUnderOrg(
             .max_cost = slice,
             .currency = currency,
         };
-        // Two caps in two currencies cannot be compared, and inventing a rate
-        // would be worse than not enforcing.
         if (!std.mem.eql(u8, file_cap.currency, currency)) {
             break :asked .{ .max_cost = slice, .currency = currency };
         }
@@ -2369,9 +2168,6 @@ fn budgetUnderOrg(
     };
 
     var diag: ?chock_cost.budget.Diagnostic = null;
-    // Neither variant this call can raise owns memory today. `deinit` is still
-    // called, because a caller that asks which variant it holds before releasing
-    // it breaks the day a variant that does own memory is added.
     defer if (diag) |*d| d.deinit(gpa);
     return chock_cost.budget.underCeiling(
         asked,
@@ -2396,8 +2192,6 @@ fn spawnChain(options: Options) []const chock_proto.event.SpawnLink {
     return options.parent_chain;
 }
 
-/// Read from the command line and never from the log: `chock run --continue`
-/// names no kind.
 fn agentRole(options: Options) chock_core.tools.Role {
     return if (chock_broker.review.isArbitrator(options.agent_kind)) .arbitrator else .worker;
 }
@@ -2464,11 +2258,6 @@ fn prepareScratchpad(
     return dir;
 }
 
-/// The spelling of `dir` a sandbox rule can act on, or null for a directory that
-/// was never made. A build that moves no path turns a mount into a rule, and a
-/// rule matches the path the kernel resolved: macOS reaches `$TMPDIR` below
-/// `/var`, a link to `/private/var`, so a rule on the unresolved spelling
-/// matches nothing and every tool call reads as refused.
 fn resolvedForSandbox(arena: std.mem.Allocator, io: std.Io, dir: ?[]const u8) ?[]const u8 {
     const path = dir orelse return null;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -2597,9 +2386,6 @@ fn loadDevShell(
         } else {
             tty.print(.err, "chock: this project's dev shell could not be read ({t})\n", .{err});
         }
-        // A project with a flake this cannot read still runs, under the host's
-        // own environment. A named attribute does not: a session that asked
-        // for one environment and got another is the fault this refuses.
         if (shell_name) |name| {
             tty.print(
                 .err,
@@ -2612,8 +2398,6 @@ fn loadDevShell(
         break :loaded null;
     };
 
-    // A session whose toolchain is not rooted breaks under a
-    // `nix-collect-garbage` that runs while it does.
     if (loaded != null) {
         if (diag) |*notice| tty.print(.warn, "chock: {f}\n", .{notice});
     }
@@ -2646,8 +2430,6 @@ fn devShellDirFor(
     return dir;
 }
 
-/// The dev shell's staging directory, made. Null leaves `nix` to pick its own,
-/// which a session with no guest does not mind.
 fn devShellStagingDirFor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2670,11 +2452,6 @@ fn reportEvaluatingDevShell(project_root: []const u8) void {
     tty.print(.plain, "chock: reading the dev shell of {s} with nix\n", .{project_root});
 }
 
-// The host's own system directories are the third answer because `/nix/store` is
-// a bind source that is not there on a machine with no Nix, so every tool call
-// of such a session died with `MountTreeFailed`. They are read only, they reach
-// no home directory, and a machine with none of them is refused at session start.
-
 const Toolchain = struct {
     store_paths: []const []const u8 = &.{},
     mounts: []const chock_core.tools.ToolchainMount = &.{},
@@ -2683,12 +2460,6 @@ const Toolchain = struct {
     const Which = enum { dev_shell, image, host };
 };
 
-/// The host directories a session mounts when the project states no toolchain of
-/// its own, each read only. `/etc` is the one entry that is not obviously a
-/// toolchain: Debian resolves `/usr/bin/cc` through `/etc/alternatives`, glibc
-/// reads `/etc/ld.so.cache` to find a shared library, and TLS needs the
-/// certificates at `/etc/ssl/certs`. A routed tool call takes this one directory
-/// for itself, because it has to write a `resolv.conf` into it.
 pub const host_toolchain_candidates: []const []const u8 = &.{
     "/nix/store",
     "/usr",
@@ -2702,10 +2473,6 @@ pub const host_toolchain_candidates: []const []const u8 = &.{
     "/opt",
 };
 
-/// The host directories this machine can run a program from, read only. One
-/// answer, read by `chock run` for its own mounts and by `chock daemon` for the
-/// grant it gives a guest: two spellings is a guest granted a different set from
-/// the one its session binds.
 pub fn hostToolchainPaths(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2716,8 +2483,6 @@ pub fn hostToolchainPaths(
 
     var found: std.ArrayList([]const u8) = .empty;
     for (host_toolchain_candidates[1..]) |path| {
-        // A symbolic link counts: `/bin` is a link into `/usr` on Debian and on
-        // Arch, and a bind mount follows it.
         if (!pathIsDirectory(io, path)) continue;
         try found.append(arena, path);
     }
@@ -2729,23 +2494,13 @@ fn pathIsDirectory(io: std.Io, path: []const u8) bool {
     return stat.kind == .directory;
 }
 
-/// A directory of Chock's own that a guest's grant over a project would hold.
 pub const ChockOwnHeld = struct {
-    /// The directory the grant covers, which is what a refusal names first.
     project: []const u8,
-    /// Chock's own directory inside it.
     own: []const u8,
 };
 
 pub const ChockOwnError = std.mem.Allocator.Error || chock_auth.paths.DirError;
 
-/// The one directory of a project that reaches a guest's grant: its own `.git`
-/// when it is a repository, because that is all the workspace binds of it, and
-/// the project itself otherwise, because an overlay's lower layer is the project.
-///
-/// One answer, read by the daemon for the root it grants and by
-/// `chockOwnInProject` for the root it checks. Two spellings is a check against
-/// a directory other than the one granted.
 pub fn projectGrantDir(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2755,33 +2510,12 @@ pub fn projectGrantDir(
     return if (pathIsDirectory(io, git_dir)) git_dir else project_root;
 }
 
-/// Whether a guest started for this project would be granted a directory of
-/// Chock's own, naming both when it would.
-///
-/// **Whoever starts a session names the project and nothing bounds where it
-/// is.** A project at or above the configuration, data or state directory, and
-/// `--project /` is the same shape, puts `credentials.zon` inside a guest's read
-/// grant. Two processes can start a guest: the daemon starts one per session, and
-/// `chock run` forks its own whenever it was given none. So both ask this, and a
-/// check in one alone only moves which process holds the grant.
-///
-/// The directory named is the one that reaches the grant: the project's own
-/// `.git` when it is a repository, because that is all the workspace binds, and
-/// the project itself otherwise, because an overlay's lower layer is the project.
-///
-/// It is here, beside `hostToolchainPaths`, because the answer needs
-/// `chock-auth`'s paths and `chock-sandbox` imports none of that, and because
-/// that function is already the one derivation both this session's mounts and
-/// the daemon's grant read.
 pub fn chockOwnInProject(
     arena: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
     project_root: []const u8,
 ) ChockOwnError!?ChockOwnHeld {
-    // Resolved first, so a project named through a symbolic link is checked as
-    // the directory it really is. A path that resolves to nothing is checked as
-    // it was given: a project that is not there fails on its own further down.
     var resolved: [std.fs.max_path_bytes]u8 = undefined;
     const root = root: {
         var dir = std.Io.Dir.cwd().openDir(io, project_root, .{}) catch break :root project_root;
@@ -2797,21 +2531,12 @@ pub fn chockOwnInProject(
         try chock_auth.paths.stateDir(arena, env),
     };
     for (chock_own) |own| {
-        // The direction is what makes this a guard: the question is whether
-        // Chock's own directory is inside the one granted, and asked the other
-        // way round it refuses every ordinary project instead.
         if (!vmm.shareCovers(own, granted)) continue;
         return .{ .project = try arena.dupe(u8, granted), .own = own };
     }
     return null;
 }
 
-/// The mount set of a container image, minus any entry that would sit above
-/// something the sandbox puts there itself. `.dockerenv` is a regular file at the
-/// top of a real Debian image tree, and Landlock answers `EINVAL` for a directory
-/// right over a file. An image entry that is a strict ancestor of another mount's
-/// target breaks both orders: the image first leaves `mkdirat` answering `EROFS`
-/// inside a read only `/home`, and the image second covers the workspace.
 fn imageToolchainMounts(
     arena: std.mem.Allocator,
     image: *const chock_container.Image,
@@ -2862,9 +2587,6 @@ fn isAboveAMount(target: []const u8, mounts: []const sandbox.namespace.Mount) bo
     return false;
 }
 
-/// `PATH` is rewritten to name the tree on the host, because this resolution
-/// happens before any sandbox exists and the image's own `PATH` names paths
-/// inside one. An image that states no `PATH` gets none.
 fn imageToolEnvironment(
     arena: std.mem.Allocator,
     image: *const chock_container.Image,
@@ -2902,8 +2624,6 @@ fn hostSearchPath(
     return built.toOwnedSlice(arena);
 }
 
-/// The workspace's own variables win, because its git variables are what make git
-/// work at all against a read only object store.
 fn imageSandboxEnvironment(
     arena: std.mem.Allocator,
     workspace_env: []const []const u8,
@@ -2923,9 +2643,6 @@ fn imageSandboxEnvironment(
     return entries.toOwnedSlice(arena);
 }
 
-/// Every refusal here happens at session start, because a tool call has no
-/// network and no daemon socket. The `Image` owns the strings the mount set and
-/// both environments borrow.
 fn loadImage(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -2950,9 +2667,6 @@ fn loadImage(
         .named => |reference| reference,
     };
 
-    // The arena owns the message and never the library's own working allocator:
-    // `Image.load` builds a private arena and destroys it on every error path,
-    // so a message built from that one is read after the free.
     var diag: ?chock_container.Diagnostic = null;
     defer if (diag) |*d| d.deinit(arena);
     const sink = chock_container.sinkOf(arena, &diag);
@@ -3207,9 +2921,6 @@ fn reportWaitingForImage(reference: []const u8) void {
     );
 }
 
-/// The trust position of an image is its own line and never a layer. A root
-/// daemon that unpacked the image is a weaker trust position, not a broken
-/// sandbox, and `chock_sandbox.guarantees` is unchanged either way.
 fn toolchainFor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -3276,20 +2987,12 @@ fn toolchainFor(
 const Provisioning = struct {
     nix_program: []const u8,
     nix_store_program: ?[]const u8,
-    /// The flake registry entry, so a user who pinned `nixpkgs` gets programs
-    /// from the revision they pinned. Chock resolves what the user's own Nix
-    /// resolves, and the model does not choose this.
     registry: []const u8,
     root_dir: ?[]const u8,
 };
 
 const provision_action = chock_broker.actions.Kind.nix_build.wireName();
 
-/// Whether this session may add a program to its toolchain, and what it needs to
-/// do it. Read once, at the start: `Loop.run` holds the exclusive lock on the
-/// log for the whole session, so nothing can append an answer while a turn is
-/// running and a mid-session question can only time out. A project with no
-/// `chock.zon` therefore cannot provision.
 fn provisionDecision(
     arena: std.mem.Allocator,
     policy: *const chock_policy.table.Table,
@@ -3355,11 +3058,6 @@ fn languageServerPermitted(
     return false;
 }
 
-/// Only `allow` exposes a device, and only a device this project named in its own
-/// `devices` block is ever asked about at all.
-/// `chock_core.devices.HostSource.scan` calls this seam for every USB or serial
-/// device the machine has plugged in, named or not, because it cannot tell the
-/// difference from sysfs alone, and `declared` draws the line.
 const DevicePolicySeam = struct {
     policy: *const chock_policy.table.Table,
     chain: []const []const u8,
@@ -3400,9 +3098,6 @@ const DevicePolicySeam = struct {
     }
 };
 
-/// Every field is null together when this project named no device, so a
-/// `Sandbox.spawn` that reads this session's config never binds `/dev`, never
-/// forks the device helper, and never polls an extra descriptor.
 const DeviceWiring = struct {
     seam: ?*DevicePolicySeam = null,
     host: ?*chock_core.devices.HostSource = null,
@@ -3441,20 +3136,10 @@ fn devicesFor(
     return .{
         .seam = seam,
         .host = host,
-        // The hidden tree is the host's own `/dev`, mirrored, so a node's path
-        // relative to it is what `DEVNAME` already gives. Never granted through
-        // `sandbox_config.rules`: Landlock is an allowlist, so a path this
-        // session never names cannot be opened, listed or resolved through, even
-        // though the bind is really there after the pivot.
         .device_tree = .{ .host = "/dev", .inside = "/.chock-device-tree" },
     };
 }
 
-/// Read the `workspace` block, find what each name matches, and resolve every
-/// match to the real path a mount source has to name.
-///
-/// Before the workspace is built, because a block this cannot honour refuses
-/// the session rather than half building one.
 fn workspaceBinds(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -3478,8 +3163,6 @@ fn workspaceBinds(
     };
     if (block.binds.len == 0) return &.{};
 
-    // The real path, because every match is compared against it and a project
-    // reached through a link would make every one of them look outside.
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const length = std.Io.Dir.cwd().realPathFile(io, project_root, &root_buffer) catch |err| {
         tty.print(.err, "chock run: {s} could not be resolved: {t}\n", .{ project_root, err });
@@ -3564,9 +3247,6 @@ fn narrower(a: chock_policy.table.Decision, b: chock_policy.table.Decision) choc
     return if (a.rank() <= b.rank()) a else b;
 }
 
-/// The two modes that reach the user's own disk say what they will do with a
-/// change, because a bind that silently writes nothing back and a bind that
-/// silently overwrites are the same line on the screen without this.
 fn sayWhatTheWriteDoes(
     bind: chock_policy.workspace.Bind,
     permitted: chock_policy.table.Decision,
@@ -3603,17 +3283,8 @@ fn sayWhatTheWriteDoes(
     }
 }
 
-/// How deep a pattern may descend. A `**` in a name would otherwise walk the
-/// whole project, and a project holds a `.direnv` with thousands of entries in
-/// it.
 const bind_max_depth: usize = 16;
 
-/// What one name matches, as paths under the project root, sorted so the
-/// session start report reads the same way twice.
-///
-/// The project directory and never git's own list of ignored files: a name
-/// that happens to be tracked already is harmless, it is simply in the
-/// workspace too.
 fn matchesFor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -3664,7 +3335,6 @@ fn descend(
         return descend(arena, io, root, next, rest, out);
     }
 
-    // A `**` matches no component at all as well as any run of them.
     const any_depth = std.mem.eql(u8, part, "**");
     if (any_depth) try descend(arena, io, root, prefix, rest, out);
 
@@ -3675,8 +3345,6 @@ fn descend(
     var entries = dir.iterate();
     while (entries.next(io) catch null) |entry| {
         if (out.items.len >= chock_policy.workspace.max_binds) return;
-        // git's own directory is the backing's, and `chock.zon` is bound read
-        // only already. Neither is ever a match.
         if (std.mem.eql(u8, entry.name, ".git")) continue;
         const next = try joinUnder(arena, prefix, entry.name);
         if (any_depth) {
@@ -3697,12 +3365,6 @@ fn joinUnder(
     return std.fs.path.join(arena, &.{ prefix, name });
 }
 
-/// Bring the resolved binds into the workspace. A path that cannot be copied
-/// is one warning and not a failed session: the agent sees a workspace with
-/// that one path missing, and the report says which.
-///
-/// A workspace this process took over copies nothing in, the same rule
-/// `handleUncommitted` keeps: its copies are the last owner's agent's own.
 fn attachBinds(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -3712,9 +3374,6 @@ fn attachBinds(
 ) StartError!void {
     if (resolved.len == 0) return;
 
-    // The same allocator that fills the report frees it. `attachBinds` below
-    // is given the arena, and the bind list it keeps outlives this call, so
-    // the report's own strings come off the arena too.
     var report = chock_workspace.worktree.ImportReport{};
     defer report.deinit(arena);
     workspace.attachBinds(arena, io, resolved, copy_in, &report) catch |err| {
@@ -3847,8 +3506,6 @@ test "the four modes decide what is bound read only and what is written back" {
     const resolved = try workspaceBinds(arena, io, table, &.{}, "main", "a-model", root);
     try testing.expectEqual(@as(usize, 5), resolved.len);
 
-    // Both matches of the pattern resolve to the one real file, because the
-    // second is a link to the first.
     for (resolved[0..2]) |one| {
         try testing.expectEqual(chock_policy.workspace.Mode.read_only, one.mode);
         try testing.expect(one.read_only);
@@ -4029,9 +3686,6 @@ const ApplyMode = struct {
 const bounded_mode_fmt = "this session's work would land as {s}, and the policy answers {t} " ++
     "for {s}, so the work waits at its ref and no branch of yours moves.";
 
-/// A null `mode` is that an approved apply may not move a branch of the user's.
-/// Read as a ceiling, so `Table.ceilingChain` is the verb and not
-/// `evaluateChain`: a row nobody wrote answers `allow`, which is no ceiling.
 fn applyModeFor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -4082,12 +3736,6 @@ const FlakeInputs = struct {
     wanted: []const chock_nix.fetch.Fetch = &.{},
 };
 
-/// Two names for one host, most specific first: `nix.net.eval.com.github.443` and
-/// then `nix.net.com.github.443`. The table matches a name against itself or a
-/// trailing `.*`, and `patternIsWellFormed` refuses a wildcard in the middle, so
-/// there is no one name that would do instead. A rule that names the phase scoped
-/// key decides whatever it says, because falling through would hand a silent yes
-/// to an author who asked to be prompted.
 const NixTableReader = struct {
     policy: *const chock_policy.table.Table,
     chain: []const []const u8,
@@ -4296,8 +3944,6 @@ fn fetchFlakeInputs(
     }
 }
 
-/// Read as a file an attacker may have written: every host it names goes to the
-/// policy.
 fn readProjectLock(arena: std.mem.Allocator, io: std.Io, project_root: []const u8) ?[]const u8 {
     const path = std.fs.path.join(arena, &.{ project_root, "flake.lock" }) catch return null;
     return std.Io.Dir.cwd().readFileAlloc(
@@ -4349,25 +3995,6 @@ fn provisioningFor(
     };
 }
 
-/// The `TMPDIR` a session's tool environment gets, or null to keep the one the
-/// environment already states.
-///
-/// **This is where a tool call stages a program's input on the host**, and it is
-/// not the harness's own temporary directory. That one is the user's `TMPDIR`, or
-/// `/tmp`, and a guest that has to reach a staged file would be granted every
-/// other process's temporary files along with it. This is one directory of this
-/// session's own, beside the scratchpad and outside the part of it the sandbox
-/// mounts, so a staged file is reachable by the guest that serves the bind and by
-/// nothing the agent runs. See `chock_core.scratchpad.stage_leaf`.
-///
-/// **One answer whether or not this project has a dev shell.** A dev shell
-/// exports a `TMPDIR` of its own, and staging there would make a guest's offer
-/// list depend on which of the two cases a project is in: a grant that holds for
-/// half the projects is a root a compromised VMM may read for all of them. This
-/// directory is inside the session scratchpad a guest is granted anyway.
-///
-/// Null only for a session whose scratchpad could not be made, which has nowhere
-/// better to go and is already running degraded.
 pub fn toolStagingDir(
     arena: std.mem.Allocator,
     scratch_dir: ?[]const u8,
@@ -4377,10 +4004,6 @@ pub fn toolStagingDir(
 }
 
 test "the directory a tool call stages into is inside the scratchpad and built with it" {
-    // A daemon grants this session's scratchpad and nothing wider, so a staging
-    // directory outside it is every tool call of the session refused. It also has
-    // to be a directory `makeLayout` builds, because `offersFor` leaves out a
-    // path it cannot stat and would offer this one to no guest at all.
     const gpa = testing.allocator;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -4401,23 +4024,12 @@ test "the directory a tool call stages into is inside the scratchpad and built w
     try testing.expect(std.mem.startsWith(u8, staging, scratch));
     try testing.expect(pathIsDirectory(io, staging));
 
-    // And outside the half of the scratchpad the sandbox mounts, so a staged
-    // secret is not also a file the agent reads out of its own notes.
     const mounted = try std.fs.path.join(arena, &.{ scratch, chock_core.scratchpad.scratch_leaf });
     try testing.expect(!std.mem.startsWith(u8, staging, mounted));
 
-    // A session with no scratchpad has nowhere better, so it keeps what the
-    // environment states.
     try testing.expectEqual(@as(?[]const u8, null), try toolStagingDir(arena, null));
 }
 
-/// The environment the harness itself runs a tool call's setup with: the dev
-/// shell's, or a copy of this process's own when there is no dev shell.
-///
-/// **A copy and never the process's own map.** This session gives the tool
-/// environment a `TMPDIR` of its own, and `session_paths.scratchpadDir` derives
-/// that directory from the `TMPDIR` the process was started with: one map for
-/// both would have the second answer depend on the first.
 fn toolEnvironment(
     arena: std.mem.Allocator,
     host_env: *std.process.Environ.Map,
@@ -4439,13 +4051,6 @@ fn toolEnvironment(
     return map;
 }
 
-/// The workspace's own `GIT_OBJECT_DIRECTORY` and
-/// `GIT_ALTERNATE_OBJECT_DIRECTORIES` win, because they are what make git work
-/// against a read only object store. Written as a skip, because two entries with
-/// one name is undefined in POSIX. `PATH` is given: `cargo build` answered
-/// `ENOENT` for `rustc` without it, since a child's own lookup has no dev shell
-/// `PATH`. The mount set is the boundary, so a `PATH` naming store paths reaches
-/// nothing that is not bound.
 fn sandboxEnvironment(
     arena: std.mem.Allocator,
     workspace_env: []const []const u8,
@@ -4542,10 +4147,6 @@ fn reportNotes(io: std.Io, started: *const Started) void {
     tty.print(.plain, "chock: {d} notes ({s}). Read or clear them with: chock memory\n", .{ now, dir });
 }
 
-/// Resolve chock.zon's `instructions` block to real paths on disk, ready for
-/// `chock_core.instructions.load`. A missing file or a link that leaves the
-/// project refuses the session rather than starting one that silently
-/// dropped a file the project's own configuration named.
 fn projectNamedInstructions(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -4577,11 +4178,6 @@ fn projectNamedInstructions(
     return resolved;
 }
 
-/// Every skill this session found, the layer the user trusts most first.
-///
-/// Order is precedence: `skills.discover` gives a name to the first root that
-/// holds it, so the user's own skill wins over a repository's and a
-/// repository's over a package's.
 fn skillsFor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -4607,14 +4203,6 @@ fn skillsFor(
     return chock_core.skills.discover(arena, io, roots.items);
 }
 
-/// Where each skill's own directory is inside the sandbox, and the extra read
-/// only mounts that makes true.
-///
-/// Three layers, three answers. A package's skills are inside a store path the
-/// session already mounts, so the host path is the path. A project's are in the
-/// workspace, so the same relative path under the workspace root is. The
-/// operator's are in the configuration directory, which nothing mounts, so each
-/// one is bound under `inside_root` and that is what the agent is told.
 fn placeSkills(
     arena: std.mem.Allocator,
     found: []chock_core.skills.Skill,
@@ -4648,7 +4236,6 @@ fn placeSkills(
     return mounts.toOwnedSlice(arena);
 }
 
-/// `path` relative to `root`, or null when it is not under it.
 fn underneath(path: []const u8, root: []const u8) ?[]const u8 {
     if (root.len == 0) return null;
     if (!std.mem.startsWith(u8, path, root)) return null;
@@ -4687,9 +4274,6 @@ fn projectSkillDirs(
     return resolved;
 }
 
-/// Say what was found, the way `reportInstructions` does. A user who clones a
-/// repository and sees eleven skills appear has learned something worth knowing,
-/// and a skill that was refused must not be silently absent.
 fn reportSkills(found: chock_core.skills.Found) void {
     if (found.skills.len != 0) {
         tty.print(.plain, "chock: skills", .{});
@@ -4737,9 +4321,6 @@ fn shortId(id: []const u8) []const u8 {
     return if (id.len > 7) id[0..7] else id;
 }
 
-/// Never the branch the user has checked out. The worktree is detached exactly
-/// so a session cannot move one, and a ref of the session's own is reachable and
-/// inert until the user merges or cherry-picks it.
 fn applyRef(gpa: std.mem.Allocator, session_id: []const u8) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(gpa, "refs/chock/{s}", .{session_id});
 }
@@ -4764,11 +4345,6 @@ const landing_question =
     \\Which? [merge/rebase/squash] 
 ;
 
-/// The question comes before the approval and not instead of it, so the prompt a
-/// person says yes to is still the one that describes the act. Nobody to ask
-/// means no landing: a subagent, a session the daemon started, a `chock run`
-/// whose standard input is a pipe, and one with the display up all keep the work
-/// at the ref.
 fn landingFor(answer: chock_core.ask.Answer) ?chock_policy.apply.Landing {
     return switch (answer) {
         .answered => |said| chock_policy.apply.Mode.fromAnswer(said),
@@ -4812,11 +4388,6 @@ fn chosenLanding(
     return .{ .none = .nobody_answered };
 }
 
-/// `given` is what the driver of this build declares it applies. Every layer is
-/// in it on Linux; Darwin declares four, and neither a system call filter nor a
-/// mounted workspace. A layer that failed to apply never reaches this, because
-/// the Linux driver refuses rather than degrades. `witness` is the one thing this
-/// machine can answer differently, and it only ever takes a layer away.
 fn sandboxLayers(
     given: sandbox.Sandbox.Guarantees,
     witness: LayerWitness,
@@ -4849,9 +4420,6 @@ fn sandboxLayers(
     return built;
 }
 
-/// Two sets and not one, so a refusal can be told from a question nobody asked.
-/// `unavailable` is always a subset of `probed`. A guarantee in neither reads
-/// on, because the driver applies it and dies if it cannot.
 const LayerWitness = struct {
     probed: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.initEmpty(),
     unavailable: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.initEmpty(),
@@ -4862,13 +4430,6 @@ const LayerWitness = struct {
     }
 };
 
-/// A layer this build applies is enforced or the call dies, so a probe cannot
-/// make its tick truer. What a probe can find is a machine that refuses the layer
-/// outright. `path_restricted` reads the Landlock ABI version and changes
-/// nothing. The three namespace guarantees come from one fork that calls
-/// `namespace.enter`. `syscall_restricted` forks a child that installs this
-/// build's filter, because a filter cannot be removed. `workspace_mounted` is not
-/// probed: the namespace probe builds no root and pivots into none. Linux only.
 fn witnessLayers(
     gpa: std.mem.Allocator,
     given: sandbox.Sandbox.Guarantees,
@@ -4896,10 +4457,7 @@ fn witnessLayers(
     }
 
     if (given.contains(.syscall_restricted)) {
-        // Built here and not in the child: a fork may happen while another thread
-        // holds this allocator's lock. No trap set: a filter that asks for a user
-        // notification with no listener behind it makes the kernel answer every
-        // observed call with `ENOSYS`.
+        // No trap set here: a user notification with no listener behind it makes the kernel answer every call with ENOSYS.
         if (sandbox.seccomp.build(gpa, .{})) |insns| {
             defer gpa.free(insns);
             switch (sandbox.seccomp.probeInstall(sandbox.bpf.Prog.init(insns))) {
@@ -4938,9 +4496,6 @@ comptime {
     );
 }
 
-/// Never both a display and the bare prompt: two readers on one descriptor race
-/// for every byte, and a prompt written around a display lands in cells the
-/// display believes it owns.
 fn asksHere(has_display: bool, at_terminal: bool) enum { display, terminal, nobody } {
     if (has_display) return .display;
     if (at_terminal) return .terminal;
@@ -5053,8 +4608,6 @@ const QuestionConsole = struct {
         budget_ms: u64,
     ) chock_core.ask.Console.Read {
         const self: *QuestionConsole = @ptrCast(@alignCast(ptr));
-        // No `else`: a way for a read to end that `src/approval.zig` adds and
-        // this forgets fails the build rather than becoming a silent `idle`.
         return switch (self.stdin.console().read(io, buffer, budget_ms)) {
             .idle => .idle,
             .bytes => |count| .{ .bytes = count },
@@ -5064,9 +4617,6 @@ const QuestionConsole = struct {
     }
 };
 
-/// `src/ui.zig` reads its keyboard and repaints in one place, and that place runs
-/// only when an event arrives, so between two events nothing reads the keyboard.
-/// Built in place and never copied: both seams hold a pointer into this.
 const DisplayPump = struct {
     screen: *ui.Ui,
 
@@ -5087,9 +4637,6 @@ const DisplayPump = struct {
     }
 };
 
-/// This is not the arbiter and never becomes one. An ask grants nothing,
-/// whatever the person types, and appends nothing to the log at all. Built in
-/// place and never copied: an `Asker` holds a pointer into this.
 const DisplayAsker = struct {
     screen: *ui.Ui,
     stop: *const fn () bool = interrupt.requested,
@@ -5162,12 +4709,6 @@ const ApprovalLock = @typeInfo(
     @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
 ).error_union.payload;
 
-/// `decide` is handed the loop's own `locked` handle and passes it to
-/// `Broker.request`, so there is no second open of the log and no second lock.
-/// `foldSessionSince` resumes each question's fold from where the last one
-/// stopped: a full replay per question is quadratic in the length of the session,
-/// and `gateToolCall` asks for every ordinary tool call. A session that cannot
-/// start a reviewer gets `review_unavailable`, which does not permit.
 const SessionArbiter = struct {
     gpa: std.mem.Allocator,
     environ: std.process.Environ,
@@ -5175,10 +4716,6 @@ const SessionArbiter = struct {
     started: *Started,
     options: Options,
     screen: ?*ui.Ui = null,
-    /// Kept after the first question and only ever caught up, never rebuilt.
-    /// `PolicyFold` and not `state.Session`: a `Session` carries `context`, the
-    /// mirrored message history, which grows for the life of the run and which
-    /// nothing below ever reads.
     folded: ?chock_proto.state.PolicyFold = null,
     folded_at: u64 = 0,
 
@@ -5218,10 +4755,6 @@ const SessionArbiter = struct {
             .waiter = approvers.waiter(),
             .reviewer = review_spawner.reviewer(),
             .redaction = self.started.redact_values,
-            // `session` was just caught up, so it holds every
-            // `approved_by_user_for_session` answer given earlier and a person
-            // is not asked twice. `session.grants` is filled through that
-            // arena, so a live grant has to grow through it too.
             .grants = .{ .memory = &session.grants, .allocator = session.arena.allocator() },
         };
 
@@ -5239,13 +4772,6 @@ const SessionArbiter = struct {
 
         var broker_diag: ?chock_broker.Diagnostic = null;
         defer if (broker_diag) |*d| d.deinit(session.arena.allocator());
-        // `session.arena.allocator()` and not `gpa`.
-        // `chock_proto.state.SessionGrants.granted` is a
-        // `std.StringHashMapUnmanaged`, so its `grow` frees the old backing
-        // array with whatever allocator the current call passes.
-        // `foldSessionSince` filled `session.grants` through this arena, and
-        // a regrow past the map's first capacity would otherwise free arena
-        // memory through the wrong allocator.
         const outcome = broker.request(session.arena.allocator(), io, self.started.storage, locked, .{
             .action = ask.action,
             .summary = ask.summary,
@@ -5295,13 +4821,6 @@ const SessionArbiter = struct {
     }
 };
 
-/// One of these for the whole session. A dispatch runs to completion before the
-/// next one starts unless it asked to run in the background, and a background
-/// call is kept away from this seam, so renaming `network.tool` once per call is
-/// safe. `network.asker` starts null and `giveFn` fills it exactly once, after
-/// `Loop.run` takes the handle; until then an `ask` decision refuses outright.
-/// The fold is caught up before every call and resumed from a kept offset,
-/// because a mid session `restrict_self` is invisible to a stale copy.
 const ToolNetwork = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -5328,19 +4847,12 @@ const ToolNetwork = struct {
         .background_router = backgroundRouterFn,
     };
 
-    /// One network per background call, because that call reads it on a thread of
-    /// its own long after this returns and `self.network` is rewritten by the
-    /// next foreground call.
     const BackgroundNet = struct {
         network: chock_broker.network.Network = undefined,
         id: [64]u8 = undefined,
         id_len: usize = 0,
     };
 
-    /// `asker` is left null on purpose. A `Network` with no asker answers `allow`
-    /// from the table and refuses everything else outright, so a background call
-    /// reaches what the policy permits and never reaches for the session loop's
-    /// locked handle.
     fn backgroundRouterFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) ?sandbox.NetRouter {
         const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
         if (!self.started.policy.wantsBackgroundRouter()) return null;
@@ -5380,10 +4892,6 @@ const ToolNetwork = struct {
             .policy = self.started.policy,
             .waiter = self.approvers.waiter(),
             .redaction = self.started.redact_values,
-            // `self.session.grants` is filled through `self.session.arena`, and
-            // `chock_broker.network.zig` calls `asker.broker.request` with a
-            // plain allocator, so a `grants_allocator` left unset here lets a
-            // `grow` free arena memory through that plain allocator.
             .grants = .{ .memory = &self.session.grants, .allocator = self.session.arena.allocator() },
         };
         self.network.asker = .{
@@ -5431,10 +4939,6 @@ const ToolNetwork = struct {
     }
 };
 
-/// Hands the session's own locked handle to every party that asks a question from
-/// inside a turn. All of them run inside the turn `Loop.run` holds the log's
-/// exclusive lock for, so none may open the log a second time. A session whose
-/// asker is null runs no third party tool at all.
 const GiveLockedToAll = struct {
     network: *ToolNetwork,
     mcp: *chock_core.mcp.Session,
@@ -5506,11 +5010,6 @@ fn logNetworkSummary(
     };
 }
 
-/// Always, and not only when something degraded. A reader that finds no event
-/// cannot tell a session where every supervisor confined itself from a session
-/// written by a build that did not know the fact. Walking
-/// `sandbox.Sandbox.failModeFor` keeps the log and the driver naming the same
-/// three layers.
 fn logSupervisorAudit(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -5643,8 +5142,6 @@ fn syscallEvent(
             .observed = counts.observed,
             .unobserved = counts.unobserved,
             .calls = rows,
-            // False: the supervisor lets the held call run, so the program can change
-            // the argument after the reader read it.
             .paths_verified = false,
             .path_readers_unreported = paths.readers_unreported,
             .path_readers_absent = paths.readers_absent,
@@ -6144,11 +5641,6 @@ const SessionHandback = struct {
         _ = io;
         const self: *SessionHandback = @ptrCast(@alignCast(ptr));
 
-        // An `Io` of its own: phase 2 runs over `Allocator.failing`, so
-        // `Threaded.spawnPosix` fails there and every step below runs `git`.
-        // Backed by the page allocator, because a background task's thread
-        // may be inside `Sandbox.spawn` and a lock another thread holds at a
-        // `fork` is one the child inherits as held for ever.
         var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = self.environ });
         defer threaded.deinit();
         const spawning_io = threaded.io();
@@ -6314,9 +5806,6 @@ fn reviewNote(outcome: chock_broker.Broker.Outcome) []const u8 {
     return chock_broker.review.requesterText(review);
 }
 
-/// What became of the branch, in words to put after "the branch did not move".
-/// `already_there` is the one reason with nothing to add: it says the branch
-/// reaches the commit, and a caller only reaches here when it has said that.
 fn branchNote(
     gpa: std.mem.Allocator,
     park: chock_broker.integrate.Parked,
@@ -6330,11 +5819,6 @@ fn branchNote(
     );
 }
 
-/// Carry the session's own commit back into the user's repository, through the
-/// broker, after an approval. The worktree is thrown away at the end of the run,
-/// so without this the agent's work has no path back at all. Nothing here widens
-/// what the sandbox can do: the act runs in this process, on the host, with the
-/// agent already gone.
 fn applyWork(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -6453,13 +5937,8 @@ fn applyWork(
 
 const CarryOut = union(enum) {
     not_described,
-    /// The ref is at this commit already. The `Parked` is the branch's own
-    /// answer, which is a different question and not always the same one.
     already_there: chock_broker.integrate.Parked,
     refused: chock_broker.Broker.Outcome,
-    /// This one owns memory. The branch names and the two object ids come out of
-    /// the broker's own `Result` and are handed on rather than copied, so nothing
-    /// here can fail for want of memory once the work has landed.
     landed: struct {
         objects: usize,
         integration: chock_broker.integrate.Outcome,
@@ -6476,10 +5955,6 @@ const CarryOut = union(enum) {
     }
 };
 
-/// Ask for one `workspace.apply` and carry it out when the answer permits it. An
-/// agent that asks gains nothing an agent that waits would not have had, and in
-/// particular it cannot move a branch. It takes the lock and never opens the log,
-/// so it works both mid session and at the end of one.
 fn carryCommit(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -6529,12 +6004,6 @@ fn carryCommit(
     };
     if (describe_diag) |*notice| tty.print(.warn, "chock run: {f}\n", .{notice});
 
-    // Before anybody is asked: a compare and swap from an id to itself moves
-    // nothing. The branch has to have nothing to gain either, because a mode that
-    // integrates can leave the branch untouched when the working tree was dirty
-    // at the moment of the first request. That is why the plan's own reason is
-    // carried out rather than replaced: `already_there` would say the branch
-    // reaches this commit, and a parked branch does not.
     if (std.mem.eql(u8, apply.old_id, apply.new_id) and apply.integration == .park) {
         const park = apply.integration.park;
         recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{ .park = park });
@@ -6567,11 +6036,6 @@ fn carryCommit(
         .waiter = approvers.waiter(),
         .reviewer = review_spawner.reviewer(),
         .redaction = started.redact_values,
-        // `session` holds every `approved_by_user_for_session` answer already
-        // given, so a person keeps the rest of the session they were offered. The
-        // arena and not `gpa`: `gpa` frees the `Result` after `session` is gone,
-        // so growing `session.grants` through it would free arena memory through
-        // the wrong allocator.
         .grants = .{ .memory = &session.grants, .allocator = session.arena.allocator() },
     };
 
@@ -6629,9 +6093,6 @@ fn carryCommit(
     }
 }
 
-/// The `workspace` block's copies which land on the user's own files when the
-/// session's work applies. The prompt names them, so the answer to it is the
-/// answer to these too.
 fn copiesOf(
     arena: std.mem.Allocator,
     workspace: *const chock_workspace.Workspace,
@@ -6644,8 +6105,6 @@ fn copiesOf(
     return out.toOwnedSlice(arena);
 }
 
-/// After the apply is permitted and never before it. A refused apply leaves
-/// the user's files untouched and the session's copies in the workspace.
 fn writeBackCopies(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -6704,9 +6163,6 @@ fn recordIntegration(
     };
 }
 
-/// An agent that can write leaves files behind and `git worktree remove` deletes
-/// them, so saying nothing is a run that exits 0 with the project unchanged and
-/// the work gone.
 fn uncommittedWork(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -6734,11 +6190,6 @@ fn uncommittedWork(
     return .uncommitted;
 }
 
-/// `git worktree add` checks out the commit and not the working tree, so an agent
-/// in a fresh worktree sees `HEAD` and a user who is not told believes it can see
-/// work it cannot. The overlay kind of workspace copies the whole project
-/// directory, so nothing there is invisible. Returns how many files the agent
-/// will not see, which is zero in every case where nothing is hidden.
 fn handleUncommitted(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -6845,19 +6296,12 @@ fn warnUnmeasurableBudget(
         .{ cap.max_cost, cap.currency, model, provider_name },
     );
 }
-/// Well above a forge token and far below `chock_core.ask.max_answer_bytes`. A
-/// person who types more is refused plainly rather than given a value cut in
-/// half, because half a password is a wrong password.
 const max_secret_bytes: usize = 512;
 
 const secret_prompt_timeout_ms: i64 = 180_000;
 
 const secret_look_ms: u64 = 100;
 
-/// A terminal and the display, and never the approval socket. The unix path of
-/// that socket checks `peercred` and the TCP path checks nobody, so a password
-/// crossing it would be a password on the wire. A session with neither refuses
-/// the push.
 const SecretAsker = struct {
     io: std.Io,
     screen: ?*ui.Ui = null,
@@ -6902,18 +6346,9 @@ const SecretAsker = struct {
     }
 };
 
-/// What one approved `git push` may reach, and nothing else may. `arm` opens what
-/// the push needs, `disarm` closes it, and `grantFn` answers null for every call
-/// but the one between them. A proxied ssh agent can sign anything at all while
-/// it is reachable and the agent protocol cannot say what a signature is for, so
-/// scope is the only defence there is. The value is typed by a person, held for
-/// one tool call, and overwritten in `disarm`.
 const GitCredentials = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// Not the session's `.ctl` directory, which is bound into no sandbox
-    /// ever: an agent that could reach the approval socket could answer its
-    /// own questions.
     dir: []const u8,
     helper: []const u8,
     secrets: SecretAsker,
@@ -6949,8 +6384,6 @@ const GitCredentials = struct {
         const self: *GitCredentials = @ptrCast(@alignCast(ptr));
         const armed = self.armed_call orelse return null;
         if (!std.mem.eql(u8, armed, call_id)) return null;
-        // The tool is checked as well as the call, so a grant cannot travel
-        // to a different tool that happened to be given the same id.
         if (!std.mem.eql(u8, tool, "run_command")) return null;
 
         return .{
@@ -7058,8 +6491,6 @@ const GitCredentials = struct {
         self.secret_len = typed.len;
         errdefer self.wipe();
 
-        // Before anything is opened. Nothing can echo the value until the
-        // socket exists, so there is no window at all rather than a short one.
         if (self.live) |slot| slot.value = self.secret[0..self.secret_len];
 
         @memcpy(self.host[0..host.len], host);
@@ -7107,11 +6538,7 @@ const GitCredentials = struct {
             "{s}={s}/{s}",
             .{ chock_broker.askpass.env_socket, inside, chock_broker.askpass.socket_name },
         ));
-        // git writes its two prompts through gettext, so a translated git
-        // writes bytes `askpass.readPrompt` cannot read and then refuses.
         try entries.append(gpa, try gpa.dupe(u8, "LC_ALL=C"));
-        // Nothing may fall back to a terminal: a git that opened /dev/tty
-        // inside the sandbox would be asking nobody.
         try entries.append(gpa, try gpa.dupe(u8, "GIT_TERMINAL_PROMPT=0"));
         self.env = try entries.toOwnedSlice(gpa);
 
@@ -7172,9 +6599,6 @@ const GitCredentials = struct {
         return .ready;
     }
 
-    /// Called on every path out of an approved push, including a failing one,
-    /// because the socket existing one moment longer than the act is what
-    /// this design guards against.
     fn disarm(self: *GitCredentials, gpa: std.mem.Allocator, io: std.Io) void {
         if (self.endpoint) |*one| one.close(io);
         self.endpoint = null;
@@ -7202,11 +6626,6 @@ const GitCredentials = struct {
         self.asker.grants = .{};
     }
 
-    /// Write what the sockets did into the session log, after the tool call
-    /// has ended: a look runs in the middle of a call the loop has not
-    /// returned from and may not append. A prompt's text is bytes `git`
-    /// composed out of a URL, and `askpass.appendPrompt` takes no `Grants` at
-    /// all.
     fn record(self: *GitCredentials, gpa: std.mem.Allocator, io: std.Io, locked: ?*chock_core.arbiter.Locked) void {
         const endpoint = if (self.endpoint) |*one| one else return;
         const handle = locked orelse return;
@@ -7227,9 +6646,6 @@ const GitCredentials = struct {
     }
 };
 
-/// The project's own `.git`, and never the session workspace's, which is the
-/// agent's to write. A linked worktree shares the project's configuration
-/// anyway, so this is also the file `git` would really read.
 fn projectConfigPath(gpa: std.mem.Allocator, project_root: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/.git/config", .{project_root});
 }
@@ -7268,12 +6684,6 @@ const nothing_typed_text = "git push was not run: chock asked for the password a
     "typed one, so the push was declined. Nothing was sent anywhere. Ask the user whether they " ++
     "want this push to happen at all before trying it again.";
 
-/// A `ToolRunner` that reads a `run_command` call for a git command line before
-/// it runs. It prevents a mistake and it is not a boundary: the capability layers
-/// stop the same things whether this runner is in the way or not. A subcommand
-/// that reaches another host is asked about and still does not run, even
-/// approved, because an act that leaves the sandbox needs a payload naming the
-/// effect and an argument vector holds no object id, no lease and no remote URL.
 const GitToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
     asker: ?chock_core.arbiter.Asker = null,
@@ -7334,8 +6744,6 @@ const GitToolRunner = struct {
 
         const argv = parsed.value.argv;
         if (argv.len == 0) return null;
-        // `chock_core.tools` refuses any spelling with a slash in it before this
-        // runner is reached, so there is one spelling of git to match here.
         if (!std.mem.eql(u8, argv[0], "git")) return null;
 
         const ask = switch (chock_broker.git_shim.classify(argv)) {
@@ -7387,15 +6795,6 @@ const GitToolRunner = struct {
     }
 };
 
-/// What a project's `secrets` block gives one tool call, and the only place an
-/// entry becomes a value.
-///
-/// A decorator and a seam at once, for the reason `GitCredentials` is one. A
-/// value has to be asked about, read out of the store and put in a redaction
-/// slot, and all three want an allocator, an `Io` and the log's own handle.
-/// `tool_secrets.Seam.grant` is answered deep inside one call and holds none of
-/// them, so `arm` runs here, before the call is handed on, and `grant` is the
-/// lookup that follows it.
 const ToolSecrets = struct {
     inner: chock_core.Loop.ToolRunner,
     gpa: std.mem.Allocator,
@@ -7403,16 +6802,11 @@ const ToolSecrets = struct {
     store: chock_auth.store.Store,
     block: chock_policy.secrets.Block,
     asker: ?chock_core.arbiter.Asker = null,
-    /// One per secret a call may hold at once. A grant wanting more than there
-    /// are slots is refused: see `tool_secret_slots`.
     slots: []chock_core.redact.Secret = &.{},
 
     armed_call: ?[]u8 = null,
     armed_action: []u8 = &.{},
     env: []const []const u8 = &.{},
-    /// A file bind's value, held here rather than in an environment entry: the
-    /// variable will name a path, so the value needs a buffer of its own for the
-    /// redaction slot to point into.
     files: []chock_core.tool_secrets.File = &.{},
     used: []chock_core.tool_secrets.Used = &.{},
     filled: usize = 0,
@@ -7453,9 +6847,6 @@ const ToolSecrets = struct {
                 .truncated = false,
             };
         }
-        // Recorded after the call and not while arming, which is the trap
-        // `GitCredentials.record` documents: a call the loop has not returned
-        // from may not append.
         defer self.finish(gpa, io);
 
         return self.inner.dispatch(gpa, io, call, action);
@@ -7466,12 +6857,6 @@ const ToolSecrets = struct {
         self.disarm();
     }
 
-    /// Null when the call may run, and the refusal text when it may not.
-    ///
-    /// A secret the project granted and this run cannot produce refuses the
-    /// call rather than running it with the secret missing. A program that
-    /// authenticates would fail on its own anyway, in its own words, and an
-    /// agent reading that has every reason to go looking for a token elsewhere.
     fn arm(
         self: *ToolSecrets,
         gpa: std.mem.Allocator,
@@ -7481,16 +6866,8 @@ const ToolSecrets = struct {
     ) std.mem.Allocator.Error!?[]u8 {
         std.debug.assert(self.armed_call == null);
         if (self.block.entries.len == 0 or action.len == 0) return null;
-        // Only a command takes a grant today. An MCP server and a plugin hold
-        // one for their whole life rather than for one call, so they are given
-        // their secrets where they are started.
         if (!std.mem.eql(u8, call.tool, "run_command")) return null;
 
-        // A background command is granted nothing, because it outlives the call
-        // it was started from. So it is not armed either: a question about a
-        // secret that will not be given is a question nobody should be asked.
-        // A call whose arguments do not parse is refused further down, and
-        // arming it would ask the same pointless question.
         const parsed = std.json.parseFromSlice(
             struct { background: ?bool = null },
             gpa,
@@ -7559,16 +6936,12 @@ const ToolSecrets = struct {
         return null;
     }
 
-    /// What one arming builds, before any of it is owned by the seam. One struct
-    /// because every failure and every refusal undoes all three together.
     const Held = struct {
         env: std.ArrayList([]const u8) = .empty,
         files: std.ArrayList(chock_core.tool_secrets.File) = .empty,
         used: std.ArrayList(chock_core.tool_secrets.Used) = .empty,
     };
 
-    /// One entry, onto the end of what this arming holds. The refusal text when
-    /// this one cannot be given, and then nothing was added.
     fn give(
         self: *ToolSecrets,
         gpa: std.mem.Allocator,
@@ -7602,16 +6975,12 @@ const ToolSecrets = struct {
         };
         const variable = entry.variable();
 
-        // Recorded first, so no failure below can leave the caller an entry to
-        // free that this one has freed already.
         try held.used.append(self.gpa, .{
             .name = entry.name,
             .bind = @tagName(entry.bind),
             .variable = variable,
         });
 
-        // The value itself for a file bind, because the variable will name a
-        // path and the redaction slot has to point at the value.
         const anchor = switch (entry.bind) {
             .env => named: {
                 defer wipeAndFree(self.gpa, value);
@@ -7627,16 +6996,11 @@ const ToolSecrets = struct {
             },
         };
 
-        // Filled before the entry can reach anything. Nothing reads the grant
-        // until `grant` answers, so there is no window rather than a short one.
         self.slots[self.filled].value = anchor;
         self.filled += 1;
         return null;
     }
 
-    /// Everything one arming made, undone. Written once because a refusal and a
-    /// failure both reach it, and a refusal that left a slot filled would keep
-    /// redacting a value nothing holds any more.
     fn undo(self: *ToolSecrets, held: *Held) void {
         self.clearSlots();
         for (held.env.items) |entry| wipeAndFree(self.gpa, entry);
@@ -7693,10 +7057,6 @@ const ToolSecrets = struct {
 
     const Read = union(enum) { held: []u8, absent, failed };
 
-    /// The name is read as the store spells it, with no prefix of Chock's own,
-    /// so a SecretSpec profile naming `GITHUB_TOKEN` is what a project's entry
-    /// names. A name cannot hold a colon, which is what Chock's own keys begin
-    /// with, so no entry can reach one.
     fn read(
         self: *ToolSecrets,
         gpa: std.mem.Allocator,
@@ -7726,8 +7086,6 @@ const ToolSecrets = struct {
         const self: *ToolSecrets = @ptrCast(@alignCast(ptr));
         const armed = self.armed_call orelse return null;
         if (!std.mem.eql(u8, armed, call_id)) return null;
-        // The tool and the action as well as the call, so a grant cannot travel
-        // to anything but the one call it was armed for.
         if (!std.mem.eql(u8, tool, "run_command")) return null;
         if (!std.mem.eql(u8, action, self.armed_action)) return null;
 
@@ -7738,15 +7096,10 @@ const ToolSecrets = struct {
         const self: *ToolSecrets = @ptrCast(@alignCast(ptr));
         const armed = self.armed_call orelse return;
         if (!std.mem.eql(u8, armed, call_id)) return;
-        // The values alone. `record` has not run yet and it reads what was
-        // used, and a value is the thing that must stop existing the moment the
-        // program has ended.
         self.clearSlots();
         self.forget();
     }
 
-    /// The values alone, wiped and freed. What `record` reads is left alone,
-    /// because a log is written after the call and names what was used.
     fn forget(self: *ToolSecrets) void {
         for (self.env) |entry| wipeAndFree(self.gpa, entry);
         if (self.env.len != 0) self.gpa.free(self.env);
@@ -7756,8 +7109,6 @@ const ToolSecrets = struct {
         self.files = &.{};
     }
 
-    /// One `secret.used` per secret the call held. The value is not in it: a
-    /// log holding the value would undo the whole arrangement.
     fn record(self: *ToolSecrets, gpa: std.mem.Allocator, io: std.Io) void {
         if (self.armed_call == null) return;
         const handle = (if (self.asker) |one| one.locked else null) orelse return;
@@ -7792,49 +7143,28 @@ const ToolSecrets = struct {
     }
 };
 
-/// The bytes are gone before the allocator can hand them to anybody else. The
-/// `@constCast` is sound: every caller owns what it passes and allocated it
-/// mutable.
 fn wipeAndFree(gpa: std.mem.Allocator, value: []const u8) void {
     std.crypto.secureZero(u8, @constCast(value));
     gpa.free(value);
 }
 
-/// What the project's `secrets` block gives an MCP server, for as long as the
-/// server runs.
-///
-/// A second reader of the same block, and deliberately not the per-call seam. A
-/// server is started once and holds its environment until the session ends, so
-/// there is no call to arm, nothing to release, and the redaction slot stays
-/// filled for the whole session. Keeping the two apart is what stops a
-/// session long value being cleared by the end of some unrelated tool call.
-///
-/// The decision is the table's alone. A server starts before the loop, when
-/// there is nobody to ask, so `ask` here means the server is not given it, the
-/// same reading `nix.build` and `model.select` take.
 const ServerSecrets = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     store: chock_auth.store.Store,
     block: chock_policy.secrets.Block,
-    /// One per entry of the block. See `sessionSecretSlots`.
     slots: []chock_core.redact.Secret = &.{},
 
     filled: usize = 0,
     kept: [chock_policy.secrets.max_entries]Record = undefined,
     records: usize = 0,
 
-    /// What to write down once the loop holds the log. A server starts before
-    /// the loop does, and nothing may append to a log it does not hold.
     const Record = struct {
         name: []const u8,
         action: []const u8,
         variable: []const u8,
     };
 
-    /// `config.env` with every secret this server was granted added to it, or
-    /// the same slice when it was granted none. Allocated in `keep`, which owns
-    /// the server for as long as it runs.
     fn forServer(
         self: *ServerSecrets,
         keep: std.mem.Allocator,
@@ -7879,13 +7209,6 @@ const ServerSecrets = struct {
         return chock_core.credentials.environment(keep, base, given.items);
     }
 
-    /// The `KEY=VALUE` this entry adds, or null when the table does not permit
-    /// it or the store does not hold it. The value is in a redaction slot before
-    /// this returns, so nothing can echo it first.
-    ///
-    /// The entry is allocated in `keep`, which the server outlives nothing of:
-    /// the redaction slot points into it, so it has to live as long as the
-    /// session and not as long as this call.
     fn permitted(
         self: *ServerSecrets,
         keep: std.mem.Allocator,
@@ -7943,8 +7266,6 @@ const ServerSecrets = struct {
         return named;
     }
 
-    /// One `secret.used` per secret a server holds, written when the loop first
-    /// hands over the log. The value is not in it.
     fn giveLocked(self: *ServerSecrets, locked: *chock_core.arbiter.Locked) void {
         if (self.records == 0) return;
         const time_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
@@ -7956,26 +7277,15 @@ const ServerSecrets = struct {
                 .variable = one.variable,
             } }, time_ms) catch return;
         }
-        // Written once. A later handover is a new lock over the same log, not a
-        // new set of secrets.
         self.records = 0;
     }
 };
 
-/// Whether `pattern` reaches anything at all under `namespace`, which is itself
-/// a pattern. `mcp.*` reaches one server, `mcp.github.*` reaches that one only,
-/// and `exec.path.gh` reaches no server.
-///
-/// Two patterns rather than a pattern and an action, because a server is given
-/// its environment before it has said what tools it has, so there is no action
-/// to match yet.
 fn reaches(pattern: []const u8, namespace: []const u8) bool {
     return chock_policy.table.patternCovers(pattern, namespace) or
         chock_policy.table.patternCovers(namespace, pattern);
 }
 
-/// A language server is long lived and stateful and the registry knows nothing
-/// that outlives one call, so the caller that owns the session holds it.
 const DiagnosticToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
     session: *chock_core.lsp.Session,
@@ -8019,9 +7329,6 @@ const DiagnosticToolRunner = struct {
     }
 };
 
-/// Outside every runner that reads a tool name and acts on it, so a name a third
-/// party program chose never reaches the sandbox runner, the git shim or the
-/// provisioner.
 const McpToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
     state: *McpState,
@@ -8074,9 +7381,6 @@ const McpToolRunner = struct {
     }
 };
 
-/// The arrays are fixed and never reallocated: a `chock_core.mcp.Server` points
-/// at the driver beside it and that driver at the helper beside it, so a list
-/// that grew would move both out from under the pointers.
 const McpState = struct {
     session: chock_core.mcp.Session,
     arena: std.heap.ArenaAllocator,
@@ -8100,9 +7404,6 @@ const McpState = struct {
             self.helpers[index].deinit(io);
             self.drivers[index].deinit();
 
-            // A refused connection has no other moment to be read: the network
-            // broker answers from inside `Sandbox.spawn`, with the session's own
-            // loop waiting on that call, so nothing can print when it happens.
             const network = &self.networks[index];
             if (network.refused != 0) {
                 tty.print(
@@ -8156,11 +7457,6 @@ const TablePolicy = struct {
     }
 };
 
-/// The promises of the sessions above this one are read at session start rather
-/// than per call, which is exact: a parent is blocked inside its own
-/// `spawn_agent` call for the whole life of a child.
-/// The search seam, filled only when the operator's own `config.zon` names an
-/// engine. A null searcher is what `Loop` reports as no engine configured.
 const SessionSearcher = struct {
     session: chock_broker.search.Session,
 
@@ -8177,9 +7473,6 @@ const SessionSearcher = struct {
         ask: chock_core.search.Ask,
     ) chock_core.search.Error!chock_core.search.Answer {
         const self: *SessionSearcher = @ptrCast(@alignCast(ptr));
-        // The broker's own `Ask` carries the query alone: the policy question
-        // was already answered live at the tool call, so nothing here reads a
-        // promise or a tool name.
         const answered = try self.session.search(gpa, io, .{ .query = ask.query });
         return .{ .text = answered.text, .is_error = answered.is_error };
     }
@@ -8249,9 +7542,6 @@ const SessionFetcher = struct {
     }
 };
 
-/// A server keeps `Sandbox.Config.network` at `none` and reaches the network only
-/// when this project's policy answers `allow` for `mcp.<server>.network`, and
-/// even then reaches nothing until a `net.connect.*` rule names a host.
 fn policyChain(
     keep: std.mem.Allocator,
     started: *const Started,
@@ -8318,8 +7608,6 @@ fn startMcp(
         } orelse continue;
 
         var config = prepared.config;
-        // Before the server is started, because a process reads its environment
-        // once and there is no way to hand it one afterwards.
         config.env = try secrets.forServer(keep, &policy, one.name, config.env);
         const index = state.count;
 
@@ -8428,18 +7716,10 @@ fn reportMcpOffers(session: *const chock_core.mcp.Session) void {
     }
 }
 
-// A plugin's tool list is read out of its own module file with no engine at all,
-// so a plugin that is never called starts no process. A wasm guest owns the
-// address space of the process that runs it in the engine this project has, so
-// its sandbox is built by taking things away.
-
 const plugin_module_target = "/plugin.wasm";
 
 const plugin_host_target = "/chock";
 
-/// Outside the MCP runner, so a name a plugin declared reaches nothing else at
-/// all. `startPlugins` fills `chock_core.plugin.Session.reserved` with what MCP
-/// got first, so the two lists are disjoint before either runner sees a call.
 const PluginToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
     state: *PluginState,
@@ -8497,9 +7777,6 @@ const PluginState = struct {
     }
 };
 
-/// Plugins come last, so an MCP server already in the session keeps every name it
-/// declared. Nothing here starts a process: the host process starts on the first
-/// call of a tool.
 fn startPlugins(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -8513,9 +7790,6 @@ fn startPlugins(
 ) std.mem.Allocator.Error!struct { []chock_core.tools.Definition, []const u8 } {
     const settings = started.plugins orelse return .{ definitions, prompt };
 
-    // There is no plugin on Darwin today, because a plugin host is a
-    // sandboxed process and `Sandbox.spawn` refuses there. Said once, and
-    // never as a tool the model is offered and cannot use.
     if (builtin.target.os.tag != .linux) {
         tty.print(
             .warn,
@@ -8631,9 +7905,6 @@ fn startPlugins(
             continue;
         }
 
-        // Every capability its offered tools declared, and no other. The list is
-        // fixed on argv before the process exists, so nothing the guest does and
-        // nothing on the pipe can widen it.
         const capabilities = try chock_core.plugin_engine.unionOfCapabilities(
             keep,
             &state.session,
@@ -8673,8 +7944,6 @@ fn startPlugins(
     };
 }
 
-/// The supplier already in the session keeps its names, and a plugin tool of the
-/// same name is refused with a reason the model reads.
 fn reservedNames(
     keep: std.mem.Allocator,
     mcp_session: *const chock_core.mcp.Session,
@@ -8699,11 +7968,6 @@ fn pluginArgv(
     return argv.toOwnedSlice(keep);
 }
 
-/// The sandbox one plugin host process runs in, built by taking things away from
-/// the config a tool call gets. The host program carries the execute right,
-/// without which `execve` on it is refused before one instruction runs. The
-/// workspace is not in it: its mounts come through with no rule, present and
-/// unreachable.
 fn pluginSandbox(
     keep: std.mem.Allocator,
     io: std.Io,
@@ -8734,8 +7998,6 @@ fn pluginSandbox(
 
     var reach: std.ArrayList(sandbox.Config.Rule) = .empty;
     try reach.appendSlice(keep, with_store.rules);
-    // A file and not a directory, so the rule cannot carry the `read_dir` right:
-    // `landlock_add_rule` answers EINVAL for a directory right over a file.
     try reach.append(keep, .{
         .path = plugin_host_target,
         .access = .{ .execute = true, .read_file = true },
@@ -8775,10 +8037,6 @@ fn reportPluginOffers(session: *const chock_core.plugin.Session) void {
     }
 }
 
-/// There is no long lived sandbox: every tool call builds its own
-/// `sandbox.Config`, so a store path added between two calls is mounted by the
-/// second. It reaches neither a background task already running, which deep
-/// copied its config, nor a subagent, nor the next session.
 const ProvisionToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
     settings: ?Provisioning,
@@ -8926,10 +8184,6 @@ const ProvisionToolRunner = struct {
             return err;
         };
 
-        // Held against the garbage collector before the model is told it is
-        // there. `nix build --no-link` leaves no root of its own, so a
-        // `nix-collect-garbage` before the next tool call would take a toolchain
-        // the agent has already been promised.
         if (answer == .provided) self.rootProvided(io, settings, program, answer.provided);
         return answer;
     }
@@ -8979,9 +8233,6 @@ const SessionMounts = struct {
     arena: std.mem.Allocator,
     context: *chock_core.tools.Context,
     tool_env: *std.process.Environ.Map,
-    /// Every store path this session mounts, with no repeats. A new package's
-    /// closure and the dev shell's overlap almost entirely, and `withStore`
-    /// builds one bind mount and one Landlock rule per entry.
     paths: std.ArrayList([]const u8) = .empty,
     mounted: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -9016,9 +8267,6 @@ const SessionMounts = struct {
     }
 };
 
-/// `nix-store --add-root` names its links after the prefix it is given, so two
-/// programs sharing one prefix means the second call replaces the first one's
-/// links and a program the agent is still using stops being held.
 fn providedRootPrefix(
     arena: std.mem.Allocator,
     dir: []const u8,
@@ -9035,10 +8283,6 @@ const provisioning_is_off = "no program was provisioned: this session cannot add
     "work with a program the toolchain already has, and do not run apt, npm, pip, cargo or " ++
     "brew, because none of them can work in this sandbox.";
 
-/// An evaluation runs in this process, outside every sandbox. Store writes stay
-/// off, and the driver is installed with `Seam.refusing`, so an evaluation that
-/// reaches for a store gets a refusal that names the path, which import from
-/// derivation needs. One engine per call, because an engine holds every value.
 const NixEvalToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
     settings: ?NixEval,
@@ -9235,11 +8479,6 @@ fn nixBuildFor(
     };
 }
 
-/// A fixed output derivation builds with the network open to it, and its output
-/// hash is integrity and never egress: a URL carrying a secret in its query
-/// string, with the hash of an innocuous file, passes it. The names are `nix.net`
-/// and never `net.connect`, so a rule that lets a build fetch from a host does
-/// not let the agent's own sandbox open a socket to it.
 const NixFetchGate = struct {
     const opaque_action = chock_broker.network.nix_opaque_action;
 
@@ -9298,9 +8537,6 @@ const NixFetchGate = struct {
         .permit_site = permitSiteFn,
     };
 
-    /// A nixpkgs closure reaches a hundred distinct hosts, and a hundred
-    /// questions is one decision and ninety nine keystrokes. A host a rule
-    /// already allows never appears in the question.
     fn permitAllFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -9334,9 +8570,6 @@ const NixFetchGate = struct {
         return self.decideMany(allocator, asking.items);
     }
 
-    /// Whether this build may fetch without saying where it goes. A fixed
-    /// output derivation's hash still proves the bytes are what the
-    /// derivation expected. What it cannot prove is where the request went.
     fn permitOpaqueFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -9437,8 +8670,6 @@ const NixFetchGate = struct {
         };
     }
 
-    /// The key is the site and the hash of that site's own list, so a rule
-    /// somebody wrote stops covering it the moment that list changes.
     fn permitSiteFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -9640,11 +8871,6 @@ const NixFetchGate = struct {
     }
 };
 
-/// The attribute is evaluated in this process, with store writes on, and the
-/// derivation closure is written into the host store through its daemon, which
-/// registers the derivation so its produced set can authorise a build of it. A
-/// path this session built still asks under `exec.nix.store.*`, because
-/// `Loop.Deps.store_closure` is read from the toolchain the session started with.
 const NixBuildToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
     settings: ?NixBuild,
@@ -9761,8 +8987,6 @@ const NixBuildToolRunner = struct {
         var writing = chock_nix.build.Writing{
             .writer = store_writer.writer(),
             .budget = &self.budget,
-            // What stops fix fetching a flake input for itself: it takes a locked
-            // input out of the store when the store says the path is valid.
             .fetched_paths = settings.inputs.store_paths,
         };
         driver.seam = writing.seam();
@@ -9788,9 +9012,6 @@ const NixBuildToolRunner = struct {
         const drv_path = switch (try self.derivationOf(gpa, io, settings, &driver, expression, installable)) {
             .refused => |text| return .{ .text = text, .refused = true },
             .found => |path| path,
-            // One retry, and never a loop. The session start fetches an input
-            // only where the policy said `allow`, because there is nobody at the
-            // prompt then, so this is the first moment a person can be asked.
             .inputs_missing => blk: {
                 const now = try self.fetchInputs(host_io, settings, input_gate.gate(), installable);
                 if (now.store_paths.len == 0) return .{
@@ -9863,10 +9084,6 @@ const NixBuildToolRunner = struct {
         inputs_missing,
     };
 
-    /// This is where a startup `ask` stops being a permanent no: a build is a
-    /// turn the model took, so there is somebody to ask. The fetch still happens
-    /// on the host through `nix flake archive`, and fix never reaches the network
-    /// itself. The workspace's own lock and not the project's.
     fn fetchInputs(
         self: *NixBuildToolRunner,
         io: std.Io,
@@ -9933,8 +9150,6 @@ const NixBuildToolRunner = struct {
             .io = io,
             .store_backend = driver.backend(),
             .store_writes = true,
-            // `network` stays off, so the inputs of that flake come out of the
-            // store and never off a connection fix opened.
             .flakes = true,
         }) catch |err| return .{ .refused = try std.fmt.allocPrint(
             gpa,
@@ -10042,10 +9257,6 @@ fn isWorkspaceFlake(workspace_root: []const u8, flake_ref: []const u8) bool {
     return rest.len == 0 or rest[0] == '/';
 }
 
-/// A reference that is not this project is refused. Fetching it means fetching
-/// its whole input graph, and what that graph reaches is written in a lock file
-/// inside the flake, which cannot be read until the flake has been fetched, so
-/// there is no moment at which the policy could be asked about those hosts.
 fn foreignFlakeRefusal(
     gpa: std.mem.Allocator,
     flake_ref: []const u8,
@@ -10129,21 +9340,12 @@ fn nixBuildRefusal(
 const nix_build_is_off = "nothing was built: this session cannot build with Nix, because there " ++
     "is no nix on this machine. Do the work with what the toolchain already has.";
 
-/// Starts a subagent: one `chock run` of its own. A child is a process and not a
-/// thread, because `Sandbox.spawn` calls `fork` and `fork` carries only the
-/// calling thread. The child cannot state a chain of its own, so a check it
-/// performed on itself would be worth nothing. The `Io` it spawns on is backed by
-/// the page allocator, because a lock another thread holds at a `fork` is one the
-/// child inherits as held for ever.
 const SubagentSpawner = struct {
     gpa: std.mem.Allocator,
     environ: std.process.Environ,
     env: *std.process.Environ.Map,
     started: *const Started,
     agent_kind: []const u8,
-    /// True to give the child no scratchpad at all. This exists for the reviewer
-    /// agent and for nothing else: a parent may read a child's scratchpad, and
-    /// the parent of a reviewer is the agent whose request is being reviewed.
     no_scratchpad: bool = false,
 
     fn spawner(self: *SubagentSpawner) chock_core.subagent.Spawner {
@@ -10280,10 +9482,6 @@ const SubagentSpawner = struct {
     }
 };
 
-/// The reviewer agent: a subagent that reads one case and answers, and acts on
-/// nothing. It gets no scratchpad, no tools at all, and the case with nothing of
-/// the parent's conversation. `session.spawn` is appended for it before the child
-/// runs, and without that a reviewer was a process the width bound could not see.
 const ReviewSpawner = struct {
     child: chock_core.subagent.Spawner,
     budget: ?chock_cost.budget.Budget,
@@ -10303,9 +9501,6 @@ const ReviewSpawner = struct {
 
     const vtable = chock_broker.review.Reviewer.VTable{ .review = reviewFn };
 
-    /// Every way this can fail is `error.ReviewNotRun`, and the broker turns each
-    /// one into `review_unavailable`, which refuses: the cheapest attack on a
-    /// review is to make it fail.
     fn reviewFn(
         ptr: *anyopaque,
         gpa: std.mem.Allocator,
@@ -10349,10 +9544,6 @@ const ReviewSpawner = struct {
         };
         defer chock_core.subagent.freePrepared(gpa, prepared);
 
-        // Before the child runs, so a crash between the two still leaves proof
-        // that this child was asked for. A spawn that cannot be written starts
-        // nothing: a child the width bound cannot see is worse than a review that
-        // did not run.
         self.recordSpawn(gpa, io, request, prepared) catch {
             tty.print(
                 .warn,
@@ -10399,9 +9590,6 @@ const ReviewSpawner = struct {
     }
 };
 
-/// Nothing here starts anything. The spawn limits and what is left of the budget
-/// are read from the session's own log, so a session that was resumed counts the
-/// children it really has.
 fn reviewerFor(
     child: chock_core.subagent.Spawner,
     started: *const Started,
@@ -10463,10 +9651,6 @@ fn reviewBounds(
 
 const max_ancestor_sessions: usize = chock_policy.subagents.max_settable;
 
-/// A promise a parent made has to reach its children, or an agent that promises
-/// not to apply its work can start a subagent to apply it. The promises come out
-/// of the ancestors' own logs and never off a command line, where a parent that
-/// passed none would be a parent widening its child.
 fn promisesFor(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -10535,10 +9719,6 @@ fn appendPromises(
     }
 }
 
-/// The file is checked before the log is opened: `chock_proto.log.Log.open`
-/// creates the file and writes a header into it when there is none, so asking
-/// about a session that never existed would bring one into being. `session`
-/// still holds everything that was read.
 fn foldSessionById(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -10579,10 +9759,6 @@ fn foldSession(
     }
 }
 
-/// A fold split across many calls reaches the same state a single fold of the
-/// whole log would, because `state.Session.apply` only ever adds or overwrites one
-/// field and never looks back. A line that will not decode stops the fold and
-/// leaves `at` unmoved; a torn tail moves `at` to the tear's own start.
 fn foldSessionSince(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -10602,9 +9778,6 @@ fn foldSessionSince(
     at.* = replay.at();
 }
 
-/// One path for every session, because a fresh log folds to nothing: none of the
-/// events phase 1 wrote is a row. A log that cannot be read is said out loud and
-/// does not refuse the session: this only decides what is on screen.
 fn replayInto(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -10666,8 +9839,6 @@ fn runSession(
     defer started.sandbox_config.supervisor_audit = null;
     defer logSupervisorAudit(gpa, io, started.storage, &supervisor_audit);
 
-    // Off unless a policy asks: the sandbox watches nothing until
-    // `Config.seccomp_options.traps` names a call.
     var syscall_audit: sandbox.Sandbox.SyscallAudit = .{};
     started.sandbox_config.syscall_audit = &syscall_audit;
     defer started.sandbox_config.syscall_audit = null;
@@ -10686,24 +9857,12 @@ fn runSession(
     context.provisioning = started.provisioning != null;
     context.role = agentRole(options);
 
-    // **Every tool call of this session now goes through the guest.** Set before
-    // the first one and never after: see `chock_core.tools.useDriver`, and
-    // `docs/security/microvm.md` for why the daemon owns the guest and this only
-    // reaches into it.
-    // An arena of its own, freed with the session: the share names, the buffers and
-    // the link outlive every turn and none of them outlives the run.
     var guest_arena = std.heap.ArenaAllocator.init(gpa);
     defer guest_arena.deinit();
 
     var guest_link: ?*GuestLink = null;
-    // Stopped here and not where it was forked, because the guest has to outlive
-    // every tool call and nothing of this session's work is left by now.
     defer if (started.own_guest) |one| one.stop(io);
 
-    // The daemon hands a socket in when it owns the guest. A session nobody handed
-    // one to forked its own in `start`, because a `chock run` of its own is one
-    // process for the whole session: it is only under the daemon that a child exits
-    // every turn.
     const guest_socket: ?[]const u8 = options.guest orelse socket: {
         const one = started.own_guest orelse break :socket null;
         break :socket one.socket;
@@ -10712,8 +9871,6 @@ fn runSession(
     if (guest_socket) |socket_path| {
         const room = guest_arena.allocator();
         const shares = try guestShares(room, io, started);
-        // The guest boots on this message, so it comes before anything reaches for
-        // its socket.
         if (started.own_guest) |one| try readyOwnGuest(room, io, one, shares);
         const link = try attachGuest(room, io, socket_path, shares);
         chock_core.tools.useDriver(link.guest.driver());
@@ -10722,18 +9879,11 @@ fn runSession(
     }
     defer if (guest_link) |link| link.close(io);
 
-    // The page allocator, and never `gpa`. A task's own thread allocates from
-    // this beside a thread that may be inside `Sandbox.spawn`, and `fork` carries
-    // only the calling thread.
     var table: ?chock_core.tasks.Table = if (started.tasks_dir) |dir| .{
         .gpa = std.heap.page_allocator,
         .dir = dir,
         .runner = chock_core.tools.backgroundRunner(),
     } else null;
-    // Ends every task still running, then waits for it: a thread of this table
-    // writes into a directory phase 3 is about to remove. Waiting alone is not an
-    // option either, because a session that is over must not sit for half an hour
-    // on a build whose output nobody will read.
     defer if (table) |*one| {
         chock_core.tools.cancelRunningTool();
         one.deinit();
@@ -10868,15 +10018,9 @@ fn runSession(
         .mounts = &session_mounts,
     };
 
-    // Started here and not in phase 1, unlike every other block of `chock.zon`. A
-    // server has to be asked what tools it has before the model can be offered
-    // one, and asking means a `fork`, which phase 1 cannot do beside the threads
-    // that build the workspace.
     var mcp_state = McpState.init(gpa);
     defer mcp_state.deinit(io);
 
-    // A server holds what it is given until the session ends, so its slots are
-    // not the per-call ones and `startMcp` fills them before it starts anything.
     var server_secrets = ServerSecrets{
         .gpa = gpa,
         .io = io,
@@ -10932,9 +10076,6 @@ fn runSession(
         .gpa = std.heap.page_allocator,
         .spawner = subagent_spawner.spawner(),
     };
-    // Waits, and does not cancel. A child holds a log of its own that a person
-    // reads afterwards, and a child killed between two turns leaves one with no
-    // `session.end`, which its parent then reads as a child that died.
     defer children.deinit();
 
     defer {
@@ -10951,8 +10092,6 @@ fn runSession(
     var screen: ?*ui.Ui = null;
     defer if (screen) |one| one.deinit();
 
-    // Before the display: two of the three probes fork, and a fork taken after
-    // `Ui.start` would be a fork of a process holding a terminal in raw mode.
     const layer_witness = witnessLayers(gpa, sandbox.Sandbox.guarantees);
 
     if (options.display) |wanted| {
@@ -11013,9 +10152,6 @@ fn runSession(
         ),
     };
 
-    // A signal does not run a deferred append, so a killed session left a log
-    // that stops mid conversation with nothing saying why. Installed here,
-    // because before the loop exists there is nothing reading the flag.
     interrupt.install();
 
     if (started.handovers) |endpoint| handover.arm(endpoint);
@@ -11074,8 +10210,6 @@ fn runSession(
         .model = started.model,
     };
 
-    // A directory of its own, and never the session's `.ctl`: an agent that could
-    // reach the approval socket could answer its own questions.
     const credential_dir = try std.fmt.allocPrint(
         gpa,
         "{s}/{s}.cred",
@@ -11084,9 +10218,6 @@ fn runSession(
     defer gpa.free(credential_dir);
     defer std.Io.Dir.cwd().deleteTree(io, credential_dir) catch {};
 
-    // The fallback keeps the sentinel `realPathFileAlloc` answers with. A plain
-    // slice makes the common type an ordinary one, and the free then releases a
-    // byte less than the allocation.
     const credential_helper = std.Io.Dir.realPathFileAlloc(
         .cwd(),
         io,
@@ -11115,8 +10246,6 @@ fn runSession(
             .model = started.model,
         },
         .host_agent = env.get(chock_broker.agentproxy.env_socket) orelse "",
-        // `@constCast` is sound here: the slice was allocated mutable in phase
-        // 1's arena, and this is the one owner that writes it, from one thread.
         .live = if (started.redact.secrets.len != 0)
             &@constCast(started.redact.secrets)[started.redact.secrets.len - 1]
         else
@@ -11175,8 +10304,6 @@ fn runSession(
     };
     defer fetcher.deinit();
 
-    // Only when both halves are named. A block with no kind or no base url is
-    // not an engine, and the seam stays null so the tool says so.
     var searcher: ?SessionSearcher = if (started.search.kind) |kind| about: {
         const base = started.search.base_url orelse break :about null;
         break :about SessionSearcher{ .session = .{
@@ -11231,14 +10358,9 @@ fn runSession(
         .agent_kind = options.agent_kind,
         .role = agentRole(options),
         .system_prompt = system_prompt,
-        // The gate reads it to turn the name a `read_skill` call gives into the
-        // layer that names the action. The same list the prompt was built from.
         .skills = started.skills.skills,
         .observer = if (sinks.count != 0) exporter.observer() else exporter.inner,
         .canceled = interrupt.requested,
-        // Only at a turn boundary, which is why this is not `canceled`. A session
-        // that stopped between two tool calls of one turn leaves an assistant
-        // message whose `tool_use` parts have no matching results.
         .handover = handover.requested,
         .budget = started.budget,
         .billing = started.billing,
@@ -11327,9 +10449,6 @@ const ShippingReport = struct {
         health: chock_proto.ship.Health,
         required: bool = false,
 
-        /// Whether this sink holds less than the whole of the session's log, and
-        /// will never hold the rest. A sink that was down and came back is not a
-        /// gap: the log on disk is the queue.
         fn gap(self: Entry) bool {
             return self.health.stalled_at != null or self.health.refused != 0;
         }
@@ -11384,9 +10503,6 @@ fn reportShipping(report: *const ShippingReport) void {
     }
 }
 
-/// Never moved after `open`: each `Sending` holds a `Sink` pointing into this
-/// struct's own arrays. Every name here is the run's own arena, because a
-/// `ShippingReport` borrows them and is read in phase 3.
 const Sinks = struct {
     drops: [max_sinks]chock_proto.ship.FileDrop = @splat(.{ .path = "" }),
     syslogs: [max_sinks]chock_proto.ship.Syslog = @splat(.{ .path = "" }),
@@ -11700,9 +10816,6 @@ const Printer = struct {
         }
     }
 
-    /// One event carries only the steps that moved, and a task list has one
-    /// current state. The abandoned count is written only while it is not zero,
-    /// or `1 of 4 done` reads as three left.
     fn foldPlan(self: *Printer, update: chock_proto.event.PlanUpdate) void {
         var gave_up: [max_said_steps]usize = undefined;
         var count: usize = 0;
@@ -11777,9 +10890,6 @@ const Printer = struct {
         self.write(self.paint.close(rank));
     }
 
-    /// A failed write is dropped on purpose. Through `src/tty.zig`'s standard
-    /// output writer and never straight to the descriptor, because that writer is
-    /// holding bytes that have not left yet.
     fn write(self: *Printer, bytes: []const u8) void {
         switch (self.out) {
             .stdout => if (!tty.writeOut(bytes)) {
@@ -11918,7 +11028,6 @@ fn refuseAdoptWithNothingToAdopt(
                 "it, and ownership is not taken from a session that is still using it.\n",
             .{id},
         ),
-        // Fails closed: an absent answer is never a permissive answer.
         .unknown => tty.print(
             .err,
             "chock run: session {s} could not be read, or its lock could not be tested, so it " ++
@@ -11932,28 +11041,14 @@ fn refuseAdoptWithNothingToAdopt(
 const busy_detail = "another process took the session's log lock first, so it owns that session " ++
     "now. Nothing was lost: the log is whole, and `chock sessions` says who is running.";
 
-/// One guest this session runs itself, in a forked process of its own.
-///
-/// **A process and not a thread, so the boundary round it can be installed.** A
-/// seccomp filter and a Landlock domain go on a whole process and cannot be taken
-/// off again, so a guest hosted on a thread of this one could only be confined by
-/// confining the session with it: see `src/vmm.zig`.
 const OwnGuest = struct {
     child: vmm.Child,
     socket: [:0]const u8,
-    /// Where the guest's console goes.
     console: [:0]const u8,
 
-    /// **This end removes the socket, and not the guest.** The path is not in the
-    /// share set, so the confined process cannot unlink its own: Landlock refuses
-    /// it, and a file left behind is one the next session of this name trips over.
     fn stop(self: *OwnGuest, io: std.Io) void {
         self.child.stop();
         const code = self.child.wait();
-        // **A guest that ended badly says so, and not only under `--detail`.** Its
-        // own reason is written to the control channel after `host` returns, by
-        // which time the line above has closed this end, so nothing reads it. The
-        // console is where it still lands.
         if (code == 0) {
             tty.detail("chock: the guest's own process ended, answering 0\n", .{});
         } else {
@@ -11968,13 +11063,6 @@ const OwnGuest = struct {
     }
 };
 
-/// Refuse a guest for a project that holds a directory of Chock's own, naming
-/// both.
-///
-/// **Asked for every session that runs in a guest, and not only for one this
-/// process forks.** A daemon that refuses a project answers no socket, and the
-/// child then forks its own, so a check on the fork alone would leave the grant
-/// with this process instead of closing it. See `chockOwnInProject`.
 fn refuseGuestOverChockOwn(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -12005,16 +11093,6 @@ fn refuseGuestOverChockOwn(
     return error.Reported;
 }
 
-/// Fork this session's own guest, before anything of this process's memory holds a
-/// credential.
-///
-/// **It returns before the guest boots.** The forked process waits for the
-/// directories it may serve, which are derived from a workspace that does not
-/// exist yet, so the boot is `readyOwnGuest`'s half of the work.
-///
-/// **A guest that will not come up stops the session.** Carrying on with the native
-/// driver would sandbox it more weakly than the operator asked for, and on a Mac far
-/// more weakly, with nothing saying so.
 fn forkOwnGuest(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -12034,10 +11112,6 @@ fn forkOwnGuest(
         return error.Reported;
     }
 
-    // **In the state directory's own root, and not under the session.** A unix
-    // socket path takes 108 bytes; a session directory is that root plus a project
-    // name and a hash, and a real one came to 137. This is where the daemon puts its
-    // guest sockets for the same reason.
     const socket = std.fmt.allocPrintSentinel(
         arena,
         "{s}/g-{s}.sock",
@@ -12062,28 +11136,14 @@ fn forkOwnGuest(
         0,
     ) catch return error.OutOfMemory;
 
-    // **A file beside the session and not this process's own output.** The agent's
-    // transcript is on standard output, and a kernel boot interleaved with it is
-    // unreadable for both. It also means a guest that says why it failed is still
-    // saying it where somebody can look, which standard output did not: a session
-    // whose display owns that stream threw the whole boot away.
-    //
-    // Opened here, because the confined process cannot open it: the console is not
-    // a directory it serves. It crosses the fork as a descriptor.
     var file = std.Io.Dir.cwd().createFile(io, console, .{}) catch {
         tty.print(.err, "chock run: the guest's console could not be opened at {s}\n", .{console});
         return error.Reported;
     };
-    // The guest's own process keeps it. Nothing this one writes goes there.
     defer file.close(io);
 
-    // Read once, so the processor count and the memory size are chosen against
-    // the same numbers.
     const guest_machine = chock_policy.sandbox.Machine.now();
 
-    // **Room for the handle before the fork, not after.** A failure to allocate
-    // once the child exists would leave its bound socket behind with nothing
-    // holding the path to unlink.
     const held = arena.create(OwnGuest) catch return error.OutOfMemory;
 
     const child = vmm.forkHost(io, .{
@@ -12107,11 +11167,6 @@ fn forkOwnGuest(
     return held;
 }
 
-/// Give the guest the directories it may serve, then wait for its socket.
-///
-/// **The set crosses the control channel and not the fork.** It is derived from
-/// this session's workspace, and the guest is forked before that exists: see
-/// `forkOwnGuest`.
 fn readyOwnGuest(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -12148,21 +11203,11 @@ fn readyOwnGuest(
         return error.Reported;
     };
 
-    // **Said only when it is on.** A guest runs in the clear on most machines,
-    // so a line for the ordinary case would be noise, and a line that named the
-    // feature either way would read as a promise on a machine that has none.
     if (one.child.sev != .off) {
         tty.print(.dim, "chock run: the guest's memory is encrypted ({s}).\n", .{one.child.sev.text()});
     }
 }
 
-/// The share set as the guest module of this build names it.
-///
-/// **The identity on a build that runs a guest**, where `vmm.Options.Share` is
-/// `chock-sandbox`'s own shape. A build that runs none states the same three fields
-/// as a type of its own, because it imports no `chock-sandbox`, so the set is
-/// copied field by field there. Nothing reaches this at runtime on that build: it
-/// is reached only so that it compiles.
 fn forGuest(
     arena: std.mem.Allocator,
     shares: []const sandbox.vm_shares.Share,
@@ -12179,25 +11224,16 @@ fn forGuest(
 }
 
 test "the guest is forked before the provider configuration is read" {
-    // A forked process keeps a copy of this one's memory, so a guest forked after
-    // the credential was read would hold a provider token for as long as it runs.
-    // Source order is the only part of `start` a test can reach: the rest of it
-    // needs a project, a configuration and a provider.
     const source = @embedFile("run.zig");
     const forked = std.mem.indexOf(u8, source, "forkOwnGuest(").?;
     const credential = std.mem.indexOf(u8, source, "chock_auth.config.load(").?;
     try std.testing.expect(forked < credential);
 
-    // And the project is checked against Chock's own directories before the fork,
-    // because the fork is what puts the grant on.
     const checked = std.mem.indexOf(u8, source, "try refuseGuestOverChockOwn(").?;
     try std.testing.expect(checked < forked);
 }
 
 test "a session with no daemon refuses a project that holds one of Chock's own directories" {
-    // Nothing of the daemon is involved here. It answers no socket for such a
-    // project, and this process then forks a guest of its own, so a check on the
-    // daemon alone would hand the grant to the child rather than close it.
     const gpa = testing.allocator;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -12219,41 +11255,24 @@ test "a session with no daemon refuses a project that holds one of Chock's own d
     var env = std.process.Environ.Map.init(arena);
     try env.put("HOME", base);
 
-    // The project is the home directory, which holds all three of Chock's own.
     try testing.expectError(error.Reported, refuseGuestOverChockOwn(arena, io, &env, base));
-    // The directory itself is named, and not only that something was refused: a
-    // person told a grant was narrowed learns nothing they can act on.
     const config = try chock_auth.paths.configDir(arena, &env);
     try testing.expect(std.mem.indexOf(u8, said.err(), config) != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), base) != null);
 
-    // A project below them holds none, and is refused nothing.
     said.clear();
     const project = try std.fs.path.join(arena, &.{ base, "project" });
     try session_paths.createDirAll(io, project);
     try refuseGuestOverChockOwn(arena, io, &env, project);
     try testing.expectEqualStrings("", said.err());
 
-    // The check follows the directory the grant covers and refuses nothing
-    // further. Make the home directory a repository and the grant becomes its
-    // `.git`, which holds none of Chock's own, so the session runs: a guard that
-    // refuses too much costs a person their session for nothing.
     try session_paths.createDirAll(io, try std.fs.path.join(arena, &.{ base, ".git" }));
     try refuseGuestOverChockOwn(arena, io, &env, base);
     try testing.expectEqualStrings("", said.err());
 }
 
-/// How long to wait for a guest to bind its socket. It reads a kernel and lays it
-/// out in guest memory first, which is not instant on a 59MB image.
 const guest_boot_ms: u64 = 30 * std.time.ms_per_s;
 
-/// What the operator's own `config.zon` says about sandboxing.
-///
-/// **A file that is not there is not a fault**, and neither is one that names
-/// nothing: both mean the native driver, which is what every session used before
-/// this existed. One that names a driver and not the images it needs is a refusal,
-/// because a session that answered `native` to an operator who asked for a guest
-/// would be sandboxed more weakly than they asked, silently.
 fn sandboxChoice(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -12292,49 +11311,23 @@ fn sandboxChoice(
         return error.Reported;
     }
 
-    // **The file is zeroed here, because the fork comes next.** The same file can
-    // carry a provider token inline, and a guest forked above this arena would
-    // keep a copy of it for as long as the session runs. The block owns its own
-    // `kernel` and `initrd` strings, so nothing left points into these bytes.
-    //
-    // These bytes are not the only copy: the tree `parse` reads holds one of every
-    // string in the file. `parse` is what zeroes that, in every optimize mode, and
-    // its own doc comment says how.
     std.crypto.secureZero(u8, source);
     return block;
 }
 
-/// Where every share appears inside a guest. One virtiofs mount, and each
-/// directory the host offered is a name inside it: see
-/// `lib/chock-sandbox/vm/shares.zig`.
 const guest_share_root = "/mnt/shares";
 
-/// The guest this session's tool calls run in, and everything it holds open.
-///
-/// **The daemon owns the guest and this owns the reach into it.** `chock run` exits
-/// at the end of every turn, so a guest started here would boot and die each time:
-/// see `docs/security/microvm.md`.
 const GuestLink = struct {
-    /// The session socket, and the stream `chock guest` opened inside the guest.
     control: std.posix.fd_t,
     stream: std.posix.fd_t,
     guest: sandbox.vm_driver.Guest,
 
-    /// The thread that answers a guest reaching out, and the flag that ends it.
     reaching: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
 
-    /// Where the call running now may reach, as `src/vmm.zig` asks it.
-    ///
-    /// **The router belongs to the call and not to the session.** A tool call
-    /// carries its own policy and its own approvals, so a guest reaching between
-    /// calls is answered by nobody, which is the honest answer: there is no call
-    /// to reach on behalf of.
     fn decide(ptr: *anyopaque, text: []const u8, port: u16) vmm.Reached {
         const self: *GuestLink = @ptrCast(@alignCast(ptr));
         const router = self.guest.routerNow() orelse return .refused;
-        // An address this host handed out, or nothing. The router refuses one it
-        // never granted, which is what stops a guest naming its own.
         const address = sandbox.vm_wire.addressIn(text) orelse return .refused;
         return switch (router.open(address, port)) {
             .granted => |fd| .{ .connected = fd },
@@ -12357,12 +11350,6 @@ const GuestLink = struct {
     }
 };
 
-/// Connect to the guest the daemon started, offer it this session's own
-/// directories, and answer the driver every tool call then uses.
-///
-/// **A guest that cannot be reached is a refusal and never a fallback.** Falling
-/// back to the native driver would sandbox the session more weakly than the
-/// operator asked for, and on a Mac far more weakly, with nothing saying so.
 fn attachGuest(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -12378,12 +11365,6 @@ fn attachGuest(
                     "run its tool calls in one, so it does not run them another way.\n",
                 .{socket_path},
             ),
-            // **The path, because the alternative cost a session four tool calls
-            // of guessing.** A guest started by `chock daemon` is granted the
-            // roots a session's directories sit under before it runs, and a
-            // Landlock domain cannot be widened afterwards, so a directory
-            // outside the grant is refused here rather than failing every mount
-            // inside the guest with nothing but `NotPermitted` to read.
             error.ShareRefused => if (refused) |one| tty.print(
                 .err,
                 "chock run: the guest would not take {s}, which this session needs " ++
@@ -12421,19 +11402,12 @@ fn attachGuest(
             .write_buffer = try arena.alloc(u8, 64 * 1024),
         },
     };
-    // Nothing answers a guest reaching out until this runs, and a session whose
-    // thread would not start is a session with no network rather than none at all:
-    // every reach is then refused, which is what `decide` answers anyway.
     link.reaching = std.Thread.spawn(
         .{},
         vmm.serveReaching,
         .{ io, link.control, link.reaches(), &link.stopping },
     ) catch null;
 
-    // **Wait for the guest's own hello before the first request.** Mirage's signal
-    // says the kernel booted, and `chock guest` dials after that, so a request
-    // written on the boot alone raced the dial and the first tool call of every
-    // session answered `GuestGone`.
     if (!waitForHello(io, link)) {
         tty.print(
             .err,
@@ -12447,7 +11421,6 @@ fn attachGuest(
     return link;
 }
 
-/// How long a guest has to say hello once its kernel is up.
 const hello_wait_ms: i32 = 20_000;
 
 fn waitForHello(io: std.Io, link: *GuestLink) bool {
@@ -12464,15 +11437,8 @@ fn waitForHello(io: std.Io, link: *GuestLink) bool {
     return sandbox.vm_wire.helloIn(line);
 }
 
-/// The port `chock guest` dials, which is the one `chock vmm` was given.
 const guest_port: u32 = 1024;
 
-/// Every directory this session's guest is offered.
-///
-/// **Derived from the config and never listed here.** A list beside the mounts
-/// misses the ones the workspace's own backing adds: the repository's git
-/// directory, the scratch object store and the worktree metadata are four binds
-/// a session makes and a hand written set named none of them.
 fn guestShares(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -12480,7 +11446,6 @@ fn guestShares(
 ) StartError![]const sandbox.vm_shares.Share {
     var wanted: std.ArrayList(sandbox.vm_shares.Wanted) = .empty;
 
-    // What a tool call's own config adds and the session's does not hold.
     for (started.toolchain.mounts) |one| {
         try wanted.append(arena, .{ .host_path = one.source, .writable = false });
     }
@@ -12497,14 +11462,8 @@ fn guestShares(
         try wanted.append(arena, .{ .host_path = dir, .writable = true });
     }
 
-    // **Where a call stages a file.** `run_command` writes a program's own input
-    // under `TMPDIR` and binds it in, and the name is made per call, so nothing
-    // derived from the session's config can name it: the directory holding them
-    // is what a guest needs.
     var resolved: [std.fs.max_path_bytes]u8 = undefined;
     const staging = sandbox.resolvedPath(io, started.tool_env.get("TMPDIR") orelse "/tmp", &resolved);
-    // Duped, because `resolvedPath` answers into the buffer above and that buffer
-    // is gone the moment this returns.
     try wanted.append(arena, .{ .host_path = try arena.dupe(u8, staging), .writable = true });
 
     return sandbox.vm_shares.offersFor(
@@ -12527,7 +11486,6 @@ fn guestShares(
     };
 }
 
-/// Every path under this is read only, so one offer covers a closure of any size.
 const store_root = "/nix/store";
 
 fn projectKind(io: std.Io, project_root: []const u8) chock_core.prompt.Project {
@@ -14254,9 +13212,6 @@ test "a display opens on the conversation the log already holds" {
 
 const own_source = @embedFile("run.zig");
 
-/// Each pattern opens with a real newline and the indent of the block, so it
-/// matches the call itself and never the same words inside a comment. The bytes
-/// written here hold a backslash and an `n`, so this file cannot match itself.
 fn callAt(pattern: []const u8) error{CallIsGone}!usize {
     return std.mem.indexOf(u8, own_source, pattern) orelse error.CallIsGone;
 }
@@ -16955,9 +15910,6 @@ test "a layer the driver gives but this run could not get reads unavailable, not
 }
 
 test "a layer nothing probed still reads on, because the driver dies rather than run without it" {
-    // Every step of `applyLayers` in `lib/chock-sandbox/linux/driver.zig` ends in
-    // `die`, so no layer can quietly fail to apply and still let the tool call
-    // run. A tick means the layer is enforced, or the call dies.
     const every = sandbox.Sandbox.Guarantees.initFull();
     const unprobed = sandboxLayers(every, .{}, .none, "worktree");
     for (unprobed) |one| try std.testing.expectEqual(ui.Layer.State.on, one.state);
@@ -16998,9 +15950,6 @@ test "the header of a normal linux session is six ticks and no other mark" {
 }
 
 test "a layer this platform never applies is drawn as missing and never as on" {
-    // Darwin's driver declares four guarantees, the network, the signals, the IPC
-    // and the paths, and declares neither a system call filter nor a mounted
-    // workspace.
     const darwin = sandbox.Sandbox.Guarantees.initMany(&.{
         .network_isolated,
         .signal_isolated,
@@ -17020,8 +15969,6 @@ test "a layer this platform never applies is drawn as missing and never as on" {
 }
 
 test "this machine really answers for the layers the witness claims to measure" {
-    // A kernel that refuses Landlock is a real machine, so this asserts the shape
-    // and not the verdict.
     if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const given = sandbox.Sandbox.guarantees;
     const seen = witnessLayers(std.testing.allocator, given);
@@ -17237,8 +16184,6 @@ test "one locked handle reaches every asker, and one that missed it runs nothing
     plugin_state.session.asker = .{ .arbiter = log.asker().arbiter };
 
     var inner = CountingToolRunner{};
-    // An empty block reads no store, so this one never asks its driver for
-    // anything and needs none.
     var tool_secrets = ToolSecrets{
         .inner = inner.runner(),
         .gpa = gpa,
@@ -17311,8 +16256,6 @@ test "one locked handle reaches every asker, and one that missed it runs nothing
         &log.locked,
     );
     try std.testing.expect(nix_build.asker.?.locked != null);
-    // Without this a secret would be given and `secret.used` would reach no
-    // log, which is the one part of the arrangement nothing else can replace.
     try std.testing.expect(tool_secrets.asker.?.locked != null);
 
     const from_server = try plugin_aware.runner().dispatch(gpa, io, .{
@@ -17854,9 +16797,6 @@ const PluginProbeHost = struct {
     }
 };
 
-/// A real session log, locked the way `Loop.run` locks one, beside an arbiter
-/// that permits every act. A session with no asker runs no MCP and no plugin tool
-/// at all.
 const PermittingLog = struct {
     var anchor: u8 = 0;
 
@@ -18882,24 +17822,17 @@ test "a tool call's secrets have somewhere to be kept out of the log" {
 
     const policy = try redactionFor(arena, "hub", "sk-not-a-real-key-0123456789", &.{}, null, 0);
 
-    // The credential, the git password's slot, and one per grantable secret.
     try testing.expectEqual(@as(usize, 1 + 1 + tool_secret_slots), policy.secrets.len);
 
     const slots = toolSecretSlots(policy);
     try testing.expectEqual(tool_secret_slots, slots.len);
 
-    // Empty until something fills them, and an empty slot redacts nothing and
-    // is not counted as a credential too short to match.
     for (slots) |slot| try testing.expectEqualStrings("", slot.value);
     try testing.expectEqual(@as(usize, 0), policy.tooShort());
 
-    // **The git password takes the last slot**, named that way where it is
-    // armed, so the tool slots must stop short of it. Without this the two
-    // would write over each other and nobody would notice: both redact.
     const git_slot = &policy.secrets[policy.secrets.len - 1];
     for (slots) |*slot| try testing.expect(slot != git_slot);
 
-    // Filled, a slot redacts, which is what a grant relies on.
     slots[0].value = "tool-secret-not-a-real-one";
     const cleaned = try chock_core.redact.text(
         arena,
@@ -18923,7 +17856,6 @@ test "the search key is kept out of the log beside the provider credential" {
     const search_key = "BSA-not-a-real-search-key-0123";
     const policy = try redactionFor(arena, "hub", token, &.{}, search_key, 0);
 
-    // Both credentials, plus the empty slot a git password goes in.
     try testing.expectEqual(@as(usize, 2 + 1 + tool_secret_slots), policy.secrets.len);
     try testing.expectEqualStrings(token, policy.secrets[0].value);
     try testing.expectEqualStrings(search_key, policy.secrets[1].value);
@@ -18933,8 +17865,6 @@ test "the search key is kept out of the log beside the provider credential" {
     for (values) |one| {
         if (std.mem.eql(u8, one, search_key)) carried = true;
     }
-    // The broker redacts from values alone, so a key held by the core policy and
-    // not carried across would still reach a fetch that was written down.
     try testing.expect(carried);
 
     try testing.expectEqualStrings("", said.err());
@@ -19647,7 +18577,6 @@ test "a git daemon host is named in the build namespace, with its own port" {
     );
 }
 
-/// A store that holds what a test put in it, and fails on demand.
 const FakeSecretStore = struct {
     const Pair = struct { name: []const u8, value: []const u8 };
 
@@ -19697,9 +18626,6 @@ const FakeSecretStore = struct {
     }
 };
 
-/// Reads the grant the way `chock_core.tools.runCommand` reads it: once, inside
-/// the call, and released when the call ends. It keeps what it saw, and what the
-/// redaction slots held at that moment, which is the ordering that matters.
 const GrantReadingRunner = struct {
     seam: chock_core.tool_secrets.Seam,
     slots: []const chock_core.redact.Secret,
@@ -19760,9 +18686,6 @@ const GrantReadingRunner = struct {
                 @memcpy(self.saw_file_value[index][0..kept], one.value[0..kept]);
                 self.saw_file_value_len[index] = kept;
             }
-            // Read here and not after the call: a slot filled only once the
-            // program had ended would leave a window where the value could
-            // reach the log.
             for (self.slots) |slot| {
                 if (slot.value.len != 0) self.slot_held = true;
             }
@@ -19837,11 +18760,8 @@ test "a granted secret reaches the call, and the log says it was used without th
     try testing.expectEqual(@as(usize, 1), reader.granted);
     try testing.expectEqualStrings("GITHUB_TOKEN=" ++ value, reader.envAt(0));
     try testing.expectEqual(@as(usize, 1), reader.saw_used);
-    // The slot was filled while the call held the value, not after it.
     try testing.expect(reader.slot_held);
 
-    // Released when the call ended, so nothing is left redacting a value that
-    // no longer exists.
     try testing.expectEqual(@as(usize, 1), reader.released);
     for (slots) |slot| try testing.expectEqualStrings("", slot.value);
 
@@ -19849,7 +18769,6 @@ test "a granted secret reaches the call, and the log says it was used without th
     try testing.expect(std.mem.indexOf(u8, written, "secret.used") != null);
     try testing.expect(std.mem.indexOf(u8, written, "GITHUB_TOKEN") != null);
     try testing.expect(std.mem.indexOf(u8, written, "exec.path.gh") != null);
-    // The one thing the log must never hold.
     try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, written, value));
 }
 
@@ -19936,7 +18855,6 @@ test "a secret the store does not hold refuses the call and says how to put it t
 
     try testing.expect(result.is_error);
     try testing.expect(std.mem.indexOf(u8, result.output, "chock login --tool-secret GITHUB_TOKEN") != null);
-    // Nothing ran, and nothing was left armed.
     try testing.expectEqual(@as(usize, 0), inner.calls);
     try testing.expectEqual(@as(?[]u8, null), subject.armed_call);
     for (slots) |slot| try testing.expectEqualStrings("", slot.value);
@@ -19981,7 +18899,6 @@ test "a refused ask refuses the call, and no slot is left holding a value" {
     try testing.expect(result.is_error);
     try testing.expectEqual(@as(usize, 1), refusing.asks);
     try testing.expectEqualStrings("secret.use.GITHUB_TOKEN", refusing.action.read());
-    // Refused before the store was read at all, so the value never existed.
     try testing.expectEqual(@as(usize, 0), held.reads);
     try testing.expectEqual(@as(usize, 0), inner.calls);
     for (slots) |slot| try testing.expectEqualStrings("", slot.value);
@@ -20075,15 +18992,11 @@ test "a secret bound as a file arrives as a file, and the variable names its pat
     try testing.expect(!result.is_error);
     try testing.expectEqual(@as(usize, 1), reader.granted);
 
-    // The value travels as a file and never as an environment entry: naming the
-    // value where a program expects a path would make it open the token.
     try testing.expectEqual(@as(usize, 0), reader.saw_env_count);
     try testing.expectEqual(@as(usize, 1), reader.saw_files);
     try testing.expectEqualStrings("GOOGLE_APPLICATION_CREDENTIALS", reader.fileVariable(0));
     try testing.expectEqualStrings("not-a-real-key-0123456789", reader.fileValue(0));
 
-    // And the slot held the value while the call did, so what the program prints
-    // is redacted the same as any other secret.
     try testing.expect(reader.slot_held);
     for (slots) |slot| try testing.expectEqualStrings("", slot.value);
 
@@ -20133,7 +19046,6 @@ test "a grant reaches the one call it was armed for and nothing else" {
     try testing.expectEqual(@as(?[]u8, null), try subject.arm(gpa, io, secret_call, "exec.path.gh"));
     try testing.expect(subject.seam().grant("run_command", "exec.path.gh", "call-1") != null);
 
-    // Another call, another tool, and another action all get nothing.
     try testing.expectEqual(
         @as(?chock_core.tool_secrets.Grant, null),
         subject.seam().grant("run_command", "exec.path.gh", "call-9"),
@@ -20149,8 +19061,6 @@ test "a grant reaches the one call it was armed for and nothing else" {
 
     subject.seam().release("call-1");
     for (slots) |slot| try testing.expectEqualStrings("", slot.value);
-    // The record survives the release, because the log is written after the
-    // call and it names what was used.
     try testing.expectEqual(@as(usize, 1), subject.used.len);
     subject.record(gpa, io);
     try testing.expect(std.mem.indexOf(u8, log.backing.bytes.items, "secret.used") != null);
@@ -20160,8 +19070,6 @@ test "a tool that is not a command arms nothing, whatever the block says" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    // An MCP server and a plugin hold a secret for their whole life, so a
-    // per-call grant is the wrong shape for them and is not quietly given.
     var block = try chock_policy.secrets.parse(
         gpa,
         ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"mcp.github.*\" } } }",
@@ -20268,20 +19176,15 @@ test "a session long secret has a slot of its own, apart from a call's and from 
     try testing.expectEqual(entries, session.len);
     try testing.expectEqual(tool_secret_slots, per_call.len);
 
-    // No slot is in two of the three sets. Without this the two kinds would
-    // write over each other and nobody would notice, because both redact.
     for (session) |*one| {
         try testing.expect(one != git_slot);
         for (per_call) |*other| try testing.expect(one != other);
     }
     for (per_call) |*one| try testing.expect(one != git_slot);
 
-    // The credential keeps the first slot, so a session secret starts after it.
     try testing.expectEqualStrings("sk-not-a-real-key-0123456789", policy.secrets[0].value);
     try testing.expect(&policy.secrets[0] != &session[0]);
 
-    // A project that named nothing keeps no session slot, and the rest of the
-    // layout is unchanged.
     const none = try redactionFor(arena, "hub", "sk-not-a-real-key-0123456789", &.{}, null, 0);
     try testing.expectEqual(@as(usize, 0), sessionSecretSlots(none, 0).len);
     try testing.expectEqual(tool_secret_slots, toolSecretSlots(none).len);
@@ -20289,8 +19192,6 @@ test "a session long secret has a slot of its own, apart from a call's and from 
     try testing.expectEqualStrings("", said.err());
 }
 
-/// A table with the rows a test names, so a server start can be given an
-/// `allow`, an `ask` and a rule for nothing at all.
 fn serverSecretsPolicyFor(
     gpa: std.mem.Allocator,
     source: [:0]const u8,
@@ -20353,14 +19254,10 @@ test "an MCP server is given what a rule allows, and the log says so once the lo
         if (std.mem.eql(u8, one, "GITHUB_TOKEN=" ++ value)) found = true;
     }
     try testing.expect(found);
-    // The base is kept, not replaced.
     try testing.expectEqual(@as(usize, 2), env.len);
 
-    // Filled for the whole session, because a server reads its environment once
-    // and holds it. Nothing releases this one.
     try testing.expectEqualStrings(value, slots[0].value);
 
-    // A server starts before the loop holds the log, so the record waits.
     var log = try PermittingLog.init(gpa);
     defer log.deinit(io);
     try log.arm(io);
@@ -20372,7 +19269,6 @@ test "an MCP server is given what a rule allows, and the log says so once the lo
     try testing.expect(std.mem.indexOf(u8, written, "mcp.github.*") != null);
     try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, written, value));
 
-    // Written once. A second handover is a new lock over the same log.
     const after = written.len;
     subject.giveLocked(&log.locked);
     try testing.expectEqual(after, log.backing.bytes.items.len);
@@ -20395,7 +19291,6 @@ test "a server is not given a secret an ask would have to reach nobody for" {
     );
     defer block.deinit(gpa);
 
-    // `ask` at a server start has nobody to ask, so it is not a permission.
     const table = try serverSecretsPolicyFor(gpa,
         \\.{ .policy = .{
         \\    .agents = .{ .{ .kind = "main" } },
@@ -20431,8 +19326,6 @@ test "a server is not given a secret an ask would have to reach nobody for" {
     try testing.expectEqual(@as(usize, 1), env.len);
     try testing.expectEqual(@as(usize, 0), held.reads);
     try testing.expectEqualStrings("", slots[0].value);
-    // Said out loud, because a server that quietly lacks its token fails in its
-    // own words and the reason is nowhere.
     try testing.expect(std.mem.indexOf(u8, said.err(), "secret.use.GITHUB_TOKEN") != null);
 }
 
@@ -20485,7 +19378,6 @@ test "one server's secret does not reach another server" {
     try testing.expectEqual(@as(usize, 1), other.len);
     try testing.expectEqual(@as(usize, 0), held.reads);
 
-    // And the one it was written for still gets it.
     const mine = try subject.forServer(arena_state.allocator(), &policy, "github", &base);
     try testing.expectEqual(@as(usize, 2), mine.len);
 
@@ -20496,12 +19388,10 @@ test "a pattern reaches a server's namespace from either side, and another's fro
     var buffer: [chock_core.mcp.max_action_bytes]u8 = undefined;
     const github = chock_core.mcp.namespaceInto(&buffer, "github").?;
 
-    // The entry names every server, this one, or one of its tools outright.
     try testing.expect(reaches("mcp.*", github));
     try testing.expect(reaches("mcp.github.*", github));
     try testing.expect(reaches("mcp.github.tool.create_issue", github));
 
-    // And these reach nothing under it.
     try testing.expect(!reaches("mcp.time.*", github));
     try testing.expect(!reaches("exec.path.gh", github));
     try testing.expect(!reaches("exec.*", github));
@@ -20513,31 +19403,20 @@ test "a relative export directory is resolved rather than aborting the session" 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The crash this fixes: `createDirAbsolute` asserts an absolute path, an
-    // assert is `unreachable` in a release build, and `dropPathIn` catches
-    // errors and not panics. So `--export-dir logs` aborted the process in
-    // `auditSinks`, before the session log existed to record why.
     const resolved = try absoluteDir(arena, testing.io, "logs/audit");
     try testing.expect(std.fs.path.isAbsolute(resolved));
     try testing.expect(std.mem.endsWith(u8, resolved, "logs/audit"));
 
-    // An absolute one is handed back as it came.
     try testing.expectEqualStrings("/var/log/chock", try absoluteDir(arena, testing.io, "/var/log/chock"));
 
-    // `.` and `..` are taken out on the way, so the path a sink is opened at is
-    // the one a person would read back.
     const tidied = try absoluteDir(arena, testing.io, "./logs/../audit");
     try testing.expect(std.mem.endsWith(u8, tidied, "/audit"));
     try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, tidied, ".."));
 }
 
 test "a relative path reaching makeDirAll is refused by name and never asserted" {
-    // The guard that makes the failure an error a caller can act on rather than
-    // an abort. Both copies of this function have it: the other is in
-    // `lib/chock-core/cache.zig`, which reaches it from the session directory.
     try testing.expectError(error.NotAbsolute, makeDirAll(testing.io, "relative/path"));
     try testing.expectError(error.NotAbsolute, makeDirAll(testing.io, "."));
 
-    // An empty path is not an error: nothing was asked for.
     try makeDirAll(testing.io, "");
 }

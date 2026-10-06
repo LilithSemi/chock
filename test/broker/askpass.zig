@@ -11,8 +11,7 @@ const askpass = chock_broker.askpass;
 const table = chock_policy.table;
 const testing = std.testing;
 
-/// `build.zig` embeds both as build time constants, because the Zig 0.16 test
-/// runner takes no argument. An empty `git_path` is a reason to skip.
+/// `build.zig` embeds both as build time constants. An empty `git_path` is a reason to skip.
 const chock_path = @import("chock_path").chock_path;
 const git_path = @import("chock_path").git_path;
 
@@ -30,9 +29,7 @@ const permit_one_host: [:0]const u8 =
     \\}
 ;
 
-/// A shell wrapper that records what `ps` would show for the helper, then
-/// becomes the helper. `$$` is the shell's own process id, and `exec` keeps
-/// the argument vector and the environment `git` really started it with.
+/// A shell wrapper that records what `ps` would show for the helper, then becomes the helper.
 const snapshot_script =
     \\#!/bin/sh
     \\cat /proc/$$/cmdline > "{s}/cmdline"
@@ -86,8 +83,7 @@ const deny_the_host: [:0]const u8 =
     \\}
 ;
 
-/// The endpoint is polled while `git` runs. `git` waits on the helper and the
-/// helper waits on this socket, so a caller that blocked on `git` would deadlock.
+/// The endpoint is polled while `git` runs, because a caller that blocked on `git` would deadlock.
 fn drive(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Run {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -101,10 +97,7 @@ fn drive(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Run {
     var endpoint = try askpass.Endpoint.open(io, socket_path, null);
     defer endpoint.close(io);
 
-    // Git runs one executable path with one argument and puts no shell in the
-    // way, so `GIT_ASKPASS="<chock> askpass"` fails with `cannot exec` on git
-    // 2.55. `build.zig` gives a path relative to the build root, and a link
-    // resolves against the directory it sits in, so it needs the absolute one.
+    // git runs one executable path with no shell, so `GIT_ASKPASS` needs a link resolved to an absolute path.
     const link_path = try std.fmt.allocPrint(gpa, "{s}/ctl/{s}", .{ dir, askpass.link_name });
     defer gpa.free(link_path);
     const chock_absolute = try std.Io.Dir.realPathFileAlloc(.cwd(), io, chock_path, gpa);
@@ -152,9 +145,7 @@ fn drive(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Run {
 
     var env = try std.testing.environ.createMap(gpa);
     defer env.deinit();
-    // git must answer in the C locale, because `askpass.readPrompt` reads the
-    // two English prompts. It must read no user configuration and fall back to
-    // no terminal, so the helper is the only route to a password.
+    // git must answer in the C locale, because `askpass.readPrompt` reads the English prompts.
     try env.put("LC_ALL", "C");
     try env.put("GIT_CONFIG_GLOBAL", "/dev/null");
     try env.put("GIT_CONFIG_SYSTEM", "/dev/null");
@@ -271,8 +262,7 @@ test "a host the policy denies gets no password even when somebody typed one" {
 }
 
 test "a user name prompt is never answered, so a password can never be read as a user" {
-    // A helper that answered the user name prompt with the password made git
-    // write `username=<the password>`, which puts it in every later URL.
+    // Answering the user name prompt with the password would put it in every later URL.
     if (git_path.len == 0) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;

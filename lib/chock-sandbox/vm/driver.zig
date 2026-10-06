@@ -1,30 +1,5 @@
-//! The host half of the microVM driver: one `Sandbox.Driver` over a stream into
-//! a guest.
-//!
-//! **A guest is a layer and not an alternative.** This driver builds no boundary
-//! of its own. It rewrites a `Config`'s host paths to where the guest sees them,
-//! sends the geometry, and the guest runs `lib/chock-sandbox/linux/driver.zig` on
-//! it. So `guarantees` here is the Linux driver's set, because that is the code
-//! that will run, and `expresses` is all five whatever the host is.
-//!
-//! ## The stream is one, and the guest opened it
-//!
-//! `chock guest` dials the host once when the guest comes up. A caller holds that
-//! stream for the life of the session, so a tool call costs no connection. One
-//! request and one answer a call, in order, because there is one guest and one
-//! loop in it.
-//!
-//! ## What this refuses, and never quietly narrows
-//!
-//! * A path no share holds, or a mount that writes into a read only share. See
-//!   `shares.zig`: answering either would put a failure inside a tool call that
-//!   nobody could trace back to here.
-//! * A supplied cgroup, because the descriptor names a directory of the host's.
-//! * A device tree, because a host device node is not in a guest.
-//! * A `Middle`, because the process to signal is in the guest and this driver
-//!   holds no handle on it. A caller that asked for one is told so rather than
-//!   handed a handle that signals nothing.
-
+//! The host half of the microVM driver: one Sandbox.Driver over a stream into a guest.
+//! A guest is a layer, not an alternative: this driver builds no boundary of its own and runs the Linux driver inside the guest.
 const std = @import("std");
 
 const iface = @import("../Sandbox.zig");
@@ -33,18 +8,9 @@ const wire = @import("wire.zig");
 
 pub const driver_name = "microvm";
 
-/// The most of a guest's refusal that is kept. Past this it is cut: the words are
-/// for a person to read, and a guest that sent a page of them is a guest saying
-/// one thing badly.
 pub const max_refusal_bytes: usize = 256;
 
-/// What the guest promises, which is what the driver inside it promises.
-///
-/// **Written out and not read from `../linux/driver.zig`.** Importing that module
-/// here pulls its signal code into a build for another platform, where
-/// `std.posix.SIG` is the C one and not the Linux one, and four of its own lines
-/// stop compiling. The test at the bottom pins both lists to that driver's own, on
-/// the platform where they can be compared.
+/// Written out, not read from `../linux/driver.zig`: importing it here would pull Linux-only signal code into another platform's build.
 pub const guarantees: iface.Guarantees = iface.Guarantees.initMany(&.{
     .network_isolated,
     .signal_isolated,
@@ -54,9 +20,7 @@ pub const guarantees: iface.Guarantees = iface.Guarantees.initMany(&.{
     .workspace_mounted,
 });
 
-/// All five, whatever the host is. **This is the Darwin gap closing**: a Mac has
-/// no bind mount, and a Linux guest on a Mac has one, because the guest has a
-/// kernel of its own.
+/// All five, whatever the host is: a Linux guest has its own kernel, so this closes the Darwin gap.
 pub const expresses: iface.Expresses = .{
     .moved_paths = true,
     .scratch_area = true,
@@ -65,65 +29,29 @@ pub const expresses: iface.Expresses = .{
     .device_passthrough = true,
 };
 
-/// One guest, as a driver. The caller owns the stream and closes it.
-///
-/// **Calls are serialised.** One guest holds one stream and `chock guest` answers
-/// one request at a time, so two tool calls writing at once would interleave two
-/// requests into one line. A background task therefore waits for a foreground call
-/// here where it would have run beside it under the native driver. That is a real
-/// difference and not a detail. Answering several at once is a change at both
-/// ends: the host would ask for a stream for each call, and `chock guest` dials
-/// exactly one and serves it in order, so it would have to serve several.
+/// Calls are serialised: one guest holds one stream, so answering two at once would interleave their requests.
 pub const Guest = struct {
-    /// The stream `chock guest` opened. Read and written in order, one request
-    /// and one answer a call.
     stream: std.Io.File,
     io: std.Io,
-    /// Every directory the host offered this guest, and where they appear in it.
     shares: shares_mod.Set,
-    /// Filled in with the last refusal, for a caller that wants to say more than
-    /// the error name. Borrows the config's own strings.
     fault: ?Fault = null,
 
     read_buffer: []u8,
     write_buffer: []u8,
-    /// Where `why` writes. Its own buffer and not the refusal's: a share fault
-    /// names a path and the guest's own words are already in that one.
     why_buffer: [max_refusal_bytes + std.fs.max_path_bytes]u8 = undefined,
-    /// Where the words of a broken stream are kept, which `why` then reads.
     gone_buffer: [max_refusal_bytes]u8 = undefined,
-    /// Where the path of a share fault is copied.
-    ///
-    /// **Copied and never borrowed.** A `shares.Fault` names a path out of the
-    /// config, and a caller frees that config as soon as `spawn` returns: the
-    /// fault then named freed memory, and the message a person read was the
-    /// allocator's own fill pattern where the path should have been.
+    /// Copied, never borrowed: a `shares.Fault` names a path in the config, which the caller frees as soon as `spawn` returns.
     share_buffer: [std.fs.max_path_bytes]u8 = undefined,
-    /// Held for the whole of one call. See this type's own doc comment.
     lock: std.Io.Mutex = .init,
-    /// How the call running now may reach the network, or null between calls.
-    ///
-    /// **Read from another thread.** A guest reaching for a name arrives on
-    /// Mirage's own control socket, which is not this stream, so whoever polls
-    /// that answers it while `spawn` is blocked here. Calls are serialised, so
-    /// there is one call to answer for and never a choice of which.
+    /// Read from another thread: a guest resolving a name arrives on Mirage's own control socket, polled while `spawn` blocks here.
     router_lock: std.Io.Mutex = .init,
     net_router: ?iface.NetRouter = null,
-    /// What a guest's refusal is copied into. **A buffer and not an allocation**:
-    /// a `Fault` that pointed into the arena of the call would name freed bytes,
-    /// and one that owned memory would need a `deinit` a driver has no place for.
     refusal_buffer: [max_refusal_bytes]u8 = undefined,
 
     pub const Fault = union(enum) {
-        /// A host path could not be placed in the guest.
         share: shares_mod.Fault,
-        /// The config holds something no guest can be asked for.
         not_expressible: NotExpressible,
-        /// The guest answered a refusal. It points into the guest's own
-        /// `refusal_buffer`, so it is good until the next call and no longer.
         refused: []const u8,
-        /// The stream is gone, so the guest is. It says at which step, because
-        /// the four are four different faults.
         gone: []const u8,
     };
 
@@ -140,10 +68,7 @@ pub const Guest = struct {
         }
     };
 
-    /// Why the last call refused, in words. Null when the last one ran.
-    ///
-    /// **Read right after `spawn` came back and on the same thread.** Calls are
-    /// serialised, so a later one overwrites this.
+    /// Read right after `spawn` returns, on the same thread: calls are serialised, so a later one overwrites this.
     pub fn why(self: *Guest) ?[]const u8 {
         const fault = self.fault orelse return null;
         return switch (fault) {
@@ -162,8 +87,6 @@ pub const Guest = struct {
         };
     }
 
-    /// How the call running now may reach the network. Null between calls, which
-    /// is a refusal: nothing is running to reach on behalf of.
     pub fn routerNow(self: *Guest) ?iface.NetRouter {
         self.router_lock.lockUncancelable(self.io);
         defer self.router_lock.unlock(self.io);
@@ -176,7 +99,6 @@ pub const Guest = struct {
         self.net_router = one;
     }
 
-    /// The same fault, naming a path this holds rather than the config's.
     fn keepShareFault(self: *Guest, said: shares_mod.Fault) shares_mod.Fault {
         const path = said.path();
         const kept = @min(path.len, self.share_buffer.len);
@@ -224,32 +146,21 @@ pub const Guest = struct {
         return self.spawn(allocator, config, argv, landlock_report, middle);
     }
 
-    /// Ask the guest to end the call it is running. `fd` is the descriptor
-    /// `spawn` put in the middle, which is this driver's own copy of the stream.
-    ///
-    /// **One write of a constant**, because a caller may be inside a signal
-    /// handler. The guest is not reading the stream while it runs a call, so the
-    /// bytes wait in the socket until its watcher polls.
+    /// One write of a constant, because a caller may be inside a signal handler.
     fn signalThunk(ptr: *anyopaque, fd: std.posix.fd_t, sig: std.posix.SIG) iface.SignalError!void {
         _ = ptr;
         if (fd < 0) return error.NoHandle;
         const line = switch (@intFromEnum(sig)) {
             @intFromEnum(std.posix.SIG.KILL) => wire.cancel_kill,
             @intFromEnum(std.posix.SIG.TERM) => wire.cancel_terminate,
-            // The tool path sends those two and nothing else. A third would need
-            // a constant of its own rather than a line built here.
             else => return error.NoHandle,
         };
-        // The platform's own call, because a caller may be in a signal handler
-        // and the negative return is the whole of the error handling needed. On
-        // Linux the result carries the errno, so both are read as a signed one.
+        // May run inside a signal handler, so this is the raw syscall with no allocation.
         const wrote = std.posix.system.write(fd, line.ptr, line.len);
         if (@as(isize, @bitCast(wrote)) < 0) return error.Gone;
     }
 
-    /// **Closes nothing.** The descriptor in the middle is the stream itself,
-    /// which outlives every call on it. Clearing the two fields is what says the
-    /// call is over, and a cancel that reads the slot after this reaches nobody.
+    /// Closes nothing: the descriptor is the stream itself, which outlives every call on it.
     fn closeThunk(ptr: *anyopaque, middle: *iface.Middle) void {
         _ = ptr;
         middle.fd = -1;
@@ -259,17 +170,11 @@ pub const Guest = struct {
     fn keyringThunk(ptr: *anyopaque, stderr_fd: std.posix.fd_t) iface.KeyringError!void {
         _ = ptr;
         _ = stderr_fd;
-        // The guest joins its own, inside, as part of running the driver. A host
-        // side join would put this process on a keyring, which is not the point.
+        // The guest joins its own keyring inside; a host side join here would not be the point.
         return error.Refused;
     }
 
-    /// Read what the guest sends back: any number of output frames, then the
-    /// answer. Each frame's bytes go to the descriptor the caller gave, in
-    /// chunks, which a caller drains while this runs.
-    ///
-    /// **The answer is whatever line is not a frame.** A refusal sends no frames
-    /// at all, because the call never ran, so a fixed count would hang on one.
+    /// Reads any number of output frames, then the answer: a refusal sends no frames, so a fixed count would hang.
     fn readBack(
         self: *Guest,
         arena: std.mem.Allocator,
@@ -296,9 +201,7 @@ pub const Guest = struct {
         }
     }
 
-    /// Resolve a name for the guest's own router, through the seam the call was
-    /// given. **The host resolves and the guest never does**, so a guest cannot
-    /// ask for one host and be handed another.
+    /// The host resolves, the guest never does, so a guest cannot ask for one host and be handed another.
     fn answerResolve(
         self: *Guest,
         arena: std.mem.Allocator,
@@ -351,14 +254,8 @@ pub const Guest = struct {
         landlock_report: ?*iface.LandlockReport,
         middle: ?*iface.Middle,
     ) iface.SpawnError!std.process.Child.Term {
-        // **Filled before the lock and not after it.** A caller waits a bounded
-        // time for a middle and gives up when none arrives, so a call queued
-        // behind another must already have one. The cost is that a cancel while
-        // two are queued reaches the one that is running: there is one guest and
-        // one stream, which is the same reason calls are serialised at all.
-        // **Copied before the middle is filled and closed at the end.** A caller
-        // closes its own end of the pipe as soon as the middle says a call began,
-        // and writing to a number that was closed reaches whatever reopened it.
+        // Filled before the lock, not after: a call queued behind another must already have a middle.
+        // Copied before the middle is filled and closed at the end, so a closed descriptor number is never reused under us.
         const out_fd = dupOne(config.stdout_fd) orelse {
             self.fault = .{ .gone = "copying the caller's own output descriptor" };
             return error.GuestGone;
@@ -380,13 +277,9 @@ pub const Guest = struct {
 
         self.fault = null;
 
-        // What answers a guest reaching out while this call runs.
         self.holdRouter(config.net_router);
         defer self.holdRouter(null);
 
-        // **An arena for the whole call.** The rewritten paths and the request's
-        // own arrays live exactly as long as the one request that is written from
-        // them, and the answer is a value.
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -416,18 +309,12 @@ pub const Guest = struct {
 
         const request = wire.requestFor(arena, moved, argv) catch
             return error.OutOfMemory;
-        // `requestFor` answers null for the two things checked above, so reaching
-        // here with none means this build grew a third and did not say so.
+        // requestFor already handled the two checked cases; reaching here with none means a third was added without a check.
         const asked = request orelse {
             self.fault = .{ .not_expressible = .supplied_cgroup };
             return error.GuestCannotExpress;
         };
 
-        // **Streaming and never positional.** A stream is a socket, a socket is
-        // never seekable, and the positional path only falls back for `ESPIPE`:
-        // any other errno from the probe becomes a read that failed, which the
-        // caller then reads as a guest that is gone.
-        // The host's clock, because the guest has none. See `wire.Request.now_ns`.
         var timed = asked;
         timed.now_ns = std.math.cast(i64, std.Io.Timestamp.now(self.io, .real).nanoseconds) orelse 0;
 
@@ -470,9 +357,7 @@ pub const Guest = struct {
             if (landlock_report) |slot| slot.abi = @intCast(said.abi);
         }
 
-        // A guest that ran a call and sent no output at all is one built before
-        // the frames existed. Saying so beats an empty answer that reads as a
-        // program which printed nothing.
+        // Zero frames with the call having ended means a guest built before frames existed, not a silent program.
         if (parsed.value.ended != null and frames == 0) {
             self.fault = .{ .refused = "the guest is an older build than this host: it ran the " ++
                 "call and sent nothing back. Rebuild the initrd." };
@@ -480,9 +365,7 @@ pub const Guest = struct {
         }
 
         const ended = parsed.value.ended orelse {
-            // A guest that could not run the call says why and reports no code.
-            // Copied out of the arena with the caller's own allocator: a `Fault`
-            // that pointed into the arena would name freed bytes.
+            // Copied with the caller's own allocator: a Fault pointing into the arena would name freed bytes.
             const said = parsed.value.refusal orelse "the guest gave no reason";
             const kept = @min(said.len, self.refusal_buffer.len);
             @memcpy(self.refusal_buffer[0..kept], said[0..kept]);
@@ -499,14 +382,11 @@ pub const Guest = struct {
     }
 };
 
-/// Close one descriptor, whichever platform this is.
 fn closeOne(fd: std.posix.fd_t) void {
     _ = std.posix.system.close(fd);
 }
 
-/// `dup`, whichever platform this is. Null when the kernel refused. Linux answers
-/// a `usize` carrying the errno and the C layer a signed one, so both are read as
-/// a signed value before the sign is looked at.
+/// Null when the kernel refused. Linux answers an unsigned carrying the errno, so both platforms are read as signed first.
 fn dupOne(fd: std.posix.fd_t) ?std.posix.fd_t {
     const made = std.posix.system.dup(fd);
     const signed: isize = if (@typeInfo(@TypeOf(made)).int.signedness == .signed)
@@ -524,16 +404,11 @@ test "the driver promises what the driver inside a guest promises, and expresses
         try testing.expect(@field(expresses, field.name));
     }
 
-    // And the whole point: a Mac's native driver expresses none of them.
     const darwin_driver = @import("../darwin/driver.zig");
     inline for (@typeInfo(iface.Expresses).@"struct".fields) |field| {
         try testing.expect(!@field(darwin_driver.expresses, field.name));
     }
 
-    // **The two lists above are pinned here and nowhere else.** Only a Linux build
-    // can compare them, so only a Linux build does: a guarantee added to that
-    // driver and forgotten here fails this, and another platform is not where that
-    // would be caught anyway.
     if (@import("builtin").os.tag != .linux) return;
     const linux_driver = @import("../linux/driver.zig");
     try testing.expectEqual(linux_driver.guarantees, guarantees);
@@ -547,9 +422,7 @@ test "every reason a guest cannot be asked for something has words of its own" {
     }
 }
 
-/// A guest whose stream is never touched. Every test below refuses before it
-/// would be, which is the point: a config a guest cannot be asked for must not
-/// reach the wire at all.
+/// A guest whose stream is never touched: every test below must refuse before reaching it.
 fn unreachableGuest(set: shares_mod.Set) Guest {
     return .{
         .stream = .{ .handle = -1, .flags = .{ .nonblocking = false } },
@@ -579,8 +452,6 @@ const plain = iface.Config{
 test "a config a guest cannot be asked for never reaches the wire" {
     var guest = unreachableGuest(one_share);
 
-    // Each of these would otherwise be written to a stream whose handle is -1,
-    // so a test that got past the check would fail on the write instead.
     var supplied = plain;
     supplied.containment = .{ .supplied = .{ .fd = 7 } };
     try testing.expectError(
@@ -627,7 +498,6 @@ test "a cancel is one line on the stream, and nothing joins a keyring on a guest
     const as_driver = guest.driver();
 
     try testing.expectError(error.Refused, as_driver.joinFreshSessionKeyring(2));
-    // No handle is no cancel, and a signal with no constant of its own is too.
     try testing.expectError(error.NoHandle, as_driver.signalMiddle(-1, .TERM));
 
     var pair: [2]std.posix.fd_t = undefined;
@@ -644,7 +514,6 @@ test "a cancel is one line on the stream, and nothing joins a keyring on a guest
     const got = try std.posix.read(pair[1], &read_into);
     try testing.expectEqualStrings(wire.cancel_terminate ++ wire.cancel_kill, read_into[0..got]);
 
-    // Closing a middle leaves the stream open: it is the stream.
     var middle: iface.Middle = .{ .fd = pair[0], .pid = iface.Middle.elsewhere };
     as_driver.closeMiddle(&middle);
     try testing.expectEqual(@as(std.posix.fd_t, -1), middle.fd);
@@ -669,7 +538,6 @@ test "the two output frames reach the two descriptors the caller gave" {
         closeOne(fd);
     };
 
-    // What the guest writes: a frame a descriptor, in that order.
     var framed: std.ArrayList(u8) = .empty;
     defer framed.deinit(testing.allocator);
     var into = std.Io.Writer.Allocating.fromArrayList(testing.allocator, &framed);
@@ -678,7 +546,6 @@ test "the two output frames reach the two descriptors the caller gave" {
     try wire.write(&into.writer, wire.Output{ .output = 3, .err = true });
     try into.writer.writeAll("bad");
 
-    // An answer after the frames, because that is what ends the read.
     try wire.write(&into.writer, wire.Answer{ .ended = .{ .exited = 0 } });
     framed = into.toArrayList();
 
@@ -715,8 +582,6 @@ test "a frame naming more than the guest sent is the guest being gone" {
     defer closeOne(pair[0]);
     defer closeOne(pair[1]);
 
-    // Eight promised and two sent: a short read here must not be taken as an
-    // answer, because the bytes after it would be read as one.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var frames: usize = 0;
@@ -738,7 +603,6 @@ test "a guest that ran the call and sent nothing back is named as an older build
     defer closeOne(pair[0]);
     defer closeOne(pair[1]);
 
-    // What a guest built before the frames existed answers: a term and no output.
     var out_buffer: [256]u8 = undefined;
     const other = std.Io.File{ .handle = pair[1], .flags = .{ .nonblocking = false } };
     var writing = other.writer(testing.io, &out_buffer);

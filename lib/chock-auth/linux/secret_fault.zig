@@ -1,9 +1,4 @@
 //! What the freedesktop secret service refused with, and what a person does
-//! about it.
-//!
-//! Split from the driver so `store.zig` can name it on every platform. The
-//! driver beside it imports the D-Bus library, which is a Linux only
-//! dependency, so a macOS build cannot reach through it to read this.
 
 const std = @import("std");
 
@@ -15,8 +10,6 @@ pub const Fault = enum {
     bad_reply,
 };
 
-/// One sentence a person can act on, or null when the fault is all there is.
-/// Mirrors `darwin/status.zig`.
 pub fn adviceFor(fault_kind: Fault) ?[]const u8 {
     return switch (fault_kind) {
         .no_session_bus => "no D-Bus session bus is reachable. A machine reached only over ssh, or a " ++
@@ -53,8 +46,6 @@ test "the locked collection names both ways out, and neither is a prompt" {
     const locked = adviceFor(.collection_locked).?;
     try testing.expect(std.mem.indexOf(u8, locked, "desktop login") != null);
     try testing.expect(std.mem.indexOf(u8, locked, "secret-tool") != null);
-    // The driver never calls Prompt, so the advice must not send a reader
-    // looking for one.
     try testing.expect(std.mem.indexOf(u8, locked, "answer the prompt") == null);
 }
 

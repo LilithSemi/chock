@@ -1,40 +1,6 @@
 //! Runs one `chock_core.tools.Registry.dispatch` call against a real
-//! `sandbox.Config` and prints the result. Its own process because `dispatch`
-//! calls `fork`, which carries only the calling thread into the child, and the
-//! zig test runner is not a single threaded caller. Nothing here touches
-//! `std.Io`: every path arrives through argv.
-//!
-//! Command line:
-//!   tools-probe <tool> <call_id> <root> <cwd> <mounts-blob> <rules-blob>
-//!               <sandbox-env-blob> <host-path> <arguments-json>
-//!               <timeout-ms> <memory-dir> <store-paths> <cache-dir>
-//!               <cancel-after-ms> <scratch-dir> <scratch-bytes>
-//!               <workspace-dir> <workspace-floor-bytes>
-//!               <approval-wait-ms> <routed> <secret-bind> <secret-variable>
-//!               <secret-value>
-//!
-//! Every optional argument is always present and may be empty, so the argument
-//! count never goes ambiguous. Empty means the production default. The blob
-//! arguments take the shape `test/sandbox/escape_probe.zig` documents.
-//!
-//! Standard output, on exit 0, is one header line:
-//!
-//!   is_error=<0 or 1> truncated=<0 or 1> len=<decimal> note_len=<decimal>
-//!     media_len=<decimal> image_bytes=<decimal> hash_len=<decimal>
-//!     data_len=<decimal>
-//!
-//! then that many raw bytes, in that order: `ToolResult.output`,
-//! `ToolResult.note`, then the three strings of `ToolResult.image`. Any of them
-//! can hold a newline. `image_bytes` is the picture size before base64.
-//!
-//! Exit status:
-//!   0   dispatch returned a result, printed above. `is_error` in the header
-//!       says whether the tool call itself was reported as failing
-//!   1   the argument count on the command line is wrong
-//!   2   a mounts or rules blob did not parse
-//!   3   dispatch returned a real error, named on standard error
-//!  63   this machine would not give the sandbox its namespaces, so the call
-//!       never ran. Not a pass and not a failure: the caller skips
+//! `sandbox.Config` and prints the result, out of process because `dispatch`
+//! forks and the zig test runner is not a single threaded caller.
 
 const std = @import("std");
 
@@ -42,9 +8,7 @@ const linux = std.os.linux;
 const sandbox = @import("chock-sandbox");
 const chock_core = @import("chock-core");
 
-/// Half of `struct itimerval`, in microseconds. `std.os.linux`'s `setitimer`
-/// wrapper names `itimerspec`, whose nanosecond field this syscall would read
-/// as a microsecond one.
+/// Half of `struct itimerval`, in microseconds: this syscall reads `setitimer`'s nanosecond field as one.
 const TimerValue = extern struct { sec: isize, usec: isize };
 
 const IntervalTimer = extern struct { interval: TimerValue, value: TimerValue };
@@ -53,9 +17,7 @@ fn onCancelAlarm(_: std.posix.SIG) callconv(.c) void {
     chock_core.tools.cancelRunningTool();
 }
 
-/// The timer repeats: a single shot landing before `Sandbox.spawn` reported the
-/// process group would cancel nothing. `SA_RESTART`, so the read loop under
-/// test does not see a short read.
+/// The timer repeats, so a single shot landing too early still cancels something.
 fn armCancelTimer(period_ms: u64) void {
     const action = std.posix.Sigaction{
         .handler = .{ .handler = onCancelAlarm },
@@ -138,9 +100,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     // Any router makes the call a routed one, which writes the resolver files.
     const routed = args[20].len != 0;
 
-    // One secret, granted to every call this probe makes. The real answerer
-    // reads a policy and a store; what is under test here is what `runCommand`
-    // does with an answer, which is the mount and the environment.
+    // One secret, granted to every call this probe makes.
     if (args[21].len != 0) {
         granting_secret = .{
             .bind = args[21],
@@ -185,8 +145,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     const call = chock_core.tools.ToolCall{ .call_id = call_id, .tool = tool, .arguments = arguments_json };
 
-    // `Threaded.init` uses its allocator only for `async`, `concurrent` and the
-    // group calls, so a failing allocator takes no lock a fork would carry.
+    // A failing allocator takes no lock a fork would carry.
     var threaded = std.Io.Threaded.init(std.mem.Allocator.failing, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -210,8 +169,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         context.approval_wait_ns = &approval_wait_counter;
     }
 
-    // The page allocator, never the arena: a task's thread allocates beside one
-    // that may be inside `Sandbox.spawn`.
+    // The page allocator, never the arena: a task's thread allocates beside one that may be in `Sandbox.spawn`.
     var tasks_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
     var table: ?chock_core.tasks.Table = if (scratch_dir) |dir| .{
         .gpa = std.heap.page_allocator,
@@ -224,8 +182,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     if (table) |*one| context.tasks = one;
 
     const result = chock_core.tools.Registry.dispatchWith(arena, io, &env, config, call, context) catch |err| switch (err) {
-        // Nothing is printed here: `build.zig`'s `failOnTestStderr` fails the
-        // build on a byte written to standard error.
+        // Nothing is printed here: the build fails on a byte written to standard error.
         error.NamespaceFailed => return sandbox.namespace.nothing_measured_exit_status,
         else => {
             std.debug.print("dispatch failed: {s}\n", .{@errorName(err)});
@@ -233,8 +190,6 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         },
     };
 
-    // A background task's thread dies with its process, and the file it writes
-    // is what the caller reads.
     if (table) |*one| one.deinit();
 
     printResult(result);
@@ -359,16 +314,13 @@ fn parseEnvBlob(arena: std.mem.Allocator, blob: []const u8) ParseError![][]const
     return list.toOwnedSlice(arena) catch return error.OutOfMemory;
 }
 
-/// Refuses everything, so a test using it proves only what a routed call places
-/// for the program, and nothing about resolving a name or reaching a host.
 var granting_secret: ?GrantedSecret = null;
 
 const GrantedSecret = struct { bind: []const u8, variable: []const u8, value: []const u8 };
 
 var granting_seam: GrantingSecrets = .{};
 
-/// Grants the one secret the command line named, to every call. The lifetime is
-/// the probe's own process, so `release` has nothing to do.
+/// Grants the one secret the command line named, to every call.
 const GrantingSecrets = struct {
     env_entry: [512]u8 = undefined,
     env_len: usize = 0,

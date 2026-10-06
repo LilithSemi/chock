@@ -10,17 +10,14 @@ const sandbox = @import("chock-sandbox");
 const Workspace = chock_workspace.Workspace;
 const git = chock_workspace.git;
 
-// Zig 0.16 has no argv a test can read, and the default test runner panics on
-// argv it does not know, so build.zig embeds the probe path at build time.
+// The default test runner panics on argv it does not know, so build.zig embeds the probe path.
 const probe_path = @import("darwin_workspace_probe_path").probe_path;
 
 const succeeded: u8 = 0;
 const refused: u8 = 1;
 
-/// The read only system paths the real git needs under `(deny default)`. A real
-/// session gets this set from the Nix dev shell closure and this suite has no
-/// dev shell, so it carries its own. None of them covers the project, the
-/// scratch directory, or the copy.
+/// The read only system paths the real git needs under `(deny default)`, carried
+/// by hand since this suite has no Nix dev shell closure to read them from.
 const system_paths = [_]struct { path: []const u8, read_only: bool = true }{
     .{ .path = "/nix/store" },
     .{ .path = "/usr" },
@@ -30,23 +27,18 @@ const system_paths = [_]struct { path: []const u8, read_only: bool = true }{
     .{ .path = "/Library" },
     .{ .path = "/private/var/db" },
     .{ .path = "/private/var/select" },
-    // git opens `/dev/null` for reading and writing before it does anything
-    // else, and fails outright without it.
+    // git opens `/dev/null` before it does anything else, and fails outright without it.
     .{ .path = "/dev", .read_only = false },
 };
 
 /// The absolute, resolved path of an open descriptor, through `F_GETPATH`.
-/// Seatbelt matches the path the kernel resolved, so a rule naming `/tmp/x`,
-/// where `/tmp` is a link to `/private/tmp`, matches nothing, and a relative
-/// path such as the `.zig-cache/tmp` one `tmpDir` hands back matches nothing.
+/// Seatbelt matches the path the kernel resolved, so a relative or linked path matches nothing.
 fn resolvedPath(handle: std.posix.fd_t, buffer: *[std.fs.max_path_bytes]u8) ![]const u8 {
     if (std.c.fcntl(handle, std.c.F.GETPATH, @as([*]u8, buffer)) != 0) return error.PathNotResolvable;
     return std.mem.sliceTo(buffer, 0);
 }
 
-/// The absolute, resolved path of `path`. Null when it cannot be opened. Every
-/// `git` on a Nix `PATH` is a link into the store, and a link in a rule matches
-/// nothing.
+/// The absolute, resolved path of `path`, or null when it cannot be opened.
 fn resolveOnDisk(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     if (path.len >= buffer.len) return null;
@@ -63,8 +55,7 @@ fn resolveOnDisk(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
     return try allocator.dupe(u8, real);
 }
 
-/// The absolute path of the real git, found on `PATH` and then resolved.
-/// Answers null when there is no git, and the caller skips.
+/// The absolute path of the real git, found on `PATH` and then resolved, or null when there is none.
 fn findGit(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
     const path_value = env.get("PATH") orelse return null;
     var entries = std.mem.splitScalar(u8, path_value, ':');
@@ -78,8 +69,6 @@ fn findGit(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?
 }
 
 /// A fresh project and a scratch directory with one commit already made.
-/// `test/workspace/escape.zig` builds the same shape but reads `/proc/self/fd`,
-/// so it cannot be shared.
 const TestProject = struct {
     allocator: std.mem.Allocator,
     tmp: std.testing.TmpDir,
@@ -105,8 +94,7 @@ const TestProject = struct {
 
         var env = try std.testing.environ.createMap(allocator);
         errdefer env.deinit();
-        // `tmpDir` puts its directory inside this project's own checkout, so
-        // git's upward search would otherwise find the real repository.
+        // Otherwise git's upward search would find the real repository.
         try env.put("GIT_CEILING_DIRECTORIES", tmp_path);
 
         var project: TestProject = .{
@@ -214,9 +202,7 @@ fn runProbe(
     const absolute_probe = (try resolveOnDisk(allocator, probe_path)) orelse return error.ProbeNotOnDisk;
     defer allocator.free(absolute_probe);
 
-    // git writes to standard error on a commit here, because it tries to pack
-    // the project's refs and the read only rule refuses. The commit still
-    // succeeds, and the exit status is the whole answer.
+    // git writes to standard error here when the read only rule refuses a ref pack, but the commit still succeeds.
     var child = try std.process.spawn(std.testing.io, .{
         .argv = &.{ absolute_probe, operation, config.cwd, mounts_blob, rules_blob, env_blob, args_blob },
         .stdin = .ignore,
@@ -226,15 +212,13 @@ fn runProbe(
     return child.wait(std.testing.io);
 }
 
-/// A Seatbelt profile cannot be layered, so a process that already carries one
-/// would answer for the outer profile and not for the one the driver built.
+/// A Seatbelt profile cannot be layered, so a process that already carries one skips.
 fn requireOwnProfile() !void {
     if (sandbox.darwin_driver_for_testing.confinedAlready()) return error.SkipZigTest;
 }
 
 test "finding 4 on macos: a tool call writes the worktree metadata directory and the user's own repository never sees it" {
-    // The third path is the root of the directory, which no read only rule can
-    // cover: `git add` creates `index.lock` there and renames it over `index`.
+    // The third path is the root of the directory: `git add` creates `index.lock` there and renames it over `index`.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     try requireOwnProfile();
 
@@ -276,8 +260,7 @@ test "finding 4 on macos: a tool call writes the worktree metadata directory and
 }
 
 test "finding 4 on macos: the project's own metadata directory refuses a write from inside the sandbox" {
-    // macOS moves no path, so the project's own metadata directory really is
-    // reachable inside the sandbox and the rule is what refuses it.
+    // The project's metadata directory is reachable inside the sandbox, so the rule is what refuses the write.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     try requireOwnProfile();
 

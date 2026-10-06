@@ -20,15 +20,12 @@ const testing = std.testing;
 /// Named by `test/workspace/escape_probe.zig`, which owns the flow.
 const agent_file = "chock-object-store-test.txt";
 
-/// `chock_proto.storage.Locked` is not `pub`. This reaches the same type
-/// through the return type of `Storage.lock`, which is.
+/// `chock_proto.storage.Locked` is not `pub`, so this reaches it through `Storage.lock`'s return type.
 const LockedHandle = @typeInfo(
     @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
 ).error_union.payload;
 
-// The sandbox work goes through `escape_probe`, because `Sandbox.spawn` forks and
-// the zig test runner is not a single threaded caller. `support.TestProject` sets
-// `GIT_CEILING_DIRECTORIES`, because `tmpDir` sits under Chock's own checkout.
+// Sandbox work goes through `escape_probe`, because `Sandbox.spawn` forks and the zig test runner is not a single threaded caller.
 const support = @import("support.zig");
 
 const absoluteDirPath = support.absoluteDirPath;
@@ -139,8 +136,7 @@ fn testAsk(action: actions.Action) actions.Ask {
 const one_reply_head = "HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\n";
 const one_reply_body = "the broker read this\n";
 
-/// `actions.perform` refuses the loopback interface before it opens anything, so a
-/// test that wants a real request out fakes the lookup. Nothing else is faked.
+/// `actions.perform` refuses the loopback interface, so a test that wants a real request out fakes the lookup.
 const loopback_on_the_internet = struct {
     const address = "93.184.216.34";
     const marker: u8 = 0;
@@ -238,8 +234,7 @@ test "the broker runs the action, and the agent never holds the capability" {
     const real_objects = try std.fs.path.join(gpa, &.{ wt.git_dir, "objects" });
     defer gpa.free(real_objects);
     try session_env.put("GIT_ALTERNATE_OBJECT_DIRECTORIES", real_objects);
-    // The sandbox writes the session's own copy of the worktree metadata
-    // directory, so the session's own HEAD is there and not in the project's.
+    // The session's own HEAD lives in the sandbox's copy of the worktree metadata, not the project's.
     try session_env.put("GIT_DIR", wt.worktree_meta_bind_source);
 
     const agent_commit = try gitOk(gpa, &session_env, wt.path, &.{ "rev-parse", "HEAD" });
@@ -307,8 +302,7 @@ test "the broker runs the action, and the agent never holds the capability" {
     var after_root_tmp = testing.tmpDir(.{});
     defer after_root_tmp.cleanup();
 
-    // Exit 1 is the probe's code for ENETUNREACH. A connection made exits 0, and a
-    // refusal by the far end exits 5, which would mean the packet left the sandbox.
+    // Exit 1 is the probe's code for ENETUNREACH. Exit 5 would mean the packet left the sandbox.
     var address_buffer: [32]u8 = undefined;
     const address = try std.fmt.bufPrint(&address_buffer, "127.0.0.1:{d}", .{server.port});
     const connect_term = try runProbe(gpa, &workspace, after_root_tmp, "connect", address);
@@ -331,8 +325,7 @@ test "the broker runs the action, and the agent never holds the capability" {
     try testing.expectEqualStrings(agent_commit, head_at_the_end);
 }
 
-/// `request_action` is the tool an agent calls and also the name `chock run`
-/// carries when it asks at the end of a run: see `actions.self_asked_tool`.
+/// `request_action` is also the name `chock run` carries when it asks at the end of a run.
 const table_allows_the_apply: [:0]const u8 =
     \\.{
     \\    .policy = .{
@@ -530,8 +523,7 @@ test "an agent that asks for an apply the table allows carries its commit into t
 }
 
 test "an approved net.fetch whose host answers this machine reads nothing" {
-    // No fake resolver here. The context is left on `actions.Resolver.system`, so
-    // `127.0.0.1` answers `127.0.0.1`, the same as it would in a real run.
+    // No fake resolver here, so `127.0.0.1` answers `127.0.0.1` as it would in a real run.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -565,8 +557,6 @@ test "an approved net.fetch whose host answers this machine reads nothing" {
 
     try testing.expectEqual(@as(usize, 0), server.captured.head.len);
 }
-
-// How an approved apply lands, every mode of it against real git.
 
 const Landing = chock_policy.apply.Landing;
 
@@ -637,8 +627,7 @@ const Carried = struct {
         return self.workspace.kind.worktree;
     }
 
-    /// One more commit on the project's own branch, so the two histories have
-    /// really diverged and a merge is a merge rather than a fast forward.
+    /// A commit on the project's own branch, so a merge is a merge and not a fast forward.
     fn commitOnMain(self: *Carried, gpa: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
         const written = try std.fs.path.join(gpa, &.{ self.project.root_path, path });
         defer gpa.free(written);
@@ -710,8 +699,7 @@ fn applying(gpa: std.mem.Allocator, carried: *const Carried, apply: actions.Work
 }
 
 test "a project that says nothing merges the work onto its branch, and says so before it is asked" {
-    // No mode is written here. The landing comes from `chock_policy.apply.Settings{}`,
-    // so this fails if the default ever stops naming a landing at all.
+    // The landing comes from `chock_policy.apply.Settings{}`, not a mode written here.
     const gpa = testing.allocator;
     const git_path = (try findGitOnPath(gpa, testing.io)) orelse return error.SkipZigTest;
     defer gpa.free(git_path);

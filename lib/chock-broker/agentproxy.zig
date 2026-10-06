@@ -1,6 +1,5 @@
-//! An ssh agent proxy: a socket in the sandbox joined to the person's agent.
-//! The agent protocol does not say what a signature is for, so no proxy can
-//! decide by the bytes. The socket lives only while one approved push runs.
+//! An ssh agent proxy joined to the person's agent. No proxy can judge a
+//! signature by its bytes, so this one just moves them, only while one approved push runs.
 
 const std = @import("std");
 const chock_proto = @import("chock-proto");
@@ -55,8 +54,7 @@ pub const Proxy = struct {
 
     pub const OpenError = socket.Endpoint.OpenError;
 
-    /// The parent directory goes into the sandbox under a Landlock rule that
-    /// grants reading alone, so a sandboxed process cannot replace the socket.
+    /// The parent directory is Landlock read-only in the sandbox, so a sandboxed process can't replace the socket.
     pub fn open(
         io: std.Io,
         path: []const u8,
@@ -89,8 +87,7 @@ pub const Proxy = struct {
         };
     }
 
-    /// The capability to sign lasts until this call, so run it on every path
-    /// out of an approved push, including a failing one.
+    /// The capability to sign lasts until this call: run it on every exit from an approved push, failing or not.
     pub fn close(self: *Proxy, io: std.Io) void {
         for (&self.links) |*link| link.drop();
         self.server.deinit(io);

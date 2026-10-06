@@ -1,15 +1,5 @@
-//! The author facing shape of a plugin's own declaration, and how it lowers to
-//! the data only form the host reads.
-//!
-//! This is a superset of `chock-plugin-core`'s `Metadata`. It adds the two
-//! things a compiler needs and a reader must never see: the `type` of a tool's
-//! arguments, and the `run` function behind it. Both exist only while the
-//! plugin compiles. `lower` drops them, and what is left is exactly what
-//! travels to the host.
-//!
-//! Keeping the two apart is the reason the host never has to instantiate
-//! anything: a `core.Metadata` holds no pointer into a guest module, so a host
-//! reads it, decides, and only then runs `chock_plugin_init`.
+//! The author's own declaration shape, lowered to the host's data only
+//! form. Adds the tool `type` and `run`, dropped by `lower`.
 
 const std = @import("std");
 const core = @import("chock-plugin-core");
@@ -18,41 +8,23 @@ const tools = @import("tools.zig");
 pub const LocaleField = core.LocaleField;
 pub const VersionConstraint = core.VersionConstraint;
 
-/// The signature every tool body has: the context, then the tool's own
-/// arguments by value, answering a `Result`.
 pub fn RunFn(comptime Args: type) type {
     return fn (tools.Context, Args) tools.Result;
 }
 
-/// One tool, as its author writes it.
 pub const Tool = struct {
     name: []const u8,
     description: []const LocaleField = &.{},
 
-    /// The action names this tool may reach for, in the language
-    /// `lib/chock-policy/table.zig` uses for its `action` key. This is what
-    /// puts a plugin tool on the policy table beside every built in tool. It
-    /// is not decoration: an empty set is a claim that the tool changes
-    /// nothing, and the host holds the plugin to it.
+    /// Not decoration: empty means the tool changes nothing.
     capabilities: []const []const u8 = &.{},
 
-    /// The type of the arguments `run` takes.
     type: type,
 
-    /// The tool body. The type is opaque because a struct field's type cannot
-    /// depend on the value of a sibling field, and `run`'s real signature
-    /// depends on `type`. `runOf` puts the signature back on, and checks it
-    /// wherever Zig lets it: see that function.
+    /// Opaque. `runOf` puts the signature back on.
     run: *const anyopaque,
 
-    /// The part of this that reaches the host.
-    ///
-    /// **The argument schema is built here and travels as data.** The `type`
-    /// itself cannot cross: it is this plugin's own Zig, and a host that read
-    /// it would be a host coupled to the plugin's compiled layout. What crosses
-    /// is what `core.schema.propertiesOf` makes of it, which is the same
-    /// mapping a built-in tool's own schema is made with, so the model reads
-    /// one spelling of one idea.
+    /// The type cannot cross. `core.schema.propertiesOf` maps what does.
     pub fn descriptor(comptime self: Tool) core.ToolDescriptor {
         return .{
             .name = self.name,
@@ -62,15 +34,11 @@ pub const Tool = struct {
         };
     }
 
-    /// How this tool is named in a compile error. Every refusal the schema
-    /// mapping raises says which tool has the field it cannot describe, and
-    /// this is where that name comes from.
     pub fn whose(comptime self: Tool) []const u8 {
         return "the tool \"" ++ self.name ++ "\"";
     }
 };
 
-/// The author's whole declaration. `plugins/hello.zig` is one of these.
 pub const Metadata = struct {
     name: []const u8,
     version: std.SemanticVersion,
@@ -79,12 +47,9 @@ pub const Metadata = struct {
     description: []const LocaleField = &.{},
     tools: []const Tool = &.{},
 
-    /// The name the author gives the declaration, and the name of the guest
-    /// symbol that carries its serialised form.
     pub const symbol = core.Metadata.symbol;
 
-    /// Drop everything that cannot cross to a host and keep the rest. Runs
-    /// while the plugin compiles, so the cost on the target is zero.
+    /// Runs while the plugin compiles.
     pub fn lower(comptime self: Metadata) core.Metadata {
         const descriptors = comptime descriptors: {
             var acc: [self.tools.len]core.ToolDescriptor = undefined;
@@ -102,23 +67,11 @@ pub const Metadata = struct {
     }
 };
 
-/// `tool.run` with its signature put back on.
-///
-/// The cast itself cannot be checked: an opaque pointer carries no signature.
-/// What can be checked is the ordinary case. Almost every author writes
-/// `.type = T` and `.run = T.run`, so when `T` publishes a `run` this refuses
-/// to build unless that `run` has the right signature and is the very function
-/// the literal named. An author who keeps `run` private gets no check, because
-/// `@hasDecl` cannot see a private declaration from another file, and the
-/// build has no way to look.
+/// `tool.run`'s signature put back on, checked only if public.
 pub fn runOf(comptime tool: Tool) *const RunFn(tool.type) {
     comptime {
         const Args = tool.type;
         const info = @typeInfo(Args);
-        // **A struct and nothing else.** The model writes a tool's arguments as
-        // a JSON object, and `core.schema.propertiesOf` refuses anything else
-        // with a message of its own. This check is here as well because a
-        // `@hasDecl` on a non struct is a worse error than that message.
         if (info != .@"struct") {
             @compileError("the tool '" ++ tool.name ++ "' declares .type = " ++
                 @typeName(Args) ++ ", and a tool's arguments must be a struct, because " ++
@@ -153,16 +106,13 @@ const Greet = struct {
 };
 
 const Silent = struct {
-    // Private on purpose: this is the shape `runOf` cannot check, and the
-    // test below pins that it still binds rather than failing the build.
+    // Private on purpose.
     fn run(ctx: tools.Context, _: Silent) tools.Result {
         return ctx.errorResult("nothing to say");
     }
 };
 
 test "lower drops the type and the run and keeps everything else" {
-    // The host must never receive a pointer into a guest module. What it does
-    // receive has to be complete, capabilities included.
     const declared: Metadata = .{
         .name = "greeter",
         .version = .{ .major = 1, .minor = 0, .patch = 0 },
@@ -185,24 +135,17 @@ test "lower drops the type and the run and keeps everything else" {
     try testing.expectEqualStrings("greet", lowered.tools[0].name);
     try testing.expectEqualStrings("fs.read", lowered.tools[0].capabilities[0]);
     try testing.expectEqualStrings("Greets", lowered.tools[0].description[0].value);
-    // The whole point: nothing that only exists inside the guest survived.
     try testing.expect(!@hasField(core.ToolDescriptor, "run"));
     try testing.expect(!@hasField(core.ToolDescriptor, "type"));
 
-    // What the type became. The `type` did not cross and the shape of it did,
-    // which is the whole reason a host can describe a tool it cannot compile.
     try testing.expectEqual(@as(usize, 1), lowered.tools[0].parameters.len);
     try testing.expectEqualStrings("who", lowered.tools[0].parameters[0].name);
     try testing.expectEqualStrings("Who to greet.", lowered.tools[0].parameters[0].description);
-    // `who` has a default, and a default is not what decides this: an optional
-    // Zig field is what the model may leave out.
     try testing.expect(lowered.tools[0].parameters[0].required);
     try testing.expectEqual(core.schema.Kind.string, lowered.tools[0].parameters[0].shape.kind);
 }
 
 test "runOf gives back a callable body with its real signature" {
-    // The erased pointer is the only thing the literal carries. If the cast
-    // were wrong the call below would answer with rubbish rather than "you".
     const tool: Tool = .{ .name = "greet", .type = Greet, .run = Greet.run };
     const body = comptime runOf(tool);
     const answer = body(.{ .tool = "greet" }, .{ .who = "you" });
@@ -211,8 +154,6 @@ test "runOf gives back a callable body with its real signature" {
 }
 
 test "runOf binds a tool whose body is private" {
-    // The case the signature check cannot reach. It must still bind, because
-    // a private body is ordinary Zig and not a mistake.
     const tool: Tool = .{ .name = "silent", .type = Silent, .run = Silent.run };
     const body = comptime runOf(tool);
     const answer = body(.{ .tool = "silent" }, .{});
@@ -221,8 +162,6 @@ test "runOf binds a tool whose body is private" {
 }
 
 test "a lowered record serialises and parses back unchanged" {
-    // The join between this file and `chock-plugin-core`. The author writes
-    // one shape, the host reads another, and the two must say the same thing.
     const declared: Metadata = .{
         .name = "greeter",
         .version = .{ .major = 1, .minor = 0, .patch = 0 },

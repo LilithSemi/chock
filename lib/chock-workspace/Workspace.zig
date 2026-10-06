@@ -18,44 +18,14 @@ const sandbox = @import("chock-sandbox");
 
 pub const Error = worktree_mod.Error || overlay_mod.Error || deny_mod.Error || error{
     OverlayCannotBeAdopted,
-    /// `chock.zon` names a symbolic link instead of an ordinary file, in the
-    /// copy the sandbox would bind.
     ChockZonIsSymlink,
 };
 
-/// The name and the address every commit made inside the sandbox carries.
-///
-/// A commit is the only way a session's work reaches the user, and without this
-/// git refuses with "Author identity unknown": the sandbox has no `HOME`, so no
-/// global configuration is readable, and the whole of `.git` is read only, so
-/// `git config user.name` cannot create one either. An agent once worked around
-/// it by inventing an identity of its own, and a second session invented a
-/// different one.
-///
-/// Environment variables and never a configuration file, for two reasons that
-/// each stand alone: they outrank every configuration file in git's own
-/// precedence, and they need nothing writable.
+/// The sandbox has no `HOME` and `.git` is read only, so git has no configured identity to fall back to.
 pub const identity_name = "Chock";
 pub const identity_email = "chock@lilithsemi.com";
 
-/// The four entries `sandboxConfig` puts in front of every other environment
-/// variable, in `KEY=VALUE` form.
-///
-/// Author and committer both, because git takes the two from separate variables
-/// and falls back to the configuration for either one it is not given.
-///
-/// No project may override this. An identity a project could rename is an
-/// identity that says nothing, and a person who wants different authorship has
-/// `git commit --amend --author` on their own branch.
-///
-/// `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are deliberately absent. `git.zig`
-/// forces both to `/dev/null` for a host side reason, which is that Chock parses
-/// what git prints. Inside the sandbox the agent reads it, and no global or
-/// system configuration is reachable anyway, so the two would neutralize nothing
-/// while taking away a gitconfig a dev shell may have put in the tree on purpose.
-///
-/// No `GIT_AUTHOR_DATE` and no `GIT_COMMITTER_DATE`: git reads the real clock
-/// when neither is set, which is what a commit's timestamp must be.
+/// No project may override this. No `GIT_AUTHOR_DATE` or `GIT_COMMITTER_DATE`, so git reads the real clock.
 pub const identity_env = [_][]const u8{
     "GIT_AUTHOR_NAME=" ++ identity_name,
     "GIT_AUTHOR_EMAIL=" ++ identity_email,
@@ -63,12 +33,7 @@ pub const identity_env = [_][]const u8{
     "GIT_COMMITTER_EMAIL=" ++ identity_email,
 };
 
-/// Which backing a session got. Both kinds are equally free to build from an
-/// ordinary, unprivileged caller, all the way through `sandboxConfig`. Neither
-/// `mounts` call opens or mounts anything, and `chock-sandbox`'s own `buildRoot`
-/// is the only place either mount is performed. An earlier `Overlay.mounts`
-/// performed the real overlay mount here, which needed `CAP_SYS_ADMIN` over the
-/// caller's own namespace and so needed a caller already inside one.
+/// Neither `mounts` call opens or mounts anything; `chock-sandbox`'s own `buildRoot` performs it.
 pub const Kind = union(enum) {
     worktree: worktree_mod.Worktree,
     overlay: overlay_mod.Overlay,
@@ -79,20 +44,10 @@ pub const Workspace = struct {
     chock_zon_source: ?[]u8,
     chock_zon_target: ?[]u8,
     deny_paths: []const []u8,
-    /// Empty until `attachBinds` runs. The `workspace` block is read and
-    /// resolved by the caller, which is the only layer that knows whether a
-    /// write to the user's own disk was permitted.
+    /// Empty until `attachBinds` runs.
     binds: []binds_mod.Attached = &.{},
 
-    /// Pick a backing for `project_root` and build it. `git.isRepository`
-    /// decides, and the caller never chooses.
-    ///
-    /// `scratch_dir` must already exist and holds every scratch file the chosen
-    /// backing needs. `session_id` is only used for the worktree path.
-    ///
-    /// Darwin adds one requirement: `scratch_dir` must sit on the project's own
-    /// volume, since a clone cannot cross one. `error.ScratchOnAnotherVolume`
-    /// rather than working in the user's real files.
+    /// On Darwin, `scratch_dir` must share the project's volume, or `error.ScratchOnAnotherVolume`.
     pub fn open(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -162,13 +117,7 @@ pub const Workspace = struct {
         also_denied: []const []const u8,
         diag: ?*?Diagnostic,
     ) Error!Workspace {
-        // Before either backing is built, so a `deny_read` block this cannot
-        // honour refuses the session rather than half building one. It reads
-        // the host project's own `chock.zon`, which for the worktree backing is
-        // not the file the checkout carries.
-        //
-        // Checked here and joined later, because where the sandbox sees the
-        // project is not known until the backing exists.
+        // Checked before either backing is built, so a bad block refuses rather than half building.
         const own = try deny_mod.loadEntries(allocator, io, project_root, diag);
         defer deny_mod.free(allocator, own);
 
@@ -197,13 +146,8 @@ pub const Workspace = struct {
         const denied = try deny_mod.joinOnto(allocator, entries, ov.sandboxRoot());
         errdefer deny_mod.free(allocator, denied);
 
-        // The overlay's lower layer is read only end to end, but an agent that
-        // deletes chock.zon only makes a whiteout in the writable upper layer,
-        // and the merged view would then show it gone. Binding the project's
-        // own file back over that path closes it.
-        //
-        // Under `.in_place` the source is the clone's own copy, because nothing
-        // can be bound over anything there.
+        // A deletion of chock.zon only whiteouts the upper layer; binding
+        // the project's file back over that path closes it.
         const zon_source_root = switch (layout) {
             .remapped => ov.project,
             .in_place => ov.upper,
@@ -249,21 +193,9 @@ pub const Workspace = struct {
         return list;
     }
 
-    /// Take over the workspace of a session that is handing over. The checkout
-    /// is already on disk, another process made it, and this runs no git
-    /// command at all.
-    ///
-    /// The argument list is `open`'s plus `base_commit`, which the disk cannot
-    /// give back: a session that committed before handing over has a HEAD that
-    /// is not its base, so reading HEAD would make `headMoved` answer "nothing
-    /// changed" for a session that changed plenty.
-    ///
-    /// The overlay backing is refused with `error.OverlayCannotBeAdopted`. That
-    /// is about moving a running session to a second process and not about
-    /// reaching the work: an ended overlay session gives its work up through
-    /// `chock workspace adopt`. What is left before this call can take the
-    /// overlay kind is `base_commit` no longer being an argument a caller must
-    /// supply, and `src/run.zig`'s `takenOver` accepting an overlay open.
+    /// `base_commit` must come from the caller: reading HEAD after the
+    /// session committed would make `headMoved` answer "nothing changed".
+    /// Refuses the overlay backing with `error.OverlayCannotBeAdopted`.
     pub fn adopt(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -292,9 +224,7 @@ pub const Workspace = struct {
             return error.OverlayCannotBeAdopted;
         }
 
-        // The host project's own `chock.zon`, and this is where that matters
-        // most. Reading the deny list out of the checkout would let a session
-        // hand over its way out of the list.
+        // The host project's own, not the checkout's, else the deny list could be escaped.
         const entries = try deny_mod.loadEntries(allocator, io, project_root, diag);
         defer deny_mod.free(allocator, entries);
 
@@ -309,9 +239,7 @@ pub const Workspace = struct {
             layout,
             diag,
         );
-        // `keep`, never `remove`, unlike `open`'s own cleanup: the checkout
-        // belongs to the session that is handing over, and a `remove` here
-        // would answer a failed handover by deleting the work.
+        // keep, never remove: a failed handover must not delete the checkout it was handed.
         errdefer wt.keep(allocator);
 
         const denied = try deny_mod.joinOnto(allocator, entries, wt.sandboxRoot());
@@ -365,10 +293,8 @@ pub const Workspace = struct {
         };
     }
 
-    /// Bring the resolved `workspace` binds in. Call it once, after `open` and
-    /// before `sandboxConfig`, because the mount list is built from what this
-    /// leaves behind. `copy_in` is false for an adopted workspace, which
-    /// already holds the copies the session that filled it made.
+    /// Call once, after `open` and before `sandboxConfig`. `copy_in` is
+    /// false for an adopted workspace, which already holds the copies.
     pub fn attachBinds(
         self: *Workspace,
         allocator: std.mem.Allocator,
@@ -389,9 +315,7 @@ pub const Workspace = struct {
         );
     }
 
-    /// Copy every `copy` bind the caller permitted back over the user's own
-    /// files. Nothing else in this library calls it: the moment is the
-    /// caller's, because the permission is.
+    /// Copies every `copy` bind the caller permitted back over the user's own files.
     pub fn writeBackBinds(
         self: *const Workspace,
         allocator: std.mem.Allocator,
@@ -401,20 +325,8 @@ pub const Workspace = struct {
         return binds_mod.writeBack(allocator, io, self.binds, report);
     }
 
-    /// Build the `Sandbox.Config` a caller hands to `Sandbox.spawn` for one
-    /// tool call: the backing's mount list, the Landlock rules that go with it,
-    /// and the `chock.zon` protection.
-    ///
-    /// `env` carries only what this library alone knows how to build. Both
-    /// backings get `identity_env`, and the worktree backing gets
-    /// `Worktree.gitEnv` as well. A caller that needs a dev shell's environment
-    /// merges it in on top.
-    ///
-    /// The caller owns the returned slices. Every string inside them is a slice
-    /// into `self` and stays valid only as long as `self` does.
-    /// Three refusals this makes provable: no write to `.git/objects`, no write
-    /// to `.git/hooks`, no delete of `chock.zon`.
-    ///
+    /// The caller owns the returned slices; every string in them is a
+    /// slice into `self` and stays valid only as long as `self` does.
     pub fn sandboxConfig(
         self: *const Workspace,
         allocator: std.mem.Allocator,
@@ -424,8 +336,7 @@ pub const Workspace = struct {
         errdefer mounts.deinit(allocator);
         var rules: std.ArrayList(sandbox.Config.Rule) = .empty;
         errdefer rules.deinit(allocator);
-        // The identity comes first and for both backings, because without it
-        // git refuses to make a commit at all.
+        // The identity comes first for both backings; without it git refuses to commit.
         var env: std.ArrayList([]const u8) = .empty;
         errdefer env.deinit(allocator);
         try env.appendSlice(allocator, &identity_env);
@@ -446,10 +357,7 @@ pub const Workspace = struct {
                     .path = wt.sandbox_git_root,
                     .access = sandbox.landlock.AccessFs.read_only,
                 });
-                // The scratch object store, read write. It is not nested
-                // under sandbox_git_root and cannot be, so no rule above
-                // covers it and the mount would otherwise be unreachable. The
-                // mount layer still refuses a write to the real object store.
+                // The scratch object store is not nested under sandbox_git_root, so it needs its own rule.
                 try rules.append(allocator, .{
                     .path = wt.object_store_target,
                     .access = sandbox.landlock.AccessFs.read_write,
@@ -483,25 +391,16 @@ pub const Workspace = struct {
             } });
         }
 
-        // The paths the project said the agent may see, which the workspace
-        // does not carry. After the backing, so a bind lands over the
-        // workspace's own path, and before the denied files, so a bind can
-        // never shadow one.
+        // After the backing and before the denied files, so a bind can never shadow one.
         try binds_mod.appendMounts(allocator, &mounts, self.binds);
 
-        // The files the project said the agent may not read. No Landlock rule
-        // goes with these and none could: rights accumulate on a nested path
-        // and are never narrowed by a wider rule, and the project directory is
-        // read write, so a denied file under it cannot be subtracted. The mount
-        // is the whole boundary here.
+        // No Landlock rule covers a denied path, so the mount is the whole boundary.
         for (self.deny_paths) |path| {
             try mounts.append(allocator, .{ .deny = .{ .target = path } });
         }
 
         return .{
-            // `.in_place` has no root of its own. A root is what
-            // `Sandbox.spawn` pivots into, and macOS cannot pivot. The layer
-            // that keeps a tool call to the workspace there is the path rules.
+            // `.in_place` has no root of its own: macOS cannot pivot into one.
             .root = switch (self.sandboxLayout()) {
                 .remapped => root,
                 .in_place => "/",
@@ -568,17 +467,7 @@ fn chockZonExists(io: std.Io, absolute_path: []const u8) (std.Io.Dir.StatFileErr
     return true;
 }
 
-/// The `chock.zon` an adopted session gets bound over it: the checkout's own
-/// first, and the project's own when the checkout has none.
-///
 /// A session must not be able to hand over its way out of its own policy file.
-/// `open` reads a checkout `git worktree add` just made, so the file is there
-/// whenever HEAD has it. `adopt` reads a checkout a whole session has used, and
-/// a missing file there would mean no bind and no policy file at all.
-///
-/// The bind is what makes the delete fail: `chock.zon` is a mount point inside
-/// the sandbox, and unlinking a mount point answers `EBUSY`. This fallback is
-/// for the checkout that lost the file some other way.
 fn findChockZonForAdopt(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -590,12 +479,7 @@ fn findChockZonForAdopt(
 ) Error!FoundChockZon {
     const in_checkout = try findChockZon(allocator, io, checkout_root, target_root, diag);
     if (in_checkout.source != null) return in_checkout;
-    // No fallback under `.in_place`, because a bind that moves a path is the
-    // one thing macOS has not got. The policy a session runs under is still
-    // read from the host project, so a checkout with no `chock.zon` changes no
-    // rule. What is lost is the covering entry, so an agent on that layout can
-    // create a `chock.zon` in its own checkout, which reaches nobody until a
-    // hand back carries it.
+    // No fallback under `.in_place`: macOS cannot bind a path to move it.
     if (layout == .in_place) return in_checkout;
     return findChockZon(allocator, io, project_root, target_root, diag);
 }
@@ -607,8 +491,6 @@ fn existsAsFile(io: std.Io, absolute_path: []const u8) std.Io.Dir.StatFileError!
     };
     return true;
 }
-
-// This file's own tests build both kinds of `Workspace`.
 
 /// `std.testing.tmpDir` hands back a directory only a relative path reaches.
 fn absoluteDirPath(buffer: []u8, dir: std.Io.Dir) ![:0]u8 {
@@ -625,8 +507,7 @@ fn testEnviron(allocator: std.mem.Allocator, scratch_path: []const u8) !std.proc
     return env;
 }
 
-/// A program the system could not start answers differently from one that ran
-/// and failed.
+/// A program the system could not start answers differently from one that ran and failed.
 fn ranWell(term: std.process.Child.Term) bool {
     return switch (term) {
         .exited => |code| code == 0,
@@ -736,7 +617,6 @@ test "open picks the worktree kind for a project that is a git repository" {
 }
 
 test "the in place layout builds a config the darwin driver can express, for both kinds" {
-    // Before this layout existed, every caller built the remapped shape.
     const darwin = sandbox.darwin_driver_for_testing;
     const allocator = std.testing.allocator;
 
@@ -778,11 +658,8 @@ test "the in place layout builds a config the darwin driver can express, for bot
 }
 
 test "a real tool call runs in the workspace on macos, and the boundaries hold" {
-    // The whole point of the in place layout: the tool call works in the
-    // checkout under its own real name.
     if (builtin.os.tag != .macos) return;
-    // Nix on macOS runs every builder under `sandbox-exec`, and macOS refuses
-    // a nested sandbox, so the check has to run outside one.
+    // Nix on macOS runs every builder under sandbox-exec, which refuses a nested sandbox.
     if (sandbox.darwin_driver_for_testing.confinedAlready()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -831,8 +708,7 @@ test "a real tool call runs in the workspace on macos, and the boundaries hold" 
     const in_objects = try std.fmt.bufPrint(&objects_buffer, "{s}/objects/agent-wrote-this", .{wt.sandbox_git_root});
     try std.testing.expect(!ranWell(try sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", in_objects }, null, null)));
 
-    // `commondir` redirects git at a git directory of the agent's
-    // own choosing.
+    // `commondir` redirects git at a git directory of the agent's own choosing.
     try std.testing.expect(!ranWell(try sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", wt.worktree_commondir_target }, null, null)));
     var index_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const in_meta = try std.fmt.bufPrint(&index_buffer, "{s}/agent-wrote-this", .{wt.worktree_meta_target});
@@ -903,8 +779,6 @@ test "keeping a workspace leaves the agent's file on disk, and closing one takes
     defer project.deinit();
     try project.makeGitRepository();
 
-    // The work an agent did and never committed. This is the 105 files of the
-    // session a rate limit ended.
     var kept_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const kept_file = kept: {
         var workspace = try Workspace.open(
@@ -999,8 +873,6 @@ test "sandboxConfig for the worktree kind needs no namespace, so an ordinary cal
 }
 
 test "both backings carry the git identity, author and committer, and neither carries a date" {
-    // The one variable set is the difference between work delivered and work
-    // lost.
     const allocator = std.testing.allocator;
 
     const wanted = [_][]const u8{
@@ -1326,8 +1198,6 @@ test "adopt refuses the overlay kind by name, because there is no overlay.adopt 
 }
 
 test "a layer above the project adds denied paths, and the project cannot take one off" {
-    // An org policy bundle could narrow a rule and be answered by a project
-    // that simply did not name the file.
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});

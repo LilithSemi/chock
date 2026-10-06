@@ -1,7 +1,6 @@
-//! The daemon's control protocol over a real socket, carrying a real session
-//! log. The far end here sends with `chock_proto.control.Feed`, the same code
-//! `src/daemon.zig` sends with, so there is no stand-in. Nothing reaches a
-//! network: the port is one the kernel gave on `127.0.0.1`.
+//! The daemon's control protocol over a real socket, carrying a real session log.
+//! The far end sends with `chock_proto.control.Feed`, the same code `src/daemon.zig` uses.
+//! Nothing reaches a network: the port is one the kernel gave on `127.0.0.1`.
 
 const std = @import("std");
 const chock_proto = @import("chock-proto");
@@ -18,8 +17,7 @@ const session_id = "01CONTROLTEST";
 
 const Greeting = struct {
     speaks: u32 = control.protocol_version,
-    /// `pcscd`'s own behaviour, in `lib/chock-pcsc/linux/wire.zig`: offering
-    /// `9:5` gets success back carrying the daemon's own `4:5`.
+    /// `pcscd`'s own behaviour: offering `9:5` gets success back carrying the daemon's own `4:5`.
     lenient: bool = false,
 };
 
@@ -221,8 +219,7 @@ fn collect(
     return got;
 }
 
-/// Greet and stop there, offering `speaks`. `control.exchange` offers only
-/// `control.protocol_version`, which leaves the refusal path out of reach.
+/// Greet and stop there, offering `speaks`, since `control.exchange` offers only `control.protocol_version`.
 fn greetOnly(
     io: std.Io,
     address: control.Address,
@@ -341,8 +338,7 @@ fn localLines(gpa: std.mem.Allocator, io: std.Io, log_path: [:0]const u8) !Colle
     return got;
 }
 
-/// Read a chain out of what arrived, with nothing local consulted. The
-/// verifier is seeded from the header record, which is why `watch` sends one.
+/// Read a chain out of what arrived, with nothing local consulted.
 fn verifyArrived(gpa: std.mem.Allocator, got: *const Collected) !chain.Report {
     try testing.expect(got.lines.items.len >= 1);
     try testing.expectEqual(@as(u64, 0), got.ids.items[0]);
@@ -578,8 +574,7 @@ test "a client that resumes gets no gap and no repeat" {
     try far.finish();
 
     try testing.expect(got.refusal == null);
-    // No header: sending it again would put a record with the identifier zero
-    // in the middle of a stream.
+    // No header: sending it again would put a record with the identifier zero in the middle of a stream.
     try testing.expectEqual(@as(usize, 2), got.ids.items.len);
     try testing.expectEqual(bench.ids[2], got.ids.items[0]);
     try testing.expectEqual(bench.ids[3], got.ids.items[1]);
@@ -614,7 +609,7 @@ test "a far end that will not serve says why, and never an empty stream" {
 }
 
 test "a daemon that is not listening is a refusal a client can name" {
-    // Nothing is started here. This is the case where there is no far end.
+    // Nothing is started here: this is the case where there is no far end.
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
@@ -629,8 +624,7 @@ test "a daemon that is not listening is a refusal a client can name" {
         (control.Address{ .unix = missing }).connect(io),
     );
 
-    // Port 1 is reserved and unused, and a connect to it on the loopback
-    // interface is refused by this machine's own kernel with no packet sent.
+    // Port 1 is reserved and unused, so the kernel refuses the connect with no packet sent.
     try testing.expectError(
         error.NotListening,
         (control.Address{ .ip = .{ .host = "127.0.0.1", .port = 1 } }).connect(io),
@@ -638,8 +632,7 @@ test "a daemon that is not listening is a refusal a client can name" {
 }
 
 test "a unix peer is named by the kernel and a TCP peer carries no identity at all" {
-    // Loopback TCP tells a listener nothing about who opened it, so peer identity
-    // only works where the kernel writes it. Both transports, because it is a contrast.
+    // Loopback TCP tells a listener nothing about who opened it.
     const io = testing.io;
     const mine = std.posix.system.getuid();
 

@@ -1,6 +1,5 @@
 //! The network broker: who answers when a sandboxed process asks to reach a
-//! host. The mechanism is in `lib/chock-sandbox/linux/netbroker.zig`, and the
-//! decision is here.
+//! host. The mechanism is in `lib/chock-sandbox/linux/netbroker.zig`.
 
 const std = @import("std");
 
@@ -18,8 +17,7 @@ const table = chock_policy.table;
 const NetBroker = chock_sandbox.NetBroker;
 const NetRouter = chock_sandbox.NetRouter;
 
-/// `chock_proto.storage.Locked` is not `pub`, so this reaches the same type
-/// through the return type of `Storage.lock`.
+/// `Locked` is not `pub`; reached through `Storage.lock`'s return type.
 pub const Locked = @typeInfo(
     @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
 ).error_union.payload;
@@ -36,14 +34,13 @@ const longest_prefix = @max(action_prefix.len, NixPhase.build.prefix().len);
 
 pub const max_action_bytes = longest_prefix + 1 + max_host_bytes + 1 + 5;
 
-/// Labels are reversed: `api.anthropic.com:443` becomes
-/// `net.connect.com.anthropic.api.443`, so a chosen name cannot widen a class rule.
+/// Labels reversed, e.g. `api.anthropic.com:443` to `net.connect.com.anthropic.api.443`,
+/// so a chosen name can't widen a class rule.
 pub fn actionInto(buffer: []u8, host: []const u8, port: u16) ?[]const u8 {
     return portedActionInto(buffer, action_prefix, host, port);
 }
 
-/// The phase word sits where a reversed host's last label sits, so a host under
-/// a top level domain named `build` or `eval` shares a name with that phase.
+/// The phase word sits where a reversed host's last label sits, so a `build`/`eval` TLD shares a name with it.
 pub const NixPhase = enum {
     eval,
     build,
@@ -61,8 +58,7 @@ pub const NixActions = struct {
     either_phase: []const u8,
 };
 
-/// The table matches a name against itself or a trailing `.*` and nothing else,
-/// so `nix.net.*.com.github.443` is a parse error and needs two names.
+/// The table matches a name or a trailing `.*` only, so `nix.net.*.com.github.443` needs two names.
 pub fn nixActionsInto(
     phase_buffer: []u8,
     either_buffer: []u8,
@@ -177,12 +173,8 @@ pub const Transport = struct {
     }
 };
 
-/// The host policy already said yes. This asks only whether the name resolved
-/// onto this machine. Refused: loopback, link local (`169.254.169.254` is the
-/// cloud metadata service on the large providers), unspecified, multicast,
-/// broadcast, the NAT64 wrapped form of those, `fd00:ec2::254` and
-/// `100.100.100.200`. The private IPv4 ranges, `fc00::/7` and `100.64.0.0/10`
-/// stay permitted: a company network or a Tailscale network lives in them.
+/// Policy already said yes; this only checks the resolved address isn't local
+/// or metadata. Private ranges stay permitted for company/Tailscale networks.
 pub fn addressIsReachable(address: Transport.Address) bool {
     switch (address) {
         .ip4 => |ip4| return ip4BytesAreReachable(ip4.bytes),
@@ -224,8 +216,7 @@ pub const Asker = struct {
     broker: *const Broker,
     storage: chock_proto.storage.Storage,
     locked: *Locked,
-    /// Bumped before `askPermits` waits and corrected when the wait ends, so a
-    /// tool call's own deadline can grow while a person is asked.
+    /// Bumped before `askPermits` waits, corrected after, so a tool call's deadline can grow while asked.
     approval_wait_ns: ?*std.atomic.Value(u64) = null,
 };
 
@@ -282,9 +273,7 @@ pub const Network = struct {
         return self.openAddress(address, port);
     }
 
-    /// `ceilingChain` and not `evaluateChain`: a query is a resource question,
-    /// so a project whose only rule names a port still resolves the bare host.
-    /// An address handed out is not a connection granted.
+    /// A query is a resource question: a port-only rule still resolves the bare host; an address isn't a connection granted.
     pub fn resolveName(self: *Network, host: []const u8, want: NetRouter.Family) NetRouter.Resolution {
         var buffer: [max_action_bytes]u8 = undefined;
         const action = classActionInto(&buffer, host) orelse {
@@ -299,8 +288,6 @@ pub const Network = struct {
             .action = action,
         };
 
-        // Two readings: the ceiling says if the host is forbidden outright, and
-        // `permitsSomethingUnder` says if anybody wrote a rule that reaches it.
         var fault: ?table.ChainFault = null;
         const ceiling = chock_policy.ratchet.ceilingFor(self.self_policy, action)
             .intersect(chock_policy.ratchet.ceilingFor(self.self_policy, action_prefix))
@@ -316,8 +303,7 @@ pub const Network = struct {
 
         const found = self.transport.lookup(self.io, host, 0) catch return .unresolved;
 
-        // glibc asks for both widths, one after the other. An IPv4 address
-        // given back as an `AAAA` answer is four bytes where sixteen belong.
+        // glibc asks both widths in turn; an IPv4 answer to an `AAAA` query is 4 bytes where 16 belong.
         const address: NetRouter.Address = switch (found) {
             .ip4 => |ip4| if (want == .ipv4) .{ .ipv4 = ip4.bytes } else return .unresolved,
             .ip6 => |ip6| if (want == .ipv6) .{ .ipv6 = ip6.bytes } else return .unresolved,
@@ -332,8 +318,7 @@ pub const Network = struct {
         return .{ .granted = address };
     }
 
-    /// This dials the address it resolved and does not look the name up again.
-    /// A second answer opens the window a rebinding attack needs.
+    /// Dials the resolved address, no second lookup: that gap is what a rebinding attack needs.
     pub fn openAddress(self: *Network, address: NetRouter.Address, port: u16) NetBroker.Grant {
         var name: [max_host_bytes]u8 = undefined;
         const found = self.handed_out.nameFor(address) orelse {
@@ -354,15 +339,13 @@ pub const Network = struct {
         port: u16,
         known: ?Transport.Address,
     ) NetBroker.Grant {
-        // The policy first: nothing below runs for a host the table refuses.
         var buffer: [max_action_bytes]u8 = undefined;
         // The name failed the shape rule, so it is not kept for a diagnostic.
         const action = actionInto(&buffer, host, port) orelse
             return self.refuse(.{ .net_host_not_a_name = .{ .host = "", .port = port } });
 
         var fault: ?table.ChainFault = null;
-        // The session's own promises fold in here too, because an `allow` never
-        // reaches the broker.
+        // The session's own promises fold in here too, since an `allow` never reaches the broker.
         const decision = chock_policy.ratchet.narrow(
             self.table.evaluateChain(self.chain, .{
                 .agent_kind = self.agent_kind,
@@ -374,7 +357,6 @@ pub const Network = struct {
             action,
         ).intersect(chock_policy.ratchet.ceilingFor(self.self_policy, action_prefix));
         if (decision != .allow) {
-            // Only `ask` is sent on. The other three refuse right here.
             if (decision == .ask) {
                 if (self.asker) |asker| {
                     if (self.askPermits(asker, action, host, port)) return self.finishConnect(host, port, known);
@@ -408,9 +390,7 @@ pub const Network = struct {
         const summary = std.fmt.bufPrint(&summary_buf, "reach {s} on port {d}", .{ host, port }) catch
             "reach a host this session asked for";
 
-        // Read `self.io` only inside this `if`. A probe that calls
-        // `Sandbox.spawn` keeps no working `Io` and no counter either, so a
-        // read outside this branch crashes the reentrant escape tests.
+        // A probe from `Sandbox.spawn` keeps no working `Io`, so `self.io` stays inside this `if`.
         var asked_at: std.Io.Clock.Timestamp = undefined;
         if (asker.approval_wait_ns) |counter| {
             asked_at = std.Io.Clock.Timestamp.now(self.io, .awake);
@@ -552,8 +532,7 @@ fn addressesEqual(a: NetRouter.Address, b: NetRouter.Address) bool {
     };
 }
 
-/// The lookup has no deadline of its own. A resolver that never answers holds
-/// the driver's serve loop until the call's own deadline ends it.
+/// No deadline of its own: a resolver that never answers holds the serve loop until the call's deadline.
 pub const System = struct {
     /// Nothing reads this today. It is the value a dial bound wants.
     timeout_ms: u64 = 10_000,
@@ -594,11 +573,8 @@ pub const System = struct {
         return found orelse error.NotResolved;
     }
 
-    /// No deadline on this connect. In Zig 0.16 `netConnectIpPosix` with a
-    /// timeout is a `@panic`, which killed a real session with `SIGABRT`.
-    /// `std.Io` cannot await a future with a deadline, and `std.posix` no
-    /// longer carries `socket`, `connect` or `fcntl`, so the kernel's own SYN
-    /// retry, over two minutes, is the only bound today.
+    /// No deadline on this connect: a timeout on `netConnectIpPosix` panics
+    /// in Zig 0.16, so the kernel's two-minute SYN retry is the only bound.
     fn dialFn(ptr: *anyopaque, io: std.Io, address: Transport.Address) Transport.DialError!std.posix.fd_t {
         _ = ptr;
         const stream = address.connect(io, .{ .mode = .stream }) catch return error.NotConnected;

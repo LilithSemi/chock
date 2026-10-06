@@ -1,6 +1,6 @@
-//! The daemon's control protocol: one greeting line, one request line, and a reply
-//! of lines that ends when the connection closes. A reader must tolerate unknown
-//! fields; a changed verb, field order or separator must move `protocol_version`.
+//! The daemon's control protocol: a greeting, a request, then a reply of
+//! lines until the connection closes. Unknown fields are tolerated; any other
+//! wire change bumps `protocol_version`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,7 +17,7 @@ pub const socket_name = "daemon.sock";
 
 pub const address_env = "CHOCK_DAEMON";
 
-/// Never in a project: that is a path a sandboxed tool call can name.
+/// Never in a project, a path a tool call could name.
 pub fn socketPathIn(gpa: std.mem.Allocator, state_dir: []const u8) std.mem.Allocator.Error![]u8 {
     return std.fs.path.join(gpa, &.{ state_dir, socket_name });
 }
@@ -44,8 +44,7 @@ pub const Address = union(enum) {
             return .{ .unix = path };
         }
 
-        // In a bracketed IPv6 host the port separator is the colon after the
-        // closing bracket, never the last colon in the string.
+        // In a bracketed IPv6 host, the port colon follows the bracket, not the string's last colon.
         const separator = if (std.mem.startsWith(u8, text, "["))
             (std.mem.indexOfScalar(u8, text, ']') orelse return error.NoPort) + 1
         else
@@ -121,8 +120,7 @@ pub const Address = union(enum) {
         }
     }
 
-    /// A unix connect to a stale socket file gives `ECONNREFUSED`, which
-    /// `UnixAddress.ConnectError` has no member for, so it arrives as `Unexpected`.
+    /// A stale socket gives `ECONNREFUSED`, which has no `ConnectError` member, so it arrives as `Unexpected`.
     pub fn classify(self: Address, err: anyerror) ConnectError {
         return switch (err) {
             error.FileNotFound, error.ConnectionRefused => error.NotListening,
@@ -147,8 +145,7 @@ pub const Listener = struct {
     }
 };
 
-/// One byte below `sun_path`, so the name has room for its closing zero. Never use
-/// `UnixAddress.max_len`: it is a flat 108, unchecked, and `sun_path` is 104 on Darwin.
+/// One byte below `sun_path`'s length, not `UnixAddress.max_len` (a flat, unchecked 108): `sun_path` is 104 on Darwin.
 pub const max_socket_path: usize = sun_path_bytes - 1;
 
 const sun_path_bytes: usize = @typeInfo(@FieldType(std.posix.sockaddr.un, "path")).array.len;
@@ -158,7 +155,7 @@ pub fn unixAddress(path: []const u8) error{PathTooLong}!std.Io.net.UnixAddress {
     return std.Io.net.UnixAddress.init(path) catch error.PathTooLong;
 }
 
-/// Null when the kernel will not say. A TCP peer carries no identity, so it is null.
+/// Null when the kernel won't say; a TCP peer has no identity.
 pub fn peerUid(handle: std.posix.fd_t) ?std.posix.uid_t {
     switch (builtin.os.tag) {
         .linux => {
@@ -174,8 +171,7 @@ pub fn peerUid(handle: std.posix.fd_t) ?std.posix.uid_t {
             );
             if (std.posix.errno(rc) != .SUCCESS) return null;
             if (length != @sizeOf(Ucred)) return null;
-            // A TCP socket does not refuse this call: `getsockopt` succeeds and
-            // fills in a pid of zero and a uid of (uid_t)-1, meaning no credential.
+            // A TCP socket fills in pid 0 instead of refusing: no credential.
             if (credentials.pid == 0) return null;
             if (credentials.uid == std.math.maxInt(u32)) return null;
             return credentials.uid;
@@ -204,7 +200,7 @@ pub fn peerUid(handle: std.posix.fd_t) ?std.posix.uid_t {
     }
 }
 
-/// A peer the kernel will not name is refused: an absent answer is never permissive.
+/// An unnamed peer is refused; absence is never permissive.
 pub fn peerAllowed(uid: ?std.posix.uid_t, owner_uid: std.posix.uid_t) bool {
     const said = uid orelse return false;
     return said == owner_uid;
@@ -244,14 +240,12 @@ pub fn refusalFor(writer: *std.Io.Writer, address: Address, err: Address.Connect
     }
 }
 
-/// The wire's own number, never the program's. It moves when a client built
-/// against the old number would misread the new one, and at no other time.
+/// The wire's number, not the program's: moves only on a breaking change.
 pub const protocol_version: u32 = 1;
 
 pub const protocol_name = "chock-control";
 
-/// The client speaks first and waits. A daemon that closes a connection with a
-/// request still unread sends a reset, and a reset discards what it already wrote.
+/// The client speaks first: closing with the request unread sends a reset, discarding what was written.
 pub const Greeting = struct {
     version: u32 = protocol_version,
 
@@ -290,8 +284,7 @@ pub const Greeting = struct {
     }
 };
 
-/// Equal, and nothing else. A window of numbers promises this build was run
-/// against every number in it, and it never was.
+/// Equal, nothing else: a version window would promise untested compatibility.
 pub fn accepts(ours: u32, theirs: u32) bool {
     return ours == theirs;
 }
@@ -312,8 +305,7 @@ pub const HandshakeError = std.Io.Writer.Error || error{
     StreamTooLong,
 };
 
-/// The check is `accepts` and never the shape of the reply: a real `pcscd` answers
-/// a version mismatch with a success code, which a status check reads as agreement.
+/// Checks `accepts`, never the reply's shape: a real `pcscd` answers a mismatch with a success code.
 pub fn handshake(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
@@ -388,8 +380,7 @@ pub const Verb = enum {
     answer,
 };
 
-/// `read` is space separated and the rest are tab separated. Both spellings are
-/// fixed: `src/detach.zig` already speaks them.
+/// `read` is space separated, the rest tab separated; `src/detach.zig` already speaks them.
 pub const Request = union(Verb) {
     start: Start,
     adopt: Adopt,
@@ -403,15 +394,11 @@ pub const Request = union(Verb) {
 
     pub const Start = struct { project: []const u8, message: []const u8 };
     pub const Adopt = struct { project: []const u8, session: []const u8 };
-    /// A session with a log and nothing running. For a caller that has to name a
-    /// session before it has anything to say in it: `session/new` in the agent
-    /// client protocol answers with an identifier and no prompt.
+    /// A session with a log and nothing running, named before there is anything to say.
     pub const Create = struct { project: []const u8 };
-    /// Stop the turn a session is running now. Nothing when it is running none.
+    /// Stops the running turn; a no-op if there is none.
     pub const Cancel = struct { project: []const u8, session: []const u8 };
-    /// One more message in a session that already exists, and the turn it starts.
-    /// `start` makes a session and says something in it at once, which a second
-    /// message cannot do.
+    /// A message in a session that already exists; `start` both creates and speaks.
     pub const Prompt = struct {
         project: []const u8,
         session: []const u8,
@@ -530,7 +517,7 @@ pub const no_verb_text = text: {
     break :text built;
 };
 
-/// Exactly `count` fields: an extra field is refused, never quietly ignored.
+/// Exactly `count` fields; an extra one is refused, not ignored.
 fn field(rest: []const u8, want: usize, count: usize) Request.ParseError![]const u8 {
     var found: usize = 0;
     var start: usize = 0;
@@ -546,8 +533,7 @@ fn field(rest: []const u8, want: usize, count: usize) Request.ParseError![]const
     return answer orelse error.BadArguments;
 }
 
-/// Two members, which is the whole trust boundary of this protocol. A client that
-/// could name `allowed_by_policy` would be forging somebody else's answer.
+/// Two members, the protocol's whole trust boundary: naming `allowed_by_policy` would forge another's answer.
 pub const Answer = enum {
     yes,
     no,
@@ -567,8 +553,7 @@ pub const Answer = enum {
     }
 };
 
-/// Never an alias of a local struct, or a field added locally would change the
-/// wire. Every field has a default, and no default is a pass.
+/// Never alias a local struct, or a local field changes the wire; every field defaults, none a pass.
 pub const SessionRow = struct {
     id: []const u8,
     started_ms: u64 = 0,
@@ -583,10 +568,10 @@ pub const SessionRow = struct {
     output_tokens: u64 = 0,
     amount: f64 = 0,
     currency: []const u8 = "",
-    /// False as soon as one turn could not be priced. The number is not a total.
+    /// False once a turn can't be priced; the number then isn't a total.
     spend_enforceable: bool = true,
     readable: bool = true,
-    /// False when the log could not be read to its end. The numbers are a floor.
+    /// False if the log couldn't be read to its end; the numbers are then a floor.
     complete: bool = true,
     chain: []const u8 = "unreadable",
     chain_events: u64 = 0,
@@ -646,14 +631,14 @@ pub const Reply = union(enum) {
 pub const max_request_bytes: usize = 1024 * 1024;
 
 pub const Feed = struct {
-    /// Inclusive: the first event read back is one the client has, and is dropped.
+    /// Inclusive: the first event back is one the client has, so it's dropped.
     after: u64 = 0,
     ended: bool = false,
     sent: usize = 0,
 
     pub const Error = std.Io.Writer.Error || storage.ReplayError;
 
-    /// Zero is the header line's own byte offset, which is what a verifier wants.
+    /// Zero is the header's own byte offset, what a verifier wants.
     pub fn header(
         self: *Feed,
         io: std.Io,
@@ -704,8 +689,7 @@ pub const Feed = struct {
     }
 };
 
-/// The request is not written until the greeting agreed. `said` points into
-/// `reader`'s own buffer. `each` answers false to stop reading.
+/// The request waits for the greeting. `said` points into `reader`'s buffer; `each` returns false to stop.
 pub fn exchange(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
@@ -721,8 +705,7 @@ pub fn exchange(
     try writer.flush();
 
     while (true) {
-        // `takeDelimiter` and never `takeDelimiterExclusive`: the exclusive one
-        // stops before the line break, so a second call gives an empty line for ever.
+        // Never `takeDelimiterExclusive`: it stops before the break, looping on an empty line.
         const line = (try reader.takeDelimiter('\n')) orelse return;
         const reply = Reply.parse(std.mem.trimEnd(u8, line, "\r")) catch continue;
         if (!try each(context, reply)) return;
@@ -1207,8 +1190,7 @@ test "a daemon that is not running is a plain refusal that names what to do" {
 }
 
 test "a daemon somebody stopped reads as one that is not listening" {
-    // Driven through `classify` and not a real refused connect: a refused unix
-    // connect makes the standard library print a stack trace on standard error.
+    // Driven through `classify`: a real refused unix connect prints a stack trace to stderr.
     const unix = Address{ .unix = "/run/user/1000/chock/daemon.sock" };
     const ip = Address{ .ip = .{ .host = "127.0.0.1", .port = 7373 } };
 
@@ -1230,8 +1212,7 @@ test "the socket path is under the state directory and nowhere near a project" {
     try testing.expectEqualStrings("/home/ross/.local/state/chock/" ++ socket_name, path);
 }
 
-/// A directory below `TMPDIR`, because `std.testing.tmpDir` puts its directory
-/// below the build directory, which on macos in a Nix build is already too long.
+/// Below `TMPDIR`: `std.testing.tmpDir`'s own path is already too long on macOS in a Nix build.
 const BoundBench = struct {
     parent: std.Io.Dir,
     sub: [sub_len]u8,
@@ -1280,8 +1261,7 @@ const BoundBench = struct {
 };
 
 test "the daemon binds and is reached at exactly the bound, and refuses one byte more" {
-    // Both ends, because `std` copies the path into `sun_path` at both. A wrong
-    // bound passes here on Linux and ends the test binary on Darwin.
+    // Both ends: a wrong bound passes here on Linux and ends the test binary on Darwin.
     const io = testing.io;
 
     var bench = try BoundBench.open(io);
@@ -1323,7 +1303,6 @@ test "the refusal a person reads names this platform's own bound and not 108" {
 }
 
 test "the bound always leaves room inside sun_path for the closing zero" {
-    // Strict: `std` copies past the end of a 104 byte `sun_path` for a path of 105
-    // to 108, and a path that fills the field can be named only without a terminator.
+    // Strict: a path that fills a 104 byte `sun_path` can be named only without a terminator.
     try testing.expect(max_socket_path < sun_path_bytes);
 }

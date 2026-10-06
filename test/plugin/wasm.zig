@@ -1,9 +1,5 @@
-//! The plugin the project ships, read back out of the real
-//! `wasm32-freestanding` module that `build.zig` builds. Tests of a refusal
-//! reach it by changing one thing in that module.
-//!
-//! Nothing here runs the plugin. The engine lives in the plugin host process,
-//! which `test/plugin/engine.zig` drives.
+//! Reads the plugin the project ships back out of the real wasm module that
+//! `build.zig` builds. Nothing here runs the plugin. See `test/plugin/engine.zig`.
 
 const std = @import("std");
 const chock_core = @import("chock-core");
@@ -29,9 +25,7 @@ fn readModule(gpa: std.mem.Allocator) ![]u8 {
     );
 }
 
-/// The magic word can appear by chance in half a megabyte of debug information,
-/// so the first candidate the blob reader accepts wins. The host does not search
-/// like this: it resolves the address the `chock_plugin_metadata` global holds.
+/// Finds the metadata blob by scanning for the magic word. The host resolves it from the global instead.
 fn findBlob(module: []const u8) !usize {
     var magic_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &magic_bytes, core.Magic.word, .little);
@@ -119,9 +113,7 @@ test "the two roads to the blob meet at the same bytes" {
 }
 
 test "the real linker exports the metadata as a global holding an address" {
-    // On wasm32 the linker turns a data export into an exported global whose
-    // value is the address, not into the bytes. The export section comes before
-    // every custom section, so the first time the name appears is that section.
+    // On wasm32 the linker exports a data symbol as a global holding its address, not its bytes.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
 
@@ -160,7 +152,6 @@ test "a real module built for another plugin ABI is refused with both numbers" {
     const blob_at = try findBlob(module);
 
     // The `chock_plugin_magic` global holds the four bytes in front of the blob.
-    // Asserted, so a linker that lays the two out differently fails here.
     try testing.expectEqual(
         @as(u32, @intFromEnum(core.AbiVersion.current)),
         std.mem.readInt(u32, module[blob_at - 4 ..][0..4], .little),
@@ -274,8 +265,7 @@ test "a file of the right length full of zeros is not a plugin" {
 }
 
 test "a real module that exports no chock_plugin_magic is not a Chock plugin" {
-    // The name is replaced everywhere it appears, so the debug information
-    // cannot leave a copy behind for a search to find.
+    // Replaced everywhere it appears, so debug information cannot leave a copy for the search to find.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
 
@@ -372,8 +362,6 @@ test "the real plugin's tool is refused by policy like any other action" {
 }
 
 test "a real module whose tool is named after a built-in fails to load entirely" {
-    // A fresh blob goes over the one the module carries. The reader reads only
-    // the length the blob states, so leftover bytes behind it change nothing.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
     const blob_at = try findBlob(module);
@@ -394,8 +382,7 @@ test "a real module whose tool is named after a built-in fails to load entirely"
     };
     defer testing.allocator.free(blob);
 
-    // `glob` is shorter than `hello`, so the new blob fits in place. A module
-    // that had to grow would need its segment and section lengths rewritten.
+    // `glob` is shorter than `hello`, so the new blob fits without rewriting section lengths.
     const was = std.mem.readInt(u32, module[blob_at + core.Prefix.total_len_offset ..][0..4], .little);
     try testing.expect(blob.len < was);
     @memcpy(module[blob_at..][0..blob.len], blob);

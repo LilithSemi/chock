@@ -1,6 +1,5 @@
 //! Why the broker refused an act, or could not carry one out. A library must
-//! not decide what a person sees, so nothing here prints. Some variants own
-//! memory and the rest borrow from the `Ask` the caller holds for the call.
+//! not decide what a person sees, so nothing here prints.
 
 const std = @import("std");
 
@@ -150,10 +149,7 @@ pub const Diagnostic = union(enum) {
         path: []const u8,
     };
 
-    /// Every variant is named here and there is no `else`, so a variant added
-    /// later must say whether it owns memory. An `else` once folded a
-    /// `@tagName` pointer into `.rodata` in with a copied name, and `gpa.free`
-    /// on the literal ended the process.
+    /// No `else`: a variant added later must say whether it owns memory.
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .git_refused_a_description,
@@ -186,7 +182,6 @@ pub const Diagnostic = union(enum) {
                 gpa.free(about.path);
             },
 
-            // Every one below owns nothing.
             .path_read_failed,
             .scratch_store_unreadable,
             .scratch_store_walk_failed,
@@ -396,8 +391,6 @@ pub const Diagnostic = union(enum) {
                 "the connection to {s} on port {d} did not open",
                 .{ about.host, about.port },
             ),
-            // The agent is told a different sentence for the same refusal: see
-            // `chock_broker.fetch.Session.refusalForHost`.
             .fetch_host_not_permitted => |about| {
                 try writer.print("nothing was read from {s}. ", .{about.host});
                 const action = about.action orelse {
@@ -430,9 +423,7 @@ pub const Diagnostic = union(enum) {
     }
 };
 
-/// The first fault is kept, not the last. The answer matters because several
-/// variants own memory: a site that hands one over must release it itself when
-/// the answer is false.
+/// A site that hands one over must release it itself when this answers false.
 pub fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     const slot = out orelse return false;
     if (slot.* != null) return false;
@@ -461,8 +452,7 @@ test "the first fault is kept, and a caller that wants none pays nothing" {
 }
 
 test "a message is released by the allocator that filled it, and by nothing else" {
-    // A dangling read alone often does not fail, because a freed page still
-    // holds the text. It is the invalid free that never passes.
+    // A dangling read can still pass; only the invalid free fails here.
     var debug: std.heap.DebugAllocator(.{ .safety = true }) = .init;
     defer testing.expect(debug.deinit() == .ok) catch @panic("a leak");
     const gpa = debug.allocator();

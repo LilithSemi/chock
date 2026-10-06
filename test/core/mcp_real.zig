@@ -1,10 +1,5 @@
 //! A real third party MCP server, `mcp-server-time`, driven by the production
-//! protocol into the offers a model would be given.
-//!
-//! Not real here: the sandbox. The server is an ordinary child process, so the
-//! mount tree and the seccomp filter go untested.
-//!
-//! An MCP server frames a message with a newline, not a `Content-Length` header.
+//! protocol. The sandbox is not real here. The server runs as an ordinary child.
 
 const std = @import("std");
 const chock_core = @import("chock-core");
@@ -55,8 +50,7 @@ const LockedLog = struct {
         return .{ .backing = try chock_proto.storage.Memory.init(gpa, "01MCPREAL") };
     }
 
-    /// Separate from `init` because the handle points at the storage beside it,
-    /// and a struct returned by value moves.
+    /// Separate from `init`, because the handle points at the storage beside it.
     fn arm(self: *LockedLog, io: std.Io) !void {
         self.store = self.backing.storage();
         self.locked = try self.store.lock(io);
@@ -78,8 +72,7 @@ const RealServer = struct {
             .argv = &.{program},
             .stdin = .pipe,
             .stdout = .pipe,
-            // The server writes validation warnings there, and a pipe nobody
-            // drains fills up and wedges it mid sentence.
+            // An undrained stderr pipe would fill up and wedge the server mid sentence.
             .stderr = .ignore,
         });
         errdefer child.kill(io);
@@ -190,8 +183,7 @@ test "a real tool runs, and its answer reaches the context through the flattenin
 }
 
 test "a real tool that fails is a result, and the server still answers the next call" {
-    // This server answers a bad time zone with a text result and `isError` true,
-    // and not with a JSON-RPC error.
+    // This server answers a bad time zone with a text result and `isError` true, not a JSON-RPC error.
     const program = server_path orelse return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;

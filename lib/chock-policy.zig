@@ -1,7 +1,4 @@
-//! The policy table the broker evaluates, plus the four rules that fold over
-//! it: a parent over a child, an organisation over a project, an agent's own
-//! promise over itself, and a ceiling over a limit. This library imports no
-//! other chock library.
+//! The policy table and evaluation rules.
 
 pub const table = @import("chock-policy/table.zig");
 pub const devices = @import("chock-policy/devices.zig");
@@ -13,11 +10,8 @@ pub const hardening = @import("chock-policy/hardening.zig");
 pub const apply = @import("chock-policy/apply.zig");
 pub const limits = @import("chock-policy/limits.zig");
 pub const instructions = @import("chock-policy/instructions.zig");
-/// The `skills` block: directories a project says its own skills are in.
 pub const skills = @import("chock-policy/skills.zig");
 pub const search = @import("chock-policy/search.zig");
-/// Which way of sandboxing a session uses. **Read from the operator's own file and
-/// never from a project's**, for the reason its own top comment gives.
 pub const sandbox = @import("chock-policy/sandbox.zig");
 pub const secrets = @import("chock-policy/secrets.zig");
 pub const nix = @import("chock-policy/nix.zig");

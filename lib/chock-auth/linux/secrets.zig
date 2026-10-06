@@ -1,37 +1,13 @@
-//! The Linux credential driver: a file in the data directory, mode `0600`,
-//! in a directory `0700`.
-//!
-//! **A file with wider permissions is refused, and the message names the
-//! mode that was found.** A wrong mode is a fault, never a warning: a
-//! credential another account can read is already a credential given away,
-//! and carrying on after saying so would give it away again on the next
-//! turn.
-//!
-//! This file holds values and no metadata. The name, the kind, the base URL,
-//! and the time are in the index `store.zig` keeps, which holds no secret.
+//! The Linux credential driver: a file in the data directory, mode `0600`.
 
 const std = @import("std");
 const store = @import("../store.zig");
 const paths = @import("../paths.zig");
 
-/// The file this driver keeps values in, inside the data directory.
 pub const file_name = "credentials.zon";
 
-/// The lock a writer takes before it reads and rewrites `file_name`.
-///
-/// **This driver holds every value in one file**, so a login for `work` and a
-/// login for `personal` are two writers of the same bytes, and so is the
-/// signing key `chock sessions seal` makes. Without exclusion the second writer
-/// reads the file the first has not written yet and publishes it without the
-/// first one's credential. A name of its own, and not the index's, because
-/// `store.Store.put` holds the index's lock over this whole call: one name for
-/// both would be a lock this process already holds, and `flock` would never
-/// give it back. This one is therefore always taken inside that one, and never
-/// the other way about. See `../lock.zig`.
 pub const lock_file_name = "credentials.lock";
 
-/// The largest credential file this driver accepts. Chock writes it itself,
-/// so this bounds a corrupted file rather than a hostile author.
 pub const max_file_bytes: usize = 1024 * 1024;
 
 const Entry = struct {
@@ -44,8 +20,6 @@ const File = struct {
     credentials: []const Entry = &.{},
 };
 
-/// The driver. `data_dir` is not owned: the caller keeps it alive for as long
-/// as this value is in use.
 pub const Driver = struct {
     data_dir: []const u8,
 
@@ -87,8 +61,6 @@ pub const Driver = struct {
         const file_path = try self.filePath(gpa);
         defer gpa.free(file_path);
 
-        // Held across the read and the write, because the two are one change:
-        // see `store.takeStoreLock`.
         var held = try store.takeStoreLock(gpa, io, self.data_dir, lock_file_name, diag);
         defer held.release(io);
 
@@ -107,9 +79,7 @@ pub const Driver = struct {
 
         const text = try store.serializeZon(gpa, File{ .version = 1, .credentials = list.items });
         defer {
-            // The whole serialized file holds every credential this driver
-            // knows, so the buffer it was built in is wiped before it goes
-            // back to the allocator.
+            // The whole serialized file holds every credential this driver knows, so the buffer it was built in is wiped before it goes back to the allocator.
             std.crypto.secureZero(u8, text);
             gpa.free(text);
         }
@@ -122,9 +92,6 @@ pub const Driver = struct {
     }
 };
 
-/// The whole credential file, or null when there is none. Applies the mode
-/// rule first: a file others can read is refused before a single byte of it
-/// is read.
 fn read(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -133,12 +100,8 @@ fn read(
 ) store.Error!?File {
     var mode_fault: ?paths.Diagnostic = null;
     paths.requirePrivate(io, file_path, &mode_fault) catch |err| switch (err) {
-        // No file at all is "not logged in", the same answer the index gives
-        // for a machine that has never run `chock login`.
         error.CredentialFileMissing => return null,
         error.StatFailed => {
-            // The path is joined into a buffer the caller releases, so the
-            // store's diagnostic keeps its own copy of it.
             if (store.wantsDiagnostic(diag)) {
                 _ = store.note(diag, .{ .credential_file_unreadable = .{
                     .path = try gpa.dupe(u8, file_path),
@@ -190,9 +153,7 @@ fn read(
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => {
-            // **The diagnostics are dropped here on purpose.** They carry the
-            // file's own text, which is the credential, so only the path
-            // travels: say where the fault is and never what is in it.
+            // The diagnostics are dropped here on purpose: they carry the file's own text, which is the credential, so only the path travels and never what is in it.
             if (store.wantsDiagnostic(diag)) {
                 _ = store.note(diag, .{ .credential_file_not_valid = try gpa.dupe(u8, file_path) });
             }
@@ -249,8 +210,6 @@ test "the file this driver writes is mode 0600, and one that others can read is 
     const stat = try std.Io.Dir.cwd().statFile(testing.io, file_path, .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o7777);
 
-    // Widen it by hand, the way a user with an over-helpful `chmod` would,
-    // and the driver refuses to read it at all.
     {
         var file = try std.Io.Dir.openFileAbsolute(testing.io, file_path, .{});
         defer file.close(testing.io);
@@ -260,9 +219,6 @@ test "the file this driver writes is mode 0600, and one that others can read is 
 }
 
 test "a replaced value leaves no copy of the old one in the file" {
-    // The file is rewritten whole, so an old credential must not survive
-    // anywhere in it. A driver that appended instead of replacing would keep
-    // a key the user believes they have rotated away.
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

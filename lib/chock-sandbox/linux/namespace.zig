@@ -4,104 +4,28 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-/// How the sandboxed process reaches the network.
-///
-/// **Every name here states what the process can reach, and no name states how
-/// the kernel does it.** Before 2026-08-24 the first two were called `isolated`
-/// and `brokered`, and the project owner read the first as a network that is
-/// filtered and the second as the one that is cut off, which is the opposite of
-/// what each did. "isolated" describes the namespace and says nothing about
-/// what comes out of it. `none`, `filtered` and `host` answer the one question
-/// a reader has, which is what this process can talk to.
-///
-/// `none` and `filtered` take **the same closed network namespace**. The
-/// difference between them is one descriptor, not one route: see `filtered`.
 pub const Network = enum {
-    /// **Nothing can be reached.** Its own network namespace, with no route out
-    /// and no descriptor to ask on.
-    ///
-    /// This is `Sandbox.Config.network`'s own zero value and what a session gets
-    /// when no rule permits anything under `net`: `src/run.zig` reads
-    /// `policy.wantsRouter()`, which is false for the shipped defaults. A project
-    /// that permits a host gets `filtered` instead.
     none,
-    /// **Only the hosts a policy names can be reached, one connection at a
-    /// time.** Its own network namespace, and a unix socket to the parent. The
-    /// process cannot open a connection. It asks the parent, and the parent
-    /// sends back a connected socket for a host that a policy permits.
-    ///
-    /// **The namespace here is the same one `none` takes, and that is the whole
-    /// point.** A `filtered` process has no route out of its own accord. What
-    /// it has in addition is one descriptor, and one only, on a socket pair
-    /// whose other end is held on the far side of the boundary. See
-    /// `lib/chock-sandbox/linux/netbroker.zig` for the exchange, and
-    /// `Sandbox.Config.net_broker` for who answers it.
-    ///
-    /// **An empty policy is not the same thing as `none`, and a caller must not
-    /// read it as one.** Measured on 2026-08-24, in this tree: making this the
-    /// default of `Sandbox.Config.network` failed 69 tests. `spawn` refuses a
-    /// `filtered` config that names no broker with `error.NetBrokerMissing`,
-    /// before it forks, so every caller that omits one stops running at all.
-    /// The filter below takes `connect` away, which is a second, separate
-    /// change. See `Sandbox.Config.net_broker`.
-    ///
-    /// It is also **stricter than `none` on system calls**, not looser: the
-    /// Linux driver turns on `seccomp.Options.block_connect` for this case, so
-    /// the process cannot aim a granted descriptor at anything else. See that
-    /// option's own comment for the measurement that made it necessary.
     filtered,
-    /// **Everything the host can reach.** The network namespace of the host.
-    /// Nothing is removed. Only the broker gets this, and only for an action
-    /// that the user approved.
     host,
 };
 
 pub const Options = struct {
-    /// Which network the process gets. Defaults to `.none`, so a caller that
-    /// omits this field gets no network, not the host's.
     network: Network = .none,
-    /// Give the process its own mount tree.
     mount: bool = true,
-    /// Map a second user and group, for the processes this driver runs beside
-    /// the call. See `writeIdMaps`, and `buildRoot`'s `hide_other_users` for what
-    /// it is for.
     helper_user: bool = false,
-    /// Whether whoever forked this process writes its maps. **Required for
-    /// `helper_user`**: see `unshareOnly`.
     map_from_parent: bool = false,
 };
 
 pub const Error = error{
-    /// The kernel refused the namespace. A policy can turn off a user namespace for an
-    /// ordinary user. Report this to the user. Do not continue without the layer.
     NotPermitted,
-    /// The caller has more than one thread. The kernel refuses `CLONE_NEWUSER` once a
-    /// process has started a second thread. Call `enter` before starting any other
-    /// thread, or move the call to a fresh single threaded process.
     MultiThreaded,
-    /// A map file could not be written.
     MapFailed,
-    /// The kernel returned an errno that does not match any of the cases above. The
-    /// caller has no specific recovery for this and should report it as a bug.
     Unexpected,
 };
 
-/// Enter the namespaces. The caller must have one thread only, because the kernel
-/// refuses `CLONE_NEWUSER` from a process with more than one thread.
-///
-/// `diag` is filled with the call the kernel refused and the errno it answered.
-/// **Every error out of this function needs it.** `error.NotPermitted` covers a
-/// machine whose policy turns off a user namespace for an ordinary user and a
-/// machine that has run out of them, and `error.MapFailed` covers five separate
-/// calls, so neither name alone says what a person must change. Measured on
-/// 2026-08-25: a CI runner answered `MapFailed`, and the log could not say
-/// which of the three map files, nor whether the open or the write, nor with
-/// what errno. See `probeAvailability`, which asks this same question in a
-/// child and reports the answer.
 pub fn enter(options: Options, diag: ?*?Diagnostic) Error!void {
-    // **Read before the namespace changes.** With no map written yet this process
-    // is the overflow user inside the new namespace, and mapping that identity is
-    // refused: the only one it may map unprivileged is the one it had out here.
+    // Read before the namespace changes: this process can only map the identity it had out here.
     const uid = linux.getuid();
     const gid = linux.getgid();
 
@@ -110,41 +34,17 @@ pub fn enter(options: Options, diag: ?*?Diagnostic) Error!void {
     try writeIdMaps(uid, gid, options.helper_user, diag);
 }
 
-/// The namespaces, and none of the mapping.
-///
-/// **Split out because a range can only be mapped from outside.** The kernel
-/// checks `CAP_SETUID` in the parent namespace against the credential the map
-/// file was opened with, and after this call that credential belongs to the new
-/// namespace, which is not an ancestor of its parent. So a process that wants
-/// more than the one identity it already had asks whoever forked it to write the
-/// map, through `writeIdMapsFor`. Measured in a guest on 2026-09-29: root itself
-/// was refused a range this way round.
 pub fn unshareOnly(options: Options, diag: ?*?Diagnostic) Error!void {
-    // NEWPID and NEWIPC are not optional and have no configuration field, the same
-    // as NEWNET below. Without NEWPID every process the user owns is a legal
-    // signal target, including chockd itself, and prlimit64 and setpriority reach
-    // arbitrary host processes too. Without NEWIPC, System V shared memory,
-    // message queues, and semaphores cross the sandbox boundary in both
-    // directions: host data can be read in, and a sandboxed process can write
-    // into a host segment as a covert channel the network namespace never sees.
+    // NEWPID and NEWIPC are not optional: without them, this process stays a legal signal target and System V IPC crosses the boundary.
     var flags: usize = linux.CLONE.NEWUSER | linux.CLONE.NEWPID | linux.CLONE.NEWIPC;
     if (options.mount) flags |= linux.CLONE.NEWNS;
     switch (options.network) {
-        // **`filtered` takes the same closed namespace as `none`, and it always
-        // will.** The socket to the parent is a descriptor, not a route: a
-        // `filtered` process can still open no connection of its own, which is
-        // exactly what makes asking the parent the only way out. See `Network`.
         .none, .filtered => flags |= linux.CLONE.NEWNET,
         .host => {},
     }
 
     switch (linux.errno(linux.unshare(flags))) {
         .SUCCESS => {},
-        // **Both of these are noted, not only the last case.** `EPERM` is a
-        // policy that refuses an unprivileged user namespace, and `ENOSPC` is
-        // a machine that permits one and has no room for another, because
-        // `max_user_namespaces` or the nesting depth is reached. The two need
-        // different answers from a person and share one error name.
         .PERM, .NOSPC => |err| {
             note(diag, .userns_unshare, err);
             return error.NotPermitted;
@@ -160,17 +60,8 @@ pub fn unshareOnly(options: Options, diag: ?*?Diagnostic) Error!void {
     }
 }
 
-/// Map the user to itself inside the new user namespace. Without a map, the process has
-/// the overflow user and cannot own a file.
-/// How many ids the namespace maps when the helpers get one of their own. The
-/// call keeps the first and every helper takes the second.
 pub const helper_id_offset: u32 = 1;
 
-/// Write the maps of a process that has unshared and is waiting for them.
-///
-/// **Called by whoever forked it, and never by the process itself.** Only a
-/// credential in the parent namespace carries `CAP_SETUID` there, and mapping
-/// more than the one identity the process already had needs it.
 pub fn writeIdMapsFor(
     pid: linux.pid_t,
     uid: linux.uid_t,
@@ -194,15 +85,6 @@ pub fn writeIdMapsFor(
     try writeFile(gid_at.ptr, gid_line, .gid_map_open, .gid_map_write, diag);
 }
 
-/// Map this process's own user and group into the new namespace.
-///
-/// **`helpers` asks for a second of each**, so the processes this driver runs
-/// beside a call can be a user the call is not, and `Mount.Proc.hide_other_users`
-/// then has something to hide. The kernel takes a range only from a namespace
-/// that owns it: a call made by root maps two, and one made by an ordinary user
-/// is refused rather than quietly given one. **That refusal is the point.** A
-/// sandbox that asked to hide its helpers and did not must not run as though it
-/// had.
 pub fn writeIdMaps(
     uid: linux.uid_t,
     gid: linux.gid_t,
@@ -212,8 +94,7 @@ pub fn writeIdMaps(
     var buffer: [64]u8 = undefined;
     const span: u32 = if (helpers) helper_id_offset + 1 else 1;
 
-    // The write to setgroups must happen first. Without it the write to gid_map fails
-    // with EPERM, because a user could otherwise drop a group to gain access.
+    // setgroups must be written first, or the gid_map write fails with EPERM.
     try writeFile("/proc/self/setgroups", "deny", .setgroups_open, .setgroups_write, diag);
 
     const uid_line = std.fmt.bufPrint(&buffer, "{d} {d} {d}", .{ uid, uid, span }) catch unreachable;
@@ -223,15 +104,6 @@ pub fn writeIdMaps(
     try writeFile("/proc/self/gid_map", gid_line, .gid_map_open, .gid_map_write, diag);
 }
 
-// Zig 0.16 moved the hosted file API behind std.Io, and this file already calls the
-// kernel by hand everywhere else, so a map line goes through linux.open/write/close
-// directly rather than pull std.Io into a namespace module.
-//
-// `open_call` and `write_call` name the two halves separately, because they fail
-// for different reasons: an open that is refused is a `/proc` this process may
-// not write, and a write that is refused is a mapping the parent user namespace
-// does not hold. `error.MapFailed` alone cannot tell a reader which happened,
-// and this one function serves all three map files.
 fn writeFile(
     path: [*:0]const u8,
     contents: []const u8,
@@ -247,55 +119,29 @@ fn writeFile(
     const fd: i32 = @intCast(fd_rc);
     defer _ = linux.close(fd);
 
-    // One write must carry the whole line. The kernel refuses a partial map line.
     const written = linux.write(fd, contents.ptr, contents.len);
     if (linux.errno(written) != .SUCCESS) {
         note(diag, write_call, linux.errno(written));
         return error.MapFailed;
     }
-    // The kernel takes a map line whole or not at all, so a short write is a
-    // fault of its own with no errno behind it. `EIO` stands for it, the same
-    // way `makeNoticeFile` names a write of zero bytes, so the record carries
-    // a reason rather than the zero that means "nothing was carried this far".
+    // The kernel takes a map line whole or not at all, so a short write is reported as a fault, not a retry.
     if (written != contents.len) {
         note(diag, write_call, .IO);
         return error.MapFailed;
     }
 }
 
-/// Whether this machine lets an ordinary user build the namespaces `enter`
-/// takes, and, when it does not, which call the kernel refused and with what
-/// errno.
-///
-/// **`unknown` is not a pass and must never be read as one.** It says the
-/// question was asked and no answer came back, which is a different fact from
-/// both `ok` and `unavailable`. A caller that folds it into either one reports
-/// a measurement it does not have. The same rule the whole project follows: a
-/// check that was not made is never a pass.
 pub const Availability = union(enum) {
-    /// A child really entered the namespaces. Every layer above them can be
-    /// built on this machine.
     ok,
-    /// The kernel refused, and this is the call and the errno it refused with.
     unavailable: Diagnostic,
-    /// The probe itself could not run to an answer.
     unknown: Unknown,
 
-    /// Why no answer came back. Never a reason the kernel gave. Every one of
-    /// these is the probe's own machinery.
     pub const Unknown = enum {
-        /// The pipe the child answers on could not be made.
         pipe_failed,
-        /// The child could not be started.
         fork_failed,
-        /// The child ended by a signal, or could not be reaped.
         child_died,
-        /// The child ended, and what it left on the pipe does not read as an
-        /// answer. Refused rather than guessed at, the same way
-        /// `readSetupReport` in the driver refuses a short record.
         unreadable_answer,
 
-        /// What happened, as a phrase that reads after "the probe ".
         pub fn text(self: Unknown) []const u8 {
             return switch (self) {
                 .pipe_failed => "could not make the pipe its answer comes back on",
@@ -306,7 +152,6 @@ pub const Availability = union(enum) {
         }
     };
 
-    /// True only when a child really entered the namespaces.
     pub fn available(self: Availability) bool {
         return self == .ok;
     }
@@ -320,47 +165,13 @@ pub const Availability = union(enum) {
     }
 };
 
-/// The exit status a helper program uses to say "this machine would not give
-/// me a sandbox, so nothing here was measured".
-///
-/// **It is not a pass and not a failure.** Every helper program in this
-/// project's own suite already reports what it measured through its exit
-/// status, and each one has a scheme of its own. This number is the one value
-/// they all share, so a suite can tell "the boundary held" from "the boundary
-/// was never reached" without reading text. The caller that reads it must skip
-/// and say why, and must never count it as a boundary that held.
-///
-/// 63 is far outside every scheme in use, so a number a helper already answers
-/// cannot be mistaken for this one.
 pub const nothing_measured_exit_status: u8 = 63;
 
-/// The answer the probe's child sends back. Fixed size, and always written by
-/// one `write` call far below `PIPE_BUF`, so the kernel carries it whole. The
-/// same shape, and for the same reason, as `SetupFailureRecord` in the driver.
 const ProbeRecord = extern struct {
     call: u8,
     errno: i32,
 };
 
-/// Ask the kernel whether the namespaces can be entered on this machine.
-///
-/// **A child, because entering a user namespace cannot be undone.** A process
-/// gets one `enter`, and every layer the caller is about to build sits on it,
-/// so asking in this process would spend the very thing the caller needs.
-/// `../darwin/seatbelt.zig`'s own `nestingWorks` forks for the same class of
-/// reason, and reads its answer off an exit status because one bit is all it
-/// needs. Two facts identify a fault here, the call and the errno, so the
-/// child sends a record back on a pipe and the exit status only says whether
-/// there is one to read.
-///
-/// **The child asks exactly what `spawn` asks**, with the default options,
-/// which is the user, pid, ipc, mount and network namespaces together. A
-/// smaller question could answer `ok` for a machine that then refuses the
-/// sandbox.
-///
-/// A second thread in the caller costs nothing here: `fork` gives the child one
-/// thread, whatever the parent had, so this is answerable from a process that
-/// could not call `enter` itself.
 pub fn probeAvailability() Availability {
     var fds: [2]i32 = undefined;
     if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) {
@@ -378,8 +189,6 @@ pub fn probeAvailability() Availability {
         _ = linux.close(fds[0]);
         var diag: ?Diagnostic = null;
         if (enter(.{}, &diag)) |_| {
-            // Nothing on the pipe, and a zero status. The two together are
-            // what the parent reads as `ok`.
             std.process.exit(0);
         } else |_| {
             if (diag) |d| {
@@ -416,15 +225,6 @@ pub fn probeAvailability() Availability {
     return readAnswer(linux.W.EXITSTATUS(status), buffer[0..filled]);
 }
 
-/// Turn what the child left behind into the answer.
-///
-/// A function of its own, with no syscall in it, so the branch a healthy
-/// machine never takes can still be driven by a test. `exit_code` is null when
-/// the child did not exit normally.
-///
-/// **Only one shape reads as `ok`**: nothing on the pipe and a zero status. A
-/// record with a zero status, or a status with no record, is two halves that
-/// disagree, and a disagreement is reported rather than resolved.
 fn readAnswer(exit_code: ?u32, bytes: []const u8) Availability {
     const code = exit_code orelse return .{ .unknown = .child_died };
     if (code == 0 and bytes.len == 0) return .ok;
@@ -433,9 +233,7 @@ fn readAnswer(exit_code: ?u32, bytes: []const u8) Availability {
     }
 
     const record = std.mem.bytesToValue(ProbeRecord, bytes[0..@sizeOf(ProbeRecord)]);
-    // Read with `fromInt` and never with `@enumFromInt`: these bytes came over
-    // a pipe, and a number that names no call is dropped rather than turned
-    // into an invalid tag.
+    // fromInt, not @enumFromInt: these bytes came over a pipe, and an unknown tag is dropped rather than turned into a crash.
     const call = std.enums.fromInt(Diagnostic.Call, record.call) orelse
         return .{ .unknown = .unreadable_answer };
     const errno = std.enums.fromInt(linux.E, record.errno) orelse
@@ -444,22 +242,14 @@ fn readAnswer(exit_code: ?u32, bytes: []const u8) Availability {
 }
 
 test "the probe reads the child's answer, and never reads silence as a pass" {
-    // **Every branch here is one a healthy machine never takes.** On a machine
-    // where the namespaces work, `probeAvailability` answers `ok` and proves
-    // nothing about the four answers below, which are exactly the ones that
-    // decide whether a suite skips. A skip that has only ever been seen not
-    // firing is not proved, so the decision is a function with no syscall in
-    // it and it is driven directly.
     const record = ProbeRecord{
         .call = @intFromEnum(Diagnostic.Call.uid_map_write),
         .errno = @intFromEnum(linux.E.PERM),
     };
     const record_bytes = std.mem.asBytes(&record);
 
-    // The one shape that is a pass: the child exited zero and said nothing.
     try std.testing.expect(readAnswer(0, &.{}).available());
 
-    // The CI failure of 2026-08-25, as this now reports it.
     const refused = readAnswer(1, record_bytes);
     try std.testing.expect(!refused.available());
     try std.testing.expectEqual(Diagnostic.Call.uid_map_write, refused.unavailable.call);
@@ -471,14 +261,10 @@ test "the probe reads the child's answer, and never reads silence as a pass" {
         try std.fmt.bufPrint(&line_buffer, "{f}", .{refused}),
     );
 
-    // A child that was killed measured nothing. **Not a pass**, and not a
-    // refusal either: neither fact is in evidence.
     const died = readAnswer(null, &.{});
     try std.testing.expect(!died.available());
     try std.testing.expectEqual(Availability.Unknown.child_died, died.unknown);
 
-    // The two halves that disagree. A status with no record, and a record with
-    // a status that says the child succeeded.
     try std.testing.expectEqual(
         Availability.Unknown.unreadable_answer,
         readAnswer(1, &.{}).unknown,
@@ -488,8 +274,6 @@ test "the probe reads the child's answer, and never reads silence as a pass" {
         readAnswer(0, record_bytes).unknown,
     );
 
-    // A truncated record, and a number that names no call. Both are dropped
-    // rather than read as some other fault.
     try std.testing.expectEqual(
         Availability.Unknown.unreadable_answer,
         readAnswer(1, record_bytes[0 .. record_bytes.len - 1]).unknown,
@@ -502,16 +286,10 @@ test "the probe reads the child's answer, and never reads silence as a pass" {
 }
 
 test "the probe answers for this machine, and asks in a child that is spent by asking" {
-    // The positive branch, and the one property that makes the probe usable at
-    // all: it can be called twice. A probe that entered the namespaces in this
-    // process would answer once and leave the caller with nothing to build on.
     const first = probeAvailability();
     const second = probeAvailability();
     try std.testing.expectEqual(std.meta.activeTag(first), std.meta.activeTag(second));
 
-    // This process can still enter a namespace of its own afterwards, which is
-    // what "the child is spent, not this process" means. Asked in a child,
-    // because a test binary has more than one thread and `enter` refuses that.
     if (!first.available()) return error.SkipZigTest;
     const fork_rc = linux.fork();
     try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
@@ -535,34 +313,22 @@ test "an id map line maps one id to itself" {
 }
 
 test "the first fault is kept, and a caller that wants none pays nothing" {
-    // **The first, not the last.** A pivot can only fail after a mount tree
-    // that did not, so a later call overwriting an earlier one would replace
-    // the fault that explains the run with the fault it caused.
     var diag: ?Diagnostic = null;
     note(&diag, .mount_call, .PERM);
     note(&diag, .pivot_root, .NOENT);
     try std.testing.expectEqual(Diagnostic.Call.mount_call, diag.?.call);
     try std.testing.expectEqual(linux.E.PERM, diag.?.errno);
 
-    // A caller that asked for no diagnostic is the ordinary case, and it must
-    // reach no store at all rather than write into a scratch value.
     note(null, .pivot_root, .NOENT);
 }
 
 test "a diagnostic names the call and the errno, and allocates nothing" {
-    // The two facts `error.Unexpected` throws away. Rendering happens here, at
-    // a caller with a buffer, because the sites that fill one run in the child
-    // after `clone` where there is no allocator.
     var buffer: [128]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{f}", .{
         Diagnostic{ .call = .overlay_mount, .errno = .NODEV },
     });
     try std.testing.expectEqualStrings("the overlay mount failed: NODEV", line);
 
-    // **No two calls read the same.** That is the fact worth pinning: a
-    // reader has to be able to tell which one failed. An underscore is not
-    // the test, because `mount_setattr` and `pivot_root` are what those calls
-    // are really named and spelling them any other way would help nobody.
     const calls = std.enums.values(Diagnostic.Call);
     for (calls, 0..) |call, i| {
         try std.testing.expect(call.text().len > 0);
@@ -572,39 +338,18 @@ test "a diagnostic names the call and the errno, and allocates nothing" {
     }
 }
 
-/// One entry in the sandbox's own mount tree. Every entry describes a mount.
-/// None of them perform one. `buildRoot` is the only place that ever calls
-/// `mount(2)`, so a caller can build a full mount list, including an overlay
-/// entry, from an ordinary, unprivileged process, and hand it to
-/// `Sandbox.spawn` without ever entering a namespace itself.
 pub const Mount = union(enum) {
-    /// `source`, a path outside the sandbox, appears at `target` inside it.
     bind: Bind,
-    /// An overlayfs mount, merging a read only lower layer and a read write
-    /// upper layer at `target`. See `Overlay`'s own doc comment.
     overlay: Overlay,
-    /// A fresh procfs, showing this sandbox's own processes and no other.
-    /// See `Proc`'s own doc comment.
     proc: Proc,
-    /// One file whose bytes must not be inside the sandbox at all. See
-    /// `Deny`'s own doc comment.
     deny: Deny,
 
     pub const Bind = struct {
-        /// The path outside the sandbox.
         source: []const u8,
-        /// The path inside the sandbox. Chock uses the real path of the
-        /// project, so that a path in a compiler message is a path the user
-        /// can open.
         target: []const u8,
         read_only: bool = false,
     };
 
-    /// A project with no git of its own gets an overlayfs mount instead of a
-    /// worktree. `lower` stays read only, and
-    /// every write lands in `upper`, with `work` as overlayfs's own scratch
-    /// directory. `target` is where the merged view appears inside the
-    /// sandbox, the project's own real path.
     pub const Overlay = struct {
         lower: []const u8,
         upper: []const u8,
@@ -612,186 +357,25 @@ pub const Mount = union(enum) {
         target: []const u8,
     };
 
-    /// A fresh procfs at `target`, and never the host's own.
-    ///
-    /// **An ordinary program assumes `/proc` exists**, the same assumption the
-    /// `/dev/null` bind mount in `lib/chock-core/tools.zig` already answers.
-    /// Measured on 2026-08-21: `zig build-exe` inside the sandbox answers
-    ///
-    ///   error: unable to find zig self exe path: FileNotFound
-    ///
-    /// because a compiler reads `/proc/self/exe` to find its own installation,
-    /// and Python, Perl and Go each read something under `/proc` for the same
-    /// class of reason. So without this no real toolchain runs here at all.
-    ///
-    /// **It shows this sandbox's own processes and no other.** `enter` always
-    /// takes a PID namespace, and a procfs mounted inside one lists only the
-    /// processes of that namespace. So this is not a window onto the host: it
-    /// is the sandbox looking at itself. `test/sandbox/escape.zig` holds the
-    /// test that says so.
-    ///
-    /// Mounted read only, with `nosuid`, `nodev` and `noexec`, because nothing
-    /// a tool call does needs to write a kernel interface, and `/proc/sys` is
-    /// the part of this tree with real reach.
-    ///
-    /// **The global files that describe the host read empty.** See
-    /// `masked_proc_entries`. The process list needs nothing of the kind: a
-    /// procfs mounted inside a PID namespace lists that namespace's own
-    /// processes and no other.
     pub const Proc = struct {
         target: []const u8 = "/proc",
     };
 
-    /// One file the sandbox must not hold the bytes of. `target` is the path
-    /// inside the sandbox, and there is no source: `buildRoot` binds
-    /// `deny_notice` over it instead, the same mechanism `maskProcEntries`
-    /// already uses for `/proc`.
-    ///
-    /// **This is the only layer that keeps a secret out of a tool call, and
-    /// the reason is one sentence: bytes that never enter the process cannot
-    /// be missed.** `lib/chock-core/redact.zig` searches an outbound request
-    /// for a value it already knows, which helps with an accident and stops no
-    /// attack, because an agent that can read a file can also spell it out one
-    /// character at a time. A mount is not a filter. There is nothing left to
-    /// find.
-    ///
-    /// **Landlock cannot do this and never will.** Landlock rights accumulate
-    /// on a nested path and are never narrowed by a wider rule, so a file
-    /// under a read write project directory cannot be subtracted from it. See
-    /// `lib/chock-workspace/Workspace.zig`, which writes the same rule down
-    /// beside the rules it builds.
-    ///
-    /// **A denied path always exists inside the sandbox, and it reads as
-    /// `deny_notice`.** It cannot be made absent: a bind mount covers a path,
-    /// and no unprivileged operation removes one name from a directory that is
-    /// itself a mount of the project. So the choice is what the covering file
-    /// holds, and an empty file is the one answer that must not be given: an
-    /// agent that reads an empty `.env` concludes the project has no
-    /// configuration and acts on that, which costs many turns. A line that
-    /// says what happened costs one.
-    ///
-    /// **A file only, never a directory.** `buildRoot` refuses a target that
-    /// is a directory with `error.DenyTargetIsDirectory` rather than covering
-    /// it with something. A bind of an empty directory would read as "this
-    /// project keeps no credentials here", which is the same confusion an
-    /// empty file makes, with no place to put a line of text that corrects it.
-    /// `lib/chock-workspace/deny.zig` refuses a directory earlier still, when
-    /// it reads the project's own list, so this refusal is for the path that
-    /// became a directory after that read.
-    ///
-    /// **A target that does not exist yet is created, empty, and then
-    /// covered.** So a project that denies a file it does not have today is
-    /// still protected on the day it makes one, and the protection does not
-    /// depend on a race between the mount and the file. See
-    /// `applyDenyMounts` for what that leaves behind.
     pub const Deny = struct {
-        /// The path inside the sandbox, absolute, naming one file.
         target: []const u8,
     };
 };
 
-/// What a denied path holds inside the sandbox. See `Mount.Deny` for why this
-/// is a sentence and not an empty file.
-///
-/// **It names no policy file.** This library reads no `chock.zon` and imports
-/// no other chock library, so the words here say
-/// what is true of the mount alone. `lib/chock-core/tools.zig` is the layer
-/// that knows which block of which file asked for this, and its own refusal
-/// names both.
 pub const deny_notice = "chock: this file is denied by the project. Its bytes are not in this sandbox.\n";
 
-/// The name of the file every deny mount is a bind of. It exists only while
-/// `applyDenyMounts` runs, under the sandbox root, and the name is gone before
-/// anything runs inside the sandbox. Separate from
-/// `proc_mask_source_name` because the two hold different bytes.
 const deny_notice_source_name = ".chock-denied";
 
-/// A writable area the sandbox owns, held in memory, with a hard cap on how
-/// much it can hold. **This is the only capacity limit an unprivileged process
-/// can put on a filesystem**, and it is the answer to the one row of
-/// `rlimits.zig`'s own table that used to say "not solved".
-///
-/// ## Why a tmpfs, and why nothing else
-///
-/// `RLIMIT_FSIZE` bounds **one file**. Ten thousand files of one byte each
-/// still fill a filesystem, and a filesystem that fills breaks the machine for
-/// everything else on it, including the session log that is supposed to
-/// explain what happened. Of the ways to bound total bytes:
-///
-/// * **An XFS or ext4 project quota needs privilege.** Chock has none.
-/// * **A loopback image needs a loop device.** Chock cannot make one.
-/// * **The cgroup `io` controller bounds bandwidth, not capacity.** A slow
-///   writer still fills a disk, only later.
-/// * **A tmpfs with a `size=` option needs nothing at all**, inside the mount
-///   namespace the sandbox already takes. Measured on 2026-08-22, on Linux
-///   6.18.42, in exactly the namespace shape `enter` makes, with the invoking
-///   uid mapped to itself and never to root: the mount succeeded, its root
-///   came out owned by that same uid, and a write past the cap answered
-///   `ENOSPC`.
-///
-/// ## The bound this shares with `memory.max`, which a later reader must not
-/// raise on its own
-///
-/// **A tmpfs page is a memory page, and it is charged to the cgroup of
-/// whichever process dirtied it.** So the capacity of these areas comes out of
-/// the same budget `rlimits.default_memory_bytes` names, and a tmpfs as large
-/// as that budget turns a full disk into an out of memory kill.
-///
-/// Measured on 2026-08-22, with `memory.max` at 128 MiB and one program
-/// filling a tmpfs one page at a time:
-///
-/// * tmpfs `size=64M`: filled to exactly 64 MiB, stopped with `ENOSPC`, exited
-///   0, and `memory.events` counted no kill.
-/// * tmpfs `size=96M`: the same, cleanly.
-/// * tmpfs `size=120M`: the same, cleanly.
-/// * tmpfs `size=128M`, equal to `memory.max`: **killed with `SIGKILL`**, and
-///   `memory.events` counted `oom_kill 1`.
-/// * tmpfs `size=160M`: the same kill.
-///
-/// So the two numbers are one decision and not two.
-/// `rlimits.default_scratch_bytes` sits far below
-/// `rlimits.default_memory_bytes` on purpose, and
-/// `rlimits.Limits.scratchFitsUnderMemory` is that rule written down, with a
-/// test that fails if a later reader raises one number and not the other.
-///
-/// ## A page is the smallest thing a file can cost
-///
-/// Measured on the same machine, whose pages are 64 KiB: a tmpfs of `size=16M`
-/// held **256 files**, and it held 256 of them whether each one carried 1 byte,
-/// 4096 bytes or 65536 bytes. A file costs a whole page whatever is in it, so
-/// the number of files an area holds is its cap divided by the page size, and a
-/// machine with 4 KiB pages holds sixteen times as many files in the same cap
-/// as this one does. **A number of files is never the thing to reason about
-/// here. A number of bytes is.**
-///
-/// ## What is mounted, and what is deliberately not
-///
-/// `nosuid` and `nodev`, because nothing a tool call writes into a scratch area
-/// has any business being a set-user-ID binary or a device node.
-///
-/// **Not `noexec`, and that is a decision.** A scratch area stands in for
-/// `TMPDIR`, and an ordinary build writes a program there and runs it: a
-/// `configure` script and `libtool` both do. `noexec` would refuse that and buy
-/// nothing, because the workspace beside it is writable and is not `noexec`
-/// either, so a program that wants to run what it just wrote already can.
 pub const Scratch = struct {
-    /// The path inside the sandbox. Created by `mountScratch` if it is not
-    /// there, the same way a mount target is.
     target: []const u8,
 };
 
-/// `TMPFS_MAGIC` from `uapi/linux/magic.h`. `scratchIsFull` reads it so that a
-/// full **host** filesystem, reached through some path this code did not mount,
-/// can never be reported as one of the sandbox's own areas.
 pub const tmpfs_magic: u64 = 0x01021994;
 
-/// The kernel's `struct statfs`, for the one call `scratchIsFull` makes. Zig's
-/// standard library declares neither the type nor the call, so the ABI is
-/// written out here by hand from the kernel's own `asm-generic/statfs.h`, the
-/// same way `MountAttr` below is.
-///
-/// This is the 64 bit layout. Every target this project builds for is 64 bit,
-/// where `fstatfs` and `fstatfs64` carry the same structure.
 const Statfs = extern struct {
     f_type: u64,
     f_bsize: u64,
@@ -807,95 +391,24 @@ const Statfs = extern struct {
     f_spare: [4]u64,
 };
 
-/// The faults `buildRoot`, `pivotInto`, and their private helpers can return.
 pub const MountError = error{
-    /// The kernel refused a mount, a path creation, or a pivot for lack of
-    /// privilege.
     NotPermitted,
-    /// The allocator could not satisfy a request. This is our own bug, the same
-    /// as anywhere else `OutOfMemory` shows up in hosted code, not a kernel fault.
     OutOfMemory,
-    /// A mount's source path does not exist, so its type cannot be read to decide
-    /// whether the target should be a file or a directory.
     SourceMissing,
-    /// `mount_setattr` needs kernel 5.12 or later. An older kernel returns ENOSYS.
-    /// A read only mount cannot be made on this host, and the sandbox must not
-    /// start and silently drop that protection instead.
     KernelTooOld,
-    /// The running kernel does not support an unprivileged overlay mount
-    /// inside a user namespace, or the caller has not entered one yet.
-    /// Rootless overlayfs needs kernel 5.11 or later. Reported plainly,
-    /// never a silent fall back to a bind mount or a plain copy.
     OverlayNotSupported,
-    /// A `Mount.Deny` names a path that is a directory inside the sandbox. See
-    /// `Mount.Deny` for why a directory is refused instead of covered, and
-    /// `lib/chock-workspace/deny.zig` for the earlier refusal that catches
-    /// almost every one of these before a sandbox is ever built.
-    ///
-    /// **The sandbox does not start.** A tool call that ran with the denial
-    /// dropped would read the very bytes the project asked to keep out, so the
-    /// only safe answer is to refuse the call.
     DenyTargetIsDirectory,
-    /// A `Mount.Deny` names a path that is a symbolic link, or that changed
-    /// into one between `pinDenyTarget`'s own check and its use, inside the
-    /// sandbox. `mount` follows a symbolic link, and `deny_read` is the one
-    /// project supplied path in the whole mount tree, so a link aimed
-    /// outside the project would move the denial's own bind mount there
-    /// instead of covering anything inside it. Refused rather than followed.
-    ///
-    /// **The sandbox does not start**, for the same reason
-    /// `DenyTargetIsDirectory` does not let one through either.
     DenyTargetIsSymlink,
-    /// A bind mount's own source is a symbolic link, or changed into one
-    /// between `pinBindSource`'s own check and its use. `mount` follows a
-    /// symbolic link, and a bind source such as `chock.zon` is read out of
-    /// the agent's own checkout, a tree the agent can write to between tool
-    /// calls: a project with no `chock.zon` gets none, an agent can
-    /// `ln -s <host path> chock.zon` there, and the next tool call would
-    /// have bound that host path into the sandbox in its place. Refused
-    /// rather than followed, the same answer `DenyTargetIsSymlink` gives for
-    /// the same shape of fault on a denied path.
-    ///
-    /// **The sandbox does not start**, for the same reason the two faults
-    /// above do not let one through either.
     BindSourceIsSymlink,
-    /// A bind mount's own target, inside the sandbox, is a symbolic link.
-    /// Most targets are made fresh under a root this file controls, but a
-    /// target such as `chock.zon` or `.git` is one path component under a
-    /// directory an earlier bind in the same list already covered with the
-    /// agent's own checkout, so the name `makeFile` opens can be a link the
-    /// agent placed there. `open` without `O_NOFOLLOW` would follow it and
-    /// bind the mount onto whatever host path the link names instead of the
-    /// file the project meant to cover. Refused rather than followed.
-    ///
-    /// **The sandbox does not start**, for the same reason every other
-    /// symlink fault above does not let one through either.
     BindTargetIsSymlink,
-    /// The kernel returned an errno with no specific recovery. Reported as a bug.
     Unexpected,
 };
 
-/// Which call the kernel refused, and what it answered.
-///
-/// **`error.Unexpected` alone throws away the only two facts that identify the
-/// fault.** Before this type, every one of those sites printed the errno to the
-/// terminal and then returned the bare error, which put a library in charge of
-/// what a person sees and left a caller that is not a terminal with nothing.
-///
-/// **This owns no memory and allocates nothing.** The hardest callers run in
-/// the child after `clone`, where there is no allocator and no way to unwind,
-/// so the type holds two enumerations and a borrowed name. A reader turns it
-/// into words with `format`, at the caller, which is where the decision belongs.
 pub const Diagnostic = struct {
     call: Call,
     errno: linux.E,
-    /// The path the call named, when it named one. Borrowed from the mount it
-    /// came out of, which is in this same process.
     path: ?[*:0]const u8 = null,
 
-    /// The calls that can answer an errno this code cannot interpret. Named for
-    /// what was being done, not for the system call alone, because `open` says
-    /// much less than "open on a mount target".
     pub const Call = enum {
         userns_unshare,
         setgroups_open,
@@ -930,7 +443,6 @@ pub const Diagnostic = struct {
         chdir_after_pivot,
         old_root_umount,
 
-        /// What was being done, as a phrase that reads after "chock: ".
         pub fn text(self: Call) []const u8 {
             return switch (self) {
                 .userns_unshare => "the unshare that makes the namespaces",
@@ -975,17 +487,12 @@ pub const Diagnostic = struct {
     }
 };
 
-/// Fill `diag` when the caller asked for one.
-///
-/// **The first fault is kept, not the last.** A later call can only fail
-/// because an earlier one did, so the first is the one that explains the rest.
 fn note(diag: ?*?Diagnostic, call: Diagnostic.Call, errno: linux.E) void {
     const slot = diag orelse return;
     if (slot.* != null) return;
     slot.* = .{ .call = call, .errno = errno };
 }
 
-/// Fill `diag` the way `note` does, and keep the path the call named.
 fn notePath(
     diag: ?*?Diagnostic,
     call: Diagnostic.Call,
@@ -997,12 +504,8 @@ fn notePath(
     slot.* = .{ .call = call, .errno = errno, .path = path };
 }
 
-/// Whether a mount target should be created as a file or a directory. A bind
-/// mount needs a target of the same kind as its source, or the mount call fails
-/// with ENOTDIR.
 const PathKind = enum { directory, file };
 
-/// Build the mount tree. Call this after `enter` with `mount` set.
 pub fn buildRoot(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -1010,11 +513,8 @@ pub fn buildRoot(
     hide_other_users: bool,
     diag: ?*?Diagnostic,
 ) MountError!void {
-    // Make every mount private first. Without this, a mount inside the namespace can
-    // travel back to the mount tree of the host.
     try mountCall(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0, diag);
 
-    // The new root must be a mount point of its own before `pivot_root` accepts it.
     const root_z = try allocator.dupeZ(u8, root);
     defer allocator.free(root_z);
     try mountCall(root_z, root_z, null, linux.MS.BIND | linux.MS.REC, 0, diag);
@@ -1023,67 +523,14 @@ pub fn buildRoot(
         switch (m) {
             .bind => |b| try buildBindMount(allocator, root, b, diag),
             .overlay => |o| try buildOverlayMount(allocator, root, o, diag),
-            // **Asked for here and not in the mount.** The flag hides by user, so it
-            // is worth having only when a second user was mapped, and one field
-            // decides both: see `writeIdMaps`.
             .proc => |p| try buildProcMount(allocator, root, p, hide_other_users, diag),
-            // A second pass, below. See `applyDenyMounts`.
             .deny => {},
         }
     }
 
-    // Last, and in a pass of its own, so a denial wins whatever order the
-    // caller put the list in. See `applyDenyMounts`.
     try applyDenyMounts(allocator, root, mounts, diag);
 }
 
-/// Cover every `Mount.Deny` in `mounts` with a file that holds `deny_notice`.
-/// See `Mount.Deny` for what a denial is worth and what it costs.
-///
-/// **A pass of its own, after every other mount, and that is the whole
-/// mechanism.** The workspace binds the project's working tree in one mount,
-/// so a denial written before it would be covered by it and would protect
-/// nothing. Running the denials last means a caller cannot lose the property
-/// by reordering a list. `maskProcEntries` is the same trick against `/proc`,
-/// and this function is that trick given a caller.
-///
-/// One notice file is made under `root` and bound over every target, then its
-/// name is removed: a mount holds the file itself, so each denial stays after
-/// the name is gone, and the sandbox root is left with nothing extra in it.
-///
-/// **A project that denies nothing pays nothing.** The function returns before
-/// it makes any file at all, so a sandbox with no `Mount.Deny` in its list
-/// makes exactly the calls it always made.
-///
-/// **What a created target leaves behind.** A denied path that is not in the
-/// project yet is created here as an empty file, and that creation goes
-/// through the workspace mount, so it lands in the worktree checkout or in the
-/// overlay's upper layer and stays there after the mount namespace is gone. It
-/// is one empty file with a name the project itself asked to deny, it can be
-/// neither written nor removed while a tool call runs, and it never reaches
-/// the user's repository, which only a commit does. That is the price of a
-/// protection that does not lapse the moment the agent makes the file itself.
-///
-/// **The target is pinned before it is used, and never named twice.**
-/// `deny_read` is the one project supplied path in this whole mount tree, and
-/// `mount` follows a symbolic link at its target. Checking what a name holds
-/// with `statx` and then binding over that same name, as this function once
-/// did, leaves a window between the two calls for the name to become a link
-/// aimed outside the project, and `mount` would then land the notice on
-/// whatever the link resolves to, out there and not in the sandbox.
-/// `pinDenyTarget` closes that window: it opens `root`, then walks every
-/// component of the denied path in turn, with `O_NOFOLLOW` on each one, and
-/// hands back a descriptor this function mounts through as `/proc/self/fd/N`,
-/// so the bind lands on the inode that descriptor names and not on whatever a
-/// fresh lookup of the path would find. `deny.zig` accepts a path such as
-/// `secrets/config.txt` on purpose, and by the time this pass runs `root`
-/// already holds the project's own checkout, bound in by an earlier pass, so
-/// `secrets` here can be a symbolic link the agent placed in that checkout
-/// aimed outside the sandbox root entirely: measured against a real
-/// `buildRoot`, an intermediate link of that shape once let `mkdirat` and
-/// `openat` create the covering file out there instead. A symbolic link at
-/// any component, the leaf included, is refused outright, with
-/// `error.DenyTargetIsSymlink`, never opened through.
 fn applyDenyMounts(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -1105,9 +552,6 @@ fn applyDenyMounts(
     const source_z = try allocator.dupeZ(u8, source);
     defer allocator.free(source_z);
     try makeNoticeFile(source_z.ptr, diag);
-    // Runs whichever way this function leaves, the same as `maskProcEntries`.
-    // A failure to remove the name is not a failure of the sandbox: the file
-    // holds one printable line, and it is inside the session's own root.
     defer _ = linux.unlinkat(linux.AT.FDCWD, source_z.ptr, 0);
 
     for (mounts) |m| {
@@ -1123,41 +567,16 @@ fn applyDenyMounts(
         const magic_z = std.fmt.bufPrintZ(&magic_buf, "/proc/self/fd/{d}", .{fd}) catch
             return error.Unexpected;
 
-        // No `MS.REC`: one file, which has nothing under it. The mount is
-        // named by the descriptor `pinDenyTarget` handed back, so it lands on
-        // the inode that was checked and no other, whatever the target's own
-        // name resolves to by now.
         try mountCall(source_z, magic_z, null, linux.MS.BIND, 0, diag);
 
         const target = try std.fs.path.join(allocator, &.{ root, deny.target });
         defer allocator.free(target);
         const target_z = try allocator.dupeZ(u8, target);
         defer allocator.free(target_z);
-        // The original name, read only now that the mount stands on it: a
-        // write to a denied path is refused rather than editing the one
-        // notice file every other denial in this sandbox also reads.
         try markReadOnly(target_z, diag);
     }
 }
 
-/// Open `relative_target`, a `deny_read` entry's path inside the sandbox,
-/// under `root`, and hand back a descriptor `applyDenyMounts` mounts through
-/// instead of the joined name. See `applyDenyMounts` for why a name is not
-/// trusted twice.
-///
-/// **Walked one component at a time, with `O_NOFOLLOW` on every step, not
-/// only the leaf.** `deny.zig` accepts a path such as `secrets/config.txt` on
-/// purpose, and it is a string check: it cannot see that `secrets` is a
-/// symbolic link. By the time this pass runs, `root` already holds the
-/// project's own checkout, bound in by an earlier pass, so a component before
-/// the leaf can be a link the agent placed in that checkout, aimed outside
-/// the sandbox root entirely. Resolving the whole path by name in one call,
-/// as `std.fs.path.join` plus a single `mkdirat` or `open` once did here,
-/// follows every one of those links. This instead opens `root` itself once,
-/// then opens each further component through the descriptor the step before
-/// it returned, so a symbolic link at any position is refused with
-/// `error.DenyTargetIsSymlink` before this function ever asks the kernel to
-/// create or open the name behind it.
 fn pinDenyTarget(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -1177,10 +596,6 @@ fn pinDenyTarget(
             return error.Unexpected;
         },
     }
-    // Reassigned as the walk goes deeper. The `defer` below always closes
-    // whichever descriptor `dir_fd` holds when this function returns,
-    // because every earlier one is already closed by hand as soon as the
-    // next component's descriptor replaces it.
     var dir_fd: i32 = @intCast(root_fd_rc);
     defer _ = linux.close(dir_fd);
 
@@ -1200,34 +615,16 @@ fn pinDenyTarget(
     }
 }
 
-/// Open one directory component of a `deny_read` path, through `dir_fd`,
-/// making it first if `deny.zig`'s own `check` allowed a path whose
-/// directories the project has not made yet, such as `secrets/config.txt`.
-///
-/// **`O_NOFOLLOW` on a single path component is the whole guarantee.**
-/// Unlike a name resolved in one call, `openat` here only ever looks up
-/// `component` itself inside the directory `dir_fd` already names, so a
-/// symbolic link at this position answers `ELOOP` and nothing this function
-/// does can be tricked into stepping through it into some other directory.
 fn openDenyDirComponent(dir_fd: i32, component: [*:0]const u8, diag: ?*?Diagnostic) MountError!i32 {
     while (true) {
         const fd_rc = linux.openat(dir_fd, component, .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
         switch (linux.errno(fd_rc)) {
             .SUCCESS => return @intCast(fd_rc),
-            // A symlink at this component. Measured: with `O_DIRECTORY` in
-            // the same call, the kernel answers `ENOTDIR`, not `ELOOP`,
-            // because `O_NOFOLLOW` stops the walk before the directory check
-            // ever runs. Either errno means the same fault here, and a
-            // component that turns out to be an ordinary file instead of a
-            // symlink is refused the same way: `openDenyDirComponent` cannot
-            // tell the two apart without opening through whichever it is,
-            // and opening through either is what this walk exists to refuse.
+            // NOTDIR as well as LOOP: with O_DIRECTORY and O_NOFOLLOW together
+            // the kernel answers NOTDIR for a symlink at this component.
             .LOOP, .NOTDIR => return error.DenyTargetIsSymlink,
             .NOENT => {
                 switch (linux.errno(linux.mkdirat(dir_fd, component, 0o755))) {
-                    // `EEXIST` means another step of this same walk, or a
-                    // previous run, already made it: retry the open, the same
-                    // tolerance `makeDir` gives every other mount target.
                     .SUCCESS, .EXIST => continue,
                     .PERM, .ACCES => return error.NotPermitted,
                     else => |err| {
@@ -1245,27 +642,10 @@ fn openDenyDirComponent(dir_fd: i32, component: [*:0]const u8, diag: ?*?Diagnost
     }
 }
 
-/// Open the leaf of a `deny_read` path, through `dir_fd`, and hand back a
-/// descriptor `pinDenyTarget` mounts through. Creates the leaf fresh, through
-/// `createDenyLeaf`, when nothing is there yet: `deny.zig`'s own `check`
-/// accepts an entry naming a file the project has not made, such as `.env`
-/// before it exists.
-///
-/// **`O_PATH` changes what `O_NOFOLLOW` means at the last component.** With
-/// `O_PATH` alone, `open` on a symlink leaf does not fail with `ELOOP`: it
-/// succeeds, and hands back a descriptor on the link itself, never on
-/// whatever it points to. So the open below cannot be the refusal. The
-/// `statx` after it is. `AT_EMPTY_PATH` reads the descriptor's own target,
-/// not a fresh lookup of `component`, which is the same "no second name"
-/// property the open itself is for.
 fn openDenyLeaf(dir_fd: i32, leaf: [*:0]const u8, diag: ?*?Diagnostic) MountError!i32 {
     const fd_rc = linux.openat(dir_fd, leaf, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
     switch (linux.errno(fd_rc)) {
         .SUCCESS => {},
-        // A symlink loop, which at a single component can only mean the leaf
-        // itself: `O_PATH` changes what a symlink leaf answers here, see
-        // above. Still a link the sandbox does not get to resolve on the
-        // project's behalf, so it is refused the same way.
         .LOOP => return error.DenyTargetIsSymlink,
         .NOENT, .NOTDIR => return createDenyLeaf(dir_fd, leaf, diag),
         .PERM, .ACCES => return error.NotPermitted,
@@ -1293,17 +673,6 @@ fn openDenyLeaf(dir_fd: i32, leaf: [*:0]const u8, diag: ?*?Diagnostic) MountErro
     return fd;
 }
 
-/// Make `leaf` a fresh, empty file through `dir_fd` and hand back a
-/// descriptor on it, for a `deny_read` entry the project does not hold yet.
-/// Called only from `openDenyLeaf`, once an `open` with `O_NOFOLLOW` has
-/// already found nothing at that name.
-///
-/// **Created through the same directory descriptor the walk already pinned,
-/// with `O_CREAT | O_EXCL | O_NOFOLLOW`.** `O_EXCL` is what makes this
-/// atomic: between `openDenyLeaf`'s own check and this call, nothing stopped
-/// some other actor from placing a file, or a link, at the name that used to
-/// be empty. `O_EXCL` refuses to open through either rather than silently
-/// succeeding on whichever one got there first.
 fn createDenyLeaf(dir_fd: i32, leaf: [*:0]const u8, diag: ?*?Diagnostic) MountError!i32 {
     const fd_rc = linux.openat(dir_fd, leaf, .{
         .ACCMODE = .RDONLY,
@@ -1315,12 +684,6 @@ fn createDenyLeaf(dir_fd: i32, leaf: [*:0]const u8, diag: ?*?Diagnostic) MountEr
     switch (linux.errno(fd_rc)) {
         .SUCCESS => return @intCast(fd_rc),
         .PERM, .ACCES => return error.NotPermitted,
-        // Something now occupies the name `openDenyLeaf` just found empty: a
-        // link, or a file some other actor placed there in between. Refused
-        // the same way a link found straight away is refused, because this
-        // cannot tell the two apart without opening through whichever it is,
-        // and opening through either is the fault this function exists to
-        // close.
         .EXIST => return error.DenyTargetIsSymlink,
         else => |err| {
             note(diag, .deny_target_open, err);
@@ -1329,13 +692,6 @@ fn createDenyLeaf(dir_fd: i32, leaf: [*:0]const u8, diag: ?*?Diagnostic) MountEr
     }
 }
 
-/// Make `path` a file holding exactly `deny_notice`, whatever was there
-/// before it.
-///
-/// `makeFile` cannot serve here, for the same reason `makeEmptyFile` cannot
-/// serve `maskProcEntries`: `makeFile` never truncates, on purpose, because
-/// the content of a mount target does not matter to the mount that covers it.
-/// The content of this one is what every denied path in the sandbox reads.
 fn makeNoticeFile(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
     const fd_rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     switch (linux.errno(fd_rc)) {
@@ -1361,8 +717,6 @@ fn makeNoticeFile(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
                 return error.Unexpected;
             },
         }
-        // A write of zero bytes to a regular file makes no progress and would
-        // loop for ever, so it reads as a fault rather than as a retry.
         if (rc == 0) {
             note(diag, .deny_notice_write, .IO);
             return error.Unexpected;
@@ -1371,10 +725,6 @@ fn makeNoticeFile(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
     }
 }
 
-/// Apply one bind mount, `b`, under `root`. Exactly the mount `buildRoot`
-/// always made, this is only `buildRoot`'s own loop body, pulled out so the
-/// loop can switch on `Mount`'s three kinds. The source is pinned before the
-/// mount, and never named twice: see `pinBindSource`.
 fn buildBindMount(allocator: std.mem.Allocator, root: []const u8, b: Mount.Bind, diag: ?*?Diagnostic) MountError!void {
     const target = try std.fs.path.join(allocator, &.{ root, b.target });
     defer allocator.free(target);
@@ -1385,10 +735,6 @@ fn buildBindMount(allocator: std.mem.Allocator, root: []const u8, b: Mount.Bind,
     const pinned = try pinBindSource(source_z.ptr, diag);
     defer _ = linux.close(pinned.fd);
 
-    // chock.zon is protected by binding a file over a file, not a directory
-    // over a directory, so the target must match whichever kind the source
-    // actually is. `pinned.kind` reads that off the same descriptor the mount
-    // below reads the source from, never off a second lookup of `b.source`.
     try makePath(allocator, target, pinned.kind, diag);
 
     const target_z = try allocator.dupeZ(u8, target);
@@ -1398,62 +744,25 @@ fn buildBindMount(allocator: std.mem.Allocator, root: []const u8, b: Mount.Bind,
     const magic_z = std.fmt.bufPrintZ(&magic_buf, "/proc/self/fd/{d}", .{pinned.fd}) catch
         return error.Unexpected;
 
-    // The mount is named by the descriptor `pinBindSource` handed back, so it
-    // lands on the inode that was checked and no other, whatever `b.source`
-    // resolves to by now. `MS.REC` still applies: the magic symlink resolves
-    // to the same dentry the descriptor names, so a directory source with its
-    // own mounts nested under it is carried across exactly as it was when the
-    // mount was named by `b.source` directly.
     try mountCall(magic_z, target_z, null, linux.MS.BIND | linux.MS.REC, 0, diag);
 
     if (b.read_only) try markReadOnly(target_z, diag);
 }
 
-/// What `pinBindSource` pins: a descriptor on the source, and which kind of
-/// target `buildBindMount` must create for it.
 const PinnedSource = struct {
     fd: i32,
     kind: PathKind,
 };
 
-/// Open `source`, a bind mount's source path outside the sandbox, and hand
-/// back a descriptor `buildBindMount` mounts through instead of `source`'s
-/// own name, together with which kind of mount target it needs.
-///
-/// **The source is pinned once, and never named twice.** `buildBindMount`
-/// once read `source`'s type with `statx` by name, then handed that same
-/// name to `mount`, which follows a symbolic link. A source can be attacker
-/// influenced: `chock.zon` is read out of the agent's own checkout, a tree
-/// the agent can write to between tool calls, and nothing stops an agent
-/// from replacing a project's `chock.zon` with a symbolic link aimed at an
-/// arbitrary host path before the next tool call binds it in. Checking the
-/// name and then mounting the same name, as this function's caller once did,
-/// leaves a window between the two calls for exactly that substitution, even
-/// when the first check found an ordinary file. This closes the window the
-/// same way `pinDenyTarget` closes it for a denied path: `source` is opened
-/// once, with `O_NOFOLLOW`, and the descriptor this hands back is what
-/// `buildBindMount` mounts, as `/proc/self/fd/N`, so the bind lands on the
-/// inode this function checked and no other.
 fn pinBindSource(source: [*:0]const u8, diag: ?*?Diagnostic) MountError!PinnedSource {
     const fd_rc = linux.open(source, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
     switch (linux.errno(fd_rc)) {
         .SUCCESS => {},
-        // A symlink loop somewhere above the leaf, not the leaf itself:
-        // `O_PATH` changes what a symlink leaf answers here, see the statx
-        // below. Still a link this sandbox does not get to resolve on the
-        // project's behalf, so it is refused the same way.
         .LOOP => return error.BindSourceIsSymlink,
-        // The path is kept. A tool call binds about twenty sources, a refusal
-        // that says only `SourceMissing` names none of them, and a session
-        // spent four calls guessing which one had gone.
         .NOENT, .NOTDIR => |err| {
             notePath(diag, .mount_source_open, err, source);
             return error.SourceMissing;
         },
-        // The path is kept here for the reason it is kept above. A guest serves
-        // its shares over virtiofs, and a directory outside the host side's own
-        // grant answers `EACCES` here: without the path, that reached a tool call
-        // as `NotPermitted` and named nothing at all.
         .PERM, .ACCES => |err| {
             notePath(diag, .mount_source_open, err, source);
             return error.NotPermitted;
@@ -1466,13 +775,6 @@ fn pinBindSource(source: [*:0]const u8, diag: ?*?Diagnostic) MountError!PinnedSo
     const fd: i32 = @intCast(fd_rc);
     errdefer _ = linux.close(fd);
 
-    // **`O_PATH` changes what `O_NOFOLLOW` means at the last component.**
-    // With `O_PATH` alone, `open` on a symlink leaf does not fail with
-    // `ELOOP`: it succeeds, and hands back a descriptor on the link itself,
-    // never on whatever it points to. So the open above cannot be the
-    // refusal. This `statx` is. `AT_EMPTY_PATH` reads the descriptor's own
-    // target, not a fresh lookup of `source`, which is the same "no second
-    // name" property the open itself is for.
     var stat_buf: linux.Statx = undefined;
     const empty: [*:0]const u8 = "";
     const rc = linux.statx(fd, empty, linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stat_buf);
@@ -1489,22 +791,8 @@ fn pinBindSource(source: [*:0]const u8, diag: ?*?Diagnostic) MountError!PinnedSo
     return .{ .fd = fd, .kind = kind };
 }
 
-/// Mount a fresh procfs at `p.target` under `root`. See `Mount.Proc`.
-///
-/// The kernel gives a procfs mounted from inside a PID namespace the view of
-/// that namespace, so this needs no filtering of its own: `enter` always takes
-/// `CLONE_NEWPID`, and the processes in it are this sandbox's own.
-/// Room for what `procfsOptions` writes.
 pub const procfs_option_bytes: usize = 48;
 
-/// The mount options a procfs takes, or null when it takes none.
-///
-/// **`gid` names the group that still sees everything, and it must not be the
-/// call's own.** The kernel lets a reader through on `in_group_p(gid)` before it
-/// ever asks whether the reader could ptrace, and the option defaults to group
-/// zero: a call running as group zero, which is what a guest gives it, was let
-/// straight through and `hidepid` hid nothing at all. Naming the helpers' group
-/// leaves them able to see each other and the call unable to see them.
 pub fn procfsOptions(into: []u8, hide_other_users: bool, gid: linux.gid_t) ?[:0]const u8 {
     if (!hide_other_users) return null;
     return std.fmt.bufPrintZ(into, "hidepid=2,gid={d}", .{gid + helper_id_offset}) catch null;
@@ -1525,13 +813,6 @@ fn buildProcMount(
     const target_z = try allocator.dupeZ(u8, target);
     defer allocator.free(target_z);
 
-    // **`gid` names the group that still sees everything, and it must not be the
-    // call's own.** The kernel lets a reader through on `in_group_p(gid)` before
-    // it ever asks whether the reader could ptrace, and the option defaults to
-    // group zero: a call running as group zero, which is what a guest gives it,
-    // was let straight through and `hidepid` hid nothing. Naming the helpers'
-    // group instead leaves them able to see each other and the call unable to see
-    // them.
     var option_room: [procfs_option_bytes]u8 = undefined;
     const options = procfsOptions(&option_room, hide_other_users, linux.getgid());
 
@@ -1543,69 +824,20 @@ fn buildProcMount(
         if (options) |one| @intFromPtr(one.ptr) else 0,
         diag,
     );
-    // Before the mount is made read only, because every mask is itself a
-    // mount and `markReadOnly` is recursive: this order gives the empty
-    // files the same read only, `nosuid`, `nodev` mount attributes as the
-    // procfs they sit in.
     try maskProcEntries(allocator, root, target, diag);
-    // Read only after the mount, and not a mount flag, for the same reason
-    // `buildBindMount` marks a bind mount afterwards: `mount_setattr` is what
-    // this file uses everywhere to make a mount read only.
     try markReadOnly(target_z, diag);
 }
 
-/// The global files of a procfs that read empty inside the sandbox.
-///
-/// **This reduces a surface. It is not a boundary, and nothing may be built as
-/// though it were.** The list is a list of names, the same shape as the git
-/// shim in `lib/chock-broker/git_shim.zig` and for the same reason: the next
-/// kernel adds a file nobody here has heard of, and that file will read
-/// through. A denylist fails for that reason. What stops an attack is the
-/// layers: the namespaces, the Landlock rules and the seccomp filter, every
-/// one of which holds whether or not a name below is spelled correctly.
-///
-/// **Measured, and this is what a red team session read out of `/proc` on
-/// 2026-08-21**: `cmdline` gave `lsm=landlock,yama,bpf`, the NixOS system
-/// store path and the host name. `version` gave the kernel version and the
-/// compiler that built it. `kallsyms` gave every symbol name. `config.gz`
-/// gave the kernel configuration. The `lsm=` line is the one that matters,
-/// because it hands a reader the exact list of enforcement mechanisms to
-/// work around. The value of masking is that the sandbox stops describing
-/// itself for free, not that a determined reader learns nothing.
-///
-/// **`/proc/self` is deliberately absent, and must stay absent.** It is why
-/// `/proc` is mounted at all: a compiler reads `/proc/self/exe` to find its
-/// own installation, and a mask over that tree brings back "unable to find
-/// zig self exe path", which is a whole toolchain that cannot run. See
-/// `Mount.Proc`.
-///
-/// **`cpuinfo` and `meminfo` are deliberately absent too.** Both describe
-/// the host, and both are read by ordinary build tools: `nproc` counts
-/// processors with the first, and a compiler sizes its own job pool with the
-/// second. Masking them buys a little and costs every parallel build, so
-/// they are left, and this comment is the record of that choice rather than
-/// an oversight.
-///
-/// Every name here is a regular file. `maskProcEntries` skips one that is
-/// absent on the running kernel, because several are behind a kernel
-/// configuration option, and skips a directory, because a file cannot be
-/// bound over one.
 pub const masked_proc_entries: []const []const u8 = &.{
-    // What the red team session read. `cmdline` names the enforcement
-    // mechanisms, the system store path and the host name.
     "cmdline",
     "version",
     "kallsyms",
     "config.gz",
-    // Kernel memory, symbol addresses and module names: what an exploit
-    // needs to aim.
     "kcore",
     "modules",
     "iomem",
     "ioports",
     "mtrr",
-    // Kernel internals that name host processes, host timers and host
-    // hardware, in files the PID namespace does not filter.
     "sched_debug",
     "timer_list",
     "latency_stats",
@@ -1615,123 +847,31 @@ pub const masked_proc_entries: []const []const u8 = &.{
     "vmallocinfo",
     "keys",
     "key-users",
-    // A write to `sysrq-trigger` reboots the machine, and a read of `kmsg`
-    // takes the host's kernel log away from whoever reads it next. Only the
-    // read half is this list's work: a write to any part of this mount is
-    // already refused, because the whole mount is read only.
     "sysrq-trigger",
     "kmsg",
 };
 
-/// The name of the empty file each mask is a bind mount of. It exists only
-/// while `maskProcEntries` runs, under the sandbox root, and the name is
-/// gone before anything runs inside the sandbox.
-/// A file the sandbox writes for itself, and a path it hides. **Applied after
-/// the whole mount tree is built and before `pivot_root`**, so a substitution
-/// is not covered by a bind the caller asked for and a hidden path stays
-/// hidden however the caller ordered its list.
-///
-/// ## Why the sandbox has to write these at all
-///
-/// A sandbox with a network of its own has a resolver of its own, and glibc
-/// only finds it through `/etc/resolv.conf`. **On a machine with Nix there is
-/// no `/etc` inside the sandbox at all**: `src/run.zig`'s own
-/// `hostToolchainPaths` binds `/nix/store` and nothing else, so there is
-/// nothing to write into and one has to be made. On a machine without Nix
-/// `/etc` is bound from the host, read only, and the file that is there names
-/// the host's own resolver. Either way the sandbox cannot use what it finds.
-///
-/// `/etc/nsswitch.conf` matters as much as `/etc/resolv.conf` and is easy to
-/// forget. Measured on this project's own machine, whose file reads
-/// `hosts: mymachines mdns4_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] files myhostname dns`:
-/// `[NOTFOUND=return]` **returns before the lookup ever reaches `dns`**, so a
-/// correct `resolv.conf` is consulted by nobody. Chock writes its own
-/// `hosts: files dns`.
-///
-/// **And nscd has to be hidden or both files are decoration.** Measured on
-/// 2026-09-14: `/run/nscd/socket` is an `AF_UNIX` socket, so a network
-/// namespace does not touch it. glibc asks nscd first, nscd answers from the
-/// **host's** view of the network, and the sandbox's own resolver is never
-/// asked anything. A first end to end run failed exactly that way, with the
-/// ruleset loaded and `resolv.conf` written correctly.
 pub const Substitution = union(enum) {
-    /// `contents` are what is at `target` inside the root, whatever the host
-    /// has there.
     text: Text,
-    /// A symbolic link is placed at `target`, pointing at `link_to`. See
-    /// `Link`'s own doc comment.
     link: Link,
-    /// Nothing usable is at `target` inside the root, whatever the host has
-    /// there. A path the sandbox does not hold already is left alone: there is
-    /// nothing to hide.
     hide: []const u8,
 
     pub const Text = struct {
-        /// An absolute path, read relative to the sandbox root.
         target: []const u8,
         contents: []const u8,
     };
 
-    /// A symbolic link this driver places itself, rather than a bind mount.
-    ///
-    /// **The only way to put a link where an overlay would otherwise shadow
-    /// one.** A bind mount placed under a directory before `ownDirectory`
-    /// overlays it is invisible once the overlay goes on: overlayfs does not
-    /// traverse a mount in its own lower layer. A symbolic link written
-    /// after that overlay has no such problem, because it is a name inside
-    /// the writable upper layer and not a mount at all.
-    ///
-    /// **`link_to` is written exactly, unresolved and unchecked, and read
-    /// from inside the sandbox after it pivots into its own root.** It must
-    /// therefore be a path that makes sense there, such as one under
-    /// `Sandbox.runtime_prefix`, and never a path on the host.
-    ///
-    /// **No link is placed when nothing is at `link_to` yet.** A caller that
-    /// names this substitution but never put anything at `link_to`, such as
-    /// a sandbox built directly with no call through `lib/chock-core/tools.zig`
-    /// at all, gets exactly what it would have without this substitution:
-    /// whatever the mount tree already shows at `target`, the overlay's own
-    /// lower layer included. A link placed anyway would point at nothing,
-    /// and a name that used to reach the host's own file would answer
-    /// `ENOENT` instead.
     pub const Link = struct {
-        /// An absolute path, read relative to the sandbox root, same as
-        /// `Text.target`.
         target: []const u8,
-        /// What the link at `target` points to, read from inside the
-        /// sandbox once it has pivoted. Also read relative to the sandbox
-        /// root, before that pivot, to decide whether anything is there yet.
         link_to: []const u8,
     };
 };
 
-/// Where the bytes of a text substitution are staged before they are bound
-/// over a target that already exists.
 const substitute_source_name = ".chock-substitute";
 
-/// The empty directory a `hide` binds over a directory, and the empty file it
-/// binds over anything else.
 const substitute_empty_dir_name = ".chock-empty-dir";
 const substitute_empty_file_name = ".chock-empty-file";
 
-/// Apply every `Substitution` in `subs` under `root`.
-///
-/// **Two ways to place a file, and which one is used depends on the host.**
-/// A target that is not there yet is created and written, which is the Nix
-/// case where the sandbox has no `/etc`. A target that is already there is
-/// covered by a bind mount, which is the case where `/etc` came from the host
-/// read only and cannot be written at all. Both leave the same bytes at the
-/// same path, and the second is the only one that works on a read only mount.
-///
-/// **Neither way can put a file into a directory this sandbox does not own**,
-/// and `ownDirectory` is what puts it in that position before this runs. A
-/// target that is a symbolic link is refused here, and a target that is absent
-/// in a read only directory cannot be written, so a routed call takes `/etc`
-/// for itself first. See `ownDirectory` for what that costs.
-///
-/// **A project that substitutes nothing pays nothing**: the function returns
-/// before it makes any file, so a sandbox with an empty list makes exactly the
-/// calls it always made.
 pub fn substitute(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -1760,54 +900,25 @@ fn placeText(
     const target_z = try allocator.dupeZ(u8, target);
     defer allocator.free(target_z);
 
-    // **A symbolic link at the leaf is refused and never followed.** `mount`
-    // resolves its target, so a bind over a link lands wherever the link
-    // points, and a link into a path this sandbox does not hold lands nowhere
-    // at all. Refusing is loud and fail closed: the call ends with a named
-    // error rather than running with a resolver file that is not the one this
-    // function wrote.
-    //
-    // **A routed sandbox is never in that position, and that is how the
-    // machine with systemd is answered.** On such a machine `/etc` is bound
-    // from the host and `/etc/resolv.conf` there is a link into
-    // `/run/systemd/resolve`. `ownDirectory` runs first, makes `/etc` a
-    // directory the sandbox owns, and takes that name out of it, so what this
-    // function finds is nothing at all and it writes a real file. The refusal
-    // below is what still holds for any other caller. See `applyDenyMounts`,
-    // which refuses a link for a different reason and with the same error.
     if (try pathIsSymlink(target_z.ptr, diag)) return error.BindTargetIsSymlink;
 
     switch (try existingPathKind(target_z.ptr, .substitute_stat, diag)) {
-        // Nothing is there, so the file is made where it belongs and written
-        // in place. The parent directories are made too: a sandbox root with
-        // no `/etc` in it is the ordinary case on a machine with Nix.
         .missing => {
             try makePath(allocator, target, .file, diag);
             try writeSubstitute(target_z.ptr, text.contents, diag);
         },
-        // Something is there and it may well be on a read only mount, so the
-        // bytes are staged inside the root, where writing always works, and
-        // bound over the target. A mount needs no write permission on what it
-        // covers.
         .file, .directory => {
             const source = try std.fs.path.join(allocator, &.{ root, substitute_source_name });
             defer allocator.free(source);
             const source_z = try allocator.dupeZ(u8, source);
             defer allocator.free(source_z);
             try writeSubstitute(source_z.ptr, text.contents, diag);
-            // Runs whichever way this function leaves. A mount holds the file
-            // itself, so the substitution stays after the name is gone, and
-            // the sandbox root is left with nothing extra in it. The same
-            // trick `applyDenyMounts` and `maskProcEntries` use.
             defer _ = linux.unlinkat(linux.AT.FDCWD, source_z.ptr, 0);
-            // No `MS.REC`: one file, which has nothing under it.
             try mountCall(source_z, target_z, null, linux.MS.BIND, 0, diag);
         },
     }
 }
 
-/// Place one `Substitution.Link`. See its own doc comment for the whole
-/// contract, including the check below that skips a link to nothing.
 fn placeLink(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -1819,10 +930,6 @@ fn placeLink(
     const link_to_full_z = try allocator.dupeZ(u8, link_to_full);
     defer allocator.free(link_to_full_z);
 
-    // See `Substitution.Link`'s own doc comment for why nothing here is a
-    // fault: this is the answer a caller that staged no copy gets, and it is
-    // the same answer the mount tree would have given without this
-    // substitution at all.
     if (try existingPathKind(link_to_full_z.ptr, .substitute_stat, diag) == .missing) return;
 
     const target = try std.fs.path.join(allocator, &.{ root, link.target });
@@ -1830,28 +937,10 @@ fn placeLink(
     const target_z = try allocator.dupeZ(u8, target);
     defer allocator.free(target_z);
 
-    // The directories above the leaf, made the same way `placeText`'s own
-    // "missing" branch makes them. `ownDirectory` gives the sandbox `/etc`
-    // itself and nothing below it, so a target such as
-    // `/etc/ssl/certs/ca-certificates.crt` needs `ssl` and `certs` made
-    // before the link can go in.
     if (std.fs.path.dirname(target)) |parent| {
         try makePath(allocator, parent, .directory, diag);
     }
 
-    // **Whatever already answers to this name is gone before the new link
-    // goes in.** `unlinkat` acts on the name and never on what it leads to,
-    // the same rule `ownDirectory`'s own removal follows: on a machine that
-    // ships a real `ca-certificates.crt`, this takes the name inside the
-    // sandbox's own writable layer and leaves the host's file, which the
-    // overlay's lower layer still holds, untouched. `symlinkat` itself would
-    // refuse `EEXIST` on that name otherwise, and never follow it to decide
-    // what to do instead: a dangling link is a name like any other to it.
-    //
-    // A directory is the one shape `unlinkat` alone cannot remove, hence the
-    // second call with `AT.REMOVEDIR` below. Nothing this project places at
-    // `link.target` is ever a real directory, so this is defence and not a
-    // path any test exercises.
     switch (linux.errno(linux.unlinkat(linux.AT.FDCWD, target_z.ptr, 0))) {
         .SUCCESS, .NOENT, .NOTDIR => {},
         .ISDIR => switch (linux.errno(linux.unlinkat(linux.AT.FDCWD, target_z.ptr, linux.AT.REMOVEDIR))) {
@@ -1894,10 +983,6 @@ fn hidePath(
     defer allocator.free(target_z);
 
     const kind = try existingPathKind(target_z.ptr, .substitute_stat, diag);
-    // **Nothing to hide is the ordinary answer and not a fault.** A sandbox
-    // that binds only `/nix/store` has no `/run` at all, so the nscd socket is
-    // already unreachable. This call is what makes that true on a machine
-    // whose sandbox does hold one, and it must not refuse to start the others.
     if (kind == .missing) return;
 
     const name = if (kind == .directory) substitute_empty_dir_name else substitute_empty_file_name;
@@ -1906,9 +991,6 @@ fn hidePath(
     const source_z = try allocator.dupeZ(u8, source);
     defer allocator.free(source_z);
 
-    // A directory is covered by an empty directory and anything else by an
-    // empty file. The kernel refuses a bind whose source and target are not
-    // the same kind, so the two cases cannot share one source.
     if (kind == .directory) {
         try makeDir(source_z.ptr, diag);
     } else {
@@ -1923,8 +1005,6 @@ fn hidePath(
     try mountCall(source_z, target_z, null, linux.MS.BIND, 0, diag);
 }
 
-/// True when `path` itself is a symbolic link. **`AT_SYMLINK_NOFOLLOW`**, so
-/// this answers about the name and not about whatever it leads to.
 fn pathIsSymlink(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!bool {
     var stat_buf: linux.Statx = undefined;
     const rc = linux.statx(
@@ -1946,11 +1026,6 @@ fn pathIsSymlink(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!bool {
     return (stat_buf.mode & linux.S.IFMT) == linux.S.IFLNK;
 }
 
-/// Make `path` hold exactly `contents`, whatever was there before it.
-///
-/// `makeFile` cannot serve here, for the reason `makeEmptyFile` gives: the
-/// content of a mount target does not matter, and the content of this one is
-/// the whole point.
 fn writeSubstitute(path: [*:0]const u8, contents: []const u8, diag: ?*?Diagnostic) MountError!void {
     const fd_rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     switch (linux.errno(fd_rc)) {
@@ -1975,9 +1050,6 @@ fn writeSubstitute(path: [*:0]const u8, contents: []const u8, diag: ?*?Diagnosti
                 return error.Unexpected;
             },
         }
-        // A write that takes nothing would otherwise spin here forever, and a
-        // file that holds part of a resolver configuration is worse than one
-        // that holds none: the sandbox would then ask the wrong resolver.
         if (rc == 0) {
             note(diag, .substitute_write, linux.E.IO);
             return error.Unexpected;
@@ -1986,91 +1058,17 @@ fn writeSubstitute(path: [*:0]const u8, contents: []const u8, diag: ?*?Diagnosti
     }
 }
 
-/// The directory a sandbox owned layer keeps its two halves in. It is a tmpfs
-/// mounted under the sandbox root, and it is detached again before
-/// `ownDirectory` returns, so nothing extra is inside the sandbox.
 const owned_backing_name = ".chock-owned";
 
-/// How much the owned layer may hold. **Small on purpose.** The only writes it
-/// ever takes are the few files `substitute` places and the whiteouts that
-/// stand where a name was removed, all of them made before the sandboxed
-/// program starts. A tool call itself gets the directory read only, because
-/// the caller's own Landlock rule for it says read only, so nothing inside the
-/// sandbox can add to this.
 const owned_backing_bytes: u64 = 1 << 20;
 
-/// `umount2`'s "take this mount out of the tree now and free it when the last
-/// user is done with it". `std.os.linux` states no name for it.
 const mnt_detach: u32 = 2;
 
-/// A directory inside the sandbox that the sandbox takes for itself. See
-/// `ownDirectory`.
 pub const OwnedDirectory = struct {
-    /// The path inside the sandbox. It must already be a directory there, and
-    /// a path that is anything else is left alone.
     target: []const u8,
-    /// Names inside `target` that go away with it. Absolute, spelled the way
-    /// a `Substitution.Text.target` is spelled. A name that is not there is
-    /// not a fault.
     remove: []const []const u8 = &.{},
 };
 
-/// Make `owned.target` a directory the sandbox owns, keeping everything that
-/// is already there readable, and remove `owned.remove` from it. True when the
-/// sandbox took it, false when there is no such directory to take.
-///
-/// ## What this is for
-///
-/// **A routed sandbox has to put three files into `/etc`, and on most Linux
-/// machines it does not own that directory.** `src/run.zig`'s own
-/// `hostToolchainPaths` binds the host's `/etc` read only, because that is
-/// where the CA certificates are and TLS needs them. `substitute` then has two
-/// ways to place a file and neither one works there:
-///
-///  * **A target that is a symbolic link is refused**, correctly, because a
-///    bind over a link lands where the link points and the sandbox does not
-///    hold that. On a machine with systemd, `/etc/resolv.conf` is a link into
-///    `/run/systemd/resolve`.
-///  * **A target that is absent cannot be made**, because the directory it
-///    belongs in is read only and `open` answers `EROFS`. Alpine ships no
-///    `/etc/nsswitch.conf` at all.
-///
-/// Measured on 2026-09-15: each of the two ends every foreground tool call of
-/// the session, because every one of them takes a filtered network. Between
-/// them they cover most Linux machines that are not NixOS.
-///
-/// ## What it does instead
-///
-/// An overlay, with the directory the mount tree already put there as the read
-/// only lower layer and a tmpfs of this sandbox's own as the upper layer. So:
-///
-///  * everything the host has there is still readable, at the same path, with
-///    the same bytes. The CA certificates, `ld.so.cache` and `alternatives`
-///    are all still what the host has.
-///  * every write lands in the tmpfs and the host's own directory is never
-///    touched. **Nothing here can change the machine.**
-///  * the names in `owned.remove` are removed from the sandbox's view alone.
-///    A removal of a name the lower layer holds is a whiteout in the upper
-///    layer, which is why the host's own `/etc/resolv.conf` is still a link
-///    to whatever it was after a session ends.
-///
-/// `substitute` then finds nothing at those names and writes a real file,
-/// which is the branch a machine with Nix already took. **So `substitute`
-/// keeps every promise it had**: it still never follows a link and still never
-/// binds over one.
-///
-/// ## What it costs
-///
-/// **Rootless overlayfs, which needs Linux 5.11 or later.** A kernel without
-/// it answers `error.OverlayNotSupported`, and `chock doctor`'s own
-/// `overlayfs` row is where a person reads that. A machine that old could
-/// start no routed sandbox before this either, so nothing that worked stops
-/// working.
-///
-/// The backing tmpfs is detached before this returns. The overlay holds the
-/// two directories inside it open, so it goes on working, and the sandbox is
-/// left with nothing extra in it. Measured by hand on 2026-09-15 on Linux
-/// 6.18.49: the files written into the upper layer read back after the detach.
 pub fn ownDirectory(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -2082,10 +1080,6 @@ pub fn ownDirectory(
     const target_z = try allocator.dupeZ(u8, target);
     defer allocator.free(target_z);
 
-    // **Nothing there is the ordinary answer on a machine with Nix**, whose
-    // sandbox binds `/nix/store` and no `/etc` at all. Such a sandbox writes
-    // its resolver files into a root it already owns, so there is nothing here
-    // to take, and this must not refuse to start it.
     if (try existingPathKind(target_z.ptr, .owned_stat, diag) != .directory) return false;
 
     const backing = try std.fs.path.join(allocator, &.{ root, owned_backing_name });
@@ -2105,10 +1099,6 @@ pub fn ownDirectory(
         @intFromPtr(options.ptr),
         diag,
     );
-    // Runs whichever way this function leaves, the same way `applyDenyMounts`
-    // removes the name of the file its mounts hold. The overlay keeps the two
-    // directories below open, so a lazy detach takes the tmpfs out of the
-    // sandbox's view and leaves the overlay working.
     defer {
         _ = linux.umount2(backing_z.ptr, mnt_detach);
         _ = linux.unlinkat(linux.AT.FDCWD, backing_z.ptr, linux.AT.REMOVEDIR);
@@ -2126,12 +1116,6 @@ pub fn ownDirectory(
     defer allocator.free(work_z);
     try makeDir(work_z.ptr, diag);
 
-    // **The lower layer is the target itself**, and that is not a circle. The
-    // kernel resolves a lower layer to the directory it names when the mount
-    // is made, and goes on reading that directory afterward, whatever else is
-    // mounted over the name. So this works for a target that came from the
-    // host, from a container image, or from anywhere else, and this function
-    // never has to know which.
     try mountOverlay(allocator, .{
         .lower = target,
         .upper = upper,
@@ -2144,13 +1128,7 @@ pub fn ownDirectory(
         defer allocator.free(path);
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
-        // `unlinkat` acts on the name and never on what a link leads to, which
-        // is the whole reason a name is removed here rather than written
-        // through. A name the lower layer holds becomes a whiteout in the
-        // upper layer and the host's own file is untouched.
         switch (linux.errno(linux.unlinkat(linux.AT.FDCWD, path_z.ptr, 0))) {
-            // Not there is not a fault: a host that ships no
-            // `nsswitch.conf` is one of the two machines this exists for.
             .SUCCESS, .NOENT, .NOTDIR => {},
             .PERM, .ACCES, .ROFS => return error.NotPermitted,
             else => |err| {
@@ -2165,12 +1143,6 @@ pub fn ownDirectory(
 
 const proc_mask_source_name = ".chock-proc-mask";
 
-/// Bind an empty file over each of `masked_proc_entries` inside the procfs at
-/// `proc_target`. See that list for what this is worth and what it is not.
-///
-/// One empty file is made under `root` and bound over every entry, then its
-/// name is removed. A mount holds the file itself, so each mask stays after
-/// the name is gone, and the sandbox root is left with nothing extra in it.
 fn maskProcEntries(allocator: std.mem.Allocator, root: []const u8, proc_target: []const u8, diag: ?*?Diagnostic) MountError!void {
     const source = try std.fs.path.join(allocator, &.{ root, proc_mask_source_name });
     defer allocator.free(source);
@@ -2178,9 +1150,6 @@ fn maskProcEntries(allocator: std.mem.Allocator, root: []const u8, proc_target: 
     const source_z = try allocator.dupeZ(u8, source);
     defer allocator.free(source_z);
     try makeEmptyFile(source_z.ptr, diag);
-    // Runs whichever way this function leaves. A failure to remove the name
-    // is not a failure of the sandbox: the file is empty, and it is inside
-    // the session's own root.
     defer _ = linux.unlinkat(linux.AT.FDCWD, source_z.ptr, 0);
 
     for (masked_proc_entries) |name| {
@@ -2191,26 +1160,15 @@ fn maskProcEntries(allocator: std.mem.Allocator, root: []const u8, proc_target: 
         defer allocator.free(target_z);
 
         switch (try existingPathKind(target_z.ptr, .proc_entry_stat, diag)) {
-            // A kernel built without the option that makes this file.
             .missing => continue,
-            // A file cannot be bound over a directory. Nothing in
-            // `masked_proc_entries` is one today, and a kernel that turns
-            // one into a directory must not stop the sandbox from starting.
             .directory => continue,
             .file => {},
         }
 
-        // No `MS.REC`: one file, which has nothing under it.
         try mountCall(source_z, target_z, null, linux.MS.BIND, 0, diag);
     }
 }
 
-/// Make `path` an empty file, whatever was there before it.
-///
-/// `makeFile` cannot serve here. It never truncates, on purpose, because the
-/// content of a mount target does not matter to the mount that covers it. The
-/// content of this one is the whole point: every masked entry reads it, so a
-/// file left over from an earlier run must not be what a reader gets.
 fn makeEmptyFile(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
     const fd_rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     switch (linux.errno(fd_rc)) {
@@ -2224,17 +1182,6 @@ fn makeEmptyFile(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
     _ = linux.close(@intCast(fd_rc));
 }
 
-/// What is at `path`, when the answer "nothing" is a fact the caller acts on
-/// rather than a fault. Unlike `pinBindSource`, an absent path is an
-/// answer here: `maskProcEntries` skips an entry a kernel was built without,
-/// and `applyDenyMounts` makes a file for a path the project does not hold
-/// yet. `call` is what a failure is reported as, so a reader learns which of
-/// the two walks was refused.
-///
-/// **Anything that is not a directory reads as a file**, which is what both
-/// callers want. A denied path that is a symbolic link is followed, so a link
-/// aimed at a file is covered as that file's own path is, and a link aimed at
-/// a directory is refused as a directory is.
 fn existingPathKind(
     path: [*:0]const u8,
     call: Diagnostic.Call,
@@ -2255,11 +1202,6 @@ fn existingPathKind(
     return .file;
 }
 
-/// Apply one overlay mount, `o`, under `root`: make its target a directory,
-/// then mount there. See `mountOverlay` for the real mount call, which this
-/// function also uses to give `test/workspace/overlay_helper.zig` a real
-/// overlay mount to test against directly, at a target that is not under any
-/// `root` at all.
 fn buildOverlayMount(allocator: std.mem.Allocator, root: []const u8, o: Mount.Overlay, diag: ?*?Diagnostic) MountError!void {
     const target = try std.fs.path.join(allocator, &.{ root, o.target });
     defer allocator.free(target);
@@ -2274,20 +1216,6 @@ fn buildOverlayMount(allocator: std.mem.Allocator, root: []const u8, o: Mount.Ov
     }, diag);
 }
 
-/// Mount an overlayfs merging `o.lower` (read only) and `o.upper` (read
-/// write) at `o.target`, with `o.work` as overlayfs's own scratch directory.
-/// `o.target` must already exist as a directory: `buildOverlayMount` makes it
-/// first, under a sandbox root. `test/workspace/overlay_helper.zig` calls
-/// this directly, with a target it made itself, to get a real overlay mount
-/// outside any sandbox root at all, the same way it needs one to test
-/// `lib/chock-workspace/overlay.zig`'s own upper layer diff.
-///
-/// `userxattr` is always in the mount options. Without it, overlayfs tries to
-/// set `trusted.overlay.opaque`, which a user namespace cannot set, and every
-/// change with the shape of a directory, such as `rm x && mkdir x`, fails
-/// with EIO. Confirmed by hand on kernel 6.18.42: `userxattr` moves that
-/// bookkeeping into `user.overlay.*`, a
-/// namespace this process can already write.
 pub fn mountOverlay(allocator: std.mem.Allocator, o: Mount.Overlay, diag: ?*?Diagnostic) MountError!void {
     const options = std.fmt.allocPrintSentinel(
         allocator,
@@ -2303,15 +1231,7 @@ pub fn mountOverlay(allocator: std.mem.Allocator, o: Mount.Overlay, diag: ?*?Dia
     const rc = linux.mount("overlay", target_z, "overlay", 0, @intFromPtr(options.ptr));
     switch (linux.errno(rc)) {
         .SUCCESS => {},
-        // EPERM is exactly what a kernel before 5.11 returns for an overlay
-        // mount attempted from inside a user namespace: before that version
-        // overlayfs did not carry FS_USERNS_MOUNT. ENODEV is what a kernel
-        // with no overlayfs support built in actually returns here, confirmed
-        // by hand. NOSYS is kept too, in case a future kernel ever uses it.
         .PERM, .NODEV, .NOSYS => return error.OverlayNotSupported,
-        // A component of lower, upper, or work could not be read by this
-        // process. The overlay filesystem itself is available. Only one of
-        // the paths is not.
         .ACCES => return error.NotPermitted,
         else => |err| {
             note(diag, .overlay_mount, err);
@@ -2320,25 +1240,6 @@ pub fn mountOverlay(allocator: std.mem.Allocator, o: Mount.Overlay, diag: ?*?Dia
     }
 }
 
-/// Mount one capped scratch area at `target` under `root`, and give back a
-/// descriptor on it. See `Scratch` for what this is for and why a tmpfs is the
-/// only mechanism available.
-///
-/// `size_bytes` is the cap. **Null means no cap**, which mounts an ordinary
-/// tmpfs whose own default is half of the machine's memory. Only a test that
-/// has to prove the cap is what stopped something asks for that, by running the
-/// same program twice: see `rlimits.Limits.none`.
-///
-/// **Allocates nothing.** This runs in the middle process, after a `fork` that
-/// may have happened while another thread of the caller held an allocator's
-/// lock, so every path here is built in a stack buffer, the same rule
-/// `cgroup.zig` follows and for the same reason.
-///
-/// **The descriptor is the whole point of giving one back.** The area only
-/// exists inside this mount namespace, and the process that has to read it
-/// afterwards has by then denied itself every path, so a name would not resolve
-/// and a descriptor does not have to: see `scratchIsFull`. It is `CLOEXEC`, so
-/// the sandboxed program never inherits it across `execve`.
 pub fn mountScratch(
     root: []const u8,
     target: []const u8,
@@ -2352,10 +1253,6 @@ pub fn mountScratch(
     var full_z: [std.fs.max_path_bytes]u8 = undefined;
     const zeroed = terminate(&full_z, full[0..full_len]) orelse return error.Unexpected;
 
-    // An empty option string is what asks the kernel for a tmpfs with its own
-    // default size. `bufPrintZ` cannot fail on a 32 byte buffer holding
-    // "size=" and a 64 bit number, and a refusal here would be this code's own
-    // bug rather than the kernel's, so it is reported as one.
     var options_buffer: [32]u8 = undefined;
     const options: [:0]const u8 = if (size_bytes) |bytes|
         std.fmt.bufPrintZ(&options_buffer, "size={d}", .{bytes}) catch return error.Unexpected
@@ -2390,22 +1287,6 @@ pub fn mountScratch(
     return @intCast(fd_rc);
 }
 
-/// True when the scratch area `fd` names has no space left in it.
-///
-/// **This is what makes a full scratch area legible instead of confusing.** A
-/// program that fills one gets `ENOSPC`, prints "No space left on device", and
-/// exits. A person reading that goes and looks at their own disk and finds it
-/// fine. Nothing in the kernel counts this the way `memory.events` counts an
-/// out of memory kill, so the evidence has to be read from the filesystem
-/// itself, and this is the only reading of it.
-///
-/// **It is evidence and not proof, and the caller must say so.** A program that
-/// filled the area, met `ENOSPC`, deleted its own files and then failed for an
-/// unrelated reason reads as not full here. The direction of that error is the
-/// safe one: it never names a limit that was not reached.
-///
-/// The magic number is checked, so a descriptor on anything this code did not
-/// mount can never be reported as one of the sandbox's own areas.
 pub fn scratchIsFull(fd: i32) bool {
     var stat_buf: Statfs = undefined;
     const rc = linux.syscall2(
@@ -2418,9 +1299,6 @@ pub fn scratchIsFull(fd: i32) bool {
     return stat_buf.f_bavail == 0;
 }
 
-/// `a/b` in `buffer`, with exactly one separator between them and no
-/// allocation. Null when the result does not fit. The allocation free twin of
-/// what `std.fs.path.join` does for the rest of this file.
 fn joinInto(buffer: []u8, a: []const u8, b: []const u8) ?usize {
     const left = if (a.len > 1 and a[a.len - 1] == '/') a[0 .. a.len - 1] else a;
     const right = if (b.len > 0 and b[0] == '/') b[1..] else b;
@@ -2432,10 +1310,6 @@ fn joinInto(buffer: []u8, a: []const u8, b: []const u8) ?usize {
     return needed;
 }
 
-/// A null terminated copy of `text` in `buffer`, for a syscall that takes a
-/// path. Null when it does not fit, which the caller reports as a refusal
-/// rather than truncating: a truncated path names a different directory, and
-/// this code mounts over whatever it names.
 fn terminate(buffer: []u8, text: []const u8) ?[:0]const u8 {
     if (text.len + 1 > buffer.len) return null;
     @memcpy(buffer[0..text.len], text);
@@ -2443,8 +1317,6 @@ fn terminate(buffer: []u8, text: []const u8) ?[:0]const u8 {
     return buffer[0..text.len :0];
 }
 
-/// `makePath` for a directory, with no allocator. See `mountScratch` for why
-/// the caller cannot use one.
 fn makeDirPath(path: []const u8, diag: ?*?Diagnostic) MountError!void {
     std.debug.assert(path.len > 0 and path[0] == '/');
 
@@ -2462,10 +1334,6 @@ fn makeDirPath(path: []const u8, diag: ?*?Diagnostic) MountError!void {
     }
 }
 
-/// The kernel's `struct mount_attr`, the argument `mount_setattr` reads. Zig's
-/// standard library does not define this type, and its `mount_setattr` wrapper
-/// does not match the real five argument syscall, so this file defines the ABI
-/// by hand from the kernel's `uapi/linux/mount.h`.
 const MountAttr = extern struct {
     attr_set: u64 = 0,
     attr_clr: u64 = 0,
@@ -2473,39 +1341,13 @@ const MountAttr = extern struct {
     userns_fd: u64 = 0,
 };
 
-/// `MOUNT_ATTR_RDONLY` from `uapi/linux/mount.h`. Zig's `MOUNT_ATTR` packed
-/// struct is only used by the standard library's own broken wrapper above, so a
-/// call built by hand needs the raw bit again here.
 const mount_attr_rdonly: u64 = 0x00000001;
 
-/// `MOUNT_ATTR_NOSUID` from `uapi/linux/mount.h`.
 const mount_attr_nosuid: u64 = 0x00000002;
 
-/// `MOUNT_ATTR_NODEV` from `uapi/linux/mount.h`.
 const mount_attr_nodev: u64 = 0x00000004;
 
-/// Mark a mount, and everything already mounted under it, read only.
-///
-/// A remount can only replace the whole flag word, and the kernel locks RDONLY,
-/// NODEV, NOSUID, NOEXEC, and the atime group on a mount this user namespace did
-/// not create. A remount that does not repeat every locked flag is read as an
-/// attempt to loosen the mount and refused with EPERM, even for a source such as
-/// /sys that is merely noexec, not something we want writable. `mount_setattr`
-/// takes a set of attributes to add and a set to clear instead, so a locked flag
-/// already in place is never touched and never has to be guessed at.
-///
-/// `AT_RECURSIVE` makes the mark apply to every mount already nested under the
-/// target too, such as a tmpfs mounted under a project directory before the
-/// directory was marked read only. Without it, only the top mount is read only
-/// and a submount underneath stays writable.
-///
-/// NOSUID and NODEV ride along with RDONLY in the same `attr_set`. `mount_setattr`
-/// only ever adds an attribute here, never removes one, so asking for NOSUID and
-/// NODEV alongside RDONLY cannot loosen anything and cannot fail on a flag the
-/// kernel already locked. A sandboxed process should not be able to run a
-/// set-user-ID binary or open a device node from a mount meant to be read only,
-/// even if the file underneath somehow carries the set-user-ID bit or is a device
-/// special file.
+// mount_setattr only ever adds an attribute, never removes one, so a flag the kernel already locked is never touched and never guessed at.
 fn markReadOnly(target: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
     var attr = MountAttr{
         .attr_set = mount_attr_rdonly | mount_attr_nosuid | mount_attr_nodev,
@@ -2521,9 +1363,6 @@ fn markReadOnly(target: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         .PERM, .ACCES => return error.NotPermitted,
-        // mount_setattr does not exist before kernel 5.12. Name this specifically,
-        // so a user on an old kernel is told what is missing instead of being
-        // handed the same Unexpected a real bug would produce.
         .NOSYS => return error.KernelTooOld,
         else => |err| {
             note(diag, .mount_setattr, err);
@@ -2532,16 +1371,6 @@ fn markReadOnly(target: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
     }
 }
 
-// Zig 0.16 moved directory creation behind std.Io.Dir, which needs an Io instance
-// this file does not carry, so a mount target is created the same way every other
-// path in this file reaches the kernel: through linux.mkdirat and linux.open
-// directly.
-//
-// `path` must be absolute. Every caller in this file builds `path` by joining onto
-// `root`, which is always absolute, so a relative path here is our own bug.
-//
-// `kind` decides what the last path component becomes. Every component before it
-// is always a directory, because it is only ever a parent of the real target.
 fn makePath(allocator: std.mem.Allocator, path: []const u8, kind: PathKind, diag: ?*?Diagnostic) MountError!void {
     std.debug.assert(path.len > 0 and path[0] == '/');
 
@@ -2563,9 +1392,6 @@ fn makePath(allocator: std.mem.Allocator, path: []const u8, kind: PathKind, diag
 
 fn makeDir(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
     switch (linux.errno(linux.mkdirat(linux.AT.FDCWD, path, 0o755))) {
-        // EXIST is not a failure here. mkdir -p tolerates an existing directory at
-        // each step, and that is exactly what this loop hits on every path segment
-        // that a previous mount, or a previous run, already created.
         .SUCCESS, .EXIST => {},
         .PERM, .ACCES => return error.NotPermitted,
         else => |err| {
@@ -2575,22 +1401,6 @@ fn makeDir(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
     }
 }
 
-/// **No `O_EXCL`, kept, not added.** The same `root` is reused across every
-/// tool call of a session, so a target such as `chock.zon` legitimately
-/// exists already, from the run before this one, and `O_EXCL` would refuse
-/// that ordinary reuse with `EEXIST` on the second tool call onward. An
-/// existing file at this path is left alone and simply opened: its content
-/// does not matter, the bind mount is about to cover it.
-///
-/// **`O_NOFOLLOW`, added.** A target such as `chock.zon` or the worktree's
-/// own `.git` file is one path component under a directory an earlier bind
-/// in the same list already covered with the agent's own checkout, so the
-/// name this function opens can be a symbolic link the agent placed there
-/// between tool calls. `O_NOFOLLOW` refuses that leaf rather than following
-/// it and binding onto whatever host path the link names. It costs nothing
-/// against the reuse case above: a plain file left over from a previous run
-/// is not a symlink, and `O_NOFOLLOW` only refuses a name that actually is
-/// one.
 fn makeFile(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
     const fd_rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .NOFOLLOW = true }, 0o644);
     switch (linux.errno(fd_rc)) {
@@ -2618,29 +1428,12 @@ fn mountCall(
         .SUCCESS => {},
         .PERM, .ACCES => return error.NotPermitted,
         else => |err| {
-            // Every other errno above already tells the caller what to do. This
-            // one does not, so the errno is the only fact left that can point at
-            // the real cause, and folding it into Unexpected without printing it
-            // would throw that fact away right where it matters most.
             note(diag, .mount_call, err);
             return error.Unexpected;
         },
     }
 }
 
-/// Move the process into the new root and remove the old one.
-///
-/// After this call, no path resolves to anything on the host: open() on a host
-/// path fails, because the host tree is no longer anywhere in this process's
-/// mount namespace. That is not the same claim as "the host is unreachable". A
-/// file descriptor opened before `enter` keeps working after this call, because
-/// a descriptor does not go through path resolution again once it is open, and
-/// a directory descriptor can still be used with openat to reach the host tree
-/// by name. A caller that wants the "cannot reach the host" property to actually
-/// hold must close every descriptor opened before `enter`, before it lets the
-/// sandboxed process run. This function does not close them: that decision
-/// belongs to whichever function started the process, not to the one building
-/// its mount tree.
 pub fn pivotInto(allocator: std.mem.Allocator, root: []const u8, diag: ?*?Diagnostic) MountError!void {
     const old = try std.fs.path.join(allocator, &.{ root, ".old_root" });
     defer allocator.free(old);
@@ -2668,8 +1461,6 @@ pub fn pivotInto(allocator: std.mem.Allocator, root: []const u8, diag: ?*?Diagno
         },
     }
 
-    // Detach the old root. Without this the process keeps a path to every host file.
-    // MNT_DETACH removes it from the tree even while something still uses it.
     switch (linux.errno(linux.umount2("/.old_root", mnt_detach))) {
         .SUCCESS => {},
         else => |err| {
@@ -2678,31 +1469,13 @@ pub fn pivotInto(allocator: std.mem.Allocator, root: []const u8, diag: ?*?Diagno
         },
     }
 
-    // Best effort only. The mount point is already gone. Failing to remove the now
-    // empty directory does not leave any path back to the host.
     _ = linux.rmdir("/.old_root");
 }
 
 test "a resolver file the sandbox does not hold is made where it belongs and written" {
-    // **Linux only, and a crash without this.** This drives the substitution
-    // path in this file, which reaches the kernel through `std.os.linux`. On
-    // macOS those numbers are not the same calls, so the test died with
-    // `SIGSYS` on the CI Mac rather than failing: a crash reads as a broken
-    // build and not as a platform that does not apply. The same guard
-    // `linux/cgroup.zig` carries for the same reason.
     const builtin = @import("builtin");
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
-    // **The Nix case, which is the one this project's own machine takes.**
-    // `src/run.zig`'s `hostToolchainPaths` binds `/nix/store` and nothing
-    // else, so the sandbox has no `/etc` at all: there is nothing to replace
-    // and one has to be made, parent directories and all.
-    //
-    // No mount namespace is needed for this branch, because nothing is
-    // mounted: the file is created and written in place. The other branch,
-    // where the target is already there and is covered by a bind, is measured
-    // through a real spawn by `test/sandbox/escape.zig`'s own routed glibc
-    // test, which binds an `/etc` of the shape a machine without Nix gives.
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2719,36 +1492,15 @@ test "a resolver file the sandbox does not hold is made where it belongs and wri
     defer gpa.free(written);
     try std.testing.expectEqualStrings("nameserver 10.99.0.1\n", written);
 
-    // **And a second sandbox in the same root takes the other branch**, which
-    // is the one this test cannot drive: `config.root` is reused by every tool
-    // call of a session and nothing removes what a successful call left in it,
-    // so the file is already there next time and is covered by a bind mount.
-    // That branch needs a mount namespace, and it is measured through a real
-    // spawn by `test/sandbox/escape.zig`'s own routed glibc test. Asking for
-    // it here answers `error.NotPermitted` from the mount call, which is the
-    // fact that says the branch was really taken and not skipped.
     try std.testing.expectError(error.NotPermitted, substitute(gpa, root, &.{
         .{ .text = .{ .target = "/etc/resolv.conf", .contents = "nameserver 10.99.0.1\n" } },
     }, null));
 }
 
 test "a path the sandbox does not hold is not hidden, and is not a fault either" {
-    // **Linux only, and a crash without this.** This drives the substitution
-    // path in this file, which reaches the kernel through `std.os.linux`. On
-    // macOS those numbers are not the same calls, so the test died with
-    // `SIGSYS` on the CI Mac rather than failing: a crash reads as a broken
-    // build and not as a platform that does not apply. The same guard
-    // `linux/cgroup.zig` carries for the same reason.
     const builtin = @import("builtin");
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
-    // **Nothing to hide is the ordinary answer.** A sandbox that binds only a
-    // toolchain has no `/run` at all, so the nscd socket is already
-    // unreachable, and a `hide` that refused to start such a sandbox would
-    // refuse every sandbox this project builds on a machine with Nix.
-    //
-    // Mutation check: delete the `if (kind == .missing) return;` in `hidePath`
-    // and this answers `error.Unexpected` from the mount call instead.
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2761,38 +1513,9 @@ test "a path the sandbox does not hold is not hidden, and is not a fault either"
 }
 
 test "a substitution target that is a symbolic link is refused and never followed" {
-    // **Linux only, and a crash without this.** This drives the substitution
-    // path in this file, which reaches the kernel through `std.os.linux`. On
-    // macOS those numbers are not the same calls, so the test died with
-    // `SIGSYS` on the CI Mac rather than failing: a crash reads as a broken
-    // build and not as a platform that does not apply. The same guard
-    // `linux/cgroup.zig` carries for the same reason.
     const builtin = @import("builtin");
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
-    // `mount` resolves its target, so a bind over a link lands wherever the
-    // link points, and a link into a path this sandbox does not hold lands
-    // nowhere at all. **Refused, loudly, rather than run with a resolver file
-    // that is not the one the sandbox wrote.**
-    //
-    // This is the case a machine with systemd and no Nix hits: `/etc` is bound
-    // from the host and `/etc/resolv.conf` there is a link into
-    // `/run/systemd/resolve`. It is a known gap, named here so it is a
-    // refusal a person can read rather than a silence.
-    //
-    // **Two links, because only one of them needs this check.** A link with
-    // nothing at the end of it reads as a missing path, so `makeFile`'s own
-    // `O_NOFOLLOW` refuses it with the same error by accident. A link that
-    // leads somewhere reads as a file, and without the check it would be bound
-    // over, which means bound over **whatever the link leads to**. The second
-    // is what this check is for and the first is what a reader would test by
-    // mistake.
-    //
-    // Mutation check, measured on 2026-09-15: delete the `pathIsSymlink` check
-    // in `placeText` and the dangling link still answers
-    // `error.BindTargetIsSymlink`, from `makeFile`, while the live one reaches
-    // the mount call and answers `error.NotPermitted` instead, because this
-    // test has no mount namespace. Only the second line below sees it.
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2810,25 +1533,12 @@ test "a substitution target that is a symbolic link is refused and never followe
     try std.testing.expectError(error.BindTargetIsSymlink, substitute(gpa, root, &.{
         .{ .text = .{ .target = "/etc/nsswitch.conf", .contents = "hosts: files dns\n" } },
     }, null));
-    // **And what the link leads to is untouched.** Without the check this is
-    // the file the substitution would have landed on.
     const beside = try tmp.dir.readFileAlloc(std.testing.io, "etc/real", gpa, .limited(4096));
     defer gpa.free(beside);
     try std.testing.expectEqualStrings("somebody else\n", beside);
 }
 
 test "a substitution that names nothing makes no call at all" {
-    // A sandbox with no router substitutes nothing, and must make exactly the
-    // calls it always made. The check is the absence of the staging file.
-    //
-    // **The early return this reads as is an equivalent mutation and this test
-    // knows it.** Measured on 2026-09-15: deleting `if (subs.len == 0) return;`
-    // changes nothing, because the loop below it walks an empty list. The
-    // return is there so a reader sees the rule stated rather than derived,
-    // the same way `applyDenyMounts` states it. What this test really pins is
-    // that no staging file is made for an empty list, which would stop being
-    // true the moment somebody moved the staging out of `placeText` and up to
-    // the top of `substitute`.
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2842,17 +1552,11 @@ test "a substitution that names nothing makes no call at all" {
 test "a procfs that hides other users names a group the call is not in" {
     var room: [procfs_option_bytes]u8 = undefined;
 
-    // Nothing asked for, nothing given: the ordinary mount takes no options.
     try std.testing.expectEqual(@as(?[:0]const u8, null), procfsOptions(&room, false, 0));
 
-    // **Never the call's own group.** A call in the named group is let through
-    // before the kernel asks whether it could ptrace, so naming group zero beside
-    // a call that runs as group zero hides nothing: measured in a guest on
-    // 2026-09-29, where `/proc/1` stayed readable until this named group one.
     const said = procfsOptions(&room, true, 0).?;
     try std.testing.expectEqualStrings("hidepid=2,gid=1", said);
     try std.testing.expect(std.mem.indexOf(u8, said, "gid=0") == null);
 
-    // And it follows the call's group rather than assuming zero.
     try std.testing.expectEqualStrings("hidepid=2,gid=1001", procfsOptions(&room, true, 1000).?);
 }

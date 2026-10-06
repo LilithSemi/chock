@@ -1,5 +1,5 @@
-//! Reading a URL for the agent. A host becomes a policy action with its labels
-//! reversed, and nothing here opens a socket: `actions.perform` does that.
+//! Reading a URL for the agent. A host becomes a policy action, labels
+//! reversed; `actions.perform` opens the socket, not this file.
 
 const std = @import("std");
 
@@ -33,12 +33,10 @@ pub const max_robots_hosts: usize = 64;
 
 pub const user_agent = actions.user_agent;
 
-/// A `robots.txt` group is matched against this token and not against the whole
-/// header, so a group written for `chock` still binds a later build.
+/// Matched against a `robots.txt` group's own User-agent value, not the header.
 pub const product_token = actions.product_token;
 
-/// The action name for reading `host`, written into `buffer`. The labels are
-/// reversed, so a host name can only fall under the class an author wrote.
+/// The labels are reversed, so a host name can only fall under the class an author wrote.
 pub fn actionInto(buffer: []u8, host: []const u8) ?[]const u8 {
     if (buffer.len < max_action_bytes) return null;
     if (host.len > max_host_bytes) return null;
@@ -138,8 +136,7 @@ pub const Robots = struct {
         return null;
     }
 
-    /// A full cache drops the site read longest ago, and never the rules it was
-    /// just given: a site read under no rules at all fails silently.
+    /// A full cache drops the oldest site, never rules just given: a site with no rules fails silently.
     pub fn keep(
         self: *Robots,
         gpa: std.mem.Allocator,
@@ -250,8 +247,7 @@ fn freeRules(gpa: std.mem.Allocator, list: *std.ArrayList(Rule)) void {
     list.deinit(gpa);
 }
 
-/// The longest matching prefix decides and an `Allow` wins a tie. A `*` or a
-/// `$` in a rule is read as an ordinary character.
+/// Longest matching prefix decides, `Allow` wins ties; a rule's `*`/`$` reads as an ordinary character.
 pub fn pathIsAllowed(rules: []const Rule, path: []const u8) bool {
     var best_len: usize = 0;
     var best_allow = true;
@@ -274,8 +270,7 @@ pub const Session = struct {
     tool: []const u8,
     env: *const std.process.Environ.Map,
     resolver: actions.Resolver = .system,
-    /// The address check lives in `network.zig` and nowhere else: two copies of
-    /// a security check drift apart.
+    /// The address check lives only in `network.zig`: two copies of a security check would drift apart.
     reachable: *const fn (address: actions.Resolver.Address) bool = network.addressIsReachable,
     robots: Robots = .{},
     hop_limit: usize = max_hops,
@@ -316,8 +311,7 @@ pub const Session = struct {
                     .{uri.scheme},
                 ));
             }
-            // `std.http.Client` turns `http://user:secret@host/` into an
-            // `Authorization` header, so a credential would leave here.
+            // `std.http.Client` turns `user:secret@host` into an `Authorization` header: a credential would leave here.
             if (uri.user != null or uri.password != null) return refuse(
                 .url_carries_user_information,
                 try self.gpa.dupe(u8, "nothing was read: that URL carries user information " ++
@@ -337,9 +331,6 @@ pub const Session = struct {
 
             var decision = self.decide(host, request.self_policy);
 
-            // Only the host the agent named, which is the first hop. A
-            // redirect keeps the refusal, so a page cannot chain hops to make
-            // a person answer one question after another.
             if (mayAsk(decision, hop)) {
                 if (request.ask_host) |asker| {
                     var key_buffer: [max_action_bytes]u8 = undefined;
@@ -460,8 +451,7 @@ pub const Session = struct {
         }
     }
 
-    /// Only `allow` reads a page. `ask` refuses here, because `Loop.run` holds
-    /// the session log lock and nobody could answer a question asked on this path.
+    /// Only `allow` reads a page; `ask` refuses here, since `Loop.run` holds the log lock and nobody could answer.
     pub fn decide(
         self: *const Session,
         host: []const u8,
@@ -521,8 +511,7 @@ pub const Session = struct {
         };
         defer result.deinit(self.gpa);
 
-        // Anything but 200 states no rules, and a redirect for `robots.txt` is
-        // not followed.
+        // Anything but 200 states no rules; a `robots.txt` redirect is not followed.
         const rules = if (result.net_fetch.status == 200)
             try rulesFor(self.gpa, result.net_fetch.body, product_token)
         else
@@ -569,9 +558,8 @@ pub const Session = struct {
     }
 };
 
-/// Puts one host to a person while the agent waits. `chock-broker` cannot
-/// import `chock-core`, so this carries the same shape as
-/// `chock_core.fetch.HostAsk` and `src/run.zig` hands one across.
+/// Puts one host to a person while the agent waits; `src/run.zig` hands one
+/// across, matching `chock_core.fetch.HostAsk`'s shape.
 pub const HostAsk = struct {
     ptr: *anyopaque,
     call: *const fn (ptr: *anyopaque, host: []const u8, action: []const u8) Error!bool,
@@ -588,13 +576,7 @@ pub const Request = struct {
     ask_host: ?HostAsk = null,
 };
 
-/// Whether this host may be put to a person while the agent waits.
-///
-/// **Only the host the agent named, which is hop zero.** A redirect hop keeps
-/// the refusal a host no rule names already gets. A page that could ask at
-/// every hop would let whoever wrote it chain redirects and turn the prompt
-/// into a way to tire a person out, and an approval answered wearily is worth
-/// nothing.
+/// Only the host named at hop zero may be put to a person, or a page could chain redirects to ask forever.
 fn mayAsk(decision: table.Decision, hop: usize) bool {
     return decision == .ask and hop == 0;
 }
@@ -625,15 +607,13 @@ fn authorityOf(arena: std.mem.Allocator, uri: std.Uri) Error![]u8 {
     return std.fmt.allocPrint(arena, "{s}://{s}", .{ uri.scheme, host });
 }
 
-/// A `Location` may be relative, so this is where a redirect target becomes a
-/// whole URL again.
+/// A `Location` may be relative, resolved here against the request URL.
 fn resolve(
     arena: std.mem.Allocator,
     base: std.Uri,
     location: []const u8,
 ) (Error || std.Uri.ResolveInPlaceError)![]u8 {
-    // `resolveInPlace` wants the location at the head of a buffer it may also
-    // use for the merged path, and it writes into it.
+    // `resolveInPlace` wants the location at the head of a buffer it also uses for the merged path.
     const room = location.len * 2 + componentBytes(base.path).len + 2;
     const scratch = try arena.alloc(u8, room);
     @memcpy(scratch[0..location.len], location);
@@ -860,16 +840,9 @@ test "a promise on the bare class binds a host the project allowed" {
 }
 
 test "only the host the agent named may be put to a person" {
-    // The host the agent asked for, and the table wants a person.
     try std.testing.expect(mayAsk(.ask, 0));
-
-    // Every redirect hop keeps the refusal. This is the whole of the bound on
-    // a page that would otherwise chain hops to make a person answer again
-    // and again.
     try std.testing.expect(!mayAsk(.ask, 1));
     try std.testing.expect(!mayAsk(.ask, 2));
-
-    // Nothing else is a question. A deny is a deny and an allow needs nobody.
     try std.testing.expect(!mayAsk(.deny, 0));
     try std.testing.expect(!mayAsk(.allow, 0));
 }

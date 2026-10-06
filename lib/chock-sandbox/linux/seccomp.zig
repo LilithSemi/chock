@@ -4,69 +4,9 @@ const linux = std.os.linux;
 
 pub const RET_ALLOW: u32 = 0x7fff0000;
 pub const RET_KILL_PROCESS: u32 = 0x80000000;
-/// Return EPERM to the caller instead of killing it.
 pub const RET_ERRNO_PERM: u32 = 0x00050000 | @as(u32, @intFromEnum(linux.E.PERM));
-/// Hold the call, tell the supervisor it happened, and then let it run.
-/// **Not a denial.** See `TrapCall`.
 pub const RET_USER_NOTIF: u32 = linux.SECCOMP.RET.USER_NOTIF;
 
-/// The calls Chock blocks outright. No correct tool needs one of these.
-/// `unshare` and `setns` are here because the sandbox is already built when the filter
-/// is installed. A later call can only try to leave it.
-///
-/// The whole mount family is here for the same reason. The mount tree is built before
-/// the filter is installed, so no correct step needs one of these calls afterwards. A
-/// process in its own user namespace holds CAP_SYS_ADMIN over that namespace, and can
-/// otherwise call `umount2` to undo the read only bind mount that protects a file such
-/// as chock.zon, then write or delete the file it was meant to protect.
-///
-/// This is a denylist of a syscall family the kernel keeps adding members to, not a
-/// fixed set. `open_tree_attr`, syscall 467, was added in kernel 6.15 and was missed
-/// on the first pass of this list. It combines `open_tree` and `mount_setattr` into
-/// one call, so without `OPEN_TREE_CLONE` it can strip `MOUNT_ATTR_RDONLY` from a live
-/// mount the same way `mount_setattr` can, and a filter that blocks `mount_setattr`
-/// but not `open_tree_attr` still lets the read only bind be undone. Whoever raises
-/// the kernel floor this project builds against must read `uapi/linux/mount.h` for the
-/// target kernel and check whether the mount family gained another member before
-/// trusting this list again.
-///
-/// `kexec_file_load` and `delete_module` sit beside `kexec_load`, `init_module`, and
-/// `finit_module` for the same reason. Each one reaches the kernel today and is only
-/// refused because the process lacks a capability in the initial user namespace. That
-/// is luck, not design, so this filter names them itself instead of relying on it.
-///
-/// `add_key`, `keyctl`, and `request_key` are here because `Sandbox.applyLayers`
-/// already joins a fresh session keyring before this filter goes on. `CLONE_NEWUSER`
-/// gives a process a fresh user keyring on its own, but the kernel has no namespace
-/// for the session keyring, so without that join a key planted on the host is
-/// readable in here and a key added in here is readable, and revocable, from the
-/// host. Once the join has run, nothing this sandbox executes has any legitimate
-/// reason to touch a keyring again, so the three calls that reach one are refused
-/// outright. The join has to run before this filter is installed, since the join
-/// itself uses `keyctl`; blocking these calls afterwards costs nothing, because by
-/// then the join has already finished.
-///
-/// The three io_uring calls are **not** here. They are on `refused_calls` below, which
-/// answers `EPERM`. io_uring stays exactly as unavailable as it was; read that list for
-/// why the answer changed and why the security did not.
-///
-/// `open_by_handle_at` sits here for the same reason as `kexec_file_load` and
-/// `delete_module` above: it reaches the kernel today and is only refused because the
-/// caller lacks `CAP_DAC_READ_SEARCH` in the user namespace that owns the target
-/// filesystem's superblock, which a process born from `CLONE_NEWUSER` never holds over
-/// a host filesystem, no matter how many capabilities it carries in its own namespace.
-/// **Measured**, with a small C program run outside Chock entirely and then again as
-/// `spawn-handle-escape` inside a real `Sandbox.spawn`: `open_by_handle_at` fails with
-/// `EPERM` both times, for this repository's own unprivileged user and for `root`
-/// inside a plain `unshare -U -r`. That is the capability check doing its job on its
-/// own, with no help from Landlock or from this filter. See
-/// `test/sandbox/escape.zig`'s "cannot reopen a file by handle" test for the full
-/// account, including why dropping this entry would not open the hole that dropping
-/// `mount` would. It is blocked anyway: a call refused only by luck is not a call this
-/// project relies on being unlucky forever. `name_to_handle_at`, the call that only
-/// encodes a handle and grants nothing by itself, is deliberately not here; that same
-/// test needs it working to prove the handle it hands to `open_by_handle_at` was ever
-/// real.
 pub const blocked_calls = [_]linux.SYS{
     .ptrace,
     .bpf,
@@ -101,92 +41,18 @@ pub const blocked_calls = [_]linux.SYS{
     .open_by_handle_at,
 };
 
-/// The calls the filter refuses with `EPERM` instead of killing the caller.
-///
-/// **io_uring is as unavailable as it was on the kill list, and that is the whole
-/// point.** A refused `io_uring_setup` creates no ring. `io_uring_enter` submits no
-/// operation, and `io_uring_register` gives no ring a buffer, a file, or an eventfd.
-/// There is no ring to hold a submission queue, so there is no kernel worker to do an
-/// operation the thread never made a syscall for. The bypass this list exists to close
-/// is closed by the refusal, not by the death of the caller. **The only thing that
-/// changed is that the process learns it was refused.**
-///
-/// io_uring is the standard way around a syscall filter. A process puts an operation in
-/// a ring, and a kernel worker does the operation, so the thread that asked never makes
-/// the syscall this filter reads. A rule written for that operation is not applied to it
-/// at all. That is why these three calls must never succeed.
-///
-/// **Nothing got through when this was measured.** The red team run of 2026-08-22 set
-/// up a ring, opened a mounted store path through it, and tried two writes outside the
-/// workspace and a `connect`. Landlock refused both writes with EACCES, and the network
-/// namespace gave ENETUNREACH, because a namespace is not a filter and so has no
-/// syscall for io_uring to avoid making. That result is a property of which layers
-/// happen to cover the file surface and the network today. It is not a statement about
-/// every operation io_uring supports, and seccomp is the only layer that covers some of
-/// them. **That run is unaffected by the change from a kill to a refusal**, because it
-/// needed a ring and a refusal gives none.
-///
-/// ## Why the kill was dropped, measured on Node v24.19.0 with `strace`
-///
-/// The old text here ended "no program a coding agent runs needs a ring". That sentence
-/// is false in the way that matters. libuv calls `io_uring_setup` six times while Node
-/// starts, before it runs one line of the program, and it does this whatever the code
-/// asks for. `UV_USE_IO_URING=0` does not stop it: six calls, measured. The probe is
-/// meant to fail on a kernel older than 5.1, and libuv then falls back to its thread
-/// pool. So Node does not need a ring. **It needs the probe to fail survivably.** A kill
-/// ends the process before `main` and `node -e` cannot run at all, which is what stopped
-/// an agent building a website with Node, Deno or Bun. With
-/// `strace -e inject=io_uring_setup:error=EPERM` the same `node -e` runs and exits 0.
-///
-/// **Killing buys nothing here.** A hostile program is free to not call io_uring, so the
-/// kill never stopped an attacker who read this file. It only stopped the honest
-/// run time that probes and falls back. A refusal costs an attacker exactly what the
-/// kill did, which is the ring, and costs the honest program nothing.
-///
-/// **This list is for a call that is probed and answered, and not for a call that is
-/// simply forbidden.** Every member of `blocked_calls` above is on that list for a
-/// reason of its own, and none of them is reached by a program that asks, reads the
-/// answer, and takes another road. Moving one of them here needs the same measurement
-/// this one got.
 pub const refused_calls = [_]linux.SYS{
     .io_uring_setup,
     .io_uring_enter,
     .io_uring_register,
 };
 
-/// The calls a supervisor can be asked to observe, and the only calls it can
-/// ever observe.
-///
-/// **A third category, beside the kill list and the refusal list.** A trapped
-/// call is not stopped. The kernel holds it, tells another process that it
-/// happened, and then lets it run. So this list answers a different question
-/// from the two above: not "may this call happen", but "is this call counted".
-///
-/// **A closed set, and that is the whole safety argument.** A policy picks a
-/// member of this enum. It never picks a syscall number. Two faults are
-/// impossible because of that:
-///
-///   * A call on `blocked_calls` can never become a call that is only counted.
-///     The `comptime` block below `bootstrap_calls` stops the build on any
-///     overlap.
-///   * A call that the handover itself makes can never be trapped. See
-///     `bootstrap_calls`, which states why that would stop two processes
-///     forever.
-///
-/// **The four members were measured on 2026-09-10, on this kernel.** `execve`,
-/// `connect`, and `getdents64` are near zero in every workload measured, so
-/// they cost nothing at all. `openat` costs about 11 microseconds for each
-/// call, which is under 0.5% of a clean `zig build` and below the noise of
-/// this machine. `connect` is the member that makes the network story
-/// auditable. `statx`, `brk`, and `mmap` were measured beside them: they
-/// double the cost and give no audit value, so they are deliberately not here.
 pub const TrapCall = enum {
     openat,
     execve,
     connect,
     getdents64,
 
-    /// The syscall this member names, for the architecture of this binary.
     pub fn number(self: TrapCall) linux.SYS {
         return switch (self) {
             .openat => .openat,
@@ -196,19 +62,6 @@ pub const TrapCall = enum {
         };
     }
 
-    /// Which argument of this call is a pointer to a path, or null for a call
-    /// that names no path at all.
-    ///
-    /// **A property of the member, and never a number written at the place
-    /// that reads memory.** A member added above answers this question here,
-    /// once, beside the syscall number it already answers. A reader that
-    /// guessed would read the wrong pointer for one call and record a
-    /// filename that was never a filename.
-    ///
-    /// `connect` is null on purpose. Its second argument is a `sockaddr` and
-    /// not a path, and the one family that carries a path inside it needs the
-    /// address to be decoded rather than copied. `getdents64` takes a
-    /// descriptor, which names no path at all.
     pub fn pathArg(self: TrapCall) ?u2 {
         return switch (self) {
             .openat => 1,
@@ -217,11 +70,6 @@ pub const TrapCall = enum {
         };
     }
 
-    /// The member a notification names, or null for a number no member holds.
-    ///
-    /// **The number comes from the kernel, inside the notification.** The
-    /// observed process cannot change it after the filter read it, so a count
-    /// made from it cannot be forged.
     pub fn fromNumber(nr: i64) ?TrapCall {
         inline for (@typeInfo(TrapCall).@"enum".fields) |field| {
             const call: TrapCall = @enumFromInt(field.value);
@@ -231,29 +79,8 @@ pub const TrapCall = enum {
     }
 };
 
-/// Which calls one filter hands to a supervisor. Empty is the default, and an
-/// empty set builds exactly the filter this project always built.
 pub const TrapSet = std.EnumSet(TrapCall);
 
-/// The calls the observed process makes between the filter going on and the
-/// supervisor holding the notification descriptor.
-///
-/// **A trap on one of these is not a slow call. It is a stop that never
-/// ends.** `linux/driver.zig` installs the filter in B, the process that runs
-/// the caller's program. B then writes the descriptor number to A, the
-/// supervisor, and waits for A to answer. A takes the descriptor with
-/// `pidfd_getfd`. Until that is finished, no process holds the descriptor, so
-/// nothing can answer a notification. A trapped `write` or `read` in that
-/// window would wait for a supervisor that does not exist yet, and A would
-/// wait for B at the same moment.
-///
-/// `sendto` is here beside `write` because `linux/notify.zig` sends on that
-/// socket with `MSG_NOSIGNAL`, so the death of the other process reaches it as
-/// an `EPIPE` it can read rather than as a `SIGPIPE` that ends it.
-///
-/// **A comment is not the guarantee.** The `comptime` block below stops the
-/// build if a `TrapCall` member ever names one of these calls. The test
-/// "no call the handover makes can ever be trapped" reads the same fact again.
 pub const bootstrap_calls = [_]linux.SYS{ .read, .write, .close, .sendto };
 
 comptime {
@@ -277,381 +104,123 @@ comptime {
     }
 }
 
-/// The calls whose `prot` argument the filter reads. `prot` is argument index
-/// 2 for all three.
 pub const memory_calls = [_]linux.SYS{ .mmap, .mprotect, .pkey_mprotect };
 
-/// The highest syscall number this project has classified, for the architecture
-/// this binary is built for. A syscall is classified once a person has read it and
-/// either put it on `blocked_calls` or decided on purpose to leave it off. Zig
-/// 0.16.0 lists the aarch64 table through `listns`, syscall 470, and that is the
-/// value below, checked by hand against `lib/zig/std/os/linux/syscalls.zig`.
-///
-/// This line only moves when a person raises it after reading the new syscalls.
-/// The test below fails the build the day the standard library adds one past it.
-///
-/// This cannot see a syscall the running kernel has but Zig does not know about
-/// yet. That gap is why the design also wants a warning when the running kernel
-/// is newer than the version Chock was hardened for. This constant is one half
-/// of that safeguard, not the whole of it.
 pub const classified_through: usize = 470;
 
-/// The audit constant for the architecture that this binary runs on.
-/// A filter must refuse a call from any other architecture. A 64 bit kernel can run a
-/// 32 bit binary, and the call numbers are different, so a filter without this check
-/// can be passed.
-///
-/// These values are written by hand on purpose. `std.os.linux.AUDIT.ARCH` does not
-/// compile in Zig 0.16.0, because its `FRV` field names `std.elf.EM.FRV` and that field
-/// is called `CYGNUS_FRV`. Use the standard library again when the bug is fixed.
-///
-/// A value is the ELF machine number, with 0x80000000 for a 64 bit architecture and
-/// 0x40000000 for a little endian architecture.
 fn nativeAuditArch() u32 {
     const bit_64: u32 = 0x80000000;
     const little_endian: u32 = 0x40000000;
     return switch (@import("builtin").cpu.arch) {
-        // EM_AARCH64 is 183.
         .aarch64 => 183 | bit_64 | little_endian,
-        // EM_X86_64 is 62.
         .x86_64 => 62 | bit_64 | little_endian,
-        // EM_RISCV is 243.
         .riscv64 => 243 | bit_64 | little_endian,
         else => @compileError("chock-sandbox has no audit arch for this target"),
     };
 }
 
-/// How to build the filter.
 pub const Options = struct {
-    /// Deny a page that is writable and executable at the same time.
-    /// Turn this off for a project that needs a run time which allocates such a page.
-    /// The Java code cache and some versions of V8 do this.
     strict_wx: bool = true,
-    /// Refuse `connect` with `EPERM`. Off by default, and the Linux driver
-    /// turns it on for one case only: `namespace.Network.filtered`.
-    ///
-    /// ## Why a `.filtered` sandbox needs this, and a `.none` one does not
-    ///
-    /// A filtered process is handed a **connected descriptor** over
-    /// `SCM_RIGHTS`. That descriptor was made by the process on the other side
-    /// of the boundary, so it belongs to **that** process's network namespace
-    /// and not to the sandbox's own empty one. The sandbox's namespace
-    /// therefore says nothing about where that one descriptor can reach.
-    ///
-    /// **Measured on 2026-08-23, on Linux 6.18.42.** A connected TCP socket:
-    ///
-    /// * `connect` to another address while connected answers `EISCONN`.
-    /// * `connect` with `AF_UNSPEC` **succeeds** and dissolves the
-    ///   association, and a `connect` to another address after that
-    ///   **succeeds too**. So a granted descriptor really can be aimed
-    ///   somewhere else.
-    /// * `sendto` with another address on a connected socket ignores that
-    ///   address: the bytes arrived at the connected peer, and the second
-    ///   listener accepted nothing. So `connect` is the only way to re-aim
-    ///   one.
-    ///
-    /// Refusing `connect` is what closes that, and it is the rule the whole
-    /// design already states: **a filtered process does not open a
-    /// connection. It asks for one.** A process that never calls `connect`
-    /// loses nothing.
-    ///
-    /// **This narrows, it never widens.** `none` keeps exactly the filter it
-    /// always had, so nothing that runs today changes, and `filtered` is
-    /// strictly the stricter of the two on system calls as well as being the
-    /// one with a channel out.
-    ///
-    /// **So the two modes do not carry the same filter, and a caller must not
-    /// treat them as interchangeable.** Measured on 2026-08-24, with the
-    /// driver reading this option as a plain `true`: four tests fail. See
-    /// `linux/driver.zig`, where that line is, for which four and what each
-    /// one names.
-    ///
-    /// **What it costs, stated rather than hidden.** `connect` is one call for
-    /// every address family, and seccomp cannot read the address behind the
-    /// pointer, so this also refuses a unix socket client inside the sandbox.
-    /// A filtered program that wants to talk to a helper of its own uses
-    /// `socketpair`, which this filter does not touch.
-    ///
-    /// `EPERM` and not a kill, for the reason the write and execute rule gives:
-    /// a program that meets a refusal can answer it, and a program that is
-    /// killed cannot.
     block_connect: bool = false,
-    /// Which calls the supervisor observes. See `TrapCall`.
-    ///
-    /// **Empty by default, so nothing changes for a caller that does not
-    /// ask.** An empty set adds no instruction at all, and the filter is byte
-    /// for byte the filter this project always built.
-    ///
-    /// **Only for a filter that goes on with `installListening`.** A filter
-    /// that returns `RET_USER_NOTIF` with no listener behind it makes the
-    /// kernel answer the call with `ENOSYS`, which is worse than either a kill
-    /// or a refusal: the program is told the call does not exist. So a filter
-    /// built with a trap set must go on with that one call and no other.
-    /// `linux/driver.zig` builds a second filter, with this field empty, for
-    /// the supervisor process itself.
-    ///
-    /// **A refusal wins over an observation.** `block_connect` above emits its
-    /// rule first, so a filter that both refuses `connect` and observes it
-    /// refuses it and never counts it. That is the narrow answer, and it is
-    /// the safe direction.
     traps: TrapSet = .initEmpty(),
 };
 
-/// Build the filter. The caller owns the memory.
-///
-/// One filter serves both the tool runner and the plugin host. Two profiles were
-/// planned, but the write and execute rule reads the protection flags of the call,
-/// so a compiler in a tool call and Vulcan in the plugin host both pass it.
 pub fn build(allocator: std.mem.Allocator, options: Options) ![]bpf.Insn {
     var insns: std.ArrayList(bpf.Insn) = .empty;
     errdefer insns.deinit(allocator);
 
-    // Refuse any architecture but this one, before anything reads a call number.
     try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_arch));
     try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, nativeAuditArch(), 1, 0));
     try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
 
-    // Load the call number one time. Every check below reads it.
     try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr));
 
-    // The x32 ABI reports the same audit architecture as x86_64 and sets bit 30 in the
-    // call number. Such a call matches no comparison below and would reach the allow at
-    // the end. Kill it before any comparison runs.
     if (@import("builtin").cpu.arch == .x86_64) {
         try insns.append(allocator, bpf.jump(bpf.JMP_JGE_K, 0x40000000, 0, 1));
         try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
     }
 
     for (blocked_calls) |call| {
-        // std.os.linux.SYS has a usize tag, but a BPF constant is 32 bits wide.
         const number: u32 = @intCast(@intFromEnum(call));
-        // If the number matches, fall to the kill. If not, skip over the kill.
         try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, number, 0, 1));
         try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
     }
 
-    // See `refused_calls`. Two instructions per call, and neither one touches the
-    // accumulator, so the call number every check below reads is still in it.
     for (refused_calls) |call| {
         const number: u32 = @intCast(@intFromEnum(call));
-        // If the number matches, fall to the refusal. If not, skip over it.
         try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, number, 0, 1));
         try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ERRNO_PERM));
     }
 
-    // See `Options.block_connect`. Two instructions, and neither one touches the
-    // accumulator, so the call number every check below reads is still in it.
     if (options.block_connect) {
         const connect_number: u32 = @intCast(@intFromEnum(linux.SYS.connect));
-        // If the number matches, fall to the refusal. If not, skip over it.
         try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, connect_number, 0, 1));
         try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ERRNO_PERM));
     }
 
-    // Refuse `execveat` when its `flags` argument sets `AT_EMPTY_PATH`. This is
-    // unconditional, unlike the write-and-execute rules below: it closes a real
-    // boundary, not a hardening cost. `SECURITY.md`'s own definition of a security
-    // bug names it directly: "defeats the Landlock rules".
-    //
-    // `AT_EMPTY_PATH` is what lets `execveat` run a bare descriptor with an empty
-    // path string, rather than a real path it would otherwise resolve relative to
-    // `dirfd`. `memfd_create` makes an anonymous file with no directory entry at
-    // all, so `execveat(memfd, "", argv, envp, AT_EMPTY_PATH)` runs it without
-    // ever naming a path. Landlock's execute right attaches to a path and only a
-    // path, so a call that names none has nothing for that right to check.
-    //
-    // **Measured, in `test/sandbox/escape.zig`'s memfd escape test, before this
-    // rule existed: the run lands.** A ruleset that grants /work every ordinary
-    // right except execute still lets a process write those exact bytes into a
-    // memfd and run them, after the identical bytes on disk were refused with
-    // `EACCES` by the same ruleset. Nothing else Chock promises was defeated by
-    // that: the seccomp filter installs once before this process's first line and
-    // cannot be shed by any execve, so `ptrace` still dies with `SIGSYS`
-    // afterward, and every other layer, the mount tree, the network namespace,
-    // the resource limits, applies to whatever code lands exactly as it did
-    // before. Only Landlock's own execute right, one specific stated boundary,
-    // was the thing with nothing to check. This rule is what gives it something.
-    //
-    // This reads the `flags` argument, `execveat`'s fifth and index 4, rather
-    // than blocking `memfd_create` itself. `memfd_create` alone grants nothing:
-    // it makes memory a process already owns, and closing the step that never
-    // executes anything costs whatever legitimate use of an anonymous, exec-free
-    // memfd this sandbox's workload has, measured or not. The execute step is the
-    // one that matters, and it is also the narrower rule: `strace` against
-    // Node v24.19.0, Python 3.14 and Go 1.26 running an ordinary program each
-    // shows neither `memfd_create` nor `execveat` called at all, so this refuses
-    // a call none of them make and keeps every one of them running.
-    //
-    // An ordinary `execveat` call, with a real path and no empty-path flag, is
-    // left alone. Nothing measured here needed one refused, so narrower costs
-    // less than wider.
     {
+        // AT_EMPTY_PATH lets execveat run a memfd_create file with no path to check.
         const execveat_number: u32 = @intCast(@intFromEnum(linux.SYS.execveat));
         const at_empty_path: u32 = 0x1000;
-        // If this is not execveat, jump over the five instructions that follow.
         try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, execveat_number, 0, 5));
-        // The kernel declares flags an int, so the low half is the whole value.
-        // The high half of the 64 bit argument slot carries nothing.
         try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offsetOfArgLow(4)));
         try insns.append(allocator, bpf.stmt(bpf.ALU_AND_K, at_empty_path));
-        // The masked value equals AT_EMPTY_PATH only when the caller asked to run
-        // a bare descriptor with no path at all. Fall through to the kill.
-        // Otherwise skip past it.
         try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, at_empty_path, 0, 1));
         try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
-        // Put the call number back, because the checks that follow expect it.
         try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr));
     }
 
-    // Refuse `socket(AF_VSOCK, ...)`, unconditionally, the same as the
-    // `execveat` rule above and for the same reason: this closes a boundary
-    // this sandbox's own design already claims, not a cost this project is
-    // choosing to add.
-    //
-    // Every other address family a tool call can reach is inside the
-    // network namespace `namespace.enter` always builds: `Network.none`
-    // brings up no interface at all, and even `Network.filtered`'s one
-    // granted descriptor was made on the other side of the boundary, in a
-    // process that is not this one. `AF_VSOCK` answers to neither. A vsock
-    // address names a hypervisor CID, not a route inside any network
-    // namespace, and the kernel does not consult the calling process's
-    // netns to decide whether one is reachable: a guest's vsock transport
-    // is the same one every netns in that guest shares. So on any host
-    // where Chock's own sandbox is itself the guest of a hypervisor, this
-    // is a channel to that hypervisor with no network namespace, no
-    // `Network` mode, and no policy rule standing in front of it at all,
-    // for a process `Network.none` is supposed to leave with no route out
-    // whatsoever.
-    //
-    // Codex already reasons this way and refuses `AF_VSOCK` even when its
-    // own network policy would otherwise allow a connection, because a
-    // vsock reaches the hypervisor and is outside any network policy by
-    // construction. Nothing here depends on whether this particular host
-    // happens to be a VM guest today: a filter built once has to hold on
-    // every host it might run on, including the ones it does not know
-    // about yet, and the cost of naming a family no coding tool has any
-    // reason to open is nothing measured against.
     {
         const socket_number: u32 = @intCast(@intFromEnum(linux.SYS.socket));
         const af_vsock: u32 = 40;
-        // If this is not socket, jump over the four instructions that follow.
         try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, socket_number, 0, 4));
-        // The kernel declares domain an int, so the low half is the whole
-        // value. socket's first argument, index 0.
         try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offsetOfArgLow(0)));
-        // AF_VSOCK and nothing else. Fall through to the kill on a match.
-        // Otherwise skip past it: every other family this sandbox already
-        // confines through the network namespace, and none of them needs
-        // this rule to say so again.
         try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, af_vsock, 0, 1));
         try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
-        // Put the call number back, because the checks that follow expect it.
         try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr));
     }
 
-    // Refuse a request for a page that is writable and executable at the
-    // same time. The `prot` argument is a scalar. The filter can read it directly. A
-    // filter can never read memory through a pointer.
-    //
-    // This rule raises the cost of running injected code. It is not a boundary. Do not
-    // read it as a guarantee. An attacker ran injected code past this rule three ways.
-    // Each way was proven by running code, not only argued.
-    //
-    //   - `shmat` has no `prot` argument. This rule never sees a `shmat` call. A
-    //     process calls `shmget`, then `shmat` with `SHM_EXEC`, and gets a mapping
-    //     that is writable and executable at the same time.
-    //   - An ELF file can set its `PT_GNU_STACK` segment to read, write, and execute.
-    //     The loader gives out that stack. No memory syscall runs for this rule to see.
-    //   - A process calls `memfd_create`, then maps the file once with
-    //     `PROT_READ | PROT_EXEC` and `MAP_SHARED`. It then calls `pwrite` on the file
-    //     descriptor. No mapping is ever writable. The code the mapping runs still
-    //     changes.
-    //
-    // The block below closes `personality(READ_IMPLIES_EXEC)`, and the block after it
-    // closes `shmat` with `SHM_EXEC`. Both cost nothing to close. Neither closes the
-    // other two routes above, and no rule that reads a syscall argument can.
     if (options.strict_wx) {
-        // The kernel adds PROT_EXEC to a mapping inside do_mmap, after seccomp has
-        // already inspected the prot argument that this filter reads below. It does
-        // this when the calling thread has set the READ_IMPLIES_EXEC personality flag.
-        // A caller can set that flag, then ask mmap for PROT_READ | PROT_WRITE only,
-        // pass the rule that follows this block, and still receive a page that maps
-        // rwxp. Refuse only the call that turns this behavior on. A build tool that
-        // calls personality(ADDR_NO_RANDOMIZE) for a reproducible build, and the
-        // standard read of the current value with personality(0xffffffff), must both
-        // keep working.
         {
             const personality_number: u32 = @intCast(@intFromEnum(linux.SYS.personality));
             const read_implies_exec: u32 = 0x0400000;
             const read_current: u32 = 0xffffffff;
-            // If this is not personality, jump over the six instructions that follow.
             try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, personality_number, 0, 6));
-            // The kernel declares the parameter unsigned int, so the low half is the
-            // whole value. The high half of the 64 bit argument slot carries nothing.
             try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offsetOfArgLow(0)));
-            // 0xffffffff only reads the current value and changes nothing. Let it
-            // through by jumping straight to the restore at the end of this block.
             try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, read_current, 3, 0));
             try insns.append(allocator, bpf.stmt(bpf.ALU_AND_K, read_implies_exec));
-            // The masked value equals READ_IMPLIES_EXEC only when the caller asked to
-            // turn the bit on. Fall through to the deny. Otherwise skip past it.
             try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, read_implies_exec, 0, 1));
             try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ERRNO_PERM));
-            // Put the call number back, because the checks that follow expect it.
             try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr));
         }
 
-        // `shmat` has no `prot` argument, so the rule below never sees a `shmat` call.
-        // Refuse it outright when the caller asks to attach the segment executable.
-        // No tool a coding agent runs needs a shared memory segment, so this costs
-        // nothing. `shmflg` is `shmat`'s third argument, index 2.
         {
             const shmat_number: u32 = @intCast(@intFromEnum(linux.SYS.shmat));
             const shm_exec: u32 = 0x8000;
-            // If this is not shmat, jump over the five instructions that follow.
             try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, shmat_number, 0, 5));
-            // The kernel declares shmflg an int, so the low half is the whole value.
-            // The high half of the 64 bit argument slot carries nothing.
             try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offsetOfArgLow(2)));
             try insns.append(allocator, bpf.stmt(bpf.ALU_AND_K, shm_exec));
-            // The masked value equals SHM_EXEC only when the caller asked to attach
-            // the segment executable. Fall through to the deny. Otherwise skip past it.
             try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, shm_exec, 0, 1));
             try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ERRNO_PERM));
-            // Put the call number back, because the checks that follow expect it.
             try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr));
         }
 
         const prot_write_exec: u32 = 0x2 | 0x4;
-        // The `prot` argument is number 2 for all three calls.
         for (memory_calls) |call| {
             const number: u32 = @intCast(@intFromEnum(call));
-            // If this is not the call, jump over the six instructions that follow.
             try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, number, 0, 6));
             try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offsetOfArgLow(2)));
             try insns.append(allocator, bpf.stmt(bpf.ALU_AND_K, prot_write_exec));
-            // Both bits set means a request for write and execute at one time.
             try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, prot_write_exec, 0, 1));
             try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ERRNO_PERM));
-            // Put the call number back, because the checks that follow expect it.
             try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr));
-            // A jump of zero. It keeps the count above correct and reads clearly.
             try insns.append(allocator, bpf.stmt(bpf.JMP_JA, 0));
         }
     }
 
-    // See `TrapCall`. Two instructions for each observed call, the same shape
-    // the refusal loop has, and neither one touches the accumulator, so the
-    // call number is still in it when the allow below is reached.
-    //
-    // **Last, after every rule that kills or refuses.** The sets are already
-    // disjoint at compile time, so nothing here can take a boundary away. The
-    // position says it a second time, for free: a call that some rule above
-    // answered never reaches this point at all.
     var traps = options.traps.iterator();
     while (traps.next()) |call| {
         const number: u32 = @intCast(@intFromEnum(call.number()));
-        // If the number matches, fall to the notification. If not, skip over it.
         try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, number, 0, 1));
         try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_USER_NOTIF));
     }
@@ -660,36 +229,6 @@ pub fn build(allocator: std.mem.Allocator, options: Options) ![]bpf.Insn {
     return insns.toOwnedSlice(allocator);
 }
 
-/// Every call the path reader may make, and the only ones it may make.
-///
-/// **An allowlist, where every other filter in this file is a denylist.** The
-/// reader is one loop of about forty lines and its whole job is four calls, so
-/// the set of calls it needs can be written down completely. Nothing else can
-/// be said about the process that holds `process_vm_readv`, which every other
-/// process Chock starts is killed for making, so nothing else is permitted.
-///
-/// What each one is for:
-///
-///   * `process_vm_readv` copies the path out of the observed process. It is
-///     the reason the reader exists, and it is a call on `blocked_calls`, so
-///     the reader can never run under the filter the rest of the sandbox runs
-///     under. `process_vm_writev` is **not** here: the reader reads.
-///   * `ioctl` carries `SECCOMP_IOCTL_NOTIF_RECV` and `SECCOMP_IOCTL_NOTIF_SEND`.
-///     The reader holds exactly one descriptor when this filter goes on,
-///     which is the notification descriptor, so the descriptor argument can
-///     reach nothing else. See `notify.runReader`, which closes every other
-///     descriptor before it installs this.
-///   * `poll` and `ppoll` wait for a notification. Which of the two the
-///     standard library calls depends on the architecture, so both are named
-///     when the architecture has both.
-///   * `exit_group`, `exit`, `rt_sigreturn` and `restart_syscall` are how a
-///     process ends and how it comes back from a signal. A process that could
-///     not make them could not die cleanly or survive an interrupted wait.
-///
-/// **No `write`, no `openat`, no `socket`, no `connect`, and no `close`.** The
-/// reader has no way to put a byte anywhere except the shared record it was
-/// given before the filter went on, so a reader that was somehow turned
-/// against its owner still reaches nothing.
 pub const reader_calls = blk: {
     var list: []const linux.SYS = &.{
         .process_vm_readv,
@@ -700,17 +239,11 @@ pub const reader_calls = blk: {
         .rt_sigreturn,
         .restart_syscall,
     };
-    // `poll` exists on x86_64 and does not exist on aarch64, where the
-    // standard library calls `ppoll` instead. Naming a member the table does
-    // not have would not build at all.
     if (@hasField(linux.SYS, "poll")) list = list ++ &[_]linux.SYS{.poll};
     break :blk list;
 };
 
 comptime {
-    // **The reader's filter must permit a call the sandbox kills.** That is
-    // the whole reason the reader is a process of its own, so a build in which
-    // the two lists agreed would mean the separation had quietly been undone.
     var reads_memory = false;
     for (reader_calls) |call| {
         if (call == .process_vm_readv) reads_memory = true;
@@ -720,17 +253,10 @@ comptime {
     );
 }
 
-/// The filter the path reader runs under. **An allowlist**: every call not in
-/// `reader_calls` kills the process.
-///
-/// The caller owns the memory.
 pub fn buildReader(allocator: std.mem.Allocator) ![]bpf.Insn {
     return buildAllowlist(allocator, reader_calls);
 }
 
-/// Every call the pid namespace keeper may make, and the only ones it may
-/// make. The keeper reaps orphaned processes, waits for its control socket,
-/// reports that its filter is active, and exits.
 pub const keeper_calls: []const linux.SYS = &.{
     .wait4,
     .ppoll,
@@ -741,50 +267,10 @@ pub const keeper_calls: []const linux.SYS = &.{
     .restart_syscall,
 };
 
-/// The allowlist for the pid namespace keeper. The caller owns the memory.
 pub fn buildKeeper(allocator: std.mem.Allocator) ![]bpf.Insn {
     return buildAllowlist(allocator, keeper_calls);
 }
 
-/// Every call the network router may make, and the only ones it may make.
-///
-/// **An allowlist, and the same shape `reader_calls` has, for the same
-/// reason.** The router is the one process inside the sandbox that holds a
-/// descriptor made in the host's own network namespace and a capability the
-/// sandboxed program does not have, so what it may do has to be written down
-/// completely rather than left to a denylist.
-///
-/// **Everything that opens something happens before this filter goes on.**
-/// `driver.runRouter` binds the relay and the resolver, opens the netlink
-/// socket the allow sets are written on, and only then installs this. So there
-/// is no `socket`, no `bind`, no `listen`, no `openat` and no `connect` here
-/// at all: the router cannot make a new socket of any kind, and the one
-/// descriptor that leaves the namespace is the one the far side sends it.
-///
-/// What each one is for:
-///
-///   * `accept4` takes the connection the kernel redirected to the relay.
-///   * `getsockopt` reads `SO_ORIGINAL_DST`, which is the pre-nat address and
-///     the only thing that says where a redirected connection was going.
-///     `setsockopt` is **not** here: the router changes no socket option after
-///     its listeners are up.
-///   * `recvfrom` and `sendto` carry a query and its answer, a relayed write,
-///     and every message on the netlink socket. `recvmsg` and `sendmsg` carry
-///     the channel out, which is the one exchange with a descriptor in it.
-///   * `read` takes bytes off a relayed connection. `shutdown` carries a half
-///     close through, which is what lets a request finish.
-///   * `close` releases a link. `fcntl` makes an inherited descriptor
-///     non blocking, and nothing else: the router never asks for a descriptor
-///     it has to open.
-///   * `ppoll` and `poll` are the wait the whole loop is built on. Which of
-///     the two the standard library calls depends on the architecture.
-///   * `clock_gettime` reads the monotonic clock every expiry is measured on.
-///   * `exit_group`, `exit`, `rt_sigreturn` and `restart_syscall` are how a
-///     process ends and how it comes back from a signal.
-///
-/// **No `write`, no `openat`, no `socket`, no `connect`, no `execve`, and no
-/// way to signal a process.** The router reads and writes only descriptors it
-/// already holds, and it reaches no path at all.
 pub const router_calls = blk: {
     var list: []const linux.SYS = &.{
         .accept4,
@@ -804,19 +290,11 @@ pub const router_calls = blk: {
         .rt_sigreturn,
         .restart_syscall,
     };
-    // `poll` exists on x86_64 and does not exist on aarch64, where the
-    // standard library calls `ppoll` instead. The same case `reader_calls`
-    // above names, and naming a member the table does not have would not build.
     if (@hasField(linux.SYS, "poll")) list = list ++ &[_]linux.SYS{.poll};
     break :blk list;
 };
 
 comptime {
-    // **The router must not be able to make a socket or reach a path.** It
-    // holds a descriptor from the host's own network namespace and
-    // `CAP_NET_ADMIN` in the sandbox's, and the only reason that is bounded is
-    // that it cannot open anything new. A call added to the list above without
-    // reading this comment stops the build.
     for (router_calls) |call| {
         const refused = switch (call) {
             .socket, .socketpair, .connect, .bind, .listen, .openat, .execve, .kill, .ptrace => true,
@@ -828,45 +306,16 @@ comptime {
     }
 }
 
-/// The filter the network router runs under. **An allowlist**: every call not
-/// in `router_calls` kills the process.
-///
-/// The caller owns the memory.
 pub fn buildRouter(allocator: std.mem.Allocator) ![]bpf.Insn {
     return buildAllowlist(allocator, router_calls);
 }
 
-/// Every call the VMM may make once its machine is built, and the only ones it
-/// may make.
-///
-/// **An allowlist, because the VMM answers bytes the guest wrote.** Mirage's
-/// device models and `Export.answer` parse ring descriptors and filesystem
-/// requests from inside the guest, and one of them ended the host process
-/// through an assert on 2026-10-04. So what this process may do is written
-/// down completely.
-///
-/// **No call that opens a socket, runs a program or changes a namespace.**
-/// `/dev/kvm`, the guest's memory, the session socket and the console are all
-/// descriptors the process holds before the filter goes on, and a connected
-/// descriptor for the network arrives over `SCM_RIGHTS`. So the VMM never has
-/// a caller for `socket`, `connect`, `execve` or `unshare`.
-///
-/// The filesystem half is wide because this process is a filesystem server.
-/// Landlock is what bounds it: see `lib/chock-sandbox/vm/confine.zig`.
 pub const vmm_calls = blk: {
     var list: []const linux.SYS = &.{
-        // KVM, and every virtio device model.
         .ioctl,
-        // The session socket, and the connected descriptor handed over it.
         .accept4,
         .recvmsg,
         .sendmsg,
-        // **A pair and never a socket.** Every stream the session hands out is one
-        // end of a `socketpair`, made when the harness asks for a port, so a filter
-        // without this kills the guest as its first tool call is reached for. It is
-        // not a way out: a pair has no name and no address, both ends start inside
-        // this process, and `socket`, `connect` and `bind` stay refused, so it
-        // reaches nothing the `sendmsg` above does not already reach.
         .socketpair,
         .read,
         .write,
@@ -874,46 +323,24 @@ pub const vmm_calls = blk: {
         .close,
         .fcntl,
         .shutdown,
-        // What virtiofs answers a guest's filesystem request with, plus the
-        // console. `fs_callers` below names the caller behind each one, and
-        // `test/sandbox/vmm_allowlist.zig` reads `Export`'s own source, so a
-        // caller that appears there with no row fails a test.
         .openat,
-        // **The vectored pair and not the scalar one.** `std.Io.Threaded` reaches
-        // the scalar `pread` and `pwrite` from one place, the read and the
-        // write-back of a `File.MemoryMap`, and nothing in this process maps a
-        // file. The guest's own console is a positional write too, so a filter
-        // without these kills the process on its first flush and leaves the
-        // console that would have said why empty.
         .preadv,
         .pwritev,
-        // **The streaming pair, for a console that is not a file.** `File.Writer`
-        // starts positional and falls back to `writev` on `error.Unseekable`, which
-        // is what a pipe or a terminal answers a `pwritev` with. A session's own
-        // guest writes to a file and never reaches it; the daemon's console is
-        // whatever it was started with, so a filter without these would kill a
-        // guest the moment the daemon's output was piped.
         .readv,
         .writev,
         .statx,
         .getdents64,
         .mkdirat,
         .unlinkat,
-        // `renameat` and not `renameat2`: `std.Io.Dir.renameAbsolute` issues the
-        // plain call, and only `renamePreserve` asks for the flags one.
         .renameat,
         .symlinkat,
         .linkat,
         .readlinkat,
         .ftruncate,
         .utimensat,
-        // A guest's own `chmod` on a writable share, through `setPermissions`.
         .fchmod,
         .lseek,
-        // The vCPU threads and the ticker that interrupts one of them.
         .clone,
-        // A thread spawn with no libc: `mprotect`s the new stack, guard page
-        // excepted, and `sigaltstack` sets up its alternate signal stack.
         .mprotect,
         .sigaltstack,
         .futex,
@@ -924,29 +351,22 @@ pub const vmm_calls = blk: {
         .rt_sigprocmask,
         .rt_sigreturn,
         .restart_syscall,
-        // The allocator, and the guest's own memory.
         .mmap,
         .munmap,
         .madvise,
         .brk,
         .mremap,
-        // The deadline and the tick.
         .clock_gettime,
         .clock_nanosleep,
         .nanosleep,
         .exit_group,
         .exit,
     };
-    // `poll` exists on x86_64 and not on aarch64, the same case `router_calls`
-    // names. A member the table does not have would not build.
     if (@hasField(linux.SYS, "poll")) list = list ++ &[_]linux.SYS{.poll};
     break :blk list;
 };
 
 comptime {
-    // **A built machine has no caller for any of these.** One added to the list
-    // above without reading this comment stops the build, because each is a way
-    // out from under the Landlock grant or a way to start something new.
     for (vmm_calls) |call| {
         const refused = switch (call) {
             .socket,
@@ -989,27 +409,12 @@ comptime {
     }
 }
 
-/// One `std.Io` call a guest's filesystem server makes, and what the kernel sees
-/// when it does.
 pub const FilesystemCaller = struct {
-    /// The call's own names, spelled as `mirage-fs`'s `Export` spells them.
     names: []const []const u8,
-    /// What it reaches, or null for a caller `Export` makes only in its own
-    /// tests. A null row grants nothing and exists so that such a caller is
-    /// accounted for rather than unnoticed.
     call: ?linux.SYS,
-    /// Why, where the name alone does not say it.
     note: []const u8 = "",
 };
 
-/// **One row per `std.Io` call `mirage-fs`'s `Export` makes**, named by the
-/// caller and not by the syscall, because an earlier version of this listed a set
-/// somebody assumed and stayed green through two dead-guest bugs.
-///
-/// Public because `test/sandbox/vmm_allowlist.zig` reads `Export`'s own source
-/// out of the dependency and fails on a caller with no row here. That is what
-/// keeps the two in step across a version bump, which a list written by hand
-/// cannot do.
 pub const fs_callers = [_]FilesystemCaller{
     .{ .names = &.{ "openFileAbsolute", "openDirAbsolute", "createFileAbsolute" }, .call = .openat },
     .{ .names = &.{"readPositionalAll"}, .call = .preadv },
@@ -1035,74 +440,10 @@ pub const fs_callers = [_]FilesystemCaller{
     },
 };
 
-/// The filter the VMM runs under. **An allowlist**: every call not in
-/// `vmm_calls` kills the process.
-///
-/// The caller owns the memory.
 pub fn buildVmm(allocator: std.mem.Allocator) ![]bpf.Insn {
     return buildAllowlist(allocator, vmm_calls);
 }
 
-/// Every call the device helper may make, and the only ones it may make.
-///
-/// **An allowlist, and the same shape `router_calls` has, for the same
-/// reason.** The helper is the one process inside the sandbox that can reach
-/// the hidden device tree Chock's own policy chose, and a capability the
-/// sandboxed program does not have: the right to bind a node out of it where
-/// ordinary programs find it. So what it may do has to be written down
-/// completely rather than left to a denylist.
-///
-/// **No `openat`, so the helper can never read or write a file's own
-/// bytes.** Every call below only ever names a path to `mount`, `mkdirat`,
-/// `mknodat`, or `umount2` with, never to open its contents. The one
-/// directory this process may ever resolve a name against, the hidden tree
-/// `bindDeviceTree` bound in before this filter went on, and the one target
-/// path `Config.root` scopes every bind to, are both checked by
-/// `driver.zig`'s own `buildDeviceSource` and `buildDeviceTarget` before
-/// either call below ever sees them: see those functions' own doc comments
-/// for the one new check the path-based design turns on.
-///
-/// What each one is for:
-///
-///   * `mount` binds a node from the hidden tree, once at startup for the
-///     tree itself and once per placement for each node inside it, into the
-///     path the sandboxed program can see. `umount2` takes a placed node back
-///     out again when the device goes away, so a device that was granted for
-///     a session does not outlive the session.
-///   * `mkdirat` makes the directories a node is mounted under, both the
-///     hidden tree's own mount point and each placement's own parents. The
-///     staging tree is built as devices arrive, not laid out in advance.
-///   * `mknodat` makes the file a placement's own bind lands on. **Measured
-///     on 2026-09-16**: `mount`'s own bind only ever attaches to a target
-///     that already exists and already has the same directory-ness as the
-///     source, confirmed against a real kernel with a raw `mount(2)` call and
-///     not only against the `mount(8)` command, which would leave open the
-///     question of which of the two refused it. A character or block device,
-///     which is what this helper is for, is not a directory, so `mkdirat`
-///     alone cannot make its landing spot: it only ever makes `S_IFDIR`.
-///     `mknodat` here is always called with `S_IFREG`, never `S_IFCHR` or
-///     `S_IFBLK`, so it never fabricates a device's own identity; it only
-///     ever makes the empty regular file the bind then covers. Creating a
-///     regular file this way needs no capability at all, unlike creating a
-///     character or block special file, which needs `CAP_MKNOD` and which
-///     this helper is never given: see `runDevice`'s own
-///     `capabilities.keepOnly`.
-///   * `recvmsg` is how a `Place` or a `Drop` reaches this process at all,
-///     over the link `devicelink.zig` carries the two paths on.
-///   * `ppoll` is the wait the helper's loop is built on, the same call
-///     `router_calls` waits on its own link with.
-///   * `write` says what the helper did, onto a descriptor it already holds.
-///     It is not a general purpose write: there is no `openat` to hand it a
-///     path to write to.
-///   * `exit_group`, `exit`, `rt_sigreturn` and `restart_syscall` are how a
-///     process ends and how it comes back from a signal.
-///
-/// **No `openat` and no `socket`.** A device helper that could open a path
-/// could read any file the sandbox's mount tree makes visible to it, not
-/// only the tree its own policy named, and one that could make a socket
-/// could build a channel the log never saw. Neither is here, and neither
-/// should be added without the same argument this comment makes for
-/// everything that is.
 pub const device_calls: []const linux.SYS = &.{
     .recvmsg,
     .mount,
@@ -1118,11 +459,6 @@ pub const device_calls: []const linux.SYS = &.{
 };
 
 comptime {
-    // **The helper must not be able to open a path or make a channel.** It
-    // can reach the one hidden tree Chock's own policy named and bind a node
-    // out of it, and the only reason that is bounded is that it cannot open
-    // anything by name and cannot build a new channel of its own. A call
-    // added to the list above without reading this comment stops the build.
     for (device_calls) |call| {
         const refused = switch (call) {
             .openat, .socket, .socketpair, .connect, .bind, .listen, .execve, .kill, .ptrace => true,
@@ -1134,10 +470,6 @@ comptime {
     }
 }
 
-/// The filter the device helper runs under. **An allowlist**: every call not
-/// in `device_calls` kills the process.
-///
-/// The caller owns the memory.
 pub fn buildDevice(allocator: std.mem.Allocator) ![]bpf.Insn {
     return buildAllowlist(allocator, device_calls);
 }
@@ -1146,9 +478,6 @@ fn buildAllowlist(allocator: std.mem.Allocator, calls: []const linux.SYS) ![]bpf
     var insns: std.ArrayList(bpf.Insn) = .empty;
     errdefer insns.deinit(allocator);
 
-    // Refuse any architecture but this one, before anything reads a call
-    // number. The same first three instructions `build` writes, and for the
-    // same reason: a call number means nothing until the architecture is known.
     try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_arch));
     try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, nativeAuditArch(), 1, 0));
     try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
@@ -1160,92 +489,33 @@ fn buildAllowlist(allocator: std.mem.Allocator, calls: []const linux.SYS) ![]bpf
         try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ALLOW));
     }
 
-    // **The default is death, and it is the last instruction.** A call that
-    // matched nothing above falls here.
     try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
     return insns.toOwnedSlice(allocator);
 }
 
 pub const InstallError = error{
-    /// This kernel has no `seccomp` system call at all.
     NotSupported,
-    /// `prctl(PR_SET_NO_NEW_PRIVS)` was refused, so the filter was never
-    /// offered to the kernel.
     NoNewPrivsRefused,
-    /// The kernel refused the filter because this process holds neither
-    /// `no_new_privs` nor `CAP_SYS_ADMIN`.
     NotPermitted,
-    /// The kernel refused the filter itself. Either the instructions are not
-    /// valid, or this kernel was built with no filter mode.
     Rejected,
     Unexpected,
 };
 
-/// Install a filter on the calling thread. The filter can never be removed.
-/// Call this after the fork and before the exec.
-///
-/// **The `no_new_privs` flag goes on here, and never in a caller.** The filter
-/// and the flag that makes the kernel accept it go on together, or neither one
-/// goes on. A caller cannot get the order wrong, because it cannot get one
-/// without the other.
-///
-/// **Each way this can fail has a name of its own.** A refused flag, a missing
-/// privilege, and a filter the kernel could not read are three different
-/// faults with three different repairs. A caller that reads only `Rejected`
-/// looks for a bad filter when the real fault is one of the other two.
 pub fn install(prog: bpf.Prog) InstallError!void {
     _ = try setModeFilter(prog, 0);
 }
 
-/// Install a filter and give back the notification descriptor for it. Every
-/// word of `install` above applies here too.
-///
-/// **The only install a filter with a trap set may use.** A filter that
-/// returns `RET_USER_NOTIF` with no listener behind it makes the kernel answer
-/// the call with `ENOSYS`. See `Options.traps`.
-///
-/// The caller owns the descriptor. `linux/driver.zig` hands it to the
-/// supervisor with `pidfd_getfd` and then closes its own copy, so the observed
-/// process never holds a descriptor that could answer its own notifications.
 pub fn installListening(prog: bpf.Prog) InstallError!i32 {
     const rc = try setModeFilter(prog, linux.SECCOMP.FILTER_FLAG.NEW_LISTENER);
     return @intCast(rc);
 }
 
-/// What this machine answered when asked whether this process may install a
-/// filter at all.
 pub const InstallProbe = union(enum) {
-    /// A child of this process installed the filter. The layer is available.
     ok,
-    /// A child of this process was refused, for this reason.
     refused: InstallError,
-    /// The question could not be asked: the pipe, the fork, or the answer.
-    ///
-    /// **Never read as either of the other two.** A probe that could not run
-    /// says nothing about the machine, and reading it as `ok` is exactly the
-    /// claim this whole call exists to replace. `namespace.Availability` keeps
-    /// a third answer for the same reason.
     unknown,
 };
 
-/// Ask the kernel whether this process may install `prog`, without installing
-/// it here.
-///
-/// **A child, because a filter can never be removed.** Installing one in this
-/// process would put it on the harness for the rest of its life, so the answer
-/// comes from a fork that installs and exits. `namespace.probeAvailability`
-/// forks for the same class of reason and this follows its shape, including
-/// the third answer for a question that could not be asked.
-///
-/// **The caller builds the instructions**, for two reasons. A fork may happen
-/// while another thread holds the allocator's lock, so the child must not
-/// allocate. And a caller that means to ask about its own session's filter can
-/// pass its own, rather than being answered about a filter nobody will run.
-///
-/// **This does not prove the session's own filter went on.** It proves this
-/// process may install one. `Sandbox.spawn` refuses rather than degrade, so a
-/// tool call that ran did have the filter; this is the answer a caller can get
-/// before the first tool call. See `src/run.zig`'s own `witnessLayers`.
 pub fn probeInstall(prog: bpf.Prog) InstallProbe {
     var fds: [2]i32 = undefined;
     if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return .unknown;
@@ -1259,14 +529,6 @@ pub fn probeInstall(prog: bpf.Prog) InstallProbe {
 
     if (fork_rc == 0) {
         _ = linux.close(fds[0]);
-        // Zero says the filter went on, and every other byte names a fault.
-        //
-        // **Written after the install, so the write runs under the filter.**
-        // A filter that refuses `write` therefore answers nothing, and the
-        // parent reads that as `unknown` rather than as either result. That is
-        // the safe direction, and it is also why a caller must not hand this a
-        // filter with a trap set: with no listener behind it the kernel
-        // answers every observed call with `ENOSYS`.
         var answer: [1]u8 = .{0};
         if (install(prog)) |_| {} else |err| answer[0] = installFaultCode(err);
         _ = linux.write(fds[1], &answer, answer.len);
@@ -1289,17 +551,10 @@ pub fn probeInstall(prog: bpf.Prog) InstallProbe {
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
 
-    // A child that wrote nothing measured nothing. It must not read as either
-    // answer: see `InstallProbe.unknown`.
     if (filled != answer.len) return .unknown;
     return installProbeFor(answer[0]);
 }
 
-/// Read the answer byte a `probeInstall` child wrote.
-///
-/// **A byte this build has no fault for is `unknown` and never `ok`.** Only
-/// zero says the filter went on, so a record from a build that names a fault
-/// this one does not know still reads as a filter that did not go on.
 fn installProbeFor(answer: u8) InstallProbe {
     if (answer == 0) return .ok;
     return switch (answer) {
@@ -1312,11 +567,7 @@ fn installProbeFor(answer: u8) InstallProbe {
     };
 }
 
-/// The one body both installs share, so the flag is the only difference
-/// between them and the `no_new_privs` step cannot be lost from one of the two.
 fn setModeFilter(prog: bpf.Prog, flags: u32) InstallError!usize {
-    // Without `no_new_privs`, an unprivileged process cannot install a filter, because a
-    // set-user-ID program could then be given a filter that lies to it.
     const pr = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
     switch (linux.errno(pr)) {
         .SUCCESS => {},
@@ -1331,10 +582,6 @@ fn setModeFilter(prog: bpf.Prog, flags: u32) InstallError!usize {
     return switch (linux.errno(rc)) {
         .SUCCESS => rc,
         .NOSYS => error.NotSupported,
-        // The kernel answers EACCES only when the caller holds neither
-        // `no_new_privs` nor `CAP_SYS_ADMIN`. The call above says the flag is
-        // on, so this answer means the flag was lost between the two calls.
-        // It is a different fault from a filter the kernel could not read.
         .ACCES => error.NotPermitted,
         .INVAL => error.Rejected,
         else => error.Unexpected,
@@ -1346,8 +593,6 @@ test "the filter starts by refusing a foreign architecture" {
     const prog = try build(allocator, .{});
     defer allocator.free(prog);
 
-    // Instruction 0 must load the arch field. A filter that checks the call number
-    // before the architecture can be passed with a 32 bit call on a 64 bit kernel.
     try std.testing.expectEqual(bpf.LD_W_ABS, prog[0].code);
     try std.testing.expectEqual(bpf.offset_of_arch, prog[0].k);
     try std.testing.expectEqual(bpf.JMP_JEQ_K, prog[1].code);
@@ -1368,13 +613,6 @@ test "the filter names every call that must be blocked" {
     const prog = try build(allocator, .{});
     defer allocator.free(prog);
 
-    // **The failure names every syscall the filter forgot, and nothing is
-    // written to the terminal.** A test that writes to standard error puts a
-    // `failed command:` line in the build log even when it passes, so the
-    // names are collected here and compared against nothing at the end:
-    // `expectEqualStrings` prints both sides. A bare `expect` would say only
-    // that some syscall was missing, and stopping at the first one would hide
-    // the rest.
     var missing: std.ArrayList(u8) = .empty;
     defer missing.deinit(allocator);
 
@@ -1395,8 +633,6 @@ test "every instruction the builder emits is one the kernel accepts" {
     const prog = try build(allocator, .{});
     defer allocator.free(prog);
 
-    // A classic BPF program has a hard limit of 4096 instructions. A filter that grows
-    // past it is refused at install time with EINVAL, which is a confusing failure.
     try std.testing.expect(prog.len <= 4096);
     for (prog) |insn| {
         const known = insn.code == bpf.LD_W_ABS or insn.code == bpf.JMP_JEQ_K or
@@ -1411,30 +647,11 @@ test "the architecture mismatch branch returns RET_KILL_PROCESS" {
     const prog = try build(allocator, .{});
     defer allocator.free(prog);
 
-    // Instruction 1 is the JEQ on the arch field. jt = 1 skips the kill when the arch
-    // matches. jf = 0 falls straight into instruction 2 when it does not. Instruction
-    // 2 must be the kill, and it must return RET_KILL_PROCESS and nothing softer.
     try std.testing.expectEqual(@as(u8, 0), prog[1].jf);
     try std.testing.expectEqual(bpf.RET_K, prog[2].code);
     try std.testing.expectEqual(@as(u32, RET_KILL_PROCESS), prog[2].k);
 }
 
-/// True when `prog[i]` is a call number comparison the `blocked_calls` loop in
-/// `build` could have emitted, and not an argument comparison from some other
-/// rule that only coincidentally compares against the same numeric value.
-///
-/// **Why a numeric match on `k` is not enough on its own.** On aarch64,
-/// `mount` is syscall 40, and `AF_VSOCK` is also 40: the vsock rule's own
-/// inner comparison, `domain == AF_VSOCK`, carries the exact same `k` as
-/// `mount`'s call number check, with the same `jt`/`jf` shape, because both
-/// happen to kill on a match and fall through on a miss. Every genuine
-/// `blocked_calls` comparison reads the call number that was loaded once, at
-/// the top of the filter, into the accumulator, and every argument reading
-/// rule, `execveat`'s and the socket rule's alike, reloads the accumulator
-/// from `offsetOfArgLow` immediately beforehand. So the instruction directly
-/// before a real `blocked_calls` comparison is never an argument load: it is
-/// either that one initial load of `nr`, for the first entry, or the `RET_K`
-/// of the entry before it, for every one after.
 fn precededByArgumentLoad(prog: []const bpf.Insn, i: usize) bool {
     if (i == 0) return false;
     const before = prog[i - 1];
@@ -1446,8 +663,6 @@ test "every blocked call comparison is followed by a kill instruction" {
     const prog = try build(allocator, .{});
     defer allocator.free(prog);
 
-    // A comparison that falls through to something other than RET_K with
-    // RET_KILL_PROCESS would let a blocked call reach the allow at the end.
     var checked: usize = 0;
     for (prog, 0..) |insn, i| {
         if (insn.code != bpf.JMP_JEQ_K) continue;
@@ -1470,9 +685,6 @@ test "every blocked call comparison jumps so the kill is reachable and the skip 
     const prog = try build(allocator, .{});
     defer allocator.free(prog);
 
-    // jt = 0 falls into the kill on a match. jf = 1 skips exactly the one kill
-    // instruction on no match. A wrong offset here either misses the kill on a
-    // match or skips past it into the next check, and this test must catch both.
     var checked: usize = 0;
     for (prog, 0..) |insn, i| {
         if (insn.code != bpf.JMP_JEQ_K) continue;
@@ -1495,19 +707,11 @@ test "every refused call answers EPERM, and none of them kills" {
     const prog = try build(allocator, .{});
     defer allocator.free(prog);
 
-    // **Two facts per call, and the second is the one this change is about.**
-    // The refusal must be there, and it must not be a kill: a run time that
-    // probes for a ring reads the answer and takes another road, and a killed
-    // process reads nothing. Counted per call, the way the `blocked_calls`
-    // tests count, so a rule missing for two of the three cannot pass on the
-    // strength of the one left standing.
     var checked: usize = 0;
     for (refused_calls) |call| {
         const number: u32 = @intCast(@intFromEnum(call));
         for (prog, 0..) |insn, i| {
             if (insn.code != bpf.JMP_JEQ_K or insn.k != number) continue;
-            // jt = 0 falls into the refusal on a match. jf = 1 skips exactly
-            // that one instruction on no match, landing on the next check.
             try std.testing.expectEqual(@as(u8, 0), insn.jt);
             try std.testing.expectEqual(@as(u8, 1), insn.jf);
             try std.testing.expectEqual(bpf.RET_K, prog[i + 1].code);
@@ -1520,19 +724,12 @@ test "every refused call answers EPERM, and none of them kills" {
 }
 
 test "the two lists share no call, so nothing is both killed and refused" {
-    // **A call on both lists would be killed**, because the kill loop runs
-    // first, and the refusal after it would never be reached. The filter would
-    // still build and still install, and the only sign of it would be a run
-    // time dying at startup. This is what says the move was a move.
     for (refused_calls) |refused| {
         for (blocked_calls) |blocked| {
             try std.testing.expect(refused != blocked);
         }
     }
 
-    // And the three that moved really are the three io_uring calls. A list
-    // that grew a fourth member needs the measurement `refused_calls` names,
-    // so it fails here and a person reads why.
     try std.testing.expectEqualSlices(linux.SYS, &.{
         .io_uring_setup,
         .io_uring_enter,
@@ -1541,10 +738,6 @@ test "the two lists share no call, so nothing is both killed and refused" {
 }
 
 test "the refusal block adds only itself, and leaves the call number for the checks after it" {
-    // Every check after this point reads the call number out of the
-    // accumulator. An instruction here that loaded anything else would leave
-    // all of them comparing the wrong value, while the filter still installed
-    // and still looked correct. The same property `block_connect` is held to.
     const allocator = std.testing.allocator;
     const prog = try build(allocator, .{});
     defer allocator.free(prog);
@@ -1554,8 +747,6 @@ test "the refusal block adds only itself, and leaves the call number for the che
         for (prog, 0..) |insn, i| {
             if (insn.code != bpf.JMP_JEQ_K or insn.k != number) continue;
             try std.testing.expectEqual(bpf.RET_K, prog[i + 1].code);
-            // Two instructions and no load between them, so the next check
-            // reads the call number and not a protection flag.
             try std.testing.expect(prog[i + 2].code != bpf.LD_W_ABS);
         }
     }
@@ -1570,11 +761,6 @@ test "strict_wx off makes a shorter filter that reads no protection flag, but st
 
     try std.testing.expect(strict.len > loose.len);
 
-    // The execveat rule is a boundary, not hardening, so it is unconditional
-    // and stays whether or not strict_wx does: its own AND mask, against
-    // AT_EMPTY_PATH and nothing else, is the only one left once every
-    // strict_wx mask (personality, shmat, and the three memory_calls) is
-    // gone.
     var loose_masks: usize = 0;
     for (loose) |insn| {
         if (insn.code != bpf.ALU_AND_K) continue;
@@ -1589,19 +775,11 @@ test "the write and execute rule refuses with EPERM and does not kill" {
     const prog = try build(allocator, .{ .strict_wx = true });
     defer allocator.free(prog);
 
-    // A run time that asks for a page which is writable and executable can often use a
-    // different method after a failure. A kill would end the test suite of the user.
-    //
-    // This counts one match per call in memory_calls, the way the blocked_calls tests
-    // above count. A found flag with no count would still pass if this rule were
-    // missing for two of the three calls, and only checked the one call left standing.
     var checked: usize = 0;
     for (memory_calls) |call| {
         const number: u32 = @intCast(@intFromEnum(call));
         for (prog, 0..) |insn, i| {
             if (insn.code != bpf.JMP_JEQ_K or insn.k != number) continue;
-            // i + 1 loads prot. i + 2 masks it. i + 3 compares the mask.
-            // i + 4 returns EPERM when both write and execute bits were set.
             try std.testing.expectEqual(bpf.ALU_AND_K, prog[i + 2].code);
             try std.testing.expectEqual(bpf.JMP_JEQ_K, prog[i + 3].code);
             try std.testing.expectEqual(bpf.RET_K, prog[i + 4].code);
@@ -1617,13 +795,6 @@ test "each write and execute block jumps over exactly its own six instructions" 
     const prog = try build(allocator, .{ .strict_wx = true });
     defer allocator.free(prog);
 
-    // The outer jump enters the block on a match (jt = 0) and skips all six
-    // instructions of the block on no match (jf = 6), landing on the next block's
-    // own outer jump, or on the allow at the end of the filter for the last call.
-    // The inner jump falls into the EPERM return on a match (jt = 0) and skips
-    // exactly that one return on no match (jf = 1), landing on the restore of nr.
-    // A wrong offset here would only show up in the probe test, which needs a
-    // real kernel, so this test pins the offsets a unit test can check directly.
     var checked: usize = 0;
     for (memory_calls) |call| {
         const number: u32 = @intCast(@intFromEnum(call));
@@ -1647,16 +818,10 @@ test "the shmat rule refuses SHM_EXEC with EPERM and does not kill" {
     const prog = try build(allocator, .{ .strict_wx = true });
     defer allocator.free(prog);
 
-    // shmat has no prot argument, so the write and execute rule above never sees
-    // it. This is the separate rule that closes that gap. A kill here would end
-    // the test suite of a tool that tries a shared memory segment for a reason
-    // that has nothing to do with SHM_EXEC.
     const shmat_number: u32 = @intCast(@intFromEnum(linux.SYS.shmat));
     var found = false;
     for (prog, 0..) |insn, i| {
         if (insn.code != bpf.JMP_JEQ_K or insn.k != shmat_number) continue;
-        // i + 1 loads shmflg. i + 2 masks it. i + 3 compares the mask.
-        // i + 4 returns EPERM when SHM_EXEC was set.
         try std.testing.expectEqual(bpf.LD_W_ABS, prog[i + 1].code);
         try std.testing.expectEqual(bpf.ALU_AND_K, prog[i + 2].code);
         try std.testing.expectEqual(bpf.JMP_JEQ_K, prog[i + 3].code);
@@ -1672,11 +837,6 @@ test "the shmat rule jumps over exactly its own five instructions" {
     const prog = try build(allocator, .{ .strict_wx = true });
     defer allocator.free(prog);
 
-    // The outer jump enters the block on a match (jt = 0) and skips all five
-    // instructions of the block on no match (jf = 5), landing on the write and
-    // execute rule's own first outer jump. The inner jump falls into the EPERM
-    // return on a match (jt = 0) and skips exactly that one return on no match
-    // (jf = 1), landing on the restore of nr.
     const shmat_number: u32 = @intCast(@intFromEnum(linux.SYS.shmat));
     var found = false;
     for (prog, 0..) |insn, i| {
@@ -1694,10 +854,6 @@ test "the shmat rule jumps over exactly its own five instructions" {
 }
 
 test "the execveat rule kills on AT_EMPTY_PATH and does not read strict_wx" {
-    // Unlike shmat and the memory calls, this rule is not gated by
-    // options.strict_wx: it closes a boundary, not a hardening cost, so it must
-    // be present whether or not the caller turned write-and-execute off for a
-    // JIT runtime.
     const allocator = std.testing.allocator;
     const execveat_number: u32 = @intCast(@intFromEnum(linux.SYS.execveat));
     const at_empty_path: u32 = 0x1000;
@@ -1709,11 +865,6 @@ test "the execveat rule kills on AT_EMPTY_PATH and does not read strict_wx" {
         var found = false;
         for (prog, 0..) |insn, i| {
             if (insn.code != bpf.JMP_JEQ_K or insn.k != execveat_number) continue;
-            // i + 1 loads flags. i + 2 masks it to AT_EMPTY_PATH. i + 3 compares
-            // the mask. i + 4 kills the process when AT_EMPTY_PATH was set: a
-            // kill, and never RET_ERRNO_PERM, because a program that meant to
-            // run a path-free descriptor is exactly the case this project does
-            // not hand a recoverable answer to.
             try std.testing.expectEqual(bpf.LD_W_ABS, prog[i + 1].code);
             try std.testing.expectEqual(bpf.offsetOfArgLow(4), prog[i + 1].k);
             try std.testing.expectEqual(bpf.ALU_AND_K, prog[i + 2].code);
@@ -1750,9 +901,6 @@ test "the execveat rule jumps over exactly its own five instructions" {
 }
 
 test "the socket rule kills on AF_VSOCK and does not read strict_wx or block_connect" {
-    // Neither option gates this: it is a boundary and not hardening, and it
-    // is not about connect's own re-aim risk, so it must be present in
-    // every combination of the two.
     const allocator = std.testing.allocator;
     const socket_number: u32 = @intCast(@intFromEnum(linux.SYS.socket));
     const af_vsock: u32 = 40;
@@ -1765,10 +913,6 @@ test "the socket rule kills on AF_VSOCK and does not read strict_wx or block_con
             var found = false;
             for (prog, 0..) |insn, i| {
                 if (insn.code != bpf.JMP_JEQ_K or insn.k != socket_number) continue;
-                // i + 1 loads domain. i + 2 compares it to AF_VSOCK. i + 3
-                // kills the process on a match: a kill, and never
-                // RET_ERRNO_PERM, the same choice the execveat rule makes
-                // and for the same reason.
                 try std.testing.expectEqual(bpf.LD_W_ABS, prog[i + 1].code);
                 try std.testing.expectEqual(bpf.offsetOfArgLow(0), prog[i + 1].k);
                 try std.testing.expectEqual(bpf.JMP_JEQ_K, prog[i + 2].code);
@@ -1804,12 +948,6 @@ test "the socket rule jumps over exactly its own four instructions" {
 }
 
 test "connect is left alone by default, and the block_connect filter refuses it with EPERM" {
-    // **Both halves matter, and the first one is the one a later reader could
-    // lose.** `Network.none` is what every tool call gets today, and a unix
-    // socket client inside the sandbox works there. If this rule ever went on
-    // for every filter, that would break with nothing naming it. Measured on
-    // 2026-08-24: four tests fail when it does, and `linux/driver.zig` names
-    // them. So the default must name `connect` nowhere at all.
     const allocator = std.testing.allocator;
     const connect_number: u32 = @intCast(@intFromEnum(linux.SYS.connect));
 
@@ -1824,13 +962,8 @@ test "connect is left alone by default, and the block_connect filter refuses it 
     var found: usize = 0;
     for (filtered, 0..) |insn, i| {
         if (insn.code != bpf.JMP_JEQ_K or insn.k != connect_number) continue;
-        // jt = 0 falls into the refusal on a match. jf = 1 skips exactly that
-        // one instruction on no match. A wrong offset here either misses the
-        // refusal or skips into the middle of the next check.
         try std.testing.expectEqual(@as(u8, 0), insn.jt);
         try std.testing.expectEqual(@as(u8, 1), insn.jf);
-        // EPERM, and never a kill: see `Options.block_connect`. A program that
-        // meets a refusal can ask the broker instead; a killed one cannot.
         try std.testing.expectEqual(bpf.RET_K, filtered[i + 1].code);
         try std.testing.expectEqual(RET_ERRNO_PERM, filtered[i + 1].k);
         try std.testing.expect(filtered[i + 1].k != RET_KILL_PROCESS);
@@ -1840,10 +973,6 @@ test "connect is left alone by default, and the block_connect filter refuses it 
 }
 
 test "the connect rule adds only itself, and leaves the call number for the checks after it" {
-    // The rule sits in the middle of a filter whose every later check reads the
-    // call number out of the accumulator. An instruction that loaded anything
-    // else would leave every one of those checks comparing the wrong value, and
-    // the filter would still install and still look correct.
     const allocator = std.testing.allocator;
     const without = try build(allocator, .{});
     defer allocator.free(without);
@@ -1852,20 +981,11 @@ test "the connect rule adds only itself, and leaves the call number for the chec
 
     try std.testing.expectEqual(without.len + 2, with.len);
 
-    // The filtered filter is the ordinary one with exactly two instructions put
-    // in the middle of it, and every other instruction in the same order. So
-    // find where the two differ, step over the two, and require the rest to
-    // match again. A rule that displaced a check, changed a jump offset, or
-    // reordered anything fails here.
     var at: usize = 0;
     while (at < without.len and std.meta.eql(without[at], with[at])) : (at += 1) {}
     try std.testing.expect(at < without.len);
     try std.testing.expectEqualSlices(bpf.Insn, without[at..], with[at + 2 ..]);
 
-    // And the two that were put in are the comparison and the refusal, in that
-    // order, with no load between them: every check after this point reads the
-    // call number out of the accumulator, and a load here would leave all of
-    // them comparing the wrong value while the filter still installed.
     const connect_number: u32 = @intCast(@intFromEnum(linux.SYS.connect));
     try std.testing.expectEqual(bpf.JMP_JEQ_K, with[at].code);
     try std.testing.expectEqual(connect_number, with[at].k);
@@ -1873,20 +993,6 @@ test "the connect rule adds only itself, and leaves the call number for the chec
 }
 
 test "no syscall in std.os.linux.SYS is numbered past classified_through" {
-    // This only sees a syscall once Zig's standard library knows about it. A
-    // kernel can gain a syscall before Zig does, and this test stays quiet
-    // about it. That is a known gap, not a bug in this test.
-    //
-    // **This failure is not a broken test.** It means the Zig standard
-    // library learned about a new syscall. Read each syscall the failure
-    // names, decide whether it belongs on `blocked_calls`, and then raise
-    // `classified_through` to the new highest number.
-    //
-    // The names are collected and compared against nothing, rather than
-    // written to the terminal: `expectEqualStrings` prints both sides, so
-    // the whole list is in the failure, and a test that writes to standard
-    // error puts a `failed command:` line in the build log even when it
-    // passes.
     const allocator = std.testing.allocator;
     const info = @typeInfo(linux.SYS).@"enum";
     var found_new: std.ArrayList(u8) = .empty;
@@ -1901,8 +1007,6 @@ test "no syscall in std.os.linux.SYS is numbered past classified_through" {
     try std.testing.expectEqualStrings("", found_new.items);
 }
 
-/// Wait for one child and give back its exit code. The caller asserts on the
-/// code. A signal interrupts `waitpid`, so the call is repeated on `EINTR`.
 fn waitForExitCode(pid: linux.pid_t) !u32 {
     var status: u32 = undefined;
     var rc = linux.waitpid(pid, &status, 0);
@@ -1912,10 +1016,6 @@ fn waitForExitCode(pid: linux.pid_t) !u32 {
     return linux.W.EXITSTATUS(status);
 }
 
-/// A filter that answers `chdir` with EPERM and permits every other call.
-/// `chdir` is the probe because `execute`, in `driver.zig`, calls it after the
-/// real filter goes on. So a reader knows the real filter permits it, and a
-/// refusal here can only come from the filter that the test installs.
 fn chdirRefusedFilter() [4]bpf.Insn {
     return .{
         bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr),
@@ -1925,17 +1025,6 @@ fn chdirRefusedFilter() [4]bpf.Insn {
     };
 }
 
-/// Turn an `install` failure into an exit code. A child of these tests cannot
-/// print: `test/proto/lock.zig` refuses a line in `lib/` that names standard
-/// error, and this file obeys that rule. So the code carries the fault, and
-/// the parent's own `expectEqual` prints it.
-///
-/// **Only `NotSupported` may skip an install failure.** Every other code below
-/// is a fault on a machine that this project can run on at all. An earlier
-/// version of these tests skipped on any `install` failure, and a mutation
-/// that deleted the `prctl` call from `install` then turned both tests green
-/// by skipping them. That is the exact shape of failure these tests exist to
-/// catch.
 fn installFaultCode(err: InstallError) u8 {
     return switch (err) {
         error.NotSupported => 3,
@@ -1946,43 +1035,15 @@ fn installFaultCode(err: InstallError) u8 {
     };
 }
 
-// **Five tests below are the only ones in this file that call `install`.**
-// Every other test reads the instructions that a builder returns. Those prove
-// a filter is shaped correctly. None of them proves the kernel took it.
-//
-// Each test runs the filter in a forked child, because a filter can never be removed. A
-// filter on the test runner itself would stay on for every test after it.
-//
-// The children reserve these exit codes:
-//   0     the child measured what the test asked for.
-//   3..7  `install` failed. See `installFaultCode` for which fault each is.
-//   10    the state before the measurement was not the state the test needs.
-//   11    a `prctl` read failed, so the measurement is not available.
-//   12    the measurement did not give the answer the test needs.
-
 test "the install probe answers about the machine and never about a child that said nothing" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    // **A witness and not a claim.** Before this call, a caller that wanted to
-    // know whether a filter would install had two choices: install one and
-    // never be able to remove it, or assume. This asks in a child.
-    //
-    // Mutation check: return `.ok` for an unrecognised byte in
-    // `installProbeFor` and the last expectation below fails, which is the one
-    // that keeps "nobody answered" from reading as "the layer is on".
     const allocator = std.testing.allocator;
     const insns = try build(allocator, .{});
     defer allocator.free(insns);
 
-    // A machine that runs this suite installs filters, so this is the real
-    // answer and not a shape check. A refusal here is a machine fact and it is
-    // reported rather than skipped: see `installFaultCode`'s own note on why a
-    // skip is the wrong answer to an install failure.
     try std.testing.expectEqual(InstallProbe.ok, probeInstall(bpf.Prog.init(insns)));
 
-    // The three answers stay three. `unknown` is what a child that could not
-    // speak leaves behind, and reading it as `ok` is the exact mistake the
-    // whole call exists to replace.
     try std.testing.expectEqual(InstallProbe.ok, installProbeFor(0));
     try std.testing.expectEqual(
         InstallProbe{ .refused = error.NotSupported },
@@ -1994,15 +1055,6 @@ test "the install probe answers about the machine and never about a child that s
 test "install turns on no_new_privs, and does not rely on a caller to do it" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    // **A mutation that deletes the `prctl` call from `install` passes every
-    // other test in this file.** `applyLayers`, in `driver.zig`, calls
-    // `landlock.Ruleset.restrictSelf` first, and that call sets the same flag,
-    // so the flag is already on by the time `install` runs there. This test
-    // takes a child that has the flag off and measures `install` alone.
-    // no_new_privs is inherited and cannot be cleared. A Nix builder can set
-    // it before the test runner starts, so that environment cannot make the
-    // required before-and-after measurement. Skip only that precondition. An
-    // install failure in a measurable environment still fails below.
     const runner_nnp = linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(runner_nnp));
     if (runner_nnp != 0) return error.SkipZigTest;
@@ -2012,8 +1064,6 @@ test "install turns on no_new_privs, and does not rely on a caller to do it" {
     if (fork_rc == 0) {
         const before = linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0);
         if (linux.errno(before) != .SUCCESS) std.process.exit(11);
-        // Detect an unexpected state change between the parent check and the
-        // measurement. This is a failure, not an environment skip.
         if (before != 0) std.process.exit(10);
 
         var insns = chdirRefusedFilter();
@@ -2033,16 +1083,9 @@ test "install turns on no_new_privs, and does not rely on a caller to do it" {
 test "the kernel enforces the filter that install returned success for" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    // **`install` returning no error is not the same fact as a filter that
-    // runs.** This test calls the one system call that the filter refuses, and
-    // reads the errno back. It is the only check in this project that the
-    // `bpf.Prog` layout, the mode number, and the argument order are all
-    // correct.
     const fork_rc = linux.fork();
     try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
     if (fork_rc == 0) {
-        // The same call before the filter, so a refusal after it is the filter
-        // and never the path.
         if (linux.errno(linux.chdir("/")) != .SUCCESS) std.process.exit(10);
 
         var insns = chdirRefusedFilter();
@@ -2058,12 +1101,6 @@ test "the kernel enforces the filter that install returned success for" {
 }
 
 test "a trap set puts a user notification return in the filter, and an empty one puts nothing" {
-    // **Both halves, and the second is the one a later reader could lose.**
-    // The default must stay the filter this project always built, or every
-    // caller that never asked for an observation starts paying for one.
-    //
-    // Mutation check: delete the trap loop at the end of `build` and the
-    // `observed` count here is zero.
     const allocator = std.testing.allocator;
 
     const plain = try build(allocator, .{});
@@ -2080,9 +1117,6 @@ test "a trap set puts a user notification return in the filter, and an empty one
         const wanted: u32 = @intCast(@intFromEnum(call.number()));
         for (watching, 0..) |insn, i| {
             if (insn.code != bpf.JMP_JEQ_K or insn.k != wanted) continue;
-            // jt = 0 falls into the notification on a match. jf = 1 skips
-            // exactly that one instruction on no match, the same shape the
-            // refusal loop has.
             try std.testing.expectEqual(@as(u8, 0), insn.jt);
             try std.testing.expectEqual(@as(u8, 1), insn.jf);
             try std.testing.expectEqual(bpf.RET_K, watching[i + 1].code);
@@ -2092,7 +1126,6 @@ test "a trap set puts a user notification return in the filter, and an empty one
     }
     try std.testing.expectEqual(@as(usize, 2), observed);
 
-    // A member that was not asked for is named nowhere.
     const connect_number: u32 = @intCast(@intFromEnum(linux.SYS.connect));
     for (watching) |insn| {
         try std.testing.expect(!(insn.code == bpf.JMP_JEQ_K and insn.k == connect_number));
@@ -2100,14 +1133,6 @@ test "a trap set puts a user notification return in the filter, and an empty one
 }
 
 test "no call the handover makes can ever be trapped" {
-    // **This is the deadlock guard, read at run time.** The `comptime` block
-    // beside `bootstrap_calls` already stops the build on an overlap. This
-    // test says the same thing where a person looking for the rule will find
-    // it, and it fails for the right reason if that block is ever deleted.
-    //
-    // Mutation check: add `.read` to `TrapCall` and give it a `number` of
-    // `.read`, and the build stops with the message `bootstrap_calls` names.
-    // Delete the `comptime` block as well and this test fails instead.
     inline for (@typeInfo(TrapCall).@"enum".fields) |field| {
         const call: TrapCall = @enumFromInt(field.value);
         for (bootstrap_calls) |boot| {
@@ -2117,12 +1142,6 @@ test "no call the handover makes can ever be trapped" {
 }
 
 test "nothing on the kill list and nothing on the refusal list can be trapped" {
-    // **A trapped call runs.** A configuration that turned a killed call into
-    // a trapped one would take a boundary away and leave a count in its place,
-    // and the filter would still build and still install. The `comptime` block
-    // beside `bootstrap_calls` is what stops that. This reads it again.
-    //
-    // Mutation check: add `.ptrace` to `TrapCall` and the build stops.
     inline for (@typeInfo(TrapCall).@"enum".fields) |field| {
         const call: TrapCall = @enumFromInt(field.value);
         for (blocked_calls) |killed| {
@@ -2135,10 +1154,6 @@ test "nothing on the kill list and nothing on the refusal list can be trapped" {
 }
 
 test "a trapped call is never reached by a filter that already kills or refuses it" {
-    // The two lists are disjoint from the trap set by construction, so this
-    // checks the one overlap a runtime option can still make: `block_connect`
-    // and an observed `connect`. The refusal must come first, so the call is
-    // refused and never counted.
     const allocator = std.testing.allocator;
     const prog = try build(allocator, .{
         .block_connect = true,
@@ -2163,8 +1178,6 @@ test "every syscall number a notification can carry maps back to the call it nam
             TrapCall.fromNumber(@intCast(@intFromEnum(call.number()))),
         );
     }
-    // `getppid` is on no list here. A number with no member must read as none
-    // rather than as the first member.
     try std.testing.expectEqual(
         @as(?TrapCall, null),
         TrapCall.fromNumber(@intCast(@intFromEnum(linux.SYS.getppid))),
@@ -2174,17 +1187,6 @@ test "every syscall number a notification can carry maps back to the call it nam
 test "the reader's filter permits its own four calls and kills the rest" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    // **An allowlist is only an allowlist if the kernel enforces it.** The
-    // list itself is checked in `linux/notify.zig`. This drives the filter the
-    // list builds, in a real process, against one call it must permit and one
-    // it must kill.
-    //
-    // A signal 31 death is the pass for the second half: the filter kills the
-    // process rather than refusing the call, which is how every other denial
-    // in this file behaves.
-    //
-    // Mutation check: make `buildReader` end with `RET_ALLOW` instead of
-    // `RET_KILL_PROCESS` and the child exits 12 rather than dying.
     const allocator = std.testing.allocator;
     const insns = try buildReader(allocator);
     defer allocator.free(insns);
@@ -2194,16 +1196,12 @@ test "the reader's filter permits its own four calls and kills the rest" {
     if (fork_rc == 0) {
         install(bpf.Prog.init(insns)) catch |err| std.process.exit(installFaultCode(err));
 
-        // A permitted call, so a death below is the filter and not this line.
-        // Zero descriptors and no timeout, which the kernel answers at once.
         var none: [0]linux.pollfd = .{};
         var instant: linux.timespec = .{ .sec = 0, .nsec = 0 };
         if (linux.errno(linux.ppoll(&none, 0, &instant, null)) != .SUCCESS) {
             std.process.exit(11);
         }
 
-        // A call nobody put on the list. The filter kills this process here,
-        // so the exit below is never reached.
         _ = linux.openat(linux.AT.FDCWD, "/", .{ .ACCMODE = .RDONLY }, 0);
         std.process.exit(12);
     }
@@ -2221,8 +1219,6 @@ test "the reader's filter permits its own four calls and kills the rest" {
 test "the keeper filter permits reap wait and readiness calls" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    // Mutation check: remove wait4, ppoll, or write from keeper_calls. The
-    // child then dies from SIGSYS at the missing call.
     const allocator = std.testing.allocator;
     const insns = try buildKeeper(allocator);
     defer allocator.free(insns);
@@ -2269,8 +1265,6 @@ test "the keeper filter permits reap wait and readiness calls" {
 test "the keeper filter kills a call outside its allowlist" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    // Mutation check: end buildKeeper with RET_ALLOW. The child exits 12
-    // instead of dying from SIGSYS.
     const allocator = std.testing.allocator;
     const insns = try buildKeeper(allocator);
     defer allocator.free(insns);
@@ -2295,20 +1289,6 @@ test "the keeper filter kills a call outside its allowlist" {
 test "the router's filter permits the calls its loop makes and kills the rest" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    // **An allowlist is only an allowlist if the kernel enforces it.** The
-    // list itself is read by `linux/driver.zig`'s own `runRouter`. This drives
-    // the filter it builds, in a real process, against calls the router really
-    // makes and one it must never be able to make.
-    //
-    // **`socket` is the one that matters most.** The router keeps
-    // `CAP_NET_ADMIN` and holds a descriptor made in the host's own network
-    // namespace, and what bounds both of those is that it cannot open anything
-    // new. A router that could make a socket could make a second netlink
-    // socket and spend the capability on whatever it liked.
-    //
-    // Mutation check: put `.socket` in `router_calls` and the build stops, by
-    // the `comptime` block under that list. Make `buildRouter` end with
-    // `RET_ALLOW` and the child exits 13 rather than dying.
     const allocator = std.testing.allocator;
     const insns = try buildRouter(allocator);
     defer allocator.free(insns);
@@ -2318,23 +1298,17 @@ test "the router's filter permits the calls its loop makes and kills the rest" {
     if (fork_rc == 0) {
         install(bpf.Prog.init(insns)) catch |err| std.process.exit(installFaultCode(err));
 
-        // The wait the whole loop is built on. Zero descriptors and no
-        // timeout, which the kernel answers at once.
         var none: [0]linux.pollfd = .{};
         var instant: linux.timespec = .{ .sec = 0, .nsec = 0 };
         if (linux.errno(linux.ppoll(&none, 0, &instant, null)) != .SUCCESS) {
             std.process.exit(11);
         }
 
-        // The clock every lifetime in the router is measured on.
         var now: linux.timespec = undefined;
         if (linux.errno(linux.clock_gettime(.BOOTTIME, &now)) != .SUCCESS) {
             std.process.exit(12);
         }
 
-        // A call nobody put on the list, and the one that would undo the
-        // reasoning above. The filter kills this process here, so the exit
-        // below is never reached.
         _ = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
         std.process.exit(13);
     }
@@ -2350,16 +1324,6 @@ test "the router's filter permits the calls its loop makes and kills the rest" {
 }
 
 test "the router may not open a path, run a program, or write to a descriptor" {
-    // **A list and not a filter**, so the reasoning is checked without a fork
-    // and on every target. The three calls named here are the ones that would
-    // each undo a different sentence of `runRouter`'s own doc comment: an open
-    // would give the router a path, an `execve` would give it a program, and a
-    // `write` would let it put bytes on a descriptor the far side sent it.
-    //
-    // `sendto` and `sendmsg` are on the list and `write` is not, which reads
-    // as an oddity until you see that the router's own readiness byte goes out
-    // with `sendto`: every descriptor it writes to is a socket, so the call
-    // that writes a file is one it has no use for.
     const forbidden = [_]linux.SYS{ .openat, .execve, .write, .socket, .connect, .ptrace, .kill };
     for (forbidden) |call| {
         for (router_calls) |permitted| {
@@ -2367,8 +1331,6 @@ test "the router may not open a path, run a program, or write to a descriptor" {
         }
     }
 
-    // And the calls the loop really makes are all there, so a list that lost
-    // one is caught here as well as by a router that dies in production.
     const needed = [_]linux.SYS{ .accept4, .getsockopt, .recvfrom, .sendto, .recvmsg, .sendmsg, .read, .close };
     for (needed) |call| {
         var found = false;
@@ -2382,27 +1344,10 @@ test "the router may not open a path, run a program, or write to a descriptor" {
 test "the device helper's filter permits the calls it needs and kills the rest" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    // **A list is not a filter until the kernel enforces it.** This drives
-    // `buildDevice`'s own output in a real process, against a call the helper
-    // really makes and one it must never be able to make.
-    //
-    // Mutation check: make `buildDevice` ignore its own allowlist and return,
-    // say, an empty program, or one built from `router_calls` instead of
-    // `device_calls`. `router_calls` has `ppoll` but not `write`, so a filter
-    // built from it still kills this child with `SIGSYS`, only at `write`
-    // instead of at the forbidden call below. Dying is not enough proof by
-    // itself: the marker read below is what tells the two apart, because it
-    // only arrives if `write` actually ran. Mutation check: put `.openat` in
-    // `device_calls`. The child then exits 13 instead of dying, because the
-    // filter that should kill it now lets it through, and the marker read
-    // still succeeds so only the final `expect(IFSIGNALED)` catches it.
     const allocator = std.testing.allocator;
     const insns = try buildDevice(allocator);
     defer allocator.free(insns);
 
-    // Opened before the filter goes on, the same rule `device_calls`' own doc
-    // comment states: everything the helper touches by name is open before
-    // install, and only descriptors already in hand cross the filter.
     var pipe_fds: [2]i32 = undefined;
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe_fds, .{})));
     defer _ = linux.close(pipe_fds[0]);
@@ -2413,30 +1358,19 @@ test "the device helper's filter permits the calls it needs and kills the rest" 
     if (fork_rc == 0) {
         install(bpf.Prog.init(insns)) catch |err| std.process.exit(installFaultCode(err));
 
-        // The wait the link is read on.
         var none: [0]linux.pollfd = .{};
         var instant: linux.timespec = .{ .sec = 0, .nsec = 0 };
         if (linux.errno(linux.ppoll(&none, 0, &instant, null)) != .SUCCESS) {
             std.process.exit(11);
         }
 
-        // Saying what it did, onto a descriptor already held. This is the
-        // marker the parent reads below, so it only arrives if `write` is
-        // actually permitted, not merely if the process happens to die later.
         const written = linux.write(pipe_fds[1], message.ptr, message.len);
         if (written != message.len) std.process.exit(12);
 
-        // Nobody put this on the list, and it is exactly what a helper that
-        // takes its one descriptor from `recvmsg` must never be able to do.
-        // The filter kills this process here, so the exit below is never
-        // reached.
         _ = linux.openat(linux.AT.FDCWD, "/", .{ .ACCMODE = .RDONLY }, 0);
         std.process.exit(13);
     }
 
-    // The parent holds no write end of its own. Once the child's copy closes,
-    // whether by exit or by a signal, this read unblocks: with the marker if
-    // `write` ran, or with nothing at all if the child died before it did.
     _ = linux.close(pipe_fds[1]);
     var buf: [message.len]u8 = undefined;
     const read_back = linux.read(pipe_fds[0], &buf, buf.len);
@@ -2454,13 +1388,6 @@ test "the device helper's filter permits the calls it needs and kills the rest" 
 }
 
 test "the device helper may not open a path or make a new channel" {
-    // **A list and not a filter**, so the reasoning is checked without a fork
-    // and on every target. `openat` would let the helper read a path of its
-    // own choosing instead of the one descriptor `recvmsg` gave it, and
-    // `socket` would let it make a channel of its own instead of the one it
-    // was handed. Either would undo the reason this process holds a
-    // descriptor the sandboxed program does not: that what it may do is
-    // written down completely.
     const forbidden = [_]linux.SYS{ .openat, .socket };
     for (forbidden) |call| {
         for (device_calls) |permitted| {
@@ -2468,8 +1395,6 @@ test "the device helper may not open a path or make a new channel" {
         }
     }
 
-    // And the calls the helper really makes are all there, so a list that
-    // lost one is caught here as well as by a helper that dies in production.
     const needed = [_]linux.SYS{ .recvmsg, .mount, .umount2, .mkdirat, .mknodat, .ppoll, .write };
     for (needed) |call| {
         var found = false;
@@ -2481,10 +1406,6 @@ test "the device helper may not open a path or make a new channel" {
 }
 
 test "the VMM allow list holds every call a guest's filesystem answers with" {
-    // The rows are `fs_callers`, and `test/sandbox/vmm_allowlist.zig` is what
-    // holds them against `Export`'s own source. This test is the other half: that
-    // every call a row names is one the filter permits. It runs on every target,
-    // including one no guest boots on, which the derivation cannot.
     const allocator = std.testing.allocator;
     var wrong: std.ArrayList(u8) = .empty;
     defer wrong.deinit(allocator);
@@ -2502,10 +1423,6 @@ test "the VMM allow list holds every call a guest's filesystem answers with" {
         );
     }
 
-    // **The scalar and flag-taking twins stay out.** `std.Io` reaches the scalar
-    // `pread` and `pwrite` only from a `File.MemoryMap`, which nothing in this
-    // process makes, and `renameat2` only through `renamePreserve`, which `Export`
-    // never calls. An entry nothing reaches is a grant nothing justifies.
     for ([_]linux.SYS{ .pread64, .pwrite64, .renameat2 }) |call| {
         for (vmm_calls) |permitted| {
             if (permitted == call) try wrong.print(allocator, "the VMM allow list holds {t}, which nothing reaches\n", .{call});
@@ -2516,15 +1433,6 @@ test "the VMM allow list holds every call a guest's filesystem answers with" {
 }
 
 test "the VMM allow list holds the hypervisor and the channels it was handed" {
-    // `ioctl` is every `KVM_RUN` and every virtio device model, so a list without
-    // it is a guest that never starts.
-    //
-    // Then two more sets. The descriptors the fork handed over, which are the
-    // session socket, the control channel, and the pair a tool call's stream is
-    // one end of. And the vCPU threads: `clone` starts one, `sigaltstack` gives it
-    // an alternate signal stack, `futex` is how the threads wait on each other,
-    // `tgkill` is the tick that interrupts a blocked hypervisor call, and `mmap`
-    // is both the allocator and the guest's own memory.
     const allocator = std.testing.allocator;
     var missing: std.ArrayList(u8) = .empty;
     defer missing.deinit(allocator);
@@ -2545,13 +1453,6 @@ test "the VMM allow list holds the hypervisor and the channels it was handed" {
 }
 
 test "the VMM allow list holds the streaming pair a console that is not a file needs" {
-    // **Present on purpose, and nothing reaches them in a session today.** A
-    // forked guest's console is a seekable file, so `File.Writer` stays on the
-    // positional path and never falls back. The daemon's console is whatever it
-    // was started with, and a pipe answers `pwritev` with `error.Unseekable`,
-    // which is what sends the writer to `writev`. This test is here so a sweep
-    // that removes an entry nothing reaches does not take these two with it and
-    // break a piped daemon.
     const allocator = std.testing.allocator;
     var missing: std.ArrayList(u8) = .empty;
     defer missing.deinit(allocator);

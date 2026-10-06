@@ -1,14 +1,7 @@
 //! What the Keychain answers, and what a person should do about it.
-//!
-//! Split from the driver so it builds and is tested on every host. The driver
-//! beside it declares `extern` functions that only link against the Security
-//! framework, so a Linux test binary cannot reference them at all.
 
 const std = @import("std");
 
-/// `OSStatus`, the result of every Security framework call. `MacTypes.h` gives
-/// `typedef SInt32 OSStatus`, and `SInt32` is `signed int` on every 64 bit
-/// Apple target.
 pub const OSStatus = c_int;
 
 pub const success: OSStatus = 0;
@@ -18,21 +11,12 @@ pub const item_not_found: OSStatus = -25300;
 pub const no_default_keychain: OSStatus = -25307;
 pub const interaction_not_allowed: OSStatus = -25308;
 
-/// What a status means for the caller, apart from the number itself.
 pub const Meaning = enum {
-    /// The call worked.
     ok,
-    /// The Keychain holds no such item. Not a fault: an instance nobody has
-    /// logged in for reads back as nothing.
     absent,
-    /// The item is there and this process may not have it without asking a
-    /// person, and asking is turned off.
     needs_unlock,
-    /// The account has no default keychain at all.
     no_keychain,
-    /// The item is there and the Keychain refused this process.
     refused,
-    /// Anything else. The number is the only fact.
     other,
 };
 
@@ -47,12 +31,6 @@ pub fn meaningOf(status: OSStatus) Meaning {
     };
 }
 
-/// One sentence a person can act on, or null when the number is all there is.
-///
-/// **`needs_unlock` and `no_keychain` are the two an SSH session meets**, and
-/// they are different problems with different answers, so they never share a
-/// sentence. A locked keychain is unlocked. An account with no keychain has
-/// never logged in graphically, and no amount of unlocking makes one.
 pub fn adviceFor(status: OSStatus) ?[]const u8 {
     return switch (meaningOf(status)) {
         .needs_unlock => "the keychain is locked and this session cannot ask anybody to unlock it. " ++

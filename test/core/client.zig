@@ -27,14 +27,11 @@ fn testRequest(messages: []const message.Message) message.Request {
     return .{ .model = "glm4.7-flash:A3B", .system = "", .messages = messages };
 }
 
-/// A wire that answers from a script and lets one more piece of the reply out
-/// for each answer. This takes the clock out of the gap bound tests: a piece
-/// goes out because the client asked, so a test pins an order. The rest is real.
+/// Answers from a script and lets one more piece of the reply out per answer, so a test pins an order.
 const ScriptedWire = struct {
     gate: *fake_provider.Gate,
     /// One answer per question. The last stands for every question after it.
     answers: []const bool,
-    /// A client that never asked would get no piece of the reply at all.
     asked: usize = 0,
 
     fn wire(self: *ScriptedWire) provider.Client.Wire {
@@ -105,8 +102,7 @@ test "a complete streamed reply arrives as one assembled message" {
 }
 
 test "a stream that stops in the middle is an error and not a short message" {
-    // The chunked encoding ends cleanly with its own zero length chunk, so the
-    // transport sees nothing wrong. Only a missing `[DONE]` catches this.
+    // The chunked encoding ends cleanly on its own, so only a missing `[DONE]` catches this.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -197,8 +193,7 @@ test "a provider that stops sending mid reply is stopped, and says so, rather th
 }
 
 test "a reply that is merely slow is left alone, because the bound is on the gap and not on the call" {
-    // Every answer says "still sending" and lets one more piece out, so the check
-    // saw activity at each gap. Nothing here is a duration.
+    // Every answer says "still sending" and lets one more piece out, so the check saw activity at each gap.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -216,8 +211,7 @@ test "a reply that is merely slow is left alone, because the bound is on the gap
             .{ .bytes = fake_provider.httpChunk(
                 "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"three\"}}]}\n\n",
             ) },
-            // The end marker and the last chunk go out as one piece. Split in two
-            // they need a fifth question, which the loop never asks.
+            // Split in two, the end marker and the last chunk need a fifth question the loop never asks.
             .{ .bytes = comptime fake_provider.httpChunk("data: [DONE]\n\n") ++ fake_provider.last_chunk },
         },
         .gate = &gate,
@@ -286,8 +280,7 @@ test "a non 200 status is reported with what the body said" {
 }
 
 test "a 429 carries its own Retry-After off the wire, and a refusal without one carries null" {
-    // `Retry-After` is read off the head before the body, because reading the body
-    // invalidates every pointer the head holds. Only a real `receiveHead` gets that wrong.
+    // `Retry-After` is read off the head before the body, since reading the body invalidates its pointers.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -392,8 +385,7 @@ test "the key travels in a header and appears in no log line" {
 }
 
 test "the fake and the HTTP client produce the same assembled message for the same deltas" {
-    // Two implementations, driven through one function written against the
-    // interface, agree on one message. Not a proof that nothing can tell them apart.
+    // Two implementations, driven through the same interface function, agree on one message.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -468,8 +460,7 @@ test "the fake and the HTTP client produce the same assembled message for the sa
     try std.testing.expectEqualStrings(stub_reply.outcome.message.content[0].text, http_reply.outcome.message.content[0].text);
 }
 
-/// How far the reply had got when each text delta was handed on, in pieces let
-/// out of the gate. A count and not a clock.
+/// How far the reply had got when each text delta was handed on, in pieces let out of the gate.
 const ArrivalCtx = struct {
     allocator: std.mem.Allocator,
     wire: *const ScriptedWire,
@@ -484,9 +475,7 @@ fn recordArrival(ctx: ?*anyopaque, delta: Delta) OnDeltaError!void {
 }
 
 test "a delta sent early arrives before a later one is sent" {
-    // A fixed size read buffer that reports only once it fills makes every delta
-    // arrive together at the end. Reading the response head takes the first pieces
-    // of the body with it, so a gap bound that waits with an event in hand does too.
+    // A fixed size read buffer that reports only once it fills makes every delta arrive together at the end.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -530,8 +519,7 @@ test "a delta sent early arrives before a later one is sent" {
 }
 
 test "an empty key sends no Authorization header at all, not an empty one" {
-    // `Authorization: Bearer ` with nothing after it is not the same thing. A real
-    // provider answers 401, so the header has to be absent and not merely empty.
+    // A real provider answers 401 to `Authorization: Bearer ` with nothing after it.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -750,8 +738,7 @@ test "an error event inside a 200 stream is reported as an error, with the 200 s
 }
 
 test "an Anthropic non 200 status is reported with what the body said, and never as a truncated stream" {
-    // An error body on this wire is plain JSON and not server sent events, so a
-    // reader that hands it to the SSE parser calls the whole reply truncated.
+    // An error body on this wire is plain JSON, not server sent events.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -791,8 +778,7 @@ test "an Anthropic non 200 status is reported with what the body said, and never
 }
 
 test "the request asks for the bytes as they are, because a compressed body is not an event stream" {
-    // `std.http.Client` offers "gzip, deflate" by itself and `Response.reader` gives
-    // back what arrived, so `sse.Parser` finds no `data:` line in a good reply.
+    // The reader gives back what arrived, so a compressed body finds no `data:` line.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -918,7 +904,7 @@ test "an OpenAI compatible stream's final usage chunk reaches the caller instead
     try std.testing.expect(std.mem.indexOf(u8, fp.captured.body, "\"include_usage\":true") != null);
 }
 
-/// The trailer ai& appends after `[DONE]`. A named event and not a chunk.
+/// The trailer ai& appends after `[DONE]`, as a named event and not a chunk.
 const aiand_metrics_trailer = "event: metrics\n" ++
     "data: {\"tokens\":{\"input\":7,\"output\":2,\"total\":9,\"cached\":3}," ++
     "\"cost\":0.000018,\"currency\":\"usd\",\"ttft_ms\":120,\"inference_ms\":850}\n\n";
@@ -1264,8 +1250,7 @@ test "an Anthropic reply with no content at all assembles to an empty message th
 }
 
 test "a refused Anthropic reply carries the category and the explanation through the fold" {
-    // The value gets out of the decoder, through the fold, and into the reply the
-    // agent loop reads. Mechanisms here have shipped green with no caller.
+    // The value gets out of the decoder, through the fold, and into the reply the agent loop reads.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 

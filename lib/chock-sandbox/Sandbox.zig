@@ -1,10 +1,4 @@
 //! The public interface of chock-sandbox: one driver per way of sandboxing.
-//!
-//! `native_driver` is the one for the machine this build runs on, chosen from
-//! `builtin.os.tag`, and it is what a caller that names none gets. A `Driver` is
-//! a value, so a caller can hold another: see its own doc comment for what the
-//! four calls are and why a second way of sandboxing is a table rather than a
-//! second copy of this file.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,39 +11,20 @@ const cgroup = @import("linux/cgroup.zig");
 const nftables = @import("linux/nftables.zig");
 const grants = @import("grants.zig");
 
-/// The one directory inside a sandbox root that belongs to Chock. Nothing
-/// mounts this path: the kernel takes the last matching mount and not the
-/// longest prefix, so a mount here would hide everything below it.
+/// No mount uses this path. The kernel keeps only the last match at a spot, which would hide what is below it.
 pub const runtime_prefix = "/run/chock";
 
 pub const trust_store_inside = runtime_prefix ++ "/ca-bundle.crt";
 
-/// What a way of sandboxing can say at all, as against what it promises. A
-/// `Guarantee` is a property of the boundary; one of these is a property of the
-/// machinery, and a caller reads it to know which shape of answer to build.
-///
-/// **It belongs to the driver and not to the platform.** A guest has a kernel of
-/// its own, so a driver that boots one expresses what the host cannot: a Mac
-/// running a Linux guest has bind mounts, a real `procfs` to mask and cgroup
-/// placement, none of which the native Darwin driver has. See
-/// `docs/security/sandbox.md`.
+/// What a driver can say about itself, as opposed to Guarantee, which is what the sandbox promises.
 pub const Expresses = struct {
-    /// A path can be bound somewhere other than where it lives.
     moved_paths: bool,
-    /// A capped area can be given, which is the only capacity limit an
-    /// unprivileged process can put on a filesystem.
     scratch_area: bool,
-    /// There is a `procfs` to mount, and therefore one to mask.
     procfs: bool,
-    /// A tool call can be put in a cgroup of its own.
     cgroup_placement: bool,
-    /// A host device node can be handed in.
     device_passthrough: bool,
 };
 
-/// What the native driver can say. **A comptime view of `native.expresses`**, so
-/// the platform facts live in the driver that has them and this cannot drift
-/// from the value a caller holding a `Driver` reads.
 pub const expresses = struct {
     pub const moved_paths = native.expresses.moved_paths;
 
@@ -62,10 +37,7 @@ pub const expresses = struct {
     pub const device_passthrough = native.expresses.device_passthrough;
 };
 
-/// macOS reaches `$TMPDIR` below `/var`, a link to `/private/var`, so a rule
-/// written on the unresolved spelling matches nothing. `buffer` holds the answer.
-/// Length first, so two fields cannot run together into one reading: a mount
-/// of `/ab` at `/c` and one of `/a` at `/bc` are different sandboxes.
+/// Feeds the length before the bytes, so two fields cannot blur into one reading.
 fn feedText(hash: *std.crypto.hash.sha2.Sha256, text: []const u8) void {
     feedCount(hash, text.len);
     hash.update(text);
@@ -87,7 +59,7 @@ pub fn resolvedPath(io: std.Io, path: []const u8, buffer: []u8) []const u8 {
 
 pub const Config = struct {
     root: []const u8,
-    /// A `Mount.deny` entry is applied last whatever its place in this list.
+    /// A `.deny` entry applies last, whatever its place in this list.
     mounts: []const namespace.Mount,
     rules: []const Rule,
     cwd: []const u8,
@@ -95,48 +67,27 @@ pub const Config = struct {
     seccomp_options: seccomp.Options = .{},
     network: namespace.Network = .none,
     stdout_fd: std.posix.fd_t = std.posix.STDOUT_FILENO,
-    /// Also carries every setup failure, so `/dev/null` here makes a failed sandbox quiet.
+    /// Setup failures print here too, so `/dev/null` here hides them.
     stderr_fd: std.posix.fd_t = std.posix.STDERR_FILENO,
-    /// Null for `/dev/null`, which is what every tool call gets. A pipe here is not
-    /// a terminal, so the kernel answers `ENOTTY` to `TIOCSTI` on it.
+    /// Null becomes `/dev/null`, which answers `ENOTTY` to `TIOCSTI` since it is not a terminal.
     stdin_fd: ?std.posix.fd_t = null,
-    /// Whether the processes this driver runs beside the call are invisible to it.
-    ///
-    /// **A pair and never a flag.** The call's own user is mapped, a second is
-    /// mapped for the helpers, they become it, and the procfs carries
-    /// `hidepid=2`. Asking for the last without the first two hides nothing:
-    /// `hidepid` hides by user, and one user has nothing to hide from itself.
-    ///
-    /// **Only where a second user can be mapped.** The kernel takes a range from
-    /// a namespace that owns it, so a guest, whose driver is root, can, and an
-    /// ordinary user on a host cannot without `newuidmap` and a configured
-    /// `/etc/subuid`. A call that asks and cannot is refused rather than run as
-    /// though it had.
-    ///
-    /// What it closes: a helper is forked and never `execve`d, so its
-    /// `/proc/<pid>/environ` holds this process's own environment rather than the
-    /// curated one the call was given.
+    /// Needs a second mapped user and `hidepid=2`. Refused where no second user can be mapped.
     hide_helpers: bool = false,
     limits: Limits = .{},
     containment: Containment = .best_effort,
-    /// A tmpfs with a hard cap is the only capacity limit an unprivileged process
-    /// can put on a filesystem: `RLIMIT_FSIZE` bounds one file, and ten thousand one
-    /// byte files still fill a disk.
+    /// A capped tmpfs is the only size limit an unprivileged process can put on a filesystem.
     scratch: []const namespace.Scratch = &.{},
     /// Required when `network` is `.filtered`, and refused otherwise.
     net_broker: ?NetBroker = null,
-    /// A caller names this or `net_broker`, never both: the seccomp rule that stops
-    /// a handed over descriptor being re-aimed also stops the router's own program connecting.
+    /// Never named together with `net_broker`: the same seccomp rule that blocks a re-aimed descriptor also blocks the router's own connect.
     net_router: ?NetRouter = null,
     device_source: ?DeviceSource = null,
-    /// `inside` is never granted through `Config.rules`: a rule for it would hand
-    /// the sandboxed program the reach only the device helper may have.
+    /// Never granted through `Config.rules`, which would hand the sandboxed program the device helper's own reach.
     device_tree: ?DeviceTree = null,
     limits_report: ?*LimitsReport = null,
     supervisor_audit: ?*SupervisorAudit = null,
     syscall_audit: ?*SyscallAudit = null,
-    /// Telemetry and never evidence: the kernel runs the call after the reader has
-    /// read the argument, so a program can write one name and then open another.
+    /// Telemetry only, not evidence: the kernel runs the call after the reader reads the argument.
     path_audit: bool = false,
 
     pub const Rule = struct {
@@ -144,24 +95,10 @@ pub const Config = struct {
         access: landlock.AccessFs,
     };
 
-    /// SHA-256 over what this sandbox lets a tool call reach: every mount with
-    /// its kind and paths, every rule with its access bits, the scratch areas,
-    /// the limits, the network mode and the device tree.
-    ///
-    /// A resumed session runs a sandbox built again from the files and flags of
-    /// that run, so a change to any of them changes this. That is what it is
-    /// for: the log holds one of these per run, and two runs of one session
-    /// that differ here were not the same sandbox.
-    ///
-    /// The environment is left out on purpose. It decides what a program does
-    /// and not what it may reach, and it carries a path that moves between
-    /// machines, which would make every hash differ for no reason worth
-    /// reporting. `stdout_fd` and the report pointers are left out for the
-    /// same reason: they are this process's own, not the sandbox's shape.
+    /// Hashes everything that bounds what a call can reach. The environment and this process's own fields are left out on purpose.
     pub fn shapeHash(self: Config) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        // A version of this function's own reading. A hash written by an older
-        // Chock, over fewer fields, must not compare equal to one written now.
+        // Versions this function's own reading, so a hash from an older Chock over fewer fields never compares equal.
         feedText(&hash, "chock sandbox shape 1");
 
         feedText(&hash, self.root);
@@ -237,8 +174,6 @@ pub const Config = struct {
         inside: []const u8,
     };
 
-    /// A copy sharing no memory with the original. A field added below is copied
-    /// here on the day it is added, or by nobody.
     pub fn copy(self: Config, allocator: std.mem.Allocator) std.mem.Allocator.Error!Config {
         var out = self;
         out.root = try allocator.dupe(u8, self.root);
@@ -285,9 +220,7 @@ pub const Config = struct {
     }
 };
 
-/// Where a `Config`'s mount list and its Landlock rule list disagree. A rule
-/// above a mount target is outside the mount set, because Landlock rights
-/// accumulate downwards.
+/// Where a `Config`'s mount list and rule list disagree about reach.
 pub const LayerGap = union(enum) {
     rule_outside_mounts: []const u8,
     mount_without_rule: []const u8,
@@ -312,8 +245,7 @@ pub const LayerGap = union(enum) {
     }
 };
 
-/// The root is a real gap this cannot see: `namespace.buildRoot` binds
-/// `config.root` over itself read write, so only Landlock refuses `/`.
+/// Cannot see the root gap: `namespace.buildRoot` binds `config.root` over itself, so only Landlock refuses `/`.
 pub fn firstGap(config: Config) ?LayerGap {
     for (config.rules) |rule| {
         if (!mountSetHolds(config, rule.path)) return .{ .rule_outside_mounts = rule.path };
@@ -355,8 +287,7 @@ fn ruleSetHolds(config: Config, target_path: []const u8) bool {
     return false;
 }
 
-/// A `Mount.deny` target is not in the set, so a denial below a granted tree
-/// still reads as granted.
+/// Deny targets are excluded, so a denial under a granted tree still holds.
 pub fn grantPrefixes(
     allocator: std.mem.Allocator,
     config: Config,
@@ -381,22 +312,19 @@ pub fn copyStrings(
     return to;
 }
 
-/// A granted descriptor outlives the check, and a connected TCP socket can be
-/// re-aimed with `connect`, so the Linux driver refuses `connect` for a filtered
-/// process.
+/// `connect` is refused for a filtered process: a granted descriptor outlives the check and a connected socket can be re-aimed.
 pub const NetBroker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const Grant = union(enum) {
-        /// The implementation gives up ownership. The driver closes it either way.
         granted: std.posix.fd_t,
-        /// No reason crosses the boundary: a reason tells a process which hosts exist.
+        /// No reason crosses the boundary: a reason would tell a process which hosts exist.
         refused,
     };
 
     pub const VTable = struct {
-        /// `host` borrows the driver's own buffer and is not valid after this returns.
+        /// `host` borrows the driver's own buffer and is invalid after this returns.
         connect: *const fn (ptr: *anyopaque, host: []const u8, port: u16) Grant,
     };
 
@@ -405,9 +333,7 @@ pub const NetBroker = struct {
     }
 };
 
-/// On `open` the address is the identity and the name is not: two hosts on one
-/// content network share a name, so the implementation maps the address back to
-/// the name it handed out.
+/// The address is the identity, not the name: two hosts on one content network can share a name.
 pub const NetRouter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -441,56 +367,45 @@ pub const DeviceSource = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// The source owns this descriptor and the driver never closes it.
         wakeup: *const fn (ptr: *anyopaque) i32,
         next: *const fn (ptr: *anyopaque) ?Change,
     };
 
     pub const Change = union(enum) {
-        /// No descriptor rides with this: a descriptor cannot become a mount inside the
-        /// helper's own mount namespace, so a path crosses and is checked on the far side.
+        /// No descriptor rides with this: it cannot become a mount inside the helper's own namespace, so a path crosses and is checked on the far side.
         place: struct { kind: u8, source: []const u8, target: []const u8 },
         drop: struct { target: []const u8 },
     };
 };
 
-/// A fall back from `supplied` to a post fork write must not happen: a process
-/// that runs even briefly outside its cgroup can fork faster than the write that
-/// would contain it.
+/// Never falls back from `supplied` to a post fork write: a process running briefly outside its cgroup can fork faster than that write.
 pub const Containment = union(enum) {
     best_effort,
     supplied: Supplied,
 
     pub const Supplied = struct {
-        /// A descriptor and not a path: the kernel resolves no name for
-        /// `CLONE_INTO_CGROUP`, so a directory renamed between the caller's check and
-        /// the clone cannot make the child land elsewhere.
+        /// A descriptor, not a path: the kernel resolves no name for `CLONE_INTO_CGROUP`, so a rename cannot retarget the child.
         fd: std.posix.fd_t,
     };
 };
 
 pub const Limits = rlimits.Limits;
 
-/// `memory.max` kills with a bare `SIGKILL`, the same thing a caller sees when a
-/// person cancels a call, so the outcome has to be named.
+/// `memory.max` kills with a bare `SIGKILL`, the same signal a cancelled call gets, so the cause has to be named here.
 pub const LimitsReport = struct {
     limits: Limits = .{},
     cgroup: cgroup.Support = .off,
-    /// Whether `RLIMIT_NPROC` went on. False on a kernel older than 5.14, where it
-    /// counts the user's own processes on the host and not the sandbox's.
+    /// False on a kernel older than 5.14, where `RLIMIT_NPROC` counts the user's own host processes instead.
     nproc_applied: bool = false,
     events: cgroup.Events = .{},
     /// Read from the filesystem itself: nothing in the kernel counts a full tmpfs.
     scratch_full: bool = false,
-    /// `scratch_space` is inferred and not counted: the kernel answers `ENOSPC` and
-    /// keeps no record, so a full area plus a bad end reads as the area ending it.
+    /// Inferred, not counted: the kernel answers `ENOSPC` with no record, so a full area and a crash look the same.
     killed_by: ?rlimits.Diagnostic.Which = null,
 
     pub fn killedText(self: LimitsReport, buffer: []u8) ?[]const u8 {
         const which = self.killed_by orelse return null;
 
-        // A program that fills a scratch area prints "No space left on device", so the
-        // sentence has to say the machine's own disk is not the thing that filled.
         if (which == .scratch_space) {
             if (self.limits.scratch_bytes) |number| {
                 return std.fmt.bufPrint(
@@ -537,7 +452,6 @@ pub const LimitsReport = struct {
 
 pub const LayerProcess = enum {
     sandboxed,
-    /// The process that waits, which holds this program's own memory including the credential.
     supervisor,
 
     pub fn wireName(self: LayerProcess) []const u8 {
@@ -573,10 +487,7 @@ pub const FailMode = enum {
     open,
 };
 
-/// What happens to `process` when `layer` will not go on, or null when that
-/// process never puts it on. `linux/driver.zig` reads this table at compile time
-/// and `applyLayers` refuses to compile if it says one of its layers may be
-/// skipped, so an edit here is an edit to the behaviour.
+/// What happens when `layer` fails for `process`, read by `driver.zig` at compile time. An edit here changes behaviour.
 pub fn failModeFor(process: LayerProcess, layer: LayerName) ?FailMode {
     return switch (process) {
         .sandboxed => .closed,
@@ -587,8 +498,6 @@ pub fn failModeFor(process: LayerProcess, layer: LayerName) ?FailMode {
     };
 }
 
-/// Whether the supervisor process could confine itself. That install stays best
-/// effort, and the terminal line it prints dies with the terminal.
 pub const SupervisorAudit = struct {
     pub const process_name = LayerProcess.supervisor.wireName();
 
@@ -597,15 +506,13 @@ pub const SupervisorAudit = struct {
     pub const Counters = struct {
         confined: std.atomic.Value(u64) = .init(0),
         unconfined: std.atomic.Value(u64) = .init(0),
-        /// A cancelled call kills the supervisor before it confines itself, so there is
-        /// no answer to record and a count of zero would be a claim.
+        /// Zero here is not a claim: a cancelled call kills the supervisor before it can report either way.
         unreported: std.atomic.Value(u64) = .init(0),
         first_fault: std.atomic.Value(u8) = .init(0),
     };
 
     pub const Fault = enum(u8) {
-        /// The sandboxed process puts the same layer on from the same inputs and that
-        /// install is fatal, so this arriving means the kernel answered two processes differently.
+        /// Arriving here means the kernel answered the sandboxed and supervisor processes differently for the same inputs.
         not_supported = 1,
         no_new_privs_refused = 2,
         not_permitted = 3,
@@ -650,9 +557,6 @@ pub const SupervisorAudit = struct {
     };
 };
 
-/// What the sandboxed program asked the kernel for, at the one level a program
-/// cannot talk its way around. `observed` and `unobserved` are what make a
-/// histogram of zeros readable.
 pub const SyscallAudit = struct {
     pub const mechanism_name = "seccomp_user_notif";
 
@@ -664,8 +568,6 @@ pub const SyscallAudit = struct {
 
     pub const PathTotals = struct {
         lock: Lock = .{},
-        /// The ordinary pid namespace teardown and a program that kills its own reader
-        /// are identical at the reap, so this counts both.
         readers_unreported: u64 = 0,
         readers_absent: u64 = 0,
         seen: notify.PathRecord = .{},
@@ -688,8 +590,7 @@ pub const SyscallAudit = struct {
         }
     }
 
-    /// Plain atomics and a yield: `std.Io.Mutex.lock` needs an `Io` and `spawn` has
-    /// none to give. Never held across a system call.
+    /// Plain atomics, not `std.Io.Mutex`: `spawn` has no `Io` to give it. Never held across a system call.
     pub const Lock = struct {
         held: std.atomic.Value(bool) = .init(false),
 
@@ -704,7 +605,7 @@ pub const SyscallAudit = struct {
         }
     };
 
-    /// Everything read out of `seen` is untrusted input: the reader process wrote it.
+    /// Everything read out of `seen` is untrusted: a reader process wrote it.
     pub fn recordPaths(self: *SyscallAudit, seen: *const notify.PathRecord) void {
         self.paths.lock.lock();
         defer self.paths.lock.unlock();
@@ -746,7 +647,7 @@ pub const SyscallAudit = struct {
 
     pub const name_cap = notify.kept_path_cap;
 
-    /// The names point into this audit's own storage, and a call in flight can add one.
+    /// Names point into this audit's own storage, and a call in flight can still add one.
     pub fn pathCounts(self: *SyscallAudit) PathCounts {
         self.paths.lock.lock();
         defer self.paths.lock.unlock();
@@ -795,17 +696,14 @@ pub const SyscallAudit = struct {
     };
 };
 
-/// The guarantees a driver can give. Nothing compares against this set yet.
 pub const Guarantee = enum {
     network_isolated,
-    /// A PID namespace alone does not give this: `kill(0, sig)` names the caller's
-    /// own process group, which the kernel holds as an object and not as a number,
-    /// and from a fresh namespace it still reached a process outside.
+    /// A PID namespace alone does not give this: `kill(0, sig)` can still reach a process outside it.
     signal_isolated,
     ipc_isolated,
     path_restricted,
     syscall_restricted,
-    /// Darwin has none of this, and the gap is permanent: macOS has no bind mount.
+    /// Darwin has none of this. The gap is permanent: macOS has no bind mount.
     workspace_mounted,
 };
 
@@ -847,43 +745,27 @@ pub const SpawnError = error{
     NetRouterAndBroker,
     DeviceSourceSocketFailed,
     DeviceSourceNeedsTree,
-    /// Refused and never degraded: writing `cgroup.procs` after the fork leaves a
-    /// window in which the child is outside the cgroup the caller asked for.
+    /// Refused, never degraded: writing `cgroup.procs` after the fork leaves a window outside the cgroup.
     CgroupPlacementUnsupported,
     CgroupPlacementRefused,
-    /// The guest ran nothing and said why. Three names and not one, because
-    /// `Unexpected` is what the tool path shows a person, and "unexpected" is
-    /// the one thing a refusal with a reason is not.
     GuestRefused,
-    /// No directory the guest was offered holds a path the call needs, or a
-    /// mount writes into one offered read only.
     GuestCannotPlacePath,
-    /// The config holds something no guest can be asked for.
     GuestCannotExpress,
-    /// The stream to the guest is gone, so the guest is.
     GuestGone,
 } || SetupError || std.mem.Allocator.Error;
 
-/// The Landlock ruleset masks a right out of every rule when the running
-/// kernel's ABI has not got it, with no error and no other signal.
+/// A right is masked out of every rule, with no error, when the running kernel's ABI lacks it.
 pub const LandlockReport = struct {
     abi: i32,
     features: landlock.Features,
 };
 
-/// `spawn` reaps the process it forked before it returns, so a `kill` by number
-/// after that reaches whatever started next: one teardown path sent `SIGKILL` to
-/// a process group holding an unrelated build. Signal through `fd`, never `pid`.
+/// `spawn` reaps before returning, so a `kill` by pid afterward can hit an unrelated process. Signal through `fd`, never `pid`.
 pub const Middle = struct {
-    /// For reporting and never for signalling. `elsewhere` when the process is
-    /// not this kernel's to name.
     pid: std.posix.pid_t = 0,
     fd: std.posix.fd_t = -1,
 
-    /// What `pid` holds when a guest runs the call. A caller waiting for a
-    /// driver to fill a middle waits for `pid` to leave zero, so a driver with
-    /// no pid to report still has to say that a call began, and a caller that
-    /// prints one must not print this as a number.
+    /// What `pid` holds when a guest runs the call. A caller must not print this as a real pid.
     pub const elsewhere: std.posix.pid_t = -1;
 };
 
@@ -899,26 +781,12 @@ const native = switch (builtin.os.tag) {
     else => @compileError("chock-sandbox: no driver for target os " ++ @tagName(builtin.os.tag)),
 };
 
-/// Either error a driver answers when it cannot put the caller on a keyring of
-/// its own. The union of the two, because a driver that has no keyring at all
-/// refuses rather than failing to join one.
 pub const KeyringError = error{ JoinFailed, Refused };
 
-/// One way of sandboxing, as a value. **The four calls and the one data field
-/// are the whole of what a driver is**, which is why a second one is a table
-/// and not a second copy of this file.
-///
-/// A guest is a layer and not an alternative: a VM driver boots a kernel and
-/// then runs the driver that already exists inside it, so `guarantees` there is
-/// the inner driver's and not a weaker set.
+/// A guest is a layer, not an alternative: its guarantees are the inner driver's own, not a weaker set.
 pub const Driver = struct {
-    /// **A pointer and a table, the shape `NetBroker` and `NetRouter` already
-    /// have.** A driver with state needs one: the microVM driver holds the stream
-    /// into its guest and the set of directories that guest was offered. The two
-    /// native drivers are modules with no state and point this at nothing.
     ptr: *anyopaque,
     vtable: *const VTable,
-    /// What `chock doctor` prints, and what a log row names.
     name: []const u8,
     guarantees: Guarantees,
     expresses: Expresses,
@@ -942,12 +810,6 @@ pub const Driver = struct {
             ptr: *anyopaque,
             stderr_fd: std.posix.fd_t,
         ) KeyringError!void,
-        /// Why the last `spawn` on this driver refused, in words for a person.
-        ///
-        /// **A driver that builds a reason must be able to give it back.** A
-        /// `SpawnError` is a name, and a name that says a path could not be
-        /// placed does not say which path. The answer borrows the driver's own
-        /// memory and is good until its next call.
         whyLast: *const fn (ptr: *anyopaque) ?[]const u8,
     };
 
@@ -979,13 +841,8 @@ pub const Driver = struct {
     }
 };
 
-/// What a stateless driver's `ptr` points at. A real address, because a null one
-/// would be a pointer nothing may dereference and this one nothing does.
 var no_state: u8 = 0;
 
-/// A `Driver` over one driver module. Every call is wrapped to drop the state
-/// pointer a module has no use for, and the keyring one also widens the error
-/// set, because the two modules answer different ones.
 pub fn driverOf(comptime module: type) Driver {
     const wrapped = struct {
         fn spawn(
@@ -1019,8 +876,6 @@ pub fn driverOf(comptime module: type) Driver {
             return module.joinFreshSessionKeyring(stderr_fd);
         }
 
-        /// A native driver refuses with the kernel's own errors, which the error
-        /// name already carries, so there is nothing to add here.
         fn whyLast(ptr: *anyopaque) ?[]const u8 {
             _ = ptr;
             return null;
@@ -1043,13 +898,8 @@ pub fn driverOf(comptime module: type) Driver {
     };
 }
 
-/// The driver for the machine this build runs on. A caller that names no driver
-/// gets this one, which is every caller today.
 pub const native_driver: Driver = driverOf(native);
 
-/// What the native driver promises. **Still comptime**: every reader of this is
-/// asking what this build can do, and a second driver does not change that
-/// answer. A caller holding a `Driver` reads `Driver.guarantees` instead.
 pub const guarantees: Guarantees = native.guarantees;
 
 pub const network_modules: []const u8 = switch (builtin.os.tag) {
@@ -1061,8 +911,6 @@ pub const filter_modules: []const u8 = switch (builtin.os.tag) {
     else => "",
 };
 
-/// `namespace.substitute` refuses a `text` target that is a symbolic link rather
-/// than following it, which is what `chock doctor` reads this list to check.
 pub const resolver_substitutions: []const namespace.Substitution = switch (builtin.os.tag) {
     .linux => &native.resolver_substitutions,
     else => &.{},
@@ -1078,11 +926,7 @@ pub fn spawn(
     return spawnWith(native_driver, allocator, config, argv, landlock_report, middle);
 }
 
-/// `spawn` through a driver the caller names.
-///
-/// **The single threaded caller rule holds whichever driver this is**: the
-/// driver forks, and a fork carries only the calling thread. See
-/// `lib/chock-core/tools.zig`'s own top comment.
+/// The single threaded caller rule applies to whichever driver this is: a fork carries only the calling thread.
 pub fn spawnWith(
     sandbox_driver: Driver,
     allocator: std.mem.Allocator,
@@ -1099,7 +943,7 @@ pub fn signalMiddle(fd: std.posix.fd_t, sig: std.posix.SIG) SignalError!void {
     return native_driver.signalMiddle(fd, sig);
 }
 
-/// Call it only after the `spawn` that filled the handle in has returned.
+/// Call only after the `spawn` that filled this handle has returned.
 pub fn closeMiddle(middle: *Middle) void {
     native_driver.closeMiddle(middle);
 }
@@ -1296,9 +1140,6 @@ const StubRouter = struct {
     }
 };
 
-/// A driver that runs nothing and records that it was asked. It proves the
-/// dispatch goes through the table: a `spawnWith` that reached the native driver
-/// instead would fork, and this one cannot.
 const CountingDriver = struct {
     var spawns: usize = 0;
     var signals: usize = 0;
@@ -1391,7 +1232,6 @@ test "a driver a caller names is the one that runs, and the native one is untouc
         null,
     );
 
-    // Nothing forked, and the answer is this driver's own.
     try std.testing.expectEqual(@as(usize, 1), CountingDriver.spawns);
     try std.testing.expectEqual(@as(u8, 7), term.exited);
 
@@ -1409,18 +1249,12 @@ test "a driver a caller names is the one that runs, and the native one is untouc
 }
 
 test "the native driver's table answers exactly what its own module does" {
-    // The table is built from the module, so a field wired to the wrong
-    // declaration is what this catches.
     try std.testing.expectEqualStrings(native.driver_name, native_driver.name);
     try std.testing.expectEqual(native.guarantees, native_driver.guarantees);
     try std.testing.expectEqual(guarantees, native_driver.guarantees);
 
-    // A stateless driver points at nothing it dereferences, and every call of it
-    // reaches the module's own.
     try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&no_state)), native_driver.ptr);
 
-    // A handle nothing filled in is refused without a syscall, whichever driver
-    // this build has, so the wrapper is reached and answers the module's own.
     try std.testing.expectError(error.NoHandle, signalMiddle(-1, .TERM));
 }
 
@@ -1430,7 +1264,6 @@ test "the linux driver and the darwin driver expose the same public shape" {
     const linux_driver = @import("linux/driver.zig");
     const darwin_driver = @import("darwin/driver.zig");
 
-    // Add a name here whenever `driverOf` reads a new driver declaration.
     const shape = .{
         "spawn",
         "guarantees",
@@ -1658,11 +1491,8 @@ test "the shape hash changes when the sandbox lets through anything different" {
     };
     const first = base.shapeHash();
 
-    // The same configuration hashes the same, or one run of one session could
-    // never be compared with the next.
     try std.testing.expectEqualSlices(u8, &first, &base.shapeHash());
 
-    // A bind that became writable is the alteration this has to catch.
     const widened = [_]namespace.Mount{
         .{ .bind = .{ .source = "/nix/store/a", .target = "/nix/store/a", .read_only = false } },
         .{ .proc = .{} },
@@ -1671,7 +1501,6 @@ test "the shape hash changes when the sandbox lets through anything different" {
     changed.mounts = &widened;
     try std.testing.expect(!std.mem.eql(u8, &first, &changed.shapeHash()));
 
-    // One more mount, a wider limit, and a network where there was none.
     const added = [_]namespace.Mount{
         .{ .bind = .{ .source = "/nix/store/a", .target = "/nix/store/a", .read_only = true } },
         .{ .proc = .{} },
@@ -1689,7 +1518,6 @@ test "the shape hash changes when the sandbox lets through anything different" {
     networked.network = .filtered;
     try std.testing.expect(!std.mem.eql(u8, &first, &networked.shapeHash()));
 
-    // A rule with more access, at the same path.
     const narrow = [_]Config.Rule{.{ .path = "/project", .access = .{ .read_file = true } }};
     const wide = [_]Config.Rule{.{ .path = "/project", .access = .{ .read_file = true, .write_file = true } }};
     var reading = base;
@@ -1715,9 +1543,6 @@ test "two paths that run together are told apart by the length before each" {
 }
 
 test "what the native driver can say is the driver's own answer, not a second copy" {
-    // `expresses` above is a view of `native.expresses`, so a platform fact
-    // written in two places cannot disagree. This is what would catch a later
-    // change that edited one and not the other.
     try std.testing.expectEqual(native.expresses, native_driver.expresses);
     try std.testing.expectEqual(expresses.moved_paths, native_driver.expresses.moved_paths);
     try std.testing.expectEqual(expresses.scratch_area, native_driver.expresses.scratch_area);
@@ -1731,23 +1556,14 @@ test "what the native driver can say is the driver's own answer, not a second co
         native_driver.expresses.device_passthrough,
     );
 
-    // **Linux only from here, and the guard is the first thing after it.**
-    // Importing the other driver's module pulls that file's own tests into this
-    // binary, and the Linux ones do not compile for another platform: its `kill`
-    // takes `std.os.linux.SIG` and `std.posix.SIG` there is the C one. The test
-    // below this one keeps the same rule for the same reason.
+    // Linux only from here: importing `linux/driver.zig` would pull in tests that use `std.os.linux.SIG`, which does not compile elsewhere.
     if (builtin.os.tag != .linux) return;
 
-    // And the two native drivers still differ in the way this build documents:
-    // a Seatbelt profile names paths and does not move them.
     const linux_driver = @import("linux/driver.zig");
     const darwin_driver = @import("darwin/driver.zig");
     try std.testing.expect(linux_driver.expresses.moved_paths);
     try std.testing.expect(!darwin_driver.expresses.moved_paths);
 
-    // The Darwin driver expresses none of the five, which is the gap a guest
-    // closes. A driver that expressed one of them without saying so here would
-    // have this read the wrong way round.
     inline for (@typeInfo(Expresses).@"struct".fields) |field| {
         try std.testing.expect(!@field(darwin_driver.expresses, field.name));
         try std.testing.expect(@field(linux_driver.expresses, field.name));

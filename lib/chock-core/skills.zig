@@ -1,101 +1,30 @@
-//! Agent Skills, read in: one `SKILL.md` directory, bounded, and marked with
-//! the layer it came from.
-//!
-//! The format is `docs/specification.mdx` of
-//! <https://github.com/agentskills/agentskills>, pinned at 217be54.
-//!
-//! ## Two modules, and this one invents neither
-//!
-//! `guidance.zig` already has the disclosure the format asks for: the prompt
-//! names what exists in one line each, and a tool fetches the whole of one
-//! when the model decides it applies. `instructions.zig` already has the trust
-//! handling a skill needs: a layer on every block, a bound applied to every
-//! file, and a list of what was read for the run to print. A skill is the
-//! first mechanism with the second one's marking.
-//!
-//! ## `allowed-tools` is read as a narrowing and never as a grant
-//!
-//! The field is "a space-separated string of tools that are pre-approved to
-//! run". A skill is content that arrived in a directory somebody else wrote,
-//! so a client that honours that lets a downloaded file widen what an agent
-//! may do. `instructions.zig` states the rule this breaks: never let an
-//! instruction file change the policy, the budget, or the tool list.
-//!
-//! So the field is kept verbatim and it decides nothing. A caller may read it
-//! as the skill saying it needs no more than these, which narrows and is free.
-//! Nothing here turns it into a permission, and `Skill.allowed_tools` is a
-//! string this module never parses.
-//!
-//! ## The frontmatter scanner
-//!
-//! This build carries no YAML parser and adds none for one file. `parse` reads
-//! block style mappings: one `key: value` pair a line, spaces for indentation,
-//! an optionally quoted scalar, a whole line comment whose first character is
-//! `#`, and one nested mapping under `metadata:`. What it does not read, and
-//! never guesses at: flow style, multi-line scalars, anchors and aliases,
-//! tabs for indentation, and a trailing comment after a value on the same
-//! line, which is read as part of the value.
-//!
-//! A shape it does not read is a refusal that names the field, never silence.
-//! A skill is something a person installed and expects to work, so one that is
-//! dropped without a word is worse than one that is refused out loud.
+//! Agent Skills, read in: one SKILL.md directory, bounded, and marked
+//! with the layer it came from.
 
 const std = @import("std");
 const index = @import("index.zig");
 
-/// The one file a skill directory must hold.
 pub const file_name = "SKILL.md";
 
-/// Where the operator's own skills live, under Chock's configuration directory.
-/// Chock reads it and never writes it, the rule `lib/chock-auth/paths.zig`
-/// already states for that directory.
 pub const operator_dir_name = "skills";
 
-/// Where a skill that is not otherwise in the sandbox is bound, read only.
-///
-/// The operator's own directory is the one that needs this: a project's skills
-/// are in the workspace already and a package's are in the store the session
-/// mounted. The host path is not reused inside, because it holds the user's home
-/// directory and a session has no business learning its shape.
 pub const inside_root = "/skills";
 
-/// The three directories the format names. Nothing here reads them: they are
-/// the skill's own files, which the agent reads with `read_file` once the
-/// sandbox binds them.
 pub const optional_dirs = [_][]const u8{ "scripts", "references", "assets" };
 
-/// The spec's own bounds.
 pub const max_name_bytes: usize = 64;
 pub const max_description_bytes: usize = 1024;
 pub const max_compatibility_bytes: usize = 500;
 
-/// How much of one `SKILL.md` is read off disk. The spec recommends a body
-/// under 500 lines and under 5000 tokens, so this is generous, and a file past
-/// it is refused rather than cut: a body that stops halfway through a step is
-/// a body a model acts on believing it read the whole one.
 pub const max_file_bytes: usize = 64 * 1024;
 
-/// How many `metadata` pairs are kept. The map is arbitrary and belongs to
-/// whoever wrote the skill, so it gets a bound like everything else that
-/// arrives from outside.
 pub const max_metadata_entries: usize = 32;
 
-/// Where a skill came from, which is what decides its trust. The prompt prints
-/// it and the policy table names it, so it is a value and not a comment.
-///
-/// Chock's own compiled in advice is `guidance.zig` and is not a layer here: a
-/// skill is a file on disk, and guidance is a string in the binary.
 pub const Layer = enum {
-    /// `<config dir>/skills/<name>/`, which only the user writes.
     operator,
-    /// A path the project's own `chock.zon` names.
     project,
-    /// A store path a dev shell brought in.
     packaged,
 
-    /// The policy action for reading a skill of this layer. **Per layer and
-    /// never per skill**: a name a stranger's package chose must not become
-    /// part of the action namespace.
     pub fn actionName(self: Layer) []const u8 {
         return switch (self) {
             .operator => "skill.read.operator",
@@ -104,12 +33,6 @@ pub const Layer = enum {
         };
     }
 
-    /// Who wrote a skill of this layer, for the line above its body.
-    ///
-    /// **The parenthetical is the part that does the work**, for the reason
-    /// `instructions.Layer.heading` gives: a model told where a block came
-    /// from can weigh it, and a model told to fear its own input reasons
-    /// worse.
     pub fn wroteIt(self: Layer) []const u8 {
         return switch (self) {
             .operator => "written by the person running you",
@@ -118,9 +41,6 @@ pub const Layer = enum {
         };
     }
 
-    /// The heading over this layer's index in the prompt. One heading a layer,
-    /// because a layer is the whole of what tells a model how much weight to
-    /// give what it is about to read.
     pub fn heading(self: Layer) []const u8 {
         return switch (self) {
             .operator =>
@@ -144,33 +64,20 @@ pub const Pair = struct {
     value: []const u8,
 };
 
-/// One skill, read and within every bound. Everything in it is owned by the
-/// allocator `parse` was given.
 pub const Skill = struct {
     layer: Layer,
-    /// The skill's own directory on the host, which is what was read.
     dir: []const u8,
-    /// The same directory as the agent sees it, or empty when nothing in the
-    /// sandbox reaches it. **The answer names this one**, because a path the
-    /// agent cannot open is worse than no path: it spends a turn finding out.
     inside: []const u8 = "",
     name: []const u8,
     description: []const u8,
     license: ?[]const u8 = null,
     compatibility: ?[]const u8 = null,
     metadata: []const Pair = &.{},
-    /// What `allowed-tools` said, verbatim and unparsed. Read this module's
-    /// own top comment before using it: it is never a grant.
     allowed_tools: ?[]const u8 = null,
-    /// The Markdown after the frontmatter, which is what the read tool
-    /// answers with.
     body: []const u8,
-    /// How many `metadata` pairs were left out past `max_metadata_entries`.
     metadata_left_out: usize = 0,
 };
 
-/// Why a directory is not a skill. Every one of these names a field or a rule
-/// the format states, so a refusal can be read against the spec.
 pub const Fault = enum {
     no_frontmatter,
     frontmatter_not_closed,
@@ -205,15 +112,12 @@ pub const Fault = enum {
     }
 };
 
-/// A directory that holds a `SKILL.md` and is not a skill. The detail is the
-/// value that broke the rule, cut to a length a diagnostic can print.
 pub const Refused = struct {
     dir: []const u8,
     fault: Fault,
     detail: []const u8 = "",
 };
 
-/// How much of an offending value a refusal quotes.
 pub const max_detail_bytes: usize = 96;
 
 pub const Read = union(enum) {
@@ -223,10 +127,6 @@ pub const Read = union(enum) {
 
 pub const Error = std.mem.Allocator.Error;
 
-/// Read the `SKILL.md` of `dir`, or null when there is nothing readable there.
-///
-/// **An absent file is not an error.** Most directories are not skills, and a
-/// caller that walks a tree must not stop at the first one that is not.
 pub fn read(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -236,8 +136,6 @@ pub fn read(
     const path = try std.fs.path.join(allocator, &.{ dir, file_name });
     defer allocator.free(path);
 
-    // One byte past the bound, so a file exactly at the bound is read and a
-    // file past it is refused by size rather than cut.
     const bytes = std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
@@ -261,8 +159,6 @@ pub fn read(
     return try parse(allocator, layer, dir, bytes);
 }
 
-/// Read one `SKILL.md` document. `dir` is the skill's own directory, and the
-/// format requires the `name` to be that directory's own name.
 pub fn parse(
     allocator: std.mem.Allocator,
     layer: Layer,
@@ -372,43 +268,21 @@ pub fn parse(
     } };
 }
 
-/// How many skills reach the prompt. Every one costs a line of every turn, so
-/// this is a real bound. What is left out is counted, because a repository that
-/// arrived with two hundred skills is a fact worth telling the user.
 pub const max_skills: usize = 32;
 
-/// How many entries one directory is read for before the walk stops. A runaway
-/// directory must not be able to hold a session up.
 pub const max_dir_entries: usize = 256;
 
-/// One directory that holds skill directories, and the layer everything under
-/// it belongs to.
 pub const Root = struct {
     layer: Layer,
     path: []const u8,
 };
 
-/// What a session's skills came to. Everything in it is owned by the allocator
-/// `discover` was given, and an arena frees the whole thing at once, which is
-/// how `instructions.Loaded` is held for the same reason.
 pub const Found = struct {
-    /// Not `[]const`: the caller places each one, filling in `Skill.inside` once
-    /// it knows what the sandbox binds where.
     skills: []Skill = &.{},
-    /// Directories that hold a `SKILL.md` and are not skills. The run prints
-    /// these: a skill a person installed and that silently did nothing is the
-    /// failure this list exists to stop.
     refused: []Refused = &.{},
-    /// How many skills were found past `max_skills`.
     left_out: usize = 0,
 };
 
-/// Read every skill under every root, one level deep: the format puts each
-/// skill in its own directory, named after it.
-///
-/// **Order is precedence.** A name that two roots both hold belongs to the
-/// first, and the later one is refused. Give the roots most trusted first, so
-/// the user's own skill wins over a repository's.
 pub fn discover(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -427,9 +301,6 @@ pub fn discover(
         var walk = dir.iterate();
         var seen: usize = 0;
         while (true) {
-            // Not `catch null`: a walk that stopped partway is not a
-            // directory with nothing more in it, and reporting the two the
-            // same way is how a skill goes missing without a word.
             const next = walk.next(io) catch {
                 try refused.append(allocator, .{
                     .dir = try allocator.dupe(u8, root.path),
@@ -441,12 +312,8 @@ pub fn discover(
             if (seen >= max_dir_entries) break;
             seen += 1;
             if (entry.kind != .directory) continue;
-            // A dotted name is not a skill directory, and `.git` is the one
-            // that costs the most to walk into.
             if (entry.name.len == 0 or entry.name[0] == '.') continue;
 
-            // `read` keeps a copy of the directory it was given, so this one
-            // is this loop's own.
             const path = try std.fs.path.join(allocator, &.{ root.path, entry.name });
             defer allocator.free(path);
 
@@ -479,19 +346,8 @@ pub fn discover(
     };
 }
 
-/// Where a package puts its skills under a store path. A package that installs
-/// here has said its skills are for any agent that looks, which is the only
-/// signal a store path carries. The closure is read for this one name, and
-/// nothing about a package's intent is guessed at beyond it.
 pub const packaged_subdir = "share/agent-skills";
 
-/// Every store path that holds `packaged_subdir`, as roots of the `packaged`
-/// layer. `store_paths` is the dev shell's own closure, which `chock-nix`
-/// produces: this module asks Nix nothing.
-///
-/// One directory open a path. A closure of 2735 paths costs 16ms warm and 43ms
-/// cold on the development machine, so the whole closure is read rather than
-/// some guessed subset of it.
 pub fn packagedRootsIn(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -513,11 +369,6 @@ pub fn packagedRootsIn(
     return try out.toOwnedSlice(allocator);
 }
 
-/// One index line per skill of `layer`, in the order they were found.
-///
-/// **Every description goes through `index.oneLine`.** A skill's description
-/// is a stranger's writing and the format allows 1024 bytes of it with
-/// newlines in the middle, and the prompt carries one line a skill.
 pub fn indexEntriesFor(
     allocator: std.mem.Allocator,
     found: []const Skill,
@@ -537,25 +388,16 @@ pub fn indexEntriesFor(
     return try out.toOwnedSlice(allocator);
 }
 
-/// What a `read_skill` call names. One shape, so the gate that decides the call
-/// and the tool that answers it read the same field out of the same JSON.
 pub const Ask = struct {
     name: []const u8,
 };
 
-/// Which skill a `read_skill` call asks for.
 pub const Named = union(enum) {
-    /// The skill, found in this session's own list.
     skill: Skill,
-    /// The arguments did not parse as this call's shape.
     unparsed,
-    /// They parsed and named nothing this session found.
     unknown: []const u8,
 };
 
-/// The skill a `read_skill` call names. **Neither refusal is a policy question**:
-/// there is nothing to decide about a skill that is not there, so the gate
-/// answers both itself.
 pub fn namedIn(
     allocator: std.mem.Allocator,
     found: []const Skill,
@@ -570,8 +412,6 @@ pub fn namedIn(
     return .{ .unknown = try allocator.dupe(u8, parsed.value.name) };
 }
 
-/// What a call that named no skill is told. The list is built from the session's
-/// own skills, so one that was found cannot be missing from the message.
 pub fn detailFor(
     allocator: std.mem.Allocator,
     named: Named,
@@ -607,12 +447,6 @@ pub fn detailFor(
     return out.toOwnedSlice(allocator);
 }
 
-/// What a `read_skill` call answers with: the body, under a line saying which
-/// layer it came from and who wrote it.
-///
-/// The header is the whole of the trust marking. Without it a skill's body
-/// reads as though Chock wrote it, which is the one thing a model must not
-/// believe about a directory somebody else shipped.
 pub fn answerFor(allocator: std.mem.Allocator, skill: Skill) Error![]u8 {
     const files = if (skill.inside.len != 0)
         try std.fmt.allocPrint(allocator, "Its own files are under {s}", .{skill.inside})
@@ -627,7 +461,6 @@ pub fn answerFor(allocator: std.mem.Allocator, skill: Skill) Error![]u8 {
     );
 }
 
-/// The skill of this name, or null. What the read tool resolves a name with.
 pub fn findIn(skills: []const Skill, name: []const u8) ?Skill {
     for (skills) |one| {
         if (std.mem.eql(u8, one.name, name)) return one;
@@ -635,10 +468,6 @@ pub fn findIn(skills: []const Skill, name: []const u8) ?Skill {
     return null;
 }
 
-/// Every field this module reads. A key it does not know is dropped: the
-/// format lets a client store its own properties under `metadata`, and a
-/// refusal for an unknown top level key would refuse a skill a later spec
-/// makes valid.
 const Fields = struct {
     name: ?[]const u8 = null,
     description: ?[]const u8 = null,
@@ -646,7 +475,6 @@ const Fields = struct {
     compatibility: ?[]const u8 = null,
     allowed_tools: ?[]const u8 = null,
 
-    /// The last of two identical keys wins, which is what a YAML reader does.
     fn put(self: *Fields, key: []const u8, value: []const u8) void {
         if (std.mem.eql(u8, key, "name")) {
             self.name = value;
@@ -679,9 +507,6 @@ fn opensFrontmatter(bytes: []const u8) bool {
     return false;
 }
 
-/// The frontmatter and the body, or null when the document has neither shape.
-/// The opening fence must be the first line that holds anything, so a Markdown
-/// file with a horizontal rule in the middle of it is not read as frontmatter.
 fn frontmatterOf(bytes: []const u8) ?Split {
     var at: usize = 0;
     while (nextLine(bytes, &at)) |line| {
@@ -700,7 +525,6 @@ fn frontmatterOf(bytes: []const u8) ?Split {
     }
 }
 
-/// The next line, with its newline removed, advancing `at` past it.
 fn nextLine(bytes: []const u8, at: *usize) ?[]const u8 {
     if (at.* >= bytes.len) return null;
     const rest = bytes[at.*..];
@@ -712,8 +536,6 @@ fn nextLine(bytes: []const u8, at: *usize) ?[]const u8 {
     return rest[0..end];
 }
 
-/// The spec's own rules for `name`: lowercase letters, digits and hyphens, no
-/// hyphen at either end, and no two hyphens together.
 fn isTheShape(name: []const u8) bool {
     if (name.len == 0) return false;
     if (name[0] == '-' or name[name.len - 1] == '-') return false;
@@ -753,9 +575,6 @@ fn dupeMaybe(allocator: std.mem.Allocator, value: ?[]const u8) Error!?[]const u8
     return try allocator.dupe(u8, it);
 }
 
-/// The front of an offending value, for a refusal to quote. A skill that got
-/// its `description` wrong by pasting a whole page into it must not put that
-/// page in the diagnostic.
 fn cut(allocator: std.mem.Allocator, value: []const u8) Error![]const u8 {
     if (value.len <= max_detail_bytes) return try allocator.dupe(u8, value);
     return try std.fmt.allocPrint(allocator, "{s}...", .{value[0..max_detail_bytes]});
@@ -763,7 +582,6 @@ fn cut(allocator: std.mem.Allocator, value: []const u8) Error![]const u8 {
 
 const testing = std.testing;
 
-/// The spec's own minimal example, which has to read as a skill.
 const minimal =
     \\---
     \\name: skill-name
@@ -817,7 +635,6 @@ test "the spec's example with optional fields keeps every one of them" {
     try testing.expectEqual(@as(usize, 2), skill.metadata.len);
     try testing.expectEqualStrings("author", skill.metadata[0].key);
     try testing.expectEqualStrings("example-org", skill.metadata[0].value);
-    // The quotes are the YAML's and not the value's.
     try testing.expectEqualStrings("1.0", skill.metadata[1].value);
     try testing.expectEqualStrings("body", skill.body);
 }
@@ -844,8 +661,6 @@ test "a name that is not the directory's own name is refused" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The spec requires the two to match, and a directory listing a person
-    // reads is the only name they see before the agent reads the body.
     const document =
         \\---
         \\name: deploy-to-production
@@ -868,7 +683,6 @@ test "a document with no frontmatter is refused, and an unclosed one says which"
     const unclosed = try parse(arena, .operator, "/skills/a", "---\nname: a\n");
     try testing.expectEqual(Fault.frontmatter_not_closed, unclosed.refused.fault);
 
-    // A horizontal rule in the middle of a Markdown file is not frontmatter.
     const rule = try parse(arena, .operator, "/skills/a", "# Title\n\n---\n\nmore\n");
     try testing.expectEqual(Fault.no_frontmatter, rule.refused.fault);
 }
@@ -924,8 +738,6 @@ test "allowed-tools is kept verbatim and is never split into anything" {
     const read_it = try parse(arena, .project, "/repo/skills/a", document);
     try testing.expectEqualStrings("Bash(git:*) Bash(jq:*) Read", read_it.skill.allowed_tools.?);
 
-    // The field decides nothing, so there is no member on `Skill` that a
-    // caller could mistake for a permission. This names every one there is.
     const fields = @typeInfo(Skill).@"struct".fields;
     inline for (fields) |field| {
         try testing.expect(std.mem.indexOf(u8, field.name, "allow") == null or
@@ -936,9 +748,6 @@ test "allowed-tools is kept verbatim and is never split into anything" {
 }
 
 test "the action name is per layer, so no skill can put a name of its own in the table" {
-    // A package that chose the name `../../root` would reach the policy table
-    // through a per skill action. Per layer, there are three names and a
-    // skill cannot spell any of them.
     try testing.expectEqualStrings("skill.read.operator", Layer.operator.actionName());
     try testing.expectEqualStrings("skill.read.project", Layer.project.actionName());
     try testing.expectEqualStrings("skill.read.packaged", Layer.packaged.actionName());
@@ -949,8 +758,6 @@ test "the action name is per layer, so no skill can put a name of its own in the
         try testing.expect(layer.wroteIt().len != 0);
     }
 
-    // Two of the three say the operator did not write it, which is the line
-    // that lets a model weigh what it reads.
     try testing.expect(std.mem.indexOf(u8, Layer.project.wroteIt(), "not by your operator") != null);
     try testing.expect(std.mem.indexOf(u8, Layer.packaged.wroteIt(), "not by your operator") != null);
     try testing.expect(std.mem.indexOf(u8, Layer.operator.wroteIt(), "not by your operator") == null);
@@ -1057,8 +864,6 @@ test "a skill on disk reads, and the directory it came from is what it says" {
     try testing.expectEqualStrings("body\n", read_it.skill.body);
 }
 
-/// Writes a skill directory under `dir`, with `name` as both the directory and
-/// the frontmatter name, which is what the format requires.
 fn writeSkill(io: std.Io, dir: std.Io.Dir, name: []const u8, description: []const u8) !void {
     try dir.createDirPath(io, name);
     var buffer: [512]u8 = undefined;
@@ -1079,8 +884,6 @@ test "discovery reads every skill under a root and leaves the rest of the tree a
 
     try writeSkill(io, tmp.dir, "read-a-file", "How to read a file here.");
     try writeSkill(io, tmp.dir, "write-a-test", "How this repository writes a test.");
-    // Neither of these is a skill: one holds no SKILL.md, and a dotted
-    // directory is never walked into.
     try tmp.dir.createDirPath(io, "notes");
     try tmp.dir.createDirPath(io, ".hidden");
     try tmp.dir.writeFile(io, .{
@@ -1149,7 +952,6 @@ test "the first root keeps a name both hold, so a repository cannot shadow the u
     try testing.expectEqual(Layer.operator, found.skills[0].layer);
     try testing.expectEqualStrings("The way the user deploys.", found.skills[0].description);
 
-    // And the one that lost says so, rather than vanishing.
     try testing.expectEqual(@as(usize, 1), found.refused.len);
     try testing.expectEqual(Fault.name_already_taken, found.refused[0].fault);
     try testing.expectEqualStrings("deploy", found.refused[0].detail);
@@ -1214,8 +1016,6 @@ test "only a store path that holds the packaged directory becomes a root" {
     defer with.close(io);
     try writeSkill(io, with, "review-a-diff", "How this package reviews a diff.");
 
-    // A store path that installs nothing here, and one that puts a file where
-    // the directory would be.
     try tmp.dir.createDirPath(io, "bbb-plain/bin");
     try tmp.dir.createDirPath(io, "ccc-file/share");
     try tmp.dir.writeFile(io, .{ .sub_path = "ccc-file/share/agent-skills", .data = "not a dir" });
@@ -1253,16 +1053,12 @@ test "a walk that stops partway says so rather than reporting the skills it did 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A root that is a file rather than a directory never opens, which is the
-    // silent case: no skills and no refusal, the same as an absent root.
     try tmp.dir.writeFile(io, .{ .sub_path = "not-a-dir", .data = "x" });
     const file_root = try std.fs.path.join(arena, &.{ root, "not-a-dir" });
     const nothing = try discover(arena, io, &.{.{ .layer = .operator, .path = file_root }});
     try testing.expectEqual(@as(usize, 0), nothing.skills.len);
     try testing.expectEqual(@as(usize, 0), nothing.refused.len);
 
-    // And the fault a partway walk records names the root, so a user can see
-    // which directory was only half read.
     try testing.expect(std.mem.indexOf(
         u8,
         Fault.directory_unreadable.sentence(),
@@ -1275,8 +1071,6 @@ test "a heading says who wrote the layer's skills, and never disagrees with wrot
         const layer = @field(Layer, field.name);
         const head = layer.heading();
 
-        // The same words in both places, so the index heading and the line
-        // above a body cannot drift apart.
         try testing.expect(std.mem.indexOf(u8, head, layer.wroteIt()) != null);
         try testing.expect(std.mem.indexOf(u8, head, "read_skill") != null);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, head, "\n"));
@@ -1302,7 +1096,6 @@ test "an index line is one line a skill, with the body left behind" {
     try testing.expect(std.mem.indexOfScalar(u8, entries[0].description, '\n') == null);
     try testing.expect(entries[0].description.len <= index.max_description_bytes);
 
-    // A skill of another layer is not in this layer's index.
     try testing.expectEqual(@as(usize, 0), (try indexEntriesFor(arena, &.{one}, .operator)).len);
 
     var rendered: std.ArrayList(u8) = .empty;
@@ -1325,8 +1118,6 @@ test "the answer names who wrote it, and a path only when the agent can open it"
     try testing.expect(std.mem.indexOf(u8, placed, "under /nix/store/aaa-x/deploy") != null);
     try testing.expect(std.mem.endsWith(u8, placed, "Step one.\n"));
 
-    // Nothing binds it, so the host path is never named: the agent would spend a
-    // turn finding out it cannot open it.
     one.inside = "";
     const loose = try answerFor(arena, one);
     try testing.expect(std.mem.indexOf(u8, loose, "not in this sandbox") != null);

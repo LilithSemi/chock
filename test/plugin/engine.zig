@@ -1,14 +1,5 @@
 //! The acceptance test for running a plugin: the real host process, the real
-//! module, the real engine, over a real pipe. It is the one place guest code
-//! really runs.
-//!
-//! Most tests here spawn the host as an ordinary child and build a
-//! `helper.Channel` over its pipes, so they prove the framing, the call ABI and
-//! the engine but no sandbox. One test starts it through `helper.Helper` and a
-//! real `Sandbox.spawn`, and skips where there is no sandbox.
-//!
-//! Nothing here asserts how long anything took. The test about a plugin that
-//! does not answer stages a deadline that has already passed.
+//! module, the real engine, over a real pipe.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -65,8 +56,7 @@ const LockedLog = struct {
         return .{ .backing = try chock_proto.storage.Memory.init(gpa, "01PLUGREAL") };
     }
 
-    /// Separate from `init` because the handle points at the storage beside it,
-    /// and a struct returned by value moves.
+    /// Separate from `init`, because a struct returned by value moves.
     fn arm(self: *LockedLog, io: std.Io) !void {
         self.store = self.backing.storage();
         self.locked = try self.store.lock(io);
@@ -79,8 +69,7 @@ const LockedLog = struct {
 };
 
 const wasm_path: []const u8 = paths.plugin_wasm_path;
-/// `chock` itself, which is the one binary this project installs, started under
-/// `plugin_host.verb`. There is no second program to find.
+/// `chock` itself, started under `plugin_host.verb`.
 const host_path: []const u8 = paths.chock_path;
 
 const Host = struct {
@@ -96,8 +85,6 @@ const Host = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
         try argv.append(gpa, host_path);
-        // Read from the one place it is written, so a spelling of its own here
-        // could not pass against a word the program no longer answers to.
         try argv.append(gpa, plugin_host.verb);
         try argv.append(gpa, module);
         try argv.appendSlice(gpa, capabilities);
@@ -119,10 +106,8 @@ const Host = struct {
         };
     }
 
-    /// Close the request pipe and wait, or every test leaks a process.
     fn stop(self: *Host, io: std.Io) void {
-        // `Child.kill` already waited and gave every resource up, and
-        // `Child.wait` asserts there is still a process to wait for.
+        // A prior `Child.kill` already waited, and `Child.wait` would assert.
         if (self.child.id == null) return;
         if (self.child.stdin) |file| {
             std.Io.File.close(file, io);
@@ -150,14 +135,9 @@ fn expectMissing(haystack: []const u8, needle: []const u8) !void {
     return sayWhatItSaid(haystack, needle);
 }
 
-/// A plugin host turns every failure into a result, so a wrong answer is one
-/// sentence instead of another and a bare `expect` shows neither.
-/// `expectEqualStrings` carries both strings out, and no test in this project
-/// may write to standard error.
+/// Uses `expectEqualStrings` so a mismatch prints both strings.
 fn sayWhatItSaid(haystack: []const u8, needle: []const u8) !void {
     try testing.expectEqualStrings(needle, haystack);
-    // Reached only when the two are equal, which `expectMissing` can be here
-    // with. The caller already decided that is a failure.
     return error.TestUnexpectedResult;
 }
 
@@ -186,8 +166,6 @@ test "a plugin tool call really runs guest code and answers what the guest said"
 }
 
 test "a typed argument reaches the real guest as a value of the tool's own type" {
-    // The guest body answers `args.who`, so the name below came through the
-    // schema, the record and the struct field.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -222,7 +200,6 @@ test "a typed argument reaches the real guest as a value of the tool's own type"
 }
 
 test "the real plugin says what its tools take, read with no engine at all" {
-    // The schema is in the same record as the tool's name.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -281,7 +258,6 @@ test "the same process answers a second call, and is not restarted between them"
 }
 
 test "a tool index no guest bound is a result and never a crash" {
-    // A host process that exited would read as a plugin that crashed.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -316,17 +292,14 @@ test "a tool index no guest bound is a result and never a crash" {
 }
 
 test "a module that imports anything is stopped before it runs, and named" {
-    // The refusal must happen before instantiation. A guest that has started
-    // running owns this process, so a check made afterwards is one it can
-    // rewrite.
+    // The refusal must happen before instantiation, or a running guest could rewrite it.
     const gpa = testing.allocator;
     const io = testing.io;
 
     const spliced = try withImport(gpa, "env", "read_file");
     defer gpa.free(spliced);
 
-    // Still a plugin this reader accepts, or this tests a broken file and not
-    // the gate.
+    // Confirms this still reads as a plugin, so the test checks the gate and not a broken file.
     var read = try plugin_module.read(gpa, spliced, null);
     defer read.deinit();
     try testing.expectEqual(@as(usize, 2), read.record().tools.len);
@@ -385,8 +358,6 @@ test "a file that is not a plugin is a sentence and not a crash" {
 }
 
 test "a plugin that has gone answers the next call at once and never waits" {
-    // A guest owns the address space of the process that runs it, so a plugin
-    // that dumps core is the ordinary case.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -409,8 +380,7 @@ test "a plugin that has gone answers the next call at once and never waits" {
 
     host.child.kill(io);
 
-    // The write may still succeed into a pipe the kernel has not torn down yet,
-    // so the failure can land on either side. Both are `Gone` and never a wait.
+    // The write can still land, so the failure may come from either side, but always as `Gone`.
     try testing.expectError(error.Gone, protocol.call(
         arena_state.allocator(),
         io,
@@ -488,14 +458,11 @@ const host_target = "/chock";
 const module_target = "/plugin.wasm";
 
 test "a tool name reaches a real plugin host in a real sandbox, and the guest's own answer comes back" {
-    // Every part is the production one except the runner wrapper, which is one
-    // line of `src/run.zig` and is pinned by the tests there.
     if (builtin.target.os.tag != .linux) {
         // `Sandbox.spawn` refuses on Darwin, so there is no host process there.
         return error.SkipZigTest;
     }
-    // Asked in a child, which is the only way to ask without spending this
-    // process's one namespace.
+    // Asked in a child, the only way to ask without spending this process's one namespace.
     if (!sandbox.namespace.probeAvailability().available()) return error.SkipZigTest;
 
     const gpa = testing.allocator;
@@ -527,8 +494,7 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
     var root = try sandboxRoot(gpa);
     defer root.cleanup(io);
 
-    // `chock_sandbox.namespace` asserts a mount source is absolute, and the two
-    // paths this test is built with are relative to where the build ran.
+    // `chock_sandbox.namespace` asserts a mount source is absolute.
     const host_here = try std.Io.Dir.cwd().realPathFileAlloc(io, host_path, keep);
     const module_here = try std.Io.Dir.cwd().realPathFileAlloc(io, wasm_path, keep);
 
@@ -558,8 +524,7 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
     // Three and not four: the writable rule above is gone.
     try testing.expectEqual(@as(usize, 3), config.rules.len);
 
-    // The page allocator and never the test's own. The helper's thread is inside
-    // `Sandbox.spawn` while this one allocates, and `fork` carries one thread.
+    // The page allocator, not the test's own: `fork` carries only one thread.
     var process = helper.Helper.init(std.heap.page_allocator);
     defer process.deinit(io);
 
@@ -589,12 +554,9 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
     );
 }
 
-/// A directory a sandbox is built inside. Removing it can only happen once the
-/// process that pivoted into it has exited, which `helper.Helper.deinit` waits
-/// for.
+/// A directory a sandbox is built inside.
 const SandboxRoot = struct {
     gpa: std.mem.Allocator,
-    /// Sentinel terminated, because that is what `realPathFileAlloc` answers.
     absolute: [:0]const u8,
 
     fn path(self: *const SandboxRoot) []const u8 {
@@ -613,8 +575,7 @@ var roots_made: usize = 0;
 fn sandboxRoot(gpa: std.mem.Allocator) !SandboxRoot {
     const directory = std.fs.path.dirname(wasm_path) orelse ".";
     var name: [64]u8 = undefined;
-    // The process id, then a counter. Two runs of this binary at once would
-    // otherwise remove the directory the other has a sandbox pivoted into.
+    // A process id and a counter, so two runs of this binary never share a root.
     const leaf = try std.fmt.bufPrint(
         &name,
         "chock-plugin-root-{d}-{d}",
@@ -632,11 +593,7 @@ fn sandboxRoot(gpa: std.mem.Allocator) !SandboxRoot {
     return .{ .gpa = gpa, .absolute = absolute };
 }
 
-/// The plugin this project ships, with one function import spliced in. An import
-/// section goes after the type section, so it is inserted where that one ends. A
-/// function import and not a global one, because a global shifts the global index
-/// space that `plugin_module` resolves the metadata address through. The caller
-/// frees the answer.
+/// Splices one function import into the shipped plugin module. The caller frees the result.
 fn withImport(gpa: std.mem.Allocator, module: []const u8, field: []const u8) ![]u8 {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(
         testing.io,
@@ -700,13 +657,10 @@ fn readUleb(bytes: []const u8, at: *usize) !u32 {
 var written: usize = 0;
 
 fn writeTemporary(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    // Beside the build's own output. Not `/tmp`, which a sandboxed test run may
-    // not have, and not the project tree.
+    // Beside the build's own output, not `/tmp`, which a sandboxed test run may lack.
     const directory = std.fs.path.dirname(wasm_path) orelse ".";
     var name: [64]u8 = undefined;
-    // The process id, then a counter. Each run removes its file when the test
-    // ends, so two builds at once would take the module out from under the other
-    // run's host process.
+    // A process id and a counter, so two builds at once never share a file.
     const leaf = try std.fmt.bufPrint(
         &name,
         "chock-plugin-probe-{d}-{d}.wasm",
@@ -721,7 +675,6 @@ fn writeTemporary(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
 }
 
 comptime {
-    // Named so a change to the ABI both sides read cannot land without this file
-    // being looked at.
+    // Named so a change to the shared ABI cannot land without this file being looked at.
     _ = core.call.Answer.len;
 }

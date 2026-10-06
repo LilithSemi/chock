@@ -7,15 +7,13 @@ const builtin = @import("builtin");
 
 pub const Error = error{Unexpected};
 
-/// `F_SETFL` replaces the whole flag word, so a driver keeps the flags it found
-/// and only adds this one.
+/// `F_SETFL` replaces the whole flag word, so a driver keeps the flags it found.
 pub fn setNonblocking(fd: std.posix.fd_t) Error!void {
     return driver.setNonblocking(fd);
 }
 
-/// A count below the real buffer size makes the write complete and the test
-/// fail on the absent `error.ShortWrite`. A driver may therefore answer with an
-/// upper bound, and no driver can go quietly wrong.
+/// A count below the real buffer size makes the write complete instead of
+/// short, so a driver may answer with an upper bound but never go low.
 pub fn overCapacity(fd: std.posix.fd_t) Error!usize {
     return driver.overCapacity(fd);
 }

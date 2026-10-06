@@ -1,25 +1,5 @@
-//! The `secrets` block of a project's own `chock.zon`: which secret a tool may
-//! be given, and which tool may be given it.
-//!
-//! ## The agent never sees the value
-//!
-//! A secret named here reaches the environment of one tool call and nothing
-//! else. It does not enter the prompt, and whatever a tool prints is redacted
-//! before it reaches the log or the model. So an agent can use the GitHub CLI
-//! without ever holding the token.
-//!
-//! ## The mapping is the user's, and the agent cannot widen it
-//!
-//! Every entry is written by a person in the project's own file. Nothing is
-//! discovered, and an agent has no way to ask for a secret that is not here.
-//!
-//! ## An entry names an action and not a program
-//!
-//! `to` is an action name pattern, read by the same table every other
-//! permission uses, so `exec.path.gh` reaches one program and `mcp.github.*`
-//! reaches every tool of one MCP server. Using a secret is itself asked about,
-//! under `secret.use.<name>`, so a project decides whether that is a question
-//! or a standing permission.
+//! The `secrets` block of a project's own `chock.zon`. A secret reaches
+//! only the named tool call's environment, never the prompt or the model.
 
 const std = @import("std");
 const limits_mod = @import("limits.zig");
@@ -30,38 +10,26 @@ pub const max_file_bytes = limits_mod.max_file_bytes;
 
 pub const block_name = "secrets";
 
-/// Every entry is one more secret a tool call may carry, and one more thing to
-/// read before trusting a project. A real bound, not a round number.
 pub const max_entries: usize = 32;
 
-/// What a secret may be called. SecretSpec names look like environment
-/// variables, and this is what that shape allows.
 pub const max_name_bytes: usize = 128;
 
-/// How a secret arrives, because not every program reads one the same way.
 pub const Bind = enum {
     /// In the environment of the tool call. What most programs read.
     env,
-    /// In a file, with the environment naming its path. What a program that
-    /// wants a credentials file reads, and the only way to give one to a
-    /// program that will not read an environment variable.
+    /// In a file, with the environment naming its path, for a program that
+    /// will not read an environment variable.
     file,
 };
 
-/// One grant: a secret, what it may reach, and how it arrives.
 pub const Entry = struct {
-    /// The secret's own name, as the store knows it.
     name: []const u8,
-    /// The action name pattern this secret may be given to.
     to: []const u8,
-    /// How it arrives.
     bind: Bind = .env,
-    /// The environment variable it arrives under, or that names the file's
-    /// path. Null means the secret's own name, which is what a program that
+    /// Null means the secret's own name, which is what a program that
     /// reads `GITHUB_TOKEN` wants.
     as: ?[]const u8 = null,
 
-    /// The variable this entry sets, whichever way it binds.
     pub fn variable(self: Entry) []const u8 {
         return self.as orelse self.name;
     }
@@ -80,7 +48,6 @@ pub const Block = struct {
         self.* = undefined;
     }
 
-    /// Whether `action` may be given `name`, by any entry.
     pub fn permits(self: Block, name: []const u8, action: []const u8) bool {
         for (self.entries) |one| {
             if (!std.mem.eql(u8, one.name, name)) continue;
@@ -89,7 +56,6 @@ pub const Block = struct {
         return false;
     }
 
-    /// Every secret `action` may be given. The caller keeps the block alive.
     pub fn forAction(self: Block, gpa: std.mem.Allocator, action: []const u8) ![]const []const u8 {
         var found: std.ArrayList([]const u8) = .empty;
         errdefer found.deinit(gpa);
@@ -105,18 +71,14 @@ pub const Block = struct {
     }
 };
 
-/// The action a project answers to say whether a secret may be used at all.
-/// One key per secret, so a project can make the one that matters a question
-/// and leave the rest alone.
+/// One key per secret, so a project can make the one that matters a
+/// question and leave the rest alone.
 pub fn actionFor(gpa: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(gpa, "secret.use.{s}", .{name});
 }
 
-/// Whether `name` is a shape this reader accepts.
-///
-/// Letters, digits and underscore. A name reaches an action name as
-/// `secret.use.<name>`, so a dot would let one entry name a class of actions
-/// nobody wrote, and a `*` would do worse.
+/// A name reaches an action name as `secret.use.<name>`, so a dot would let
+/// one entry name a class of actions nobody wrote, and a `*` worse.
 pub fn nameIsWellFormed(name: []const u8) bool {
     if (name.len == 0 or name.len > max_name_bytes) return false;
     for (name) |c| {
@@ -127,11 +89,7 @@ pub fn nameIsWellFormed(name: []const u8) bool {
     return true;
 }
 
-/// Whether `name` is a shape an environment variable takes.
-///
-/// The same set a secret name allows, and it may not begin with a digit. A
-/// shell will not read one that does, so a grant naming it would set a variable
-/// the program never sees.
+/// May not begin with a digit: a shell will not read a variable that does.
 pub fn variableIsWellFormed(name: []const u8) bool {
     if (!nameIsWellFormed(name)) return false;
     return !(name[0] >= '0' and name[0] <= '9');
@@ -295,8 +253,6 @@ pub const LoadError = ParseError || error{
     ReadFailed,
 };
 
-/// The block in the project's own `chock.zon`. A project with no such file
-/// grants nothing, which is every project that never asked for a secret.
 pub fn load(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -450,9 +406,7 @@ fn readEntry(
         _ = note(diag, source_name, .{ .name_not_well_formed = try gpa.dupe(u8, held_name) });
         return error.InvalidSecrets;
     }
-    // **The same check the table makes, made here.** A pattern this reader
-    // accepted and the table did not would grant a secret to nothing at all,
-    // and the file would look right while doing nothing.
+    // A pattern accepted here and refused by the table would grant nothing.
     if (!table.patternIsWellFormed(held_to)) {
         _ = note(diag, source_name, .{ .to_not_well_formed = try gpa.dupe(u8, held_to) });
         return error.InvalidSecrets;
@@ -514,7 +468,6 @@ test "a secret reaches the action it was granted to and no other" {
     try testing.expect(block.permits("GITHUB_TOKEN", "exec.path.gh"));
     try testing.expect(block.permits("GITHUB_TOKEN", "mcp.github.tool.create_issue"));
 
-    // A program nobody granted it to, and a secret nobody granted.
     try testing.expect(!block.permits("GITHUB_TOKEN", "exec.path.curl"));
     try testing.expect(!block.permits("OPENAI_KEY", "exec.path.gh"));
 }
@@ -522,8 +475,6 @@ test "a secret reaches the action it was granted to and no other" {
 test "a pattern the policy table would refuse is refused here" {
     const gpa = testing.allocator;
 
-    // An interior star is what the table will not read, so a file holding one
-    // would grant nothing while looking as though it granted something.
     for ([_][]const u8{ "exec.*.gh", "*", "" }) |bad| {
         var diag: ?Diagnostic = null;
         defer if (diag) |*d| d.deinit(gpa);
@@ -537,7 +488,6 @@ test "a pattern the policy table would refuse is refused here" {
 }
 
 test "every pattern this reader accepts is one the table accepts too" {
-    // The binding that stops the two drifting apart.
     for ([_][]const u8{ "exec.path.gh", "mcp.github.*", "call.run_command" }) |good| {
         try testing.expect(table.patternIsWellFormed(good));
     }
@@ -546,8 +496,6 @@ test "every pattern this reader accepts is one the table accepts too" {
 test "a name that could reach past its own action is refused" {
     const gpa = testing.allocator;
 
-    // A dot would make `secret.use.<name>` name a class nobody wrote, and a
-    // star would make it name every one.
     for ([_][]const u8{ "a.b", "a*", "a b", "", "a/b" }) |bad| {
         try testing.expect(!nameIsWellFormed(bad));
     }
@@ -570,8 +518,6 @@ test "the action a secret is asked about carries its own name" {
     defer gpa.free(action);
 
     try testing.expectEqualStrings("secret.use.GITHUB_TOKEN", action);
-    // And it is a name the table can read, or a project could not write a rule
-    // about it.
     try testing.expect(table.patternIsWellFormed(action));
 }
 
@@ -590,7 +536,6 @@ test "every secret one action may be given is listed once" {
     const found = try block.forAction(gpa, "exec.path.gh");
     defer gpa.free(found);
 
-    // `A` is granted twice by two patterns and appears once.
     try testing.expectEqual(@as(usize, 2), found.len);
     try testing.expectEqualStrings("A", found[0]);
     try testing.expectEqualStrings("B", found[1]);
@@ -667,7 +612,6 @@ test "an unknown binding is refused, and the message names the two" {
 test "a variable a shell would not read is refused" {
     const gpa = testing.allocator;
 
-    // A leading digit is the one an ordinary name allows and a shell does not.
     try testing.expect(nameIsWellFormed("9LIVES"));
     try testing.expect(!variableIsWellFormed("9LIVES"));
 
@@ -684,8 +628,6 @@ test "a variable a shell would not read is refused" {
     try testing.expect(diag.?.fault == .as_not_well_formed);
 }
 
-/// `std.testing.tmpDir` hands back a directory only a relative path reaches,
-/// and the loader needs a root independent of the test binary's cwd.
 fn absoluteDirPath(buffer: []u8, dir: std.Io.Dir) ![]u8 {
     const len = dir.realPath(testing.io, buffer) catch return error.RealPathFailed;
     return buffer[0..len];
@@ -719,7 +661,5 @@ test "the block comes off the disk, and a project with no file grants nothing" {
 }
 
 test "a name a project could write cannot reach a name chock keeps for itself" {
-    // The store holds one flat set of names and Chock's own begin with a colon.
-    // A colon is not a shape a name takes, so no entry can spell one.
     try testing.expect(!nameIsWellFormed("chock:signing"));
 }

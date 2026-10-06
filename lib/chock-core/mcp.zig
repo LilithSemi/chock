@@ -20,36 +20,29 @@ pub const max_servers = 8;
 
 pub const max_tools_per_server = 64;
 
-/// Sixty four, which is what the providers accept in a tool name.
 pub const max_name_bytes = chock_policy.table.max_label_bytes;
 
 pub const max_description_bytes = 1024;
 
-/// `mcp-server-time` 2026.7.10 declares schemas of 300 and 600 bytes.
 pub const max_schema_bytes = 8 << 10;
 
 pub const max_result_bytes = 1 << 15;
 
-/// A real server lists its tools in under 100 milliseconds, so this finds a bug.
 pub const discovery_budget_ns: u64 = 10 * std.time.ns_per_s;
 
 pub const call_budget_ns: u64 = 60 * std.time.ns_per_s;
 
 pub const action_prefix = "mcp";
 
-/// A server names its own tools, so this segment keeps a tool called `network`
-/// off the rule about that server's network.
 pub const tool_segment = "tool";
 
 pub const network_segment = "network";
 
 pub const Settings = struct {
-    /// From the project and never from the server, which must not pick its own rules.
     name: []const u8,
     command: []const []const u8,
 };
 
-/// Strict, so a misspelled `.commnad` does not read as "no command".
 const WireServer = struct {
     name: []const u8 = "",
     command: []const []const u8 = &.{},
@@ -65,7 +58,6 @@ pub const LoadError = ParseError || error{
     ReadFailed,
 };
 
-/// The two ZON variants own the trees their message points into, so call `deinit`.
 pub const Diagnostic = union(enum) {
     file_not_zon: std.zon.parse.Diagnostics,
     block_not_valid: std.zon.parse.Diagnostics,
@@ -137,7 +129,6 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     return true;
 }
 
-/// No dot, because a dot separates the segments of an action name, and no `*`.
 pub fn nameIsUsable(name: []const u8) bool {
     return chock_policy.table.labelIsUsable(name);
 }
@@ -161,7 +152,6 @@ comptime {
     }
 }
 
-/// Server "time" and tool "get_current_time" give `mcp.time.tool.get_current_time`.
 pub fn actionInto(buffer: []u8, server: []const u8, tool: []const u8) ?[]const u8 {
     if (!nameIsUsable(server) or !nameIsUsable(tool)) return null;
     return std.fmt.bufPrint(buffer, action_prefix ++ ".{s}." ++ tool_segment ++ ".{s}", .{
@@ -170,19 +160,11 @@ pub fn actionInto(buffer: []u8, server: []const u8, tool: []const u8) ?[]const u
     }) catch null;
 }
 
-/// Server "github" gives `mcp.github.*`, the pattern that reaches everything one
-/// server can do.
-///
-/// A pattern and not an action, for the one caller that has to read the policy
-/// before the server has said what tools it has: what a server is given at
-/// start cannot wait for a tool name.
 pub fn namespaceInto(buffer: []u8, server: []const u8) ?[]const u8 {
     if (!nameIsUsable(server)) return null;
     return std.fmt.bufPrint(buffer, action_prefix ++ ".{s}.*", .{server}) catch null;
 }
 
-/// Server "github" gives `mcp.github.network`. Allow alone reaches nothing: the
-/// broker still refuses every connect that no `net.connect` rule covers.
 pub fn networkActionInto(buffer: []u8, server: []const u8) ?[]const u8 {
     if (!nameIsUsable(server)) return null;
     return std.fmt.bufPrint(buffer, action_prefix ++ ".{s}." ++ network_segment, .{server}) catch null;
@@ -191,7 +173,6 @@ pub fn networkActionInto(buffer: []u8, server: []const u8) ?[]const u8 {
 pub const max_action_bytes = action_prefix.len + 1 + max_name_bytes + 1 +
     @max(tool_segment.len, network_segment.len) + 1 + max_name_bytes;
 
-/// Every field comes from a third party program.
 pub const Declared = struct {
     name: []const u8,
     description: []const u8 = "",
@@ -218,24 +199,19 @@ pub const Refusal = enum {
 
 pub const Offer = struct {
     server: []const u8,
-    /// Bare and never prefixed with the server, because a mangled name never collides.
     name: []const u8,
     action: []const u8,
-    /// What the table answered at the start. Never the last word on a call:
-    /// `dispatch` asks again, because a session can narrow itself later.
     decision: chock_policy.table.Decision,
     refused: ?Refusal,
     definition: tools.Definition,
 };
 
 pub const Error = error{
-    /// Never cleared, and the server is never restarted.
     Gone,
     Late,
 } || std.mem.Allocator.Error;
 
 pub const Outcome = struct {
-    /// Raw as the server gave it. `Session.dispatch` is what cleans it.
     text: []const u8,
     is_error: bool,
 };
@@ -300,7 +276,6 @@ pub const Decider = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Never fails. Every way of not reaching a decision is already `ask`.
         decide: *const fn (ptr: *anyopaque, tool: []const u8, action: []const u8) chock_policy.table.Decision,
     };
 
@@ -310,14 +285,12 @@ pub const Decider = struct {
 };
 
 pub const Session = struct {
-    /// Outlives every tool call: a definition built at the start is read on the last turn.
     arena: std.heap.ArenaAllocator,
 
     servers: []Server = &.{},
 
     offers: std.ArrayList(Offer) = .empty,
 
-    /// Null refuses every call, which is the safe direction.
     asker: ?arbiter.Asker = null,
 
     pub fn init(gpa: std.mem.Allocator) Session {
@@ -330,7 +303,6 @@ pub const Session = struct {
         self.* = undefined;
     }
 
-    /// Once, after `Loop.run` has taken the lock, and never per call.
     pub fn giveLocked(self: *Session, locked: *arbiter.Locked) void {
         if (self.asker) |*one| one.locked = locked;
     }
@@ -339,15 +311,12 @@ pub const Session = struct {
         return self.offers.items.len == 0;
     }
 
-    /// `declared` is borrowed and copied out.
     pub fn admit(
         self: *Session,
         server: *Server,
         declared: []const Declared,
         policy: Decider,
     ) std.mem.Allocator.Error!void {
-        // Read the whole list before anything is offered, or a server gets four
-        // tools by putting the collision fifth.
         for (declared) |one| {
             if (shadowsBuiltIn(one.name)) {
                 server.failure = shadowed_a_built_in;
@@ -421,10 +390,6 @@ pub const Session = struct {
         return null;
     }
 
-    /// Null when no server declares this name, which tells the caller to pass the
-    /// call on. Never an error return: a dead server, a slow server and a refused
-    /// tool are ordinary results. Every call is asked about, because a session
-    /// can narrow itself after `admit` read the table.
     pub fn dispatch(
         self: *Session,
         gpa: std.mem.Allocator,
@@ -450,7 +415,6 @@ pub const Session = struct {
             .is_error = true,
         };
 
-        // After the local checks, so no question is spent on a call that could not run.
         const answer_about_call = try self.askAbout(gpa, io, offer, call.call_id);
         if (!answer_about_call.permitted) return .{
             .text = try arbiter.refusalText(gpa, name, answer_about_call),
@@ -468,7 +432,6 @@ pub const Session = struct {
             call_budget_ns,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            // Not finished with: the reply stays in the pipe, so the next call works.
             error.Late => return .{
                 .text = try gpa.dupe(u8, "the server did not answer inside the budget"),
                 .is_error = true,
@@ -501,7 +464,6 @@ pub const Session = struct {
         return arbiter.Asker.decide(self.asker, gpa, io, .{
             .action = offer.action,
             .summary = summary,
-            // The effect and never the arguments, which a model wrote.
             .detail = offer.action,
             .reason = "",
             .tool = offer.name,
@@ -518,9 +480,6 @@ pub const Session = struct {
     }
 };
 
-/// A schema that is not an object makes the provider answer 400 and end the
-/// session. The copy goes through text, because the server's own value dies
-/// with the discovery arena and this one lives as long as the session.
 fn schemaFor(keep: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!std.json.Value {
     if (value != .object) return emptyObject(keep);
 
@@ -535,15 +494,11 @@ fn schemaFor(keep: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.E
     return parsed;
 }
 
-/// Built and never written as `.{}`, which is a tuple in Zig and which
-/// `std.json.Stringify` writes as `[]`.
 fn emptyObject(keep: std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
     return std.json.parseFromSliceLeaky(std.json.Value, keep, "{}", .{}) catch
         error.OutOfMemory;
 }
 
-/// The newline and the tab survive, unlike `lsp.flattenMessage`: a real server
-/// answers pretty printed JSON, which one line cannot hold.
 pub fn textForModel(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u8 {
     if (try tools.outputForModel(gpa, text)) |replacement| return replacement;
 
@@ -551,7 +506,6 @@ pub fn textForModel(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.
     defer clean.deinit(gpa);
 
     for (text) |byte| {
-        // Safe over UTF-8: every byte of a multi byte character is 0x80 or above.
         if (byte != '\n' and byte != '\t' and (byte < 0x20 or byte == 0x7F)) continue;
         try clean.append(gpa, byte);
     }
@@ -587,7 +541,6 @@ pub fn parse(
     const node = try findBlockNode(zoir, diag) orelse return null;
 
     var zon_diag: std.zon.parse.Diagnostics = .{};
-    // From here the diagnostics own the two trees.
     ast_owned = false;
     zoir_owned = false;
     var zon_diag_owned = true;
@@ -702,7 +655,6 @@ pub fn load(
     return parse(gpa, source, diag);
 }
 
-/// Every other top level field belongs to another reader of this file.
 fn findBlockNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
     switch (root.get(zoir)) {
@@ -721,8 +673,6 @@ fn findBlockNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zo
         },
     }
 }
-
-// No test here starts a process. `test/core/mcp_real_probe.zig` runs a real one.
 
 const testing = std.testing;
 
@@ -884,7 +834,6 @@ const Bench = struct {
         };
     }
 
-    /// Separate from `init`, because a struct returned by value moves.
     fn openLog(self: *Bench, io: std.Io) !void {
         const gpa = self.session.arena.child_allocator;
         self.backing = try chock_proto.storage.Memory.init(gpa, "01MCPBENCH");
@@ -1009,8 +958,6 @@ test "a server's namespace is the pattern that reaches everything it can do" {
     try testing.expectEqualStrings("mcp.github.*", namespace);
     try testing.expect(chock_policy.table.patternIsWellFormed(namespace));
 
-    // Every action this server can carry is under it, and another server's is
-    // not, which is what a caller reading the policy at start relies on.
     var second: [max_action_bytes]u8 = undefined;
     try testing.expect(chock_policy.table.patternMatches(
         namespace,

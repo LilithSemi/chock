@@ -1,7 +1,5 @@
-//! The `search` block of the operator's own `config.zon`: the web search
-//! engine an agent may call. A search engine is the user's own
-//! infrastructure, the same way a model provider is, so this block is read
-//! from the operator's file and never from a project's own `chock.zon`.
+//! The `search` block of the operator's own `config.zon`, never read from
+//! a project's own `chock.zon`.
 
 const std = @import("std");
 const limits_mod = @import("limits.zig");
@@ -14,18 +12,14 @@ pub const Kind = enum {
     scrape,
 };
 
-/// Which search vendor an engine talks to. Each one has its own request shape
-/// and its own reply shape, so the kind alone does not say enough to read a
-/// reply.
 pub const Provider = enum {
     brave,
     kagi,
     exa,
     duckduckgo,
 
-    /// The kind this vendor belongs to. A keyed API and a results page read as
-    /// HTML are different shapes, and a provider fits exactly one of them, so
-    /// naming one the kind does not take is refused instead of half working.
+    /// A provider fits exactly one kind, so naming one the kind does not
+    /// take is refused instead of half working.
     pub fn kind(self: Provider) Kind {
         return switch (self) {
             .brave, .kagi, .exa => .api,
@@ -34,9 +28,7 @@ pub const Provider = enum {
     }
 };
 
-/// Every provider this reader knows, for the message that says so. Built from
-/// the enum, so a vendor added to it cannot be missing from the refusal that
-/// lists them.
+/// Built from the enum, so a vendor added to it cannot be missing here.
 pub const provider_names = text: {
     var built: []const u8 = "";
     const names = std.enums.values(Provider);
@@ -47,8 +39,6 @@ pub const provider_names = text: {
     break :text built;
 };
 
-/// Every member is optional, so "no search block" is told apart from a block
-/// that names its own fields.
 pub const Search = struct {
     kind: ?Kind = null,
     provider: ?Provider = null,
@@ -62,9 +52,8 @@ pub const Search = struct {
     }
 };
 
-/// Supplied by the org bundle. Absent `kinds` permits every kind; absent
-/// `base_url` leaves the choice to the user. Neither field ever widens what
-/// the user already chose, only narrows it.
+/// Absent `kinds` permits every kind. Absent `base_url` leaves the choice
+/// to the user.
 pub const Ceiling = struct {
     kinds: ?[]const Kind = null,
     base_url: ?[]const u8 = null,
@@ -93,8 +82,7 @@ fn hostText(component: std.Uri.Component) []const u8 {
     };
 }
 
-/// The whole 127.0.0.0/8 block loops back, not only 127.0.0.1, so a prefix
-/// check is enough without a full address parse.
+/// The whole 127.0.0.0/8 block loops back, and 127.0.0.1 is one address in it.
 fn isLoopbackHost(host: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
     if (std.mem.eql(u8, host, "::1")) return true;
@@ -141,8 +129,7 @@ pub const Diagnostic = struct {
         read_failed: anyerror,
     };
 
-    /// A provider named beside a kind it does not belong to. Both are values,
-    /// so nothing here is owned.
+    /// A provider named beside a kind it does not belong to.
     pub const ProviderMismatch = struct {
         provider: Provider,
         kind: Kind,
@@ -153,8 +140,7 @@ pub const Diagnostic = struct {
         reason: BaseUrlError,
     };
 
-    /// Borrowed from the caller's own `Search` and `Ceiling`, and not owned
-    /// by the diagnostic.
+    /// Borrowed from the caller's own `Search` and `Ceiling`.
     pub const BaseUrlMismatch = struct {
         text: []const u8,
         required: []const u8,
@@ -402,7 +388,6 @@ fn parseFields(
         },
     }
 
-    // The block being present at all commits it to naming a real engine.
     if (search.kind == null) {
         _ = note(diag, source_name, .kind_missing);
         return error.InvalidSearch;
@@ -414,15 +399,12 @@ fn parseFields(
 
     const kind = search.kind.?;
 
-    // `self_hosted` is SearXNG and nothing else, so its shape is implied and a
-    // provider there would name a second one.
+    // `self_hosted` is SearXNG and nothing else.
     if (kind == .self_hosted and search.provider != null) {
         _ = note(diag, source_name, .{ .provider_not_for_kind = kind });
         return error.InvalidSearch;
     }
 
-    // `api` and `scrape` each cover several vendors, so the reply shape is only
-    // known once one is named.
     if (kind == .api or kind == .scrape) {
         const named = search.provider orelse {
             _ = note(diag, source_name, .provider_missing);
@@ -436,10 +418,6 @@ fn parseFields(
         }
     }
 
-    // A keyed engine with no key cannot work, so the credential is required
-    // now and not on the agent's first search. The other two kinds send none,
-    // and a value that is read and never sent is how somebody comes to believe
-    // they configured something.
     if (kind == .api) {
         if (search.credential == null) {
             _ = note(diag, source_name, .credential_missing);
@@ -537,8 +515,7 @@ fn readCredential(
     return gpa.dupe(u8, text);
 }
 
-/// There is no project-level loader: `chock.zon` never carries a `search`
-/// block, so the operator's `config.zon` is the only file this reads.
+/// `chock.zon` never carries a `search` block.
 pub fn loadOperator(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -579,15 +556,12 @@ fn containsKind(allowed: []const Kind, kind: Kind) bool {
     return false;
 }
 
-/// The single configured layer, held to the org ceiling. There is no project
-/// layer to fold in: see `loadOperator`.
 pub fn foldLayers(operator: Search, ceiling: ?Ceiling, diag: ?*?Diagnostic) CeilingError!Search {
     return underCeiling(operator, ceiling, diag);
 }
 
-/// A refusal, and never a silent narrowing: `kind` and `base_url` are
-/// categorical, not a quantity a ceiling can clamp down to. A user config
-/// that names a kind or url the ceiling excludes is refused outright.
+/// A refusal, never a silent narrowing: `kind` and `base_url` are
+/// categorical, not a quantity a ceiling can clamp down to.
 pub fn underCeiling(resolved: Search, ceiling: ?Ceiling, diag: ?*?Diagnostic) CeilingError!Search {
     const bound = ceiling orelse return resolved;
     if (resolved.kind) |kind| {
@@ -903,8 +877,6 @@ test "self_hosted and scrape must not name a provider" {
     );
     try testing.expectEqual(Kind.self_hosted, self_hosted.?.fault.provider_not_for_kind);
 
-    // `scrape` takes a provider now, so naming an api vendor there is a
-    // mismatch rather than a field that does not belong.
     var scrape: ?Diagnostic = null;
     defer if (scrape) |*d| d.deinit(gpa);
     try testing.expectError(
@@ -930,8 +902,6 @@ test "the provider_unknown message names every vendor this reader knows" {
     );
     const text = try std.fmt.allocPrint(gpa, "{f}", .{diag.?});
     defer gpa.free(text);
-    // Driven off the enum, so a vendor added later fails this test rather than
-    // quietly leaving the message naming a subset.
     inline for (@typeInfo(Provider).@"enum".fields) |field| {
         try testing.expect(std.mem.indexOf(u8, text, field.name) != null);
     }
@@ -957,8 +927,6 @@ test "a scrape engine names its own vendor and sends no credential" {
     try testing.expectEqual(Kind.scrape, scrape.kind.?);
     try testing.expectEqual(Provider.duckduckgo, scrape.provider.?);
 
-    // A scrape engine has nowhere to send a key, so naming one is refused
-    // rather than read and dropped.
     var keyed: ?Diagnostic = null;
     defer if (keyed) |*d| d.deinit(gpa);
     try testing.expectError(
@@ -998,8 +966,6 @@ test "a scrape vendor named on an api engine is a mismatch, and the message says
 }
 
 test "every provider belongs to a kind that needs one named" {
-    // `self_hosted` implies SearXNG, so no provider may claim it. A provider
-    // that did would be unreachable: the parser refuses a provider there.
     inline for (@typeInfo(Provider).@"enum".fields) |field| {
         const provider: Provider = @enumFromInt(field.value);
         try testing.expect(provider.kind() != .self_hosted);

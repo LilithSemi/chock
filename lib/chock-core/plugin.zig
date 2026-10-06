@@ -16,7 +16,6 @@ const tools = @import("tools.zig");
 
 pub const action_prefix = "plugin";
 
-/// A tool named `network` must not become a rule about the network.
 pub const tool_segment = "tool";
 
 pub const max_name_bytes = 64;
@@ -27,26 +26,20 @@ pub const max_capabilities_per_tool = 16;
 
 pub const max_capability_bytes = 128;
 
-/// A tool above this is refused and never carried with an empty schema, which
-/// would tell the model the tool takes nothing while the plugin needs a field.
 pub const max_schema_bytes = mcp.max_schema_bytes;
 
 pub const locale = "en";
 
 pub const Decider = mcp.Decider;
 
-/// No dot, no `*`, and no NUL. A dot separates the segments of an action name,
-/// so a tool with one could name a class of actions an author never wrote.
 pub fn nameIsUsable(name: []const u8) bool {
     return mcp.nameIsUsable(name);
 }
 
-/// A plugin that declares one of these fails to load whole.
 pub fn shadowsBuiltIn(name: []const u8) bool {
     return mcp.shadowsBuiltIn(name);
 }
 
-/// No `*`. Only an author writes a class of actions, never a subject of them.
 pub fn capabilityIsUsable(action: []const u8) bool {
     if (action.len == 0 or action.len > max_capability_bytes) return false;
     var segments = std.mem.splitScalar(u8, action, '.');
@@ -62,7 +55,6 @@ comptime {
             "is measuring against a language that has moved",
     );
 
-    // `shadowsBuiltIn` and `nameIsUsable` must agree about what a tool name is.
     for (@typeInfo(tools.Tool).@"enum".fields) |field| {
         if (!nameIsUsable(field.name)) @compileError(
             "the built-in tool \"" ++ field.name ++ "\" is not a name this host builds a policy " ++
@@ -72,9 +64,6 @@ comptime {
     }
 }
 
-/// ```
-/// plugin "hello", tool "hello"  ->  plugin.hello.tool.hello
-/// ```
 pub fn actionInto(buffer: []u8, plugin: []const u8, tool: []const u8) ?[]const u8 {
     if (!nameIsUsable(plugin) or !nameIsUsable(tool)) return null;
     return std.fmt.bufPrint(buffer, action_prefix ++ ".{s}." ++ tool_segment ++ ".{s}", .{
@@ -106,13 +95,9 @@ pub const Refusal = enum {
     name_unusable,
     already_declared,
     capability_unusable,
-    /// Only `deny`. Every other answer leaves the tool offered, decided per call.
     policy,
     schema_unusable,
     schema_too_large,
-    /// A capability cannot be asked about per call. The capabilities of every
-    /// offered tool decide the import set the whole plugin is instantiated
-    /// with, once, before any guest code runs, and an import stays given.
     capability_policy,
 
     pub fn text(self: Refusal) []const u8 {
@@ -130,15 +115,10 @@ pub const Refusal = enum {
 
 pub const Offer = struct {
     plugin: []const u8,
-    /// Bare, not prefixed with the plugin. A prefix would hide the collision rule.
     name: []const u8,
-    /// `chock_plugin_init` binds one entry per declared tool in this same
-    /// order, so the position the host read is the position the guest bound.
     index: u32,
     action: []const u8,
     capabilities: []const []const u8,
-    /// Read once, at the start, and never the last word on a call. The tool's
-    /// own action is asked again on every call through `Session.asker`.
     decision: chock_policy.table.Decision,
     refused: ?Refusal,
     definition: tools.Definition,
@@ -160,11 +140,6 @@ pub const start_failed = "its host did not answer, so its tools are not in this 
 
 pub const not_offered = "that tool is not offered in this session";
 
-/// Where a plugin really runs, which is a process of its own. In the engine
-/// this project has, `memPtr` is `mem_base + addr + offset` with no bounds
-/// check, and `callIndirect` calls a table slot with neither a bounds check nor
-/// a signature check. A module that declared sixteen pages and stored to offset
-/// 100000000 dumped core, where wasmtime trapped.
 pub const Host = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -210,8 +185,6 @@ pub const Session = struct {
 
     loaded: std.ArrayList([]const u8) = .empty,
 
-    /// Tool names another supplier already holds. A built-in is never one of
-    /// these, because `shadowsBuiltIn` fails the whole plugin instead.
     reserved: []const []const u8 = &.{},
 
     plugins: []Loaded = &.{},
@@ -236,8 +209,6 @@ pub const Session = struct {
         return self.offers.items.len == 0;
     }
 
-    /// `name` must not come from `record.name`. `record` is borrowed, and
-    /// everything kept out of it is copied.
     pub fn admit(
         self: *Session,
         name: []const u8,
@@ -250,7 +221,6 @@ pub const Session = struct {
         }
         if (record.tools.len > max_tools_per_plugin) return .too_many_tools;
 
-        // Read the whole list first, and offer nothing until it is clean.
         for (record.tools) |tool| {
             if (shadowsBuiltIn(tool.name)) return .shadows_built_in;
         }
@@ -355,8 +325,6 @@ pub const Session = struct {
         return null;
     }
 
-    /// Null when no plugin declares this name at all, which is the caller's
-    /// signal to pass the call on. Never an error return.
     pub fn dispatch(
         self: *Session,
         gpa: std.mem.Allocator,
@@ -387,8 +355,6 @@ pub const Session = struct {
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
 
-        // A call whose arguments do not match could not have run, so nobody is
-        // asked about it.
         if (try argumentComplaint(
             arena_state.allocator(),
             offer.definition.parameters,
@@ -412,9 +378,6 @@ pub const Session = struct {
             call_budget_ns,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            // Nothing was lost. `chock_core.helper.Channel.read` leaves the
-            // reply in the pipe and the driver keeps its own buffer, so the
-            // next call still reaches the plugin.
             error.Late => return .{
                 .text = try gpa.dupe(u8, "the plugin did not answer inside the budget"),
                 .is_error = true,
@@ -435,7 +398,6 @@ pub const Session = struct {
         offer: *const Offer,
         call_id: []const u8,
     ) std.mem.Allocator.Error!?[]u8 {
-        // An offered tool always has an action, which `Broker.request` asserts on.
         std.debug.assert(offer.action.len > 0);
 
         const own = try self.askAbout(gpa, io, offer, offer.action, call_id);
@@ -522,8 +484,6 @@ fn describe(fields: []const core.LocaleField) []const u8 {
     return "";
 }
 
-/// The host checks, so a plugin only ever runs on arguments that match what it
-/// said it takes. A field the schema does not name is left alone.
 fn argumentComplaint(
     arena: std.mem.Allocator,
     schema: std.json.Value,
@@ -587,7 +547,6 @@ fn valueComplaint(
     const declared = schema.object.get("type") orelse return null;
     if (declared != .string) return null;
 
-    // Every provider writes a null for an argument the model chose not to set.
     if (value == .null) return null;
 
     const kind = core.Kind.fromJsonName(declared.string) orelse return null;
@@ -623,8 +582,6 @@ fn whose(where: []const u8) []const u8 {
     return if (where.len == 0) "the arguments " else "that field ";
 }
 
-/// A field name has to be a name. The model writes it back as a JSON key, and a
-/// key with a quote, a newline, or a byte that is not UTF-8 gets a 400.
 fn schemaInto(
     keep: std.mem.Allocator,
     properties: []const core.Property,
@@ -695,8 +652,6 @@ fn copyShape(
     }
 }
 
-/// Never written as `.{}`, which Zig makes a tuple and `std.json.Stringify`
-/// writes as `[]`. A real language server found that fault in this project.
 fn emptyObject(keep: std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
     return std.json.parseFromSliceLeaky(std.json.Value, keep, "{}", .{}) catch
         error.OutOfMemory;
@@ -713,7 +668,6 @@ pub const Settings = struct {
     module: []const u8,
 };
 
-/// Strict: an unknown field is a refusal, so `.modlue` is not "no module".
 const WirePlugin = struct {
     name: []const u8 = "",
     module: []const u8 = "",
@@ -729,8 +683,6 @@ pub const LoadError = ParseError || error{
     ReadFailed,
 };
 
-/// The two ZON variants own the syntax trees their message points into, so a
-/// caller that receives one must call `deinit`.
 pub const Diagnostic = union(enum) {
     file_not_zon: std.zon.parse.Diagnostics,
     block_not_valid: std.zon.parse.Diagnostics,
@@ -856,8 +808,6 @@ pub fn parse(
         return error.InvalidPlugins;
     }
 
-    // A mistake in the file is reported when Chock reads the file, never on the
-    // turn the model happens to call a tool.
     for (wire, 0..) |one, index| {
         if (!nameIsUsable(one.name)) {
             _ = note(diag, .plugin_name_unusable);
@@ -986,8 +936,6 @@ const FakeDecider = struct {
     }
 };
 
-/// The tool list has to live somewhere the caller holds. A helper that built
-/// `.tools = &.{ ... }` inside itself would answer a pointer to a temporary.
 const Plugin = struct {
     tools: [1]core.ToolDescriptor,
     name: []const u8 = "written by the author",
@@ -1742,7 +1690,6 @@ const Bench = struct {
         return .{ .session = .init(gpa) };
     }
 
-    /// Separate from `init` because a `Loaded` points at the fake beside it.
     fn arm(self: *Bench, io: std.Io, name: []const u8) !void {
         const gpa = self.session.arena.child_allocator;
         self.loaded[0] = .{ .name = name, .host = self.fake.host() };

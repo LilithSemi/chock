@@ -24,27 +24,16 @@ pub const Output = struct {
     }
 };
 
-/// Applied after `env` is copied in, so they always win even if `env` carried
-/// one of these names already.
+/// Applied after `env` is copied in, so they always win even if `env` already carried one.
 const forced_env = [_]struct { key: []const u8, value: []const u8 }{
-    // A user's own ~/.gitconfig or /etc/gitconfig must not change what git
-    // tells Chock. An alias, a colour setting or a core.pager there changes how
-    // output reads, and Chock parses that output.
+    // A user's own gitconfig must not change what git tells Chock.
     .{ .key = "GIT_CONFIG_GLOBAL", .value = "/dev/null" },
     .{ .key = "GIT_CONFIG_SYSTEM", .value = "/dev/null" },
-    // git must never stop to ask a question. There is nobody in this process
-    // to answer one, so a prompt left enabled would hang the caller.
+    // Nobody is here to answer a prompt; a prompt left enabled would hang the caller.
     .{ .key = "GIT_TERMINAL_PROMPT", .value = "0" },
 };
 
-/// `argv[0]` is the bare name `"git"`. `std.process.SpawnOptions.argv` resolves
-/// a name with no `/` against PATH from the parent environment, never from
-/// `environ_map`, so git is found whether or not the child gets a replacement
-/// environment.
-///
-/// `environ_map`, when given, replaces the child's whole environment rather than
-/// adding to it. This file only ever sees an `Io`, which cannot be asked what
-/// environment it started with, so `env` is a parameter and not a guess.
+/// `argv[0]` resolves against PATH from the parent environment, not `environ_map`.
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -126,10 +115,7 @@ fn buildEnviron(allocator: std.mem.Allocator, env: *const std.process.Environ.Ma
     return child_env;
 }
 
-/// Read both of `child`'s output pipes to their end, without deadlocking if one
-/// fills its kernel pipe buffer while the other has nothing to read yet.
-/// `std.Io` has no `poll` by name and needs none: `io.concurrent` drains stderr
-/// as its own task while this one reads stdout straight through.
+/// Reads both output pipes to the end without deadlocking if one fills its kernel buffer first.
 fn readPipes(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -138,9 +124,7 @@ fn readPipes(
     var stderr_future = io.concurrent(readStreamAlloc, .{ allocator, io, child.stderr.? }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return error.Unexpected,
     };
-    // If reading stdout below fails, the stderr task must still be resolved,
-    // either awaited or canceled: `std.Io` leaves resources attached to a
-    // Future until one or the other happens.
+    // The stderr future must be awaited or canceled even if stdout fails.
     errdefer if (stderr_future.cancel(io)) |slice| allocator.free(slice) else |_| {};
 
     const stdout = readStreamAlloc(allocator, io, child.stdout.?) catch |err| return mapStreamError(err);
@@ -177,19 +161,9 @@ fn mapSpawnError(err: std.process.SpawnError, diag: ?*?Diagnostic) Error {
     };
 }
 
-/// `std.Io.Dir.realPath` fails only for a handle this process does not have
-/// open.
 const AbsoluteDirPathError = error{RealPathFailed};
 
-/// `std.testing.tmpDir` hands back a directory reached only through a relative
-/// path, and a test needs an absolute one that does not depend on the test
-/// binary's own working directory. Two other copies live in
-/// `lib/chock-proto/log.zig` and `lib/chock-sandbox/Sandbox.zig`, and neither
-/// can call this one, because `chock-workspace` must not depend on either.
-///
-/// This used to read `/proc/self/fd/<dir_fd>`, which only exists on Linux.
-/// `realPath` uses `fcntl(F_GETPATH)` on Darwin, so there is no platform branch
-/// here.
+/// `std.testing.tmpDir` gives a directory reached only through a relative path.
 fn absoluteDirPath(io: std.Io, buffer: []u8, dir: std.Io.Dir) AbsoluteDirPathError![:0]u8 {
     const len = dir.realPath(io, buffer) catch return error.RealPathFailed;
     buffer[len] = 0;
@@ -297,14 +271,10 @@ test "run reports a failure of git as an error and keeps what git said" {
     defer output.deinit(allocator);
 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 128 }, output.term);
-    // The exact wording is git's own, and this substring is what makes the
-    // message readable.
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "not a git repository") != null);
 }
 
 test "a git that cannot be started names the fault, and it reaches the caller" {
-    // `error.Unexpected` says a call failed and names neither the call nor the
-    // fault.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -324,8 +294,6 @@ test "a git that cannot be started names the fault, and it reaches the caller" {
     if (result) |output| {
         var owned = output;
         owned.deinit(allocator);
-        // A host whose spawn does not refuse a `cwd` that is a file gives a
-        // different answer, so this reads the class and not the words.
         return error.SkipZigTest;
     } else |err| {
         try std.testing.expectEqual(@as(anyerror, error.Unexpected), err);
@@ -344,7 +312,6 @@ test "a caller that wants no diagnostic gets the same answer and stores nothing"
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try absoluteDirPath(std.testing.io, &path_buffer, tmp.dir);
 
-    // Ceilinged off from the checkout Chock itself lives in.
     var env = try testEnviron(allocator, path);
     defer env.deinit();
 

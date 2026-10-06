@@ -1,16 +1,7 @@
 //! Proves the boundary `chock-sandbox/vm/confine.zig` builds, from inside a
-//! forked child. A boundary that was never reached is not a boundary that held.
-//!
-//! **It needs no guest and no virtual machine**, which is what makes the same
-//! three questions answerable on both platforms: a read inside a granted share
-//! succeeds, a read outside every share fails, and a write inside a share
-//! nobody marked writable fails.
-//!
-//! The fourth question is the one whose answer has a different shape on each
-//! platform. On Linux a program the filter refuses dies with `SIGSYS` from the
-//! seccomp default. Under Seatbelt the call comes back with an errno instead.
-//! So the child says which of the two it met and the parent reads that, rather
-//! than either one assuming the other's answer.
+//! forked child, with no guest and no virtual machine.
+//! A refused exec dies with `SIGSYS` on Linux and an errno under Seatbelt, so
+//! the child reports which of the two it met.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -20,24 +11,16 @@ const sandbox = @import("chock-sandbox");
 
 const darwin = builtin.os.tag == .macos;
 
-/// What a refusal is called on this platform. Both spellings have `PERM`, which
-/// is the only member either arm below reads.
 const E = if (darwin) std.c.E else linux.E;
 
-/// A program that exists on this platform and does nothing. macOS has no
-/// `/bin/true`; its coreutils live under `/usr/bin`.
+/// macOS has no `/bin/true`. Its coreutils live under `/usr/bin`.
 const a_program: [:0]const u8 = if (darwin) "/usr/bin/true" else "/bin/true";
 
 /// One word on the pipe, so a short read and a full one are told apart.
 const word_len = 7;
 
-/// Read the absolute path of an open directory descriptor. A share's
-/// `host_path` is used as given and `std.testing.tmpDir` only gives a relative
-/// one, so it has to be asked for.
-///
-/// Linux reads it through `/proc/self/fd`. Darwin has no such directory, and
-/// `F_GETPATH` is its own answer to the same question: it fills a buffer of at
-/// least `MAXPATHLEN` with the resolved path of an open descriptor.
+/// Linux reads it through `/proc/self/fd`. Darwin has no such directory, so
+/// `F_GETPATH` fills the buffer with the resolved path instead.
 fn absoluteDirPath(buffer: []u8, dir_fd: i32) ![:0]u8 {
     if (darwin) {
         std.debug.assert(buffer.len >= 1024);
@@ -60,11 +43,6 @@ fn makePipe(fds: *[2]i32) bool {
 }
 
 /// A new process, or null when this machine would not give one.
-///
-/// `std.posix` has no `fork` in this toolchain: every fork in this project goes
-/// through the raw syscall on Linux, the same way `seccomp.zig`'s own
-/// `restrictSelfSucceeds` does, and through libSystem on Darwin, the same way
-/// `darwin/seatbelt.zig`'s own `applyInChild` does.
 fn forkNow() ?i32 {
     if (darwin) {
         const pid = std.c.fork();
@@ -75,17 +53,8 @@ fn forkNow() ?i32 {
     return @intCast(rc);
 }
 
-/// Hold standard error aside, answering the descriptor it was saved on, or -1
-/// when it was left alone. `restoreStderr` puts it back.
-///
-/// **macOS writes from inside `sandbox_init`.** A machine that will not take a
-/// profile makes the C library print "sandbox initialization failed" itself, and
-/// the build refuses a byte a test binary puts on standard error even when every
-/// test passed. That refusal is expected and already answered by a skip, so the
-/// stream is held aside for the one call that can write to it and no longer.
-///
-/// `/dev/null` and not a closed descriptor: a closed 2 is the next number any
-/// `open` inside the call would be given.
+/// Hold standard error aside so `sandbox_init` cannot write to it on a machine
+/// that refuses the profile. `restoreStderr` puts it back.
 fn quietStderr() i32 {
     if (!darwin) return -1;
     const saved = std.c.dup(2);
@@ -141,8 +110,7 @@ fn readOnce(fd: i32, buffer: []u8) Chunk {
     return .{ .got = rc };
 }
 
-/// Read until `buffer` is full or the write end closes. Returns how many bytes
-/// actually arrived, so a caller can tell a short read from a full one.
+/// Reads until `buffer` is full or the write end closes, and returns how many bytes arrived.
 fn readAll(fd: i32, buffer: []u8) usize {
     var held: usize = 0;
     while (held < buffer.len) {
@@ -155,9 +123,8 @@ fn readAll(fd: i32, buffer: []u8) usize {
     return held;
 }
 
-/// Whether a directory could really be read. **A real access and not a
-/// handle**: `O_PATH` only asks the kernel for one, and neither mechanism's
-/// hooks fire on that alone.
+/// Whether a directory could really be read. A real access and not a handle:
+/// `O_PATH` alone does not fire either mechanism's hooks.
 fn readsDirectory(path: [:0]const u8) bool {
     if (darwin) {
         const fd = std.c.openat(std.c.AT.FDCWD, path.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true });
@@ -184,11 +151,8 @@ fn makesFile(path: [:0]const u8) bool {
     return true;
 }
 
-/// Try to run a program, and say what came back.
-///
-/// `execve` only ever returns on a failure, so a return here is already the
-/// news. On Linux the seccomp default answers with a signal instead and this
-/// never returns at all.
+/// Try to run a program, and say what came back. `execve` only ever returns on
+/// a failure. On Linux the seccomp default answers with a signal instead.
 fn triedToExec(path: [:0]const u8) E {
     const nothing: [*:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{};
     if (darwin) {
@@ -221,8 +185,6 @@ fn waitFor(pid: i32) ?u32 {
 }
 
 /// The signal that ended the child, as a number, or null when nothing did.
-/// A number and not either platform's `SIG`, because the two enums are
-/// different types and the caller only ever compares one of them.
 fn killedBy(status: u32) ?u32 {
     if (darwin) {
         if (!std.c.W.IFSIGNALED(status)) return null;
@@ -279,10 +241,6 @@ test "a confined VMM cannot run a program, reach a path outside its shares, or w
         };
         restoreStderr(held);
 
-        // Said now, inside the share, outside it, and inside the read-only
-        // share: on Linux the seccomp filter kills this process outright for
-        // the exec below, so nothing written after it could ever reach the
-        // pipe.
         const inside = readsDirectory(share_path);
         const outside = readsDirectory("/etc");
 
@@ -293,9 +251,7 @@ test "a confined VMM cannot run a program, reach a path outside its shares, or w
         const fs_held = inside and !outside and !ro_write;
         say(pipes[1], if (fs_held) "fs-held" else "fs-open");
 
-        // Reached only where the mechanism answers rather than killing. Which
-        // errno it answered with is the news, because a refusal by the
-        // confinement and a program that is not there are not the same fact.
+        // A refusal by the confinement and a missing program give different errnos.
         const refusal = triedToExec(a_program);
         say(pipes[1], if (refusal == .PERM) "deny-ep" else "deny-??");
         exitNow(1);
@@ -311,29 +267,24 @@ test "a confined VMM cannot run a program, reach a path outside its shares, or w
 
     const status = waitFor(child) orelse return error.SkipZigTest;
 
-    // A machine whose confinement will not install skips rather than failing:
-    // the layer is refused there, which is the fail closed path.
+    // A machine whose confinement will not install skips rather than failing.
     if (std.mem.eql(u8, &said, "refused")) return error.SkipZigTest;
 
     try std.testing.expectEqualStrings("fs-held", &said);
 
     if (darwin) {
-        // Seatbelt answers `EPERM`, so the second word is the proof and the
-        // child ends on its own.
+        // Seatbelt answers `EPERM`, so the second word is the proof.
         try std.testing.expectEqual(@as(usize, word_len), trailing_held);
         try std.testing.expectEqualStrings("deny-ep", &trailing);
         try std.testing.expectEqual(@as(?u8, 1), exitedWith(status));
     } else {
-        // `execve` must never come back here. The filter kills this process for
-        // it, so nothing written after the attempt can ever arrive: a second
-        // message on the pipe means the filter let it through.
+        // A second message on the pipe would mean the filter let the exec through.
         try std.testing.expectEqual(@as(usize, 0), trailing_held);
         try std.testing.expectEqual(@as(?u32, @intFromEnum(linux.SIG.SYS)), killedBy(status));
     }
 }
 
-/// Set from inside the confined child's own thread, so the parent learns the
-/// thread really ran and not only that the spawn call came back.
+/// Set from inside the confined child's own thread, so the parent learns the thread really ran.
 fn markRan(ran: *std.atomic.Value(bool)) void {
     ran.store(true, .release);
 }
@@ -370,12 +321,8 @@ test "a confined VMM can start a thread of its own" {
         };
         restoreStderr(held);
 
-        // The guest's ticker and every processor after its first are threads
-        // started under this confinement. A Linux `vmm_calls` without
-        // `mprotect` and `sigaltstack` kills this process here, and it is
-        // killed before it can write anything: the pipe stays empty and the
-        // status says SIGSYS. A Darwin profile that denied `process-fork` too
-        // widely would be seen the same way, as a child that said nothing.
+        // A Linux `vmm_calls` without `mprotect` and `sigaltstack` kills this
+        // process here before it can write anything, leaving the pipe empty.
         var ran: std.atomic.Value(bool) = .init(false);
         const thread = std.Thread.spawn(.{}, markRan, .{&ran}) catch {
             say(pipes[1], "nospawn");
@@ -394,13 +341,8 @@ test "a confined VMM can start a thread of its own" {
 
     const status = waitFor(child) orelse return error.SkipZigTest;
 
-    // A machine whose confinement will not install skips, the same way the test
-    // above does.
     if (std.mem.eql(u8, &said, "refused")) return error.SkipZigTest;
 
-    // Said before the assertions on the message, because a confinement that
-    // killed the spawn leaves nothing on the pipe at all and "" is not a useful
-    // complaint.
     try std.testing.expectEqual(@as(?u32, null), killedBy(status));
     try std.testing.expectEqual(@as(usize, word_len), held);
     try std.testing.expectEqualStrings("spawned", &said);

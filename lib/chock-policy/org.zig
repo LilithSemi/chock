@@ -17,39 +17,25 @@ pub const max_subject_bytes = 256;
 
 pub const max_issuer_bytes = 256;
 
-/// A file above this was written by a newer Chock, which may narrow something
-/// this build cannot see.
+/// A file above this was written by a newer Chock.
 pub const max_version: u32 = 1;
 
 pub const max_sinks: usize = 4;
 
 pub const max_sink_path_bytes = 4096;
 
-/// A place every session of this installation sends its log, whatever the
-/// person at the keyboard asked for. This is the control the command line could
-/// not be.
 pub const RequiredSink = struct {
     kind: Kind,
-    /// Absolute, and the reader refuses anything else: a relative path puts
-    /// the trail inside the tree the observed person owns.
     path: []const u8,
 
-    /// No network sink. `chock run` is single threaded on the tool path, so a sink
-    /// that could block on a network would block the session. A bundle cannot
-    /// require what Chock cannot carry.
     pub const Kind = enum {
         directory,
         syslog,
     };
 };
 
-/// A bound and not a rule, so it is a field and not a `table.Rule`. The fold
-/// for a number is a minimum, and `chock_cost.budget.underCeiling` takes it.
-/// Written out again here because this library imports no other chock library.
 pub const BudgetCeiling = struct {
     max_cost: f64,
-    /// ISO 4217. Empty when the bundle named none, and the one default lives
-    /// in `chock_cost.budget.default_currency`.
     currency: []const u8 = "",
 };
 
@@ -64,32 +50,18 @@ pub const Bundle = struct {
     subagents: ?subagent.Ceiling = null,
     limits: ?limits_mod.Ceiling = null,
     nix: ?nix_mod.Ceiling = null,
-    /// What the search engine may be. An organisation can pin a kind or a
-    /// base url, and can forbid the `scrape` kind outright.
     search: ?search_mod.Ceiling = null,
-    /// Which way of sandboxing a session may use. An organisation that requires
-    /// a guest names `microvm` alone, and a session on a machine that cannot boot
-    /// one then does not start, which is what requiring it means.
-    ///
-    /// **A bundle that says nothing permits every driver.** Absent is not empty:
-    /// an empty list would forbid the driver every session uses today.
+    /// Absent is not empty: an empty list would forbid the driver every
+    /// session uses today.
     sandbox: ?sandbox_mod.Ceiling = null,
-    /// Files every project of this installation must keep out of the sandbox,
-    /// on top of its own `deny_read` block.
-    ///
-    /// A union and not a minimum: a project adds to this list and can take
-    /// nothing off it. The entries are checked by `chock_workspace.deny.check`,
-    /// which this module cannot reach, so the refusal happens a moment later
-    /// rather than in a second copy of that rule.
+    /// A union, not a minimum: a project adds to this list and can take
+    /// nothing off it.
     deny_read: []const []const u8 = &.{},
     version: u32 = 1,
 
-    /// An expired bundle keeps binding, in full and for ever. A bundle only
-    /// narrows, so dropping an expired one can only widen, at exactly the
-    /// moment nobody can be reached to say whether that is right. It is said
-    /// out loud on every start, and `refusalForInstall` refuses to install one:
-    /// the date is the day after which nobody may hand this file to Chock, not
-    /// the day it stops binding a machine that already has it.
+    /// An expired bundle keeps binding, in full and for ever: dropping one
+    /// can only widen. `refusalForInstall` refuses to install one, but does
+    /// not stop it binding a machine that already has it.
     pub fn expiredAt(self: *const Bundle, now_ms: i64) bool {
         if (self.expires_ms == 0) return false;
         return now_ms > self.expires_ms;
@@ -119,8 +91,7 @@ pub const ParseError = error{
 };
 
 pub const LoadError = ParseError || error{
-    /// The ordinary answer for an installation nobody gave a bundle, and never
-    /// a fault.
+    /// The ordinary answer for an installation nobody gave a bundle.
     NoBundleFile,
     BundleTooLarge,
     ReadFailed,
@@ -135,9 +106,8 @@ pub const Diagnostic = union(enum) {
     name_too_long: NameTooLong,
     version_too_new: u32,
     too_many_sinks: usize,
-    /// A position and never the path itself. A bundle that fails to validate is
-    /// freed by `parse` before this reaches a caller, so a diagnostic that
-    /// borrowed a string out of it would dangle.
+    /// A position, never the path itself: a borrowed string would dangle
+    /// once `parse` frees a bundle that fails to validate.
     sink_path_empty: usize,
     sink_path_relative: usize,
     sink_path_too_long: usize,
@@ -254,7 +224,6 @@ pub const Diagnostic = union(enum) {
     }
 };
 
-/// The first fault is kept and not the last.
 fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     const slot = out orelse return false;
     if (slot.* != null) return false;
@@ -262,10 +231,8 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     return true;
 }
 
-/// This reader is looser about a field name than `chock.zon`'s reader, and the
-/// two are loose in opposite directions on purpose. A misspelled key field in a
-/// project file makes a rule match more and so permit more. Here it makes a
-/// rule match more and so narrow more, because this layer is a ceiling.
+/// Looser about a field name than `chock.zon`'s reader, on purpose: this
+/// layer is a ceiling, so a misspelled key matching more only narrows more.
 pub fn parse(
     gpa: std.mem.Allocator,
     source: [:0]const u8,
@@ -276,8 +243,8 @@ pub fn parse(
     defer if (diag_owned) zon_diag.deinit(gpa);
 
     const bundle = std.zon.parse.fromSliceAlloc(Bundle, gpa, source, &zon_diag, .{
-        // A member this build has no field for is kept out rather than refusing
-        // the bundle: only an unknown version refuses.
+        // A member this build has no field for is kept out, not refused: only
+        // an unknown version refuses.
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -328,8 +295,7 @@ pub fn destroy(gpa: std.mem.Allocator, self: *const Bundle) void {
 }
 
 fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
-    // The version first, because every other check is a check of a schema this
-    // build may not be reading correctly at all.
+    // The version first: every other check assumes a schema this build reads.
     if (bundle.version > max_version) {
         _ = note(diag, .{ .version_too_new = bundle.version });
         return error.VersionTooNew;
@@ -387,9 +353,7 @@ fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
         }
     }
 
-    // Zero is a real ceiling here and an empty block is not. A `max_width` of
-    // zero turns subagents off for the installation, and a block that names
-    // neither limit caps nothing.
+    // Zero is a real ceiling here. An empty block is not.
     if (bundle.subagents) |ceiling| {
         if (ceiling.max_depth == null and ceiling.max_width == null) {
             _ = note(diag, .subagent_ceiling_names_nothing);
@@ -436,8 +400,6 @@ fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
     }
 }
 
-/// The same check `table.validatePattern` makes, with the message the person
-/// who installed the bundle needs.
 fn validatePattern(field: []const u8, pattern: ?[]const u8, diag: ?*?Diagnostic) ParseError!void {
     const text = pattern orelse return;
     if (std.mem.eql(u8, text, "*")) {
@@ -458,8 +420,6 @@ pub fn refusalForInstall(bundle: *const Bundle, now_ms: i64) ?[]const u8 {
     }
     return null;
 }
-
-// Every test below reads bytes built in the test binary.
 
 const testing = std.testing;
 
@@ -699,8 +659,6 @@ test "an expired bundle keeps requiring its sinks, the same way it keeps binding
 }
 
 test "a required sink that is not an absolute path is refused before it binds" {
-    // A relative path in an installation wide file resolves against the
-    // directory a session started in, which for `chock run` is the project.
     const gpa = testing.allocator;
 
     var relative: ?Diagnostic = null;
@@ -924,7 +882,6 @@ test "a bundle carries a limits ceiling, and one that caps nothing is refused" {
 }
 
 test "a limits ceiling that cannot parse is refused when the bundle is read" {
-    // Read time and not the moment it would have sized a sandbox.
     const gpa = testing.allocator;
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
@@ -946,10 +903,6 @@ test "a limits ceiling that cannot parse is refused when the bundle is read" {
 }
 
 test "a bundle carries a search ceiling, and it reaches the fold that enforces it" {
-    // `Bundle.search` is filled by the struct parser and not by a field table
-    // of its own, so nothing in this module names it. This test is what says
-    // the field is reachable from a real bundle rather than only from a Zig
-    // literal a test wrote.
     const gpa = testing.allocator;
 
     const bundle = try parse(gpa,
@@ -977,8 +930,6 @@ test "a bundle carries a search ceiling, and it reaches the fold that enforces i
 test "a bundle carries a sandbox ceiling, and it reaches the check that enforces it" {
     const gpa = std.testing.allocator;
 
-    // `Bundle.sandbox` is filled by the struct parser, so this reads a real
-    // bundle rather than building the value by hand.
     const parsed = try parse(gpa,
         \\.{ .sandbox = .{ .drivers = .{.microvm} } }
     , null);
@@ -991,7 +942,6 @@ test "a bundle carries a sandbox ceiling, and it reaches the check that enforces
         sandbox_mod.underCeiling(ceiling, .native),
     );
 
-    // And a bundle that says nothing about it permits what a session uses today.
     const quiet = try parse(gpa, ".{}", null);
     defer destroy(gpa, quiet);
     try std.testing.expectEqual(@as(?sandbox_mod.Ceiling, null), quiet.sandbox);

@@ -1,18 +1,5 @@
 //! Turns a folded session into the messages a model request carries. The
 //! context the model sees is a view over the log, never the log itself.
-//! `chock_proto.state.Session.apply` already does the folding; this file only
-//! reshapes the result, `Session.context`, into
-//! `chock_provider.message.Request.messages`.
-//!
-//! `build` never copies a `.message` entry's own content: every slice on the
-//! `chock_provider.message.Message` it returns is borrowed straight from
-//! `session`'s own arena, so the result is only valid, and only worth
-//! building at all, for as long as `session` stays alive. Only a `.summary`
-//! entry, left behind by a compaction, needs a fresh allocation, one
-//! content part holding its summary text: pass an arena as `allocator`, the
-//! same convention `lib/chock-core/tools.zig`'s own `Registry.definitions`
-//! uses, and the whole result frees at once with the arena, `.summary`
-//! allocations included.
 
 const std = @import("std");
 const chock_proto = @import("chock-proto");
@@ -24,17 +11,6 @@ const ContentPart = chock_provider.message.ContentPart;
 
 pub const Error = std.mem.Allocator.Error;
 
-/// Build one request message per context entry, in the order `session`
-/// already holds them: the same order the log itself was written in, since
-/// `Session.apply` only ever appends to `context`, or folds a run of it into
-/// one summary entry in the range's own place. See `Session.applyCompaction`'s
-/// own doc comment.
-///
-/// A `.summary` entry becomes a `system` role message carrying the summary
-/// text. `system`, not `user` or `assistant`, because a summary is not
-/// something either side of the conversation said: it stands in for a run
-/// of turns a compaction folded away, and a system role keeps a reader, model
-/// included, from mistaking it for a real turn.
 pub fn build(allocator: std.mem.Allocator, session: *const Session) Error![]Message {
     var messages: std.ArrayList(Message) = .empty;
     errdefer messages.deinit(allocator);

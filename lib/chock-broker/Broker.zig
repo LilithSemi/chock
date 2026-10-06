@@ -1,6 +1,5 @@
-//! The broker: it evaluates policy and asks for approval. The privileged work
-//! is `lib/chock-broker/actions.zig`. An approval travels as two log events,
-//! `approval.request` and `approval.response`, not on a channel of its own.
+//! The broker: it evaluates policy and asks for approval. An approval travels
+//! as two log events, `approval.request` and `approval.response`.
 
 const std = @import("std");
 const chock_proto = @import("chock-proto");
@@ -17,17 +16,15 @@ const Broker = @This();
 
 policy: *const table.Table,
 waiter: Waiter,
-/// A null reviewer is a refusal and never an allow.
+/// Null is a refusal, never an allow.
 reviewer: ?review_mod.Reviewer = null,
 secrets: secrets_mod.Store = .{},
-/// Values, and never a name: a name is a route to the value it protects. Short
-/// values match inside ordinary words, so `src/run.zig` applies a length floor.
+/// Values, never a name: a name would route to the value it protects.
 redaction: []const []const u8 = &.{},
 
 grants: ?Grants = null,
 
-/// `std.StringHashMapUnmanaged` grow frees the old array with the allocator of
-/// the current call, so `allocator` must be the one that filled `memory`.
+/// `allocator` must be the one that filled `memory`: a grow frees with the call's allocator.
 pub const Grants = struct {
     memory: *chock_proto.state.SessionGrants,
     allocator: std.mem.Allocator,
@@ -35,7 +32,7 @@ pub const Grants = struct {
 
 pub const default_timeout_ms: i64 = 5 * std.time.ms_per_min;
 
-/// An open request holds the session lock, so a longer ask is reduced to this.
+/// Caps a longer ask: an open request holds the session lock.
 pub const max_timeout_ms: i64 = 60 * std.time.ms_per_min;
 
 pub const poll_interval_ms: u64 = 50;
@@ -43,7 +40,7 @@ pub const poll_interval_ms: u64 = 50;
 pub const Request = struct {
     action: []const u8,
     summary: []const u8,
-    /// Show the effect, for example the diff, and never the command string.
+    /// The effect, e.g. the diff, never the command string.
     detail: []const u8,
     reason: []const u8,
     agent_kind: []const u8,
@@ -51,8 +48,7 @@ pub const Request = struct {
     tool: []const u8,
     tool_call_id: []const u8,
     source: []const u8 = "",
-    /// Every parent of the asking agent, root first. The asking agent itself is
-    /// not a link.
+    /// Every parent of the asking agent, root first. The asking agent itself is not a link.
     spawn_chain: []const event.SpawnLink = &.{},
     timeout_ms: i64 = default_timeout_ms,
     self_policy: []const chock_policy.ratchet.Restriction = &.{},
@@ -85,8 +81,7 @@ pub const Outcome = enum {
         };
     }
 
-    /// Coarse on purpose. The asking agent never learns which way a review was
-    /// unavailable.
+    /// Coarse on purpose: the agent never learns which way review failed.
     pub fn reviewOutcome(self: Outcome) ?review_mod.ReviewOutcome {
         return switch (self) {
             .approved_by_review => .approved,
@@ -109,21 +104,18 @@ pub const Error =
     chock_proto.storage.ReplayError ||
     std.Io.Cancelable;
 
-/// `nowMs` must move forward as real time does. A clock that never moves makes
-/// the wait in `request` run forever, and this file cannot recover from that.
+/// `nowMs` must advance, or the wait in `request` runs forever.
 pub const Waiter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const Wake = enum {
         slept,
-        /// The open `approval.request` stays in the log, the same state a crash
-        /// leaves. A client that reconnects can still answer it.
+        /// Stays logged, so a reconnecting client can still answer it.
         canceled,
     };
 
     pub const VTable = struct {
-        /// Milliseconds since the epoch, the scale `timeout_at_ms` uses.
         nowMs: *const fn (ptr: *anyopaque, io: std.Io) i64,
         wait: *const fn (ptr: *anyopaque, io: std.Io, budget_ms: u64) Wake,
     };
@@ -137,8 +129,7 @@ pub const Waiter = struct {
     }
 };
 
-/// The clock is `.real`, because `timeout_at_ms` is a unix time every client
-/// reads. The sleep is `.awake`, the monotonic clock, because it is a length.
+/// `.real` since `timeout_at_ms` is a unix time; `.awake` for the sleep, a length.
 pub const SystemWaiter = struct {
     var anchor: u8 = 0;
 
@@ -162,8 +153,7 @@ pub const SystemWaiter = struct {
     }
 };
 
-/// `locked` is `anytype` because `chock_proto.storage.Locked` is not `pub`. A
-/// generation check inside the backend is what proves the handle is real.
+/// `locked` is `anytype` because `chock_proto.storage.Locked` is not `pub`.
 pub fn request(
     self: *const Broker,
     gpa: std.mem.Allocator,
@@ -192,8 +182,7 @@ pub fn request(
         .action = ask.action,
     };
 
-    // One evaluation, over the whole chain. A second evaluation of the asking
-    // kind alone would let a reviewer be consulted about a denied key.
+    // One evaluation over the whole chain, or a reviewer could see a denied key.
     const decision = chock_policy.ratchet.narrow(
         self.policy.evaluateChain(chain, key, null),
         ask.self_policy,
@@ -209,8 +198,7 @@ pub fn request(
             return .denied_by_policy;
         },
         .ask => {
-            // `SessionGrants.apply` refuses to fold a zero `request_id` back
-            // into a grant, so this response cannot become a second source of it.
+            // `SessionGrants.apply` refuses a zero `request_id`, so this cannot source a second grant.
             if (self.grants) |grants| {
                 if (grants.memory.get(ask.action, true) != null) {
                     _ = try appendAnswer(
@@ -235,8 +223,7 @@ pub fn request(
     return self.reviewed(gpa, io, storage, locked, ask, chain, decision, diag);
 }
 
-/// A review that could not run is a refusal, because the cheapest attack on a
-/// review is to make it fail.
+/// A review that cannot run is a refusal: failing one is the cheapest attack.
 fn reviewed(
     self: *const Broker,
     gpa: std.mem.Allocator,
@@ -362,8 +349,7 @@ fn askTheHuman(
     const timeout_ms = @min(ask.timeout_ms, max_timeout_ms);
     const deadline_ms = asked_at_ms +| timeout_ms;
 
-    // The question is on disk before the wait starts, so a crash leaves it
-    // there for whoever reconnects.
+    // Logged before the wait starts, so a crash leaves it for whoever reconnects.
     const request_id = try locked.append(gpa, io, .{
         .approval_request = .{
             .action = ask.action,
@@ -409,8 +395,8 @@ fn askTheHuman(
     }
 }
 
-/// The asking kind is added at the end. Stop doing that and a child can be
-/// stronger than its parent. The caller frees the array, and not the names.
+/// Asking kind added last, or a child could outrank its parent. Caller frees
+/// the array, not the names.
 fn policyChain(gpa: std.mem.Allocator, ask: Request) Error![]const []const u8 {
     const chain = try gpa.alloc([]const u8, ask.spawn_chain.len + 1);
     for (ask.spawn_chain, chain[0..ask.spawn_chain.len]) |link, *slot| slot.* = link.agent_kind;
@@ -438,8 +424,8 @@ fn scrubbed(self: *const Broker, arena: std.mem.Allocator, ask: Request) Error!R
     return clean;
 }
 
-// Every field of `Request` is replaced above or named here as one that holds no
-// bytes an agent, a workspace or a model supplied. A new field fails the build.
+// Every field is replaced above or named here as holding none of an agent's
+// bytes; a new field fails the build.
 comptime {
     const replaced = [_][]const u8{ "summary", "detail", "reason", "spawn_chain" };
     const chock_wrote_it = [_][]const u8{
@@ -469,8 +455,7 @@ fn scrubText(
     return try scan.finish(gpa);
 }
 
-/// The note goes nowhere but the log. The agent that asked reads
-/// `review.requesterText`.
+/// Logged only; the asking agent reads `review.requesterText` instead.
 const Record = struct {
     verdict: event.ReviewVerdict = .none,
     note: []const u8 = "",
@@ -499,8 +484,7 @@ fn appendAnswer(
     } }, time_ms);
 }
 
-/// The newest open question, and only while it has no answer. Every waiter must
-/// read it the same way, or one answers a question another is showing.
+/// The newest unanswered question; every waiter must read it the same way.
 pub fn openRequest(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -547,9 +531,7 @@ pub fn requestAction(
     return try gpa.dupe(u8, parsed.value.event.approval_request.action);
 }
 
-/// More than one request can be open at once, so an answer must name the request
-/// it answers. The replay starts at that request's own id, because an id is a
-/// byte offset and another session's log can hold the same number.
+/// An answer must name its request; replay starts at that id since ids can repeat across logs.
 fn findAnswer(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -597,11 +579,9 @@ fn findAnswer(
             },
             .refused_by_user => .refused_by_user,
             .expired => .expired,
-            // This broker writes these three itself and never reads one back,
-            // so one found here cannot be true of this request.
+            // Written only by this broker, never read back, so one found here is a forgery.
             inline .approved_by_review, .refused_by_review, .review_unavailable => |_, tag| claimed: {
-                // A `ReviewDecision` and not `@tagName`: the name was a pointer
-                // into `.rodata` and `Diagnostic.deinit` freed it.
+                // `ReviewDecision`, not `@tagName`: that pointer was `.rodata` and got freed.
                 _ = diagnostic.note(diag, .{ .answer_claims_a_review = .{
                     .request_id = request_id,
                     .decision = @field(Diagnostic.ReviewDecision, @tagName(tag)),
@@ -622,9 +602,8 @@ fn findAnswer(
     return null;
 }
 
-/// This is not the seam a live session's tool results go through. `chock-core`
-/// imports no `chock-broker`, so the loop cannot reach it, and nothing fills
-/// `secrets` today. The loop's own seam is `chock_core.Loop.appendAndApply`.
+/// Not the live seam: `chock-core` can't import `chock-broker`; that seam is
+/// `chock_core.Loop.appendAndApply`.
 pub fn appendToolResult(
     self: *const Broker,
     gpa: std.mem.Allocator,
@@ -641,8 +620,7 @@ pub fn appendToolResult(
     return secrets_mod.appendToolResult(self.secrets, gpa, io, locked, scanned, time_ms);
 }
 
-/// Call this where the sandbox launcher builds the environment and nowhere else.
-/// Release the result with `secrets.freeEnv`.
+/// Call only where the sandbox launcher builds the environment; release with `secrets.freeEnv`.
 pub fn resolveEnv(
     self: *const Broker,
     gpa: std.mem.Allocator,
@@ -667,8 +645,7 @@ fn disagrees(said: []const u8, expected: []const u8) bool {
 
 const testing = std.testing;
 
-/// `chock_proto.storage.Locked` is not `pub`, so this reaches the same type
-/// through the public return type of `Storage.lock`.
+/// `Locked` is not `pub`; reached through `Storage.lock`'s public return type.
 const LockedHandle = @typeInfo(
     @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
 ).error_union.payload;
@@ -681,7 +658,6 @@ const TestWaiter = struct {
     frozen: bool = false,
     ctx: ?*anyopaque = null,
     on_wait: ?OnWait = null,
-    /// A `Waiter` cannot report an error to the broker, so the test checks this.
     failed: ?anyerror = null,
     cancel_at_wait: ?usize = null,
 
@@ -747,7 +723,6 @@ fn findRequestId(
     return null;
 }
 
-/// `freeAnswer` releases it.
 const LoggedAnswer = struct {
     id: u64,
     request_id: u64,
@@ -814,8 +789,7 @@ fn freeAnswer(gpa: std.mem.Allocator, answer: LoggedAnswer) void {
     gpa.free(answer.review_note);
 }
 
-/// This fills in neither `action` nor `tool_call_id` on purpose: a writer that
-/// does not know those two fields must still be able to answer.
+/// Omits `action` and `tool_call_id` on purpose: a writer lacking them must still answer.
 fn answerAsUser(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -851,8 +825,7 @@ fn answerAbout(
 
 const poison_width: usize = 24;
 
-/// The line is the same number of bytes whatever `request_id` holds. An event id
-/// is a byte offset, so the padding keeps the offsets after the line still.
+/// Padded to a fixed size so the offsets after this line stay put.
 fn stalePoison(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -869,15 +842,14 @@ fn stalePoison(
     } }, 1_700_000_000_000);
 }
 
-/// It counts its calls, because an outcome alone cannot tell a review that
-/// refused from one that never ran.
+/// Counts calls: an outcome alone can't tell refused from never-run.
 const TestReviewer = struct {
     kind: []const u8 = "arbiter",
     says: ?review_mod.Verdict = .approved,
     note: []const u8 = "the change is the one the task asked for",
     calls: usize = 0,
-    /// A `Case` is borrowed for the length of the call, and `Case.chain` is an
-    /// array `request` frees, so the case is taken apart rather than kept whole.
+    /// `Case.chain` is freed by `request` after the call, so fields are copied
+    /// out rather than the case kept whole.
     saw_action: []const u8 = "",
     saw_detail: []const u8 = "",
     saw_decision: ?chock_policy.table.Decision = null,
@@ -1051,8 +1023,7 @@ test "a policy of allow never appends a request, and the log says the policy all
     try testing.expectEqualStrings("call1", answer.tool_call_id);
     try testing.expectEqualStrings("", answer.responder);
 
-    // Byte zero of every log is inside the header line, so no appended event
-    // ever sits there and zero cannot be read as a real event id.
+    // Byte zero sits inside the header line, so no real event id is ever zero.
     try testing.expectEqual(@as(u64, 0), answer.request_id);
     var replay = try store.replay(gpa, io, 0);
     defer replay.deinit();
@@ -1150,8 +1121,7 @@ test "a request that expires is a refusal, and says expired rather than refused"
 }
 
 test "an answer to a different request does not answer this one" {
-    // Both action names must be in the table this test parses, because
-    // `lib/chock-policy/defaults.zig` ships `.allow` for `git.commit`.
+    // Both actions must be in this test's table: defaults.zig ships `.allow` for `git.commit`.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1243,8 +1213,7 @@ test "an answer to a different request does not answer this one" {
     defer freeAnswer(gpa, outer_answer);
     try testing.expectEqualStrings("refused_by_user", outer_answer.decision_name);
 
-    // The inner yes came first, so this catches a broker that takes the first
-    // answer it finds.
+    // Inner yes comes first: catches a broker that takes the first answer found.
     try testing.expect(inner_answer.id < outer_answer.id);
 }
 
@@ -1354,8 +1323,7 @@ test "the spawn chain reaches the request, with a reason at every level" {
 }
 
 test "a decision this broker does not know is not permission" {
-    // `event.ApprovalDecision` keeps a name it does not know, so an old reader
-    // can read a new log. That rule is about reading and is not a licence to act.
+    // Reading an unknown name is forward compatibility, not a licence to act on it.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1404,8 +1372,7 @@ test "a decision this broker does not know is not permission" {
 }
 
 test "a wait that reports a cancellation stops the request and leaves the question open" {
-    // A wait that swallows a cancellation makes a busy loop that runs until the
-    // deadline, which can be an hour, while `Loop.run` holds the session lock.
+    // Swallowing a cancellation busy-loops until the deadline, while `Loop.run` holds the lock.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1651,8 +1618,7 @@ test "an answer written before its own request does not answer it" {
 }
 
 test "a caller holding only a broker can redact and can resolve, and never holds a credential" {
-    // Nothing below names `secrets.Store`, because a caller that had to name one
-    // would be a caller holding credentials.
+    // Nothing below names `secrets.Store`: naming one would mean holding credentials.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1733,8 +1699,7 @@ const review_then_ask_about_the_push: [:0]const u8 =
 ;
 
 test "a reviewer cannot approve what its requester was denied" {
-    // `evaluateChain` alone does not give this. It bounds what a reviewer may do
-    // with its own tool calls, and a verdict is not a tool call.
+    // `evaluateChain` alone can't give this: it bounds tool calls, and a verdict isn't one.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1758,8 +1723,7 @@ test "a reviewer cannot approve what its requester was denied" {
 
     const outcome = try broker.request(gpa, io, store, &locked, ask, null);
 
-    // A broker that paid for a review and threw the answer away gives the same
-    // outcome, so the call count is what separates the two.
+    // Same outcome either way; the call count is what separates the two.
     try testing.expectEqual(Outcome.denied_by_policy, outcome);
     try testing.expect(!outcome.permits());
     try testing.expectEqual(@as(usize, 0), arbiter.calls);
@@ -1990,8 +1954,7 @@ test "a reviewer that says no is its own refusal, and the reason stays in the lo
     try testing.expectEqualStrings("rejected", answer.review_name);
     try testing.expect(std.mem.indexOf(u8, answer.review_note, "chock.zon") != null);
 
-    // The reviewer's own words stay in the log. The agent that asked reads
-    // `review.requesterText` instead.
+    // Stays in the log only; the asking agent reads `review.requesterText` instead.
     const said = review_mod.requesterText(outcome.reviewOutcome().?);
     try testing.expect(std.mem.indexOf(u8, said, "chock.zon") == null);
     try testing.expect(std.mem.indexOf(u8, said, answer.review_note) == null);
@@ -2107,8 +2070,7 @@ test "agent_then_human puts the review in front of the person and still needs a 
 }
 
 test "agent_then_human pays for no review when nobody can answer the second half" {
-    // `Loop.run` holds the exclusive lock on the session log for the whole
-    // session, so nothing can append an `approval.response` while a turn runs.
+    // `Loop.run` holds the log's exclusive lock, so nothing can append a response mid-turn.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -2163,8 +2125,7 @@ test "agent_then_human pays for no review when nobody can answer the second half
 }
 
 test "a remembered grant answers with no question and still writes a compact record" {
-    // An act a grant serves must still leave a line in the log, or the log is
-    // not the evidence for any act after the first.
+    // Must still leave a log line, or the log stops being evidence past the first act.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -2239,8 +2200,7 @@ test "a remembered grant answers with no question and still writes a compact rec
     try testing.expectEqualStrings("call1", answer.tool_call_id);
     try testing.expectEqualStrings("", answer.responder);
 
-    // `SessionGrants.apply` refuses a zero `request_id`, so a fresh fold of the
-    // whole log still holds exactly one grant.
+    // Refuses a zero `request_id`, so a fresh fold still holds exactly one grant.
     var refolded = chock_proto.state.Session.init(gpa);
     defer refolded.deinit();
     var replay = try store.replay(gpa, io, 0);
@@ -2254,11 +2214,8 @@ test "a remembered grant answers with no question and still writes a compact rec
 }
 
 test "a live grant past the map's first capacity grows through the same allocator that built it, with no invalid free" {
-    // `std.StringHashMapUnmanaged` has a minimal capacity of 8 slots at an 80
-    // percent load factor, so the sixth put fits and the seventh grows the map.
-    // A test with fewer grants reaches no grow. A wrong allocator pairing does
-    // not reliably crash, because that depends on arena chunk boundaries, so the
-    // assertions below pin the correct answer instead.
+    // Grows past 8 slots at 80 percent load, so the seventh put exercises a
+    // grow; a bad allocator pairing won't reliably crash, hence the assertions.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -2394,7 +2351,7 @@ test "a promise the session made narrows the answer, and never widens it" {
         try testing.expectEqual(@as(usize, 0), waiter.waits);
     }
 
-    // A promise is a ceiling and never a floor, so it cannot lift a `deny`.
+    // A ceiling, never a floor: cannot lift a `deny`.
     {
         var backing = try chock_proto.storage.Memory.init(gpa, "01BROKER");
         const store = backing.storage();
@@ -2598,8 +2555,7 @@ test "a request to widen a promise is judged like any other act, by the acceptan
 }
 
 test "a decision only the broker's own review writes is not an answer a client can give" {
-    // A request a reviewer settled has no open question, so one of these found
-    // as the answer to a person's question is something else claiming a review.
+    // A settled request has no open question, so finding one here is a false claim of review.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -2640,8 +2596,7 @@ test "a decision only the broker's own review writes is not an answer a client c
 const fake_key = "sk-broker-test-000000000000";
 
 test "a value this broker keeps out is in none of the log's own bytes" {
-    // The log is append only and hash chained, so a value written here stays
-    // here. There is no cleanup, only prevention.
+    // Append only and hash chained: a written value stays. No cleanup, only prevention.
     const gpa = testing.allocator;
     const io = testing.io;
 

@@ -1,61 +1,20 @@
 //! The OpenAI compatible adapter. It covers ai& and a local llama.cpp
-//! server. It translates the neutral
-//! message type in `message.zig` to and from the JSON body an OpenAI
-//! compatible chat completion endpoint expects.
-//!
-//! The adapter never sees a credential. `Request` has no field that could
-//! hold one, and a caller sends the returned body with the key in the
-//! `Authorization` header of the HTTP request, never in this text. That
-//! matters because the body is exactly what a session log ends up holding,
-//! and `chockd` re-serves that log to other clients.
-//!
-//! A tool result is its own message on the wire, with role "tool" and its
-//! own `tool_call_id`. It is never folded into another message's `content`:
-//! a neutral message that carries a tool result becomes a separate wire
-//! message for that result, in the shape a real OpenAI compatible server
-//! expects, so the result reads back the same way it went out.
 
 const std = @import("std");
 const message = @import("message.zig");
 
-/// See `message.ToolDefinition`'s own doc comment: the canonical definition
-/// lives there, neutral, so `Client`'s interface never has to import this
-/// file to name a tool's shape. Aliased, not copied, for the reason
-/// `message.zig`'s own top comment gives.
 pub const ToolDefinition = message.ToolDefinition;
 
-/// Everything one call to the model needs, in the shape `buildRequest` reads
-/// to build the wire body. `Client.HttpClient` is the only caller that builds
-/// one of these: it converts from `message.Request`, the neutral shape
-/// `Client`'s own interface carries, adding the one field, `stream`, that
-/// only matters once a request is about to become wire bytes. `Request`
-/// holds no field for the endpoint, the model backend, or a credential,
-/// because none of those belong in a value that a caller might pass to
-/// `buildRequest` and then write into the session log.
 pub const Request = struct {
     model: []const u8,
-    /// Becomes the first message, with role "system", when not empty. A
-    /// message in `messages` that already has role "system" is not
-    /// duplicated on top of this: see `buildRequest`.
     system: []const u8,
     messages: []const message.Message,
     tools: []const ToolDefinition = &.{},
-    /// Ask the server for a server sent event stream instead of one whole
-    /// JSON body. `Client.HttpClient` always sets this itself before it
-    /// builds a request, so a caller of `Client.send` never has to set it.
-    /// The field stays here, not private to `Client.zig`, because
-    /// `buildRequest` is the one place that knows how to put it on the
-    /// wire, the same reasoning `tools` already follows.
     stream: bool = false,
 };
 
-/// One function call inside a wire message's `tool_calls` array.
 pub const WireFunctionCall = struct {
     name: []const u8,
-    /// The call's arguments, already serialized to JSON text. OpenAI's
-    /// schema carries this as a JSON string, not a nested object, and
-    /// `message.ToolCall.arguments` already keeps the same shape, so no
-    /// re-encoding happens at this boundary.
     arguments: []const u8,
 };
 
@@ -65,23 +24,11 @@ pub const WireToolCall = struct {
     function: WireFunctionCall,
 };
 
-/// One entry of a `content` array, the shape a server uses for a multi-part
-/// message. Real servers add other part types, such as `image_url`; this
-/// adapter reads only `text` and skips the rest instead of failing to parse.
-/// See `WireContent.jsonParse`.
 pub const WireTextPart = struct {
     type: []const u8 = "text",
     text: []const u8,
 };
 
-/// One entry of a `content` array that carries an image rather than text.
-///
-/// **This wire has no image source but a URL**, so the bytes travel as a
-/// `data:` URL, which is what every OpenAI compatible server documents for an
-/// image the caller holds rather than one on the web. `dataUrl` below builds
-/// the string. Chock never sends an `http` URL here: the bytes were read out
-/// of the workspace, so there is no URL to send, and sending one would ask
-/// the provider to fetch something Chock never saw.
 pub const WireImagePart = struct {
     type: []const u8 = "image_url",
     image_url: Url,
@@ -91,16 +38,9 @@ pub const WireImagePart = struct {
     };
 };
 
-/// A message's `content` field. An OpenAI compatible server accepts either a
-/// plain string or an array of typed parts, and some servers send the array
-/// shape back in a response. Both directions go through this type so a
-/// caller never has to guess which shape a given message used.
 pub const WireContent = union(enum) {
     text: []const u8,
     parts: []const WireTextPart,
-    /// **Written and never read.** A response never carries an image, so
-    /// `jsonParse` below has no case that produces this: it is the shape a
-    /// request uses to send one. See `toWireMessages`.
     images: []const WireImagePart,
 
     pub fn jsonStringify(self: WireContent, jw: *std.json.Stringify) std.json.Stringify.Error!void {
@@ -120,9 +60,6 @@ pub const WireContent = union(enum) {
         switch (value) {
             .string => |text| return .{ .text = text },
             .array => |items| {
-                // A part with no "type":"text" pair, such as an image_url
-                // entry, has no field this adapter can carry: skip it rather
-                // than fail the whole response over one part it cannot read.
                 var parts: std.ArrayList(WireTextPart) = .empty;
                 errdefer parts.deinit(allocator);
                 for (items.items) |item| {
@@ -140,64 +77,26 @@ pub const WireContent = union(enum) {
     }
 };
 
-/// One reasoning block inside `WireMessage.reasoning_blocks`: present only
-/// when a message holds more than one reasoning part. See the field's doc
-/// comment on `WireMessage`.
 pub const WireReasoning = struct {
     text: []const u8,
-    /// Base64 of the raw signature bytes, not the raw bytes themselves. See
-    /// `WireMessage.reasoning_signature`.
     signature: []const u8,
 };
 
-/// A content part this adapter has no dedicated wire field for, kept by
-/// field name and raw JSON so nothing `message.ContentPart` can hold is
-/// silently dropped at this boundary. Mirrors `message.ContentPart.unknown`.
 pub const WireUnknownPart = struct {
     name: []const u8,
     raw: std.json.Value,
 };
 
-/// One message in the shape the wire expects, whether written into a
-/// request or read back out of a response. The two directions share one
-/// type because the OpenAI schema uses the same message shape for both.
 pub const WireMessage = struct {
     role: []const u8,
     content: ?WireContent = null,
     tool_calls: ?[]const WireToolCall = null,
-    /// Set only on a message with role "tool": the id of the call this
-    /// message answers.
     tool_call_id: ?[]const u8 = null,
-    /// Set only on a message with role "tool": whether the call failed.
-    /// Not part of the standard OpenAI schema, same as the reasoning fields
-    /// below: a server that has never heard of this field ignores it.
     is_error: ?bool = null,
-    /// A signed reasoning block. Not part of the standard OpenAI schema: a
-    /// server that has never heard of these two fields ignores them, and a
-    /// server that keeps reasoning across turns reads them back on the next
-    /// request. Keeping the signature in its own field, next to the text and
-    /// not inside it, is what lets it survive a round trip unchanged: nothing
-    /// has to parse it back out of prose.
     reasoning_content: ?[]const u8 = null,
-    /// Base64 of the raw signature bytes. A signature is opaque bytes a
-    /// provider signs over, not guaranteed to be valid UTF-8, and
-    /// `std.json.Stringify` falls back to writing an invalid `[]const u8` as
-    /// a JSON array of numbers rather than a string. No real server reads
-    /// `[83,73,71]` as a string, so this field is always base64 text,
-    /// whether the underlying bytes were valid UTF-8 or not, and always
-    /// decoded back on the way in.
     reasoning_signature: ?[]const u8 = null,
-    /// More than one reasoning block in one turn, each with its own
-    /// signature, for example several thinking steps. Set only when a
-    /// message holds more than one reasoning part; a single one still uses
-    /// the two fields above, which a plain reasoning capable server already
-    /// reads.
     reasoning_blocks: ?[]const WireReasoning = null,
-    /// The alias of the model that wrote this turn. A backend can hold one
-    /// model at a time, so knowing which alias produced which turn matters
-    /// even inside one session. Not part of the standard OpenAI schema.
     model_alias: ?[]const u8 = null,
-    /// See `WireUnknownPart`.
     unknown_parts: ?[]const WireUnknownPart = null,
 };
 
@@ -212,10 +111,6 @@ const WireTool = struct {
     function: WireFunctionDef,
 };
 
-/// Asks a streaming server to send a final chunk carrying the token counts.
-/// **Without this a streaming request reports no usage at all**, and usage is
-/// an event of its own, so a session that streams would have nothing to
-/// write.
 pub const WireStreamOptions = struct {
     include_usage: bool = true,
 };
@@ -224,20 +119,10 @@ const WireRequest = struct {
     model: []const u8,
     messages: []const WireMessage,
     tools: ?[]const WireTool = null,
-    /// Omitted, not written as `false`, when the request does not stream:
-    /// `emit_null_optional_fields = false` on the `Stringify` call below
-    /// drops a `null` field, and every non-streaming test in this file
-    /// asserts an exact field count that a spurious `"stream":false` would
-    /// break.
     stream: ?bool = null,
-    /// Written only alongside `stream`, for the same reason: a server that
-    /// is not streaming has no final chunk to put usage in, and the field
-    /// would be one more thing for a strict endpoint to refuse.
     stream_options: ?WireStreamOptions = null,
 };
 
-/// `buildRequest` only allocates. `std.json.Stringify.valueAlloc` writes
-/// into memory it owns, so no other error can reach the caller.
 pub const BuildError = std.mem.Allocator.Error;
 
 fn base64Encode(allocator: std.mem.Allocator, bytes: []const u8) BuildError![]const u8 {
@@ -246,11 +131,6 @@ fn base64Encode(allocator: std.mem.Allocator, bytes: []const u8) BuildError![]co
     return encoder.encode(buf, bytes);
 }
 
-/// Decode a base64 wire signature back to raw bytes. `text` may not be
-/// valid base64: a hand-written or older peer could send anything in this
-/// non-standard extension field. Rather than fail the whole message over
-/// one malformed field, keep `text` unchanged, so the caller still gets a
-/// signature value, just not a decoded one.
 fn base64Decode(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
     const decoder = std.base64.standard.Decoder;
     const size = decoder.calcSizeForSlice(text) catch return text;
@@ -262,15 +142,6 @@ fn base64Decode(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocato
     return buf;
 }
 
-/// Convert one neutral message into the wire message or messages that
-/// represent it. A tool result is its own wire message, with role "tool",
-/// never folded into another message's `content`: a neutral message with N
-/// tool result parts becomes N wire "tool" messages, in the order the
-/// results appeared, plus one more wire message for everything else the
-/// neutral message carried (text, reasoning, tool calls, an unknown part),
-/// if it carried anything else. Scratch allocations come from `allocator`;
-/// `buildRequest` gives this an arena so the caller of `buildRequest` never
-/// has to free them one by one.
 fn toWireMessages(allocator: std.mem.Allocator, msg: message.Message) BuildError![]const WireMessage {
     var texts: std.ArrayList([]const u8) = .empty;
     var reasoning_parts: std.ArrayList(WireReasoning) = .empty;
@@ -306,10 +177,6 @@ fn toWireMessages(allocator: std.mem.Allocator, msg: message.Message) BuildError
         }
     }
 
-    // Multiple text parts keep their order and stay distinct as a content
-    // array instead of being concatenated into one string with nothing
-    // between them. A single text part still serializes as a plain string,
-    // the shape every OpenAI compatible server accepts.
     const content: ?WireContent = switch (texts.items.len) {
         0 => null,
         1 => .{ .text = texts.items[0] },
@@ -329,8 +196,6 @@ fn toWireMessages(allocator: std.mem.Allocator, msg: message.Message) BuildError
             reasoning_content = reasoning_parts.items[0].text;
             reasoning_signature = reasoning_parts.items[0].signature;
         },
-        // Two or more reasoning blocks each keep their own signature instead
-        // of collapsing to the last one.
         else => reasoning_blocks = reasoning_parts.items,
     }
 
@@ -351,19 +216,9 @@ fn toWireMessages(allocator: std.mem.Allocator, msg: message.Message) BuildError
             .unknown_parts = if (unknown_parts.items.len == 0) null else unknown_parts.items,
         });
     }
-    // A neutral message that holds only tool results has nothing left for
-    // the primary message to carry: `primary_has_content` is false and only
-    // the "tool" messages below are emitted, matching what a real OpenAI
-    // compatible history looks like for a tool's answer.
     try result.appendSlice(allocator, tool_messages.items);
 
-    // **A turn of its own, after the tool messages, and always with role
-    // "user".** A message with role "tool" on this wire carries text and
-    // nothing else, so an image from a tool cannot ride in the message that
-    // answers the call: the server refuses the whole request. The picture
-    // therefore follows the answer as a plain user turn, which is the one
-    // shape this wire has for it. Two user turns in a row are accepted here,
-    // unlike on the Anthropic wire, so this needs no joining rule.
+    // A message with role tool on this wire carries text only, so an image from a tool cannot ride in the message that answers the call. It follows as a user turn of its own instead.
     if (images.items.len != 0) {
         try result.append(allocator, .{
             .role = "user",
@@ -374,10 +229,6 @@ fn toWireMessages(allocator: std.mem.Allocator, msg: message.Message) BuildError
     return result.toOwnedSlice(allocator);
 }
 
-/// `data:<media_type>;base64,<data>`, the only image source this wire takes
-/// for bytes the caller holds. `data` is already base64: see
-/// `chock_proto.event.ImagePart.data`, which says why the neutral part
-/// carries it that way rather than raw.
 fn dataUrl(
     allocator: std.mem.Allocator,
     media_type: []const u8,
@@ -386,14 +237,7 @@ fn dataUrl(
     return std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ media_type, data });
 }
 
-/// Build the JSON body for a chat completion request. The key never enters
-/// this text: `request` has no field that could hold one, so a caller adds
-/// the key to the HTTP request as an `Authorization` header, outside this
-/// body, outside anything a session log will ever hold.
 pub fn buildRequest(allocator: std.mem.Allocator, request: Request) BuildError![]u8 {
-    // Scratch allocations, the wire messages toWireMessages builds and the
-    // arrays it builds them from, live in the arena and die with it. Only
-    // the final JSON text below is the caller's to free.
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -403,9 +247,6 @@ pub fn buildRequest(allocator: std.mem.Allocator, request: Request) BuildError![
         try messages.append(arena, .{ .role = "system", .content = .{ .text = request.system } });
     }
     for (request.messages) |msg| {
-        // request.system, above, is already the system message when it is
-        // not empty. A message that also carries role "system" would
-        // otherwise ride along as a second one.
         if (request.system.len != 0 and std.meta.activeTag(msg.role) == .system) continue;
         try messages.appendSlice(arena, try toWireMessages(arena, msg));
     }
@@ -429,26 +270,16 @@ pub fn buildRequest(allocator: std.mem.Allocator, request: Request) BuildError![
     return std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
 }
 
-/// One choice in a chat completion response. Real servers add more fields,
-/// such as `index` and `finish_reason`. `ignore_unknown_fields` on
-/// `parseResponse` means adding one more never breaks this reader.
 pub const Choice = struct {
     message: WireMessage,
 };
 
-/// A chat completion response. Real servers add fields such as `id`,
-/// `object`, `model`, and `usage`. None of them are named here, and
-/// `ignore_unknown_fields` is what lets that be true without a parse error.
 pub const Response = struct {
     choices: []const Choice,
 };
 
 pub const ParseError = std.json.ParseError(std.json.Scanner);
 
-/// Parse a chat completion response body. `ignore_unknown_fields` is set:
-/// without it, a field this reader has never heard of, anywhere in the
-/// object, makes `std.json` reject the whole response, and a provider that
-/// adds one field would break every reader that has not been rebuilt yet.
 pub fn parseResponse(allocator: std.mem.Allocator, text: []const u8) ParseError!std.json.Parsed(Response) {
     return std.json.parseFromSlice(Response, allocator, text, .{ .ignore_unknown_fields = true });
 }
@@ -458,24 +289,13 @@ fn roleFromWire(text: []const u8) message.Role {
     if (std.mem.eql(u8, text, "assistant")) return .assistant;
     if (std.mem.eql(u8, text, "system")) return .system;
     if (std.mem.eql(u8, text, "tool")) return .tool;
-    // A role a future provider adds. The escape hatch argument for an enum on
-    // the wire applies here too: keep the name instead of refusing the
-    // message.
     return .{ .unknown = text };
 }
 
-/// Join the parts of an array-shaped `content` into the single string a
-/// tool result's `output` field holds. A newline separates parts that came
-/// in as distinct array entries: still lossy versus keeping each part
-/// separate, but not the no-separator concatenation Finding 3 reported,
-/// and this shape is not one a real tool message is expected to use.
 fn toolOutputText(allocator: std.mem.Allocator, content: ?WireContent) std.mem.Allocator.Error![]const u8 {
     const wire_content = content orelse return "";
     return switch (wire_content) {
         .text => |text| text,
-        // A picture is not the text of a tool's answer. Chock never builds a
-        // "tool" message holding one, and a server that sent one back has
-        // said nothing this field can hold.
         .images => "",
         .parts => |parts| blk: {
             var out: std.ArrayList(u8) = .empty;
@@ -488,23 +308,11 @@ fn toolOutputText(allocator: std.mem.Allocator, content: ?WireContent) std.mem.A
     };
 }
 
-/// Convert one wire message, such as `Response.choices[0].message`, into the
-/// neutral message type. Most strings the result holds are slices into
-/// `wire`, not a copy: the caller keeps the `std.json.Parsed` value that
-/// produced `wire` alive for as long as the returned `Message` is in use.
-/// Two exceptions allocate through `allocator` and are the caller's to free
-/// on top of the returned `content` slice itself: a reasoning signature,
-/// decoded from base64, on every `.reasoning` content part, and a tool
-/// result's `output`, when the wire content was an array of parts joined
-/// back into one string.
 pub fn toMessage(allocator: std.mem.Allocator, wire: WireMessage) std.mem.Allocator.Error!message.Message {
     var parts: std.ArrayList(message.ContentPart) = .empty;
     errdefer parts.deinit(allocator);
 
     if (wire.reasoning_blocks) |blocks| {
-        // Each block keeps its own signature: reading reasoning_blocks
-        // instead of the singular fields below is what stops two blocks
-        // from collapsing into one.
         for (blocks) |block| {
             try parts.append(allocator, .{ .reasoning = .{
                 .text = block.text,
@@ -525,8 +333,6 @@ pub fn toMessage(allocator: std.mem.Allocator, wire: WireMessage) std.mem.Alloca
     }
 
     if (wire.tool_call_id) |call_id| {
-        // A message with role "tool" answers a previous call: its content is
-        // the tool's output, not a remark from the assistant.
         try parts.append(allocator, .{ .tool_result = .{
             .call_id = call_id,
             .output = try toolOutputText(allocator, wire.content),
@@ -535,15 +341,9 @@ pub fn toMessage(allocator: std.mem.Allocator, wire: WireMessage) std.mem.Alloca
     } else if (wire.content) |content| {
         switch (content) {
             .text => |text| if (text.len != 0) try parts.append(allocator, .{ .text = text }),
-            // Each array entry stays its own text part: no entry is
-            // concatenated onto another.
             .parts => |wire_parts| for (wire_parts) |part| {
                 if (part.text.len != 0) try parts.append(allocator, .{ .text = part.text });
             },
-            // `jsonParse` never produces this variant, so a response cannot
-            // arrive holding one: see `WireContent.images`. The case is here
-            // because the union is exhaustive, and it drops nothing a parse
-            // could have built.
             .images => {},
         }
     }
@@ -566,14 +366,7 @@ pub fn toMessage(allocator: std.mem.Allocator, wire: WireMessage) std.mem.Alloca
 }
 
 comptime {
-    // Request must hold no field that could carry a credential. A caller
-    // cannot pass an API key into buildRequest even by mistake, because
-    // Request has nowhere to put one: the key belongs in the Authorization
-    // header a caller sets outside this function, never in the body that
-    // chockd logs. Verified by temporarily renaming `model` to `api_key`,
-    // and separately to `credential_handle`, during development and
-    // confirming this block failed the build with the message below, before
-    // renaming it back.
+    // Request must hold no field that could carry a credential, so a caller cannot pass an API key into buildRequest even by mistake: the key belongs in the Authorization header, set outside this function and never in the body chockd logs.
     for (@typeInfo(Request).@"struct".fields) |field| {
         const suspect = std.mem.indexOf(u8, field.name, "key") != null or
             std.mem.indexOf(u8, field.name, "token") != null or
@@ -636,9 +429,6 @@ test "a request holds the system prompt, the messages, and the tools, in the sha
 }
 
 test "a reasoning block with a signature survives neutral to wire to neutral, through buildRequest" {
-    // A signature that changes is worthless, so this is byte for byte.
-    // Goes through the public buildRequest, not the private toWireMessages
-    // helper, so this pins the path a caller actually takes.
     const allocator = std.testing.allocator;
     const signature = "EqoBCkYIARgCIkAy9f3KX+j2rAStub8vQ==";
     const content = [_]message.ContentPart{
@@ -655,8 +445,6 @@ test "a reasoning block with a signature survives neutral to wire to neutral, th
     try std.testing.expectEqual(@as(usize, 1), parsed.value.messages.len);
     const round_tripped = try toMessage(allocator, parsed.value.messages[0]);
     defer allocator.free(round_tripped.content);
-    // toMessage decodes the base64 signature into fresh memory: see the
-    // ownership note on toMessage's doc comment.
     defer allocator.free(round_tripped.content[0].reasoning.signature);
 
     try std.testing.expectEqual(@as(usize, 1), round_tripped.content.len);
@@ -686,7 +474,6 @@ test "a tool call in a response becomes a neutral tool call with its arguments i
 }
 
 test "an unknown field in a response does not fail the parse" {
-    // A provider adds fields. A reader that refuses them breaks on a Tuesday.
     const allocator = std.testing.allocator;
     const text =
         \\{"id":"chatcmpl-2","object":"chat.completion","model":"glm4.7-flash:A3B",
@@ -701,8 +488,6 @@ test "an unknown field in a response does not fail the parse" {
 }
 
 test "the request never holds the API key" {
-    // The key belongs in a header, not the body. This is the test that stops a key
-    // reaching the log, because the body is what gets logged.
     const allocator = std.testing.allocator;
     const content = [_]message.ContentPart{.{ .text = "hello" }};
     const messages = [_]message.Message{.{ .role = .user, .content = &content }};
@@ -717,10 +502,6 @@ test "the request never holds the API key" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
 
-    // The body has exactly the fields buildRequest can write: model and
-    // messages, with tools omitted because none were given. There is no
-    // fourth field for a key to ride along in, and the comptime check above
-    // proves Request never had a place to put one before this point either.
     var field_count: usize = 0;
     var it = parsed.value.object.iterator();
     while (it.next()) |_| field_count += 1;
@@ -733,9 +514,6 @@ test "the request never holds the API key" {
 }
 
 test "a tool result becomes its own wire message, not glued onto the text of the same message" {
-    // Finding 1. Before the fix, a text part and a tool_result part in one
-    // neutral message shared one `content` string, and toMessage read the
-    // whole joined string back as the tool result's output.
     const allocator = std.testing.allocator;
     const content = [_]message.ContentPart{
         .{ .text = "here is the answer" },
@@ -761,7 +539,6 @@ test "a tool result becomes its own wire message, not glued onto the text of the
     try std.testing.expectEqualStrings("FILE BODY", tool_msg.content.?.text);
     try std.testing.expectEqualStrings("call_9", tool_msg.tool_call_id.?);
 
-    // The round trip must recover the same two facts, not one joined string.
     const round_text = try toMessage(allocator, text_msg);
     defer allocator.free(round_text.content);
     try std.testing.expectEqual(@as(usize, 1), round_text.content.len);
@@ -774,8 +551,6 @@ test "a tool result becomes its own wire message, not glued onto the text of the
 }
 
 test "a failed tool result's is_error survives neutral to wire to neutral" {
-    // Finding 2. Before the fix, toWire never wrote is_error and toMessage
-    // hardcoded false, so a failed tool call re-served as a successful one.
     const allocator = std.testing.allocator;
     const content = [_]message.ContentPart{
         .{ .tool_result = .{ .call_id = "call_1", .output = "not found", .is_error = true } },
@@ -839,8 +614,6 @@ test "two tool results in one message become two separate wire tool messages, no
     const parsed = try parseWireRequest(allocator, body);
     defer parsed.deinit();
 
-    // No primary message: the neutral message carried nothing but the two
-    // tool results, so only the two "tool" messages are emitted.
     try std.testing.expectEqual(@as(usize, 2), parsed.value.messages.len);
     try std.testing.expectEqualStrings("call_a", parsed.value.messages[0].tool_call_id.?);
     try std.testing.expectEqualStrings("result A", parsed.value.messages[0].content.?.text);
@@ -864,9 +637,6 @@ test "two reasoning blocks each keep their own signature, not collapsed to the l
     const parsed = try parseWireRequest(allocator, body);
     defer parsed.deinit();
 
-    // The singular fields stay empty: reasoning_blocks is the one source of
-    // truth once there is more than one block, so a reader cannot read both
-    // and double count.
     try std.testing.expectEqual(@as(?[]const u8, null), parsed.value.messages[0].reasoning_content);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.messages[0].reasoning_blocks.?.len);
 
@@ -882,8 +652,6 @@ test "two reasoning blocks each keep their own signature, not collapsed to the l
 }
 
 test "an unknown content part survives the wire round trip instead of being dropped" {
-    // Finding 3: a message holding only one unknown part used to serialize
-    // to {"role":"assistant"} with no content at all.
     const allocator = std.testing.allocator;
     const raw = try std.json.parseFromSlice(std.json.Value, allocator, "{\"note\":\"from a future kind\"}", .{});
     defer raw.deinit();
@@ -913,8 +681,6 @@ test "an unknown content part survives the wire round trip instead of being drop
 }
 
 test "model_alias reaches the wire and comes back on the round trip" {
-    // Finding 3: a session can mix models across turns, so a reader needs to
-    // know which alias produced a turn.
     const allocator = std.testing.allocator;
     const content = [_]message.ContentPart{.{ .text = "considering options" }};
     const messages = [_]message.Message{.{ .role = .assistant, .content = &content, .model_alias = "coder-local" }};
@@ -932,9 +698,6 @@ test "model_alias reaches the wire and comes back on the round trip" {
 }
 
 test "a reasoning signature with invalid UTF-8 bytes serializes as a JSON string, not an array of numbers" {
-    // Finding 4. std.json falls back to a JSON array of numbers for a byte
-    // slice that fails UTF-8 validation. No real server reads that as a
-    // string, so the signature is always base64 on the wire.
     const allocator = std.testing.allocator;
     const raw_signature = [_]u8{ 'S', 'I', 'G', 1, 0xFF };
     const content = [_]message.ContentPart{
@@ -997,14 +760,6 @@ test "a system role message still reaches the wire when the request carries no s
 }
 
 test "a tool's image follows the tool message as a user turn holding a data URL" {
-    // What `image_results` means on this wire, and it is not what it means on
-    // the Anthropic one. A message with role "tool" here carries text and
-    // nothing else, so the picture cannot ride in the message that answers the
-    // call: it is a user turn of its own, after it.
-    //
-    // **Mutation check:** put the image part into the primary message instead.
-    // The role of the message holding it becomes "tool" and the fourth
-    // assertion fails.
     const allocator = std.testing.allocator;
     const data = "iVBORw0KGgoAAAANSUhEUg==";
     const content = [_]message.ContentPart{
@@ -1033,8 +788,6 @@ test "a tool's image follows the tool message as a user turn holding a data URL"
 }
 
 test "a response whose content is an array of text parts degrades to the text instead of failing to parse" {
-    // Finding 5: some servers send content as an array of typed parts. The
-    // non-text image_url entry is skipped rather than failing the parse.
     const allocator = std.testing.allocator;
     const text =
         \\{"choices":[{"message":{"role":"assistant","content":[

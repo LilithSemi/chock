@@ -10,8 +10,7 @@ const git = chock_workspace.git;
 const Workspace = chock_workspace.Workspace;
 const testing = std.testing;
 
-// Zig 0.16 has no argv a test can read, and the default test runner panics on
-// argv it does not know, so build.zig embeds the probe path at build time.
+// Zig 0.16 has no argv a test can read, so build.zig embeds the probe path at build time.
 const escape_probe_path = @import("escape_probe_path").escape_probe_path;
 
 pub fn absoluteDirPath(io: std.Io, buffer: []u8, dir: std.Io.Dir) ![:0]u8 {
@@ -26,8 +25,7 @@ pub fn writeFileAbsolute(io: std.Io, path: []const u8, contents: []const u8) !vo
     try file.writeStreamingAll(io, contents);
 }
 
-/// Run git at `cwd` and require it to exit zero. The trimmed standard output
-/// comes back, owned by the caller.
+/// Run git at `cwd` and require it to exit zero. Returns the trimmed standard output.
 pub fn gitOk(
     gpa: std.mem.Allocator,
     env: *const std.process.Environ.Map,
@@ -36,8 +34,7 @@ pub fn gitOk(
 ) ![]u8 {
     var output = try git.run(gpa, testing.io, env, cwd, argv, null);
     defer output.deinit(gpa);
-    // `zig build` prints a `failed command:` line for any run step that writes
-    // to standard error, so git's message goes into the assertion instead.
+    // `zig build` prints a `failed command:` line for a run step that writes to standard error.
     if (output.term != .exited or output.term.exited != 0) {
         try testing.expectEqualStrings("", output.stderr);
     }
@@ -94,8 +91,7 @@ pub const TestProject = struct {
     }
 };
 
-/// Find `git` on this process's own PATH. Null lets the caller skip instead of
-/// failing for a reason it does not pin.
+/// Find `git` on this process's own PATH. Null lets the caller skip.
 pub fn findGitOnPath(gpa: std.mem.Allocator, io: std.Io) !?[]u8 {
     const path_env = std.process.Environ.getPosix(std.testing.environ, "PATH") orelse return null;
     var it = std.mem.tokenizeScalar(u8, path_env, ':');
@@ -159,9 +155,7 @@ pub fn serializeEnv(gpa: std.mem.Allocator, env: []const []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// Run `escape_probe` with `op` and `target`, against a sandbox built from
-/// `workspace`'s own `Sandbox.Config`. The probe spawns the sandbox, not this
-/// binary.
+/// Run `escape_probe` with `op` and `target`, against a sandbox built from `workspace`'s own `Sandbox.Config`.
 pub fn runProbe(
     gpa: std.mem.Allocator,
     workspace: *const Workspace,
@@ -184,9 +178,7 @@ pub fn runProbe(
     const env_blob = try serializeEnv(gpa, config.env);
     defer gpa.free(env_blob);
 
-    // A real `git` in the sandbox writes plenty to standard error while doing
-    // what the test wants, and `zig build` prints a `failed command:` line for
-    // any run step that writes there. The exit status carries the answer.
+    // A real `git` writes to standard error, which `zig build` logs. The exit status carries the answer.
     var child = try std.process.spawn(testing.io, .{
         .argv = &.{ escape_probe_path, op, root_path, config.cwd, mounts_blob, rules_blob, env_blob, target },
         .stdin = .ignore,
@@ -198,9 +190,7 @@ pub fn runProbe(
     return term;
 }
 
-/// Skip when the probe answered "this machine would not give me a sandbox". A
-/// boundary that was never reached is not a boundary that held, so these suites
-/// also run in the CI job named "Sandbox", which fails rather than skips.
+/// Skip when the probe answered "this machine would not give me a sandbox".
 pub fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
     const code = switch (term) {
         .exited => |c| c,

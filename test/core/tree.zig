@@ -11,14 +11,12 @@ const chock_proto = @import("chock-proto");
 
 const subagent = chock_core.subagent;
 
-// `build.zig` embeds the helper's path as a build time constant, because the
-// Zig 0.16 test runner panics on an argv it does not recognize.
+// build.zig embeds the helper's path, since the test runner panics on an argv it does not recognize.
 const child_path = @import("tree_child_path").tree_child_path;
 
 const testing = std.testing;
 
-/// Twenty six Crockford characters, which is what `src/session.zig` makes and
-/// what `src/run.zig`'s own walk up the tree refuses anything else for.
+/// Twenty six Crockford characters, which is what `src/session.zig` makes.
 const root_session = "01JQ" ++ "A" ** 22;
 
 const Tree = struct {
@@ -171,8 +169,7 @@ const Folded = struct {
     }
 };
 
-/// Spelled here as well as in `test/core/tree_child.zig`, because this test
-/// cannot import a program. A name that stopped matching fails every test here.
+/// Spelled here and in `test/core/tree_child.zig`, since this test cannot import a program.
 const session_dir_variable = "CHOCK_TEST_SESSION_DIR";
 
 test "a tree three deep really runs, and every level's log names the level above it" {
@@ -361,8 +358,7 @@ test "two children of one parent really run at the same time" {
 }
 
 test "four children at once, with the parent writing its own log while they finish" {
-    // Four children means four threads, each one inside a process spawn while the
-    // others allocate, which is the fork hazard `subagent.Table.gpa` is written for.
+    // Four threads spawn at once, which is the fork hazard `subagent.Table.gpa` is written for.
     const gpa = testing.allocator;
     var tree = try Tree.init(gpa);
     defer tree.deinit(gpa);
@@ -431,8 +427,7 @@ test "the same two children run one at a time say so, which is what the handshak
     try testing.expectEqualStrings("rendezvous=met", second.answer.items);
 }
 
-/// Each agent appends its own line to one file as its very last act, so this is
-/// an order of process endings and not a set of timestamps.
+/// Each agent appends its own line to one file as its very last act: an order of endings, not timestamps.
 fn endingOrder(gpa: std.mem.Allocator, tree: *Tree) ![][]const u8 {
     const path = try std.fmt.allocPrint(gpa, "{s}/order", .{tree.project});
     defer gpa.free(path);
@@ -456,8 +451,6 @@ fn freeOrder(gpa: std.mem.Allocator, order: [][]const u8) void {
 }
 
 test "a tree tears down from the bottom, because every level waits for the level below it" {
-    // Nothing here is a clock, and no level joins its child, so `Table.deinit`
-    // is the only thing that can be waiting.
     const gpa = testing.allocator;
     var tree = try Tree.init(gpa);
     defer tree.deinit(gpa);
@@ -540,8 +533,7 @@ test "the width bound counts a reviewer, so the child after it is refused" {
     );
 }
 
-/// What the whole tree below `id` spent. It walks the real logs, because a
-/// child's spending never reaches its parent's log.
+/// What the whole tree below `id` spent, by walking the real logs.
 const Money = struct {
     spent: f64 = 0,
     agents: usize = 0,
@@ -555,8 +547,7 @@ fn addUp(gpa: std.mem.Allocator, tree: *Tree, id: []const u8, cap: ?f64) !Money 
     var promised: f64 = 0;
     for (folded.session.children.items) |one| {
         promised += one.budget_max_cost;
-        // Zero is a child that was given no cap at all, and reading it as a cap
-        // of nothing would make every spend it made a fault.
+        // Zero means the child was given no cap at all.
         const below = try addUp(
             gpa,
             tree,
@@ -628,8 +619,7 @@ test "the money a whole tree spends stays inside the cap the root was given" {
 }
 
 test "a parent that resumed does not hand out the money it already promised" {
-    // The resume is real: a second process with the same session identifier and
-    // nothing in memory from the first.
+    // The resume is real: a second process with the same session identifier.
     const gpa = testing.allocator;
     var tree = try Tree.init(gpa);
     defer tree.deinit(gpa);
@@ -714,8 +704,7 @@ test "a parent with nothing left starts no child at all" {
 }
 
 test "the identifier this suite gives the root is one a real session could have" {
-    // `src/run.zig`'s own walk up the tree refuses an identifier that is not
-    // twenty six characters of Crockford base32 before it builds a path from it.
+    // `src/run.zig` refuses an identifier that is not twenty six characters of Crockford base32.
     try testing.expectEqual(@as(usize, 26), root_session.len);
     for (root_session) |character| {
         try testing.expect(std.mem.indexOfScalar(

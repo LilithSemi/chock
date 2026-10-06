@@ -1,32 +1,6 @@
 //! ACP version 2: the methods, who answers each one, and what it renamed.
-//!
-//! ## An alpha, and spoken only when a client asks for it
-//!
-//! Version 2 was `2.0.0-alpha.5` when this was written, and its own fields moved
-//! between alphas: a diff payload was renamed, semantic string types were added,
-//! and a `cancelled` status appeared. So `common.negotiate` never chooses it over
-//! a version the client offered. It is here so a client that already speaks it
-//! is answered rather than refused, and so the difference from version 1 is
-//! written down in one place.
-//!
-//! ## What it changed, against version 1
-//!
-//! * **The client no longer reads files or runs terminals.** `fs/*` and
-//!   `terminal/*` are gone from the client's side. Chock never called them, so
-//!   this costs it nothing and is the direction it already wanted.
-//! * **The capability tree collapsed.** Version 1 has `loadSession`,
-//!   `promptCapabilities`, `mcpCapabilities` and `sessionCapabilities` beside
-//!   each other. Version 2 has `auth` and `session`.
-//! * **`session/load` became `session/resume`**, and `session/set_mode` is gone:
-//!   a mode is a config option now.
-//! * **`authenticate` and `logout` became `auth/login` and `auth/logout`.**
-//! * **The update stream was rebuilt.** A whole message can be sent as well as a
-//!   chunk of one, a tool call's content arrives as its own chunk, a terminal has
-//!   its own updates, and `plan` became `plan_update`. There is no `tool_call`
-//!   variant: a call is reported through `tool_call_update` from the start.
-//! * **A tool call may be `cancelled`**, which version 1 cannot say.
-//! * **`initialize` requires client info**, which version 1 leaves optional, and
-//!   `clientCapabilities` is called `capabilities`.
+//! It is `2.0.0-alpha.5`, so `common.negotiate` never chooses it over a
+//! version the client offered.
 
 const std = @import("std");
 
@@ -36,12 +10,9 @@ pub const StopReason = common.StopReason;
 pub const ToolKind = common.ToolKind;
 pub const PermissionKind = common.PermissionKind;
 
-/// The version this speaks.
 pub const protocol_version: u16 = 2;
 
-/// A method this agent answers, or a method it calls on the client.
 pub const Method = enum {
-    // Answered here, by the agent.
     initialize,
     auth_login,
     auth_logout,
@@ -53,12 +24,10 @@ pub const Method = enum {
     session_delete,
     session_resume,
     session_close,
-    // Called on the client.
     session_update,
     session_request_permission,
     elicitation_create,
     elicitation_complete,
-    // Either side.
     cancel_request,
 
     pub const Side = enum { agent, client, protocol };
@@ -123,7 +92,6 @@ pub const Method = enum {
     }
 };
 
-/// The `sessionUpdate` member of a `session/update` notification.
 pub const UpdateKind = enum {
     user_message_chunk,
     user_message,
@@ -147,7 +115,7 @@ pub const UpdateKind = enum {
     }
 };
 
-/// Where a tool call has got to. Version 1 has the first four.
+/// Version 1 has the first four of these.
 pub const ToolCallStatus = enum {
     pending,
     in_progress,
@@ -193,9 +161,7 @@ test "the methods this agent answers are the ones the schema puts on the agent" 
 }
 
 test "what version 2 dropped is absent here, not renamed" {
-    // The client no longer reads files or runs terminals for the agent. A method
-    // table that still held these would let a caller reach for one and be
-    // refused by a client rather than by this.
+    // The client no longer reads files or runs terminals.
     for ([_][]const u8{
         "fs/read_text_file", "fs/write_text_file", "terminal/create",
         "terminal/output",   "terminal/release",   "terminal/wait_for_exit",
@@ -212,7 +178,7 @@ test "what version 2 dropped is absent here, not renamed" {
     try testing.expect(Method.fromWireName("auth/logout") != null);
     try testing.expect(Method.fromWireName("session/resume") != null);
 
-    // A mode is a config option in version 2, so there is no method for one.
+    // A mode is a config option in v2; no method for one.
     try testing.expectEqual(@as(?Method, null), Method.fromWireName("session/set_mode"));
 }
 
@@ -224,7 +190,7 @@ test "version 2's own enums spell themselves the way its schema does" {
         }
     }
 
-    // The two differences from version 1 that a caller has to know about.
+    // Two differences from version 1 a caller must know.
     try testing.expectEqualStrings("cancelled", ToolCallStatus.cancelled.wireName());
     try testing.expectEqual(@as(usize, 5), @typeInfo(ToolCallStatus).@"enum".fields.len);
     try testing.expectEqualStrings("plan_update", UpdateKind.plan_update.wireName());
@@ -232,10 +198,7 @@ test "version 2's own enums spell themselves the way its schema does" {
 }
 
 test "a tool call is reported without a tool_call variant" {
-    // Version 1 opens a call with `tool_call` and follows it with
-    // `tool_call_update`. Version 2 has only the update, so an encoder that
-    // reached for a `tool_call` here would not compile rather than send a
-    // variant no client reads.
+    // Version 2 has only `tool_call_update`; reaching for `tool_call` wouldn't compile.
     inline for (@typeInfo(UpdateKind).@"enum".fields) |field| {
         try testing.expect(!std.mem.eql(u8, field.name, "tool_call"));
         try testing.expect(!std.mem.eql(u8, field.name, "plan"));

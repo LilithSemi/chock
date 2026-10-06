@@ -1,43 +1,6 @@
 //! The program `test/workspace/darwin_escape.zig` drives. It rebuilds a real
-//! `Sandbox.Config` from the blobs on its command line, calls
-//! `chock_sandbox.spawn`, and reports what the kernel answered.
-//!
-//! A separate program, because `spawn` forks and its caller must be single
-//! threaded. Nothing here reads a Seatbelt profile: a test that read the profile
-//! text would pass against a profile that denies nothing.
-//!
-//! Command line, for the outer invocation:
-//!   darwin-probe <op> <cwd> <mounts-blob> <rules-blob> <env-blob> <args-blob>
-//!
-//! `<op>` is one of:
-//!   write    spawn this same program again, inside the sandbox, with
-//!            "spawned-write" and the one path `<args-blob>` holds. The inner
-//!            invocation builds no sandbox of its own.
-//!   run      spawn the argv `<args-blob>` holds, inside the sandbox, in `<cwd>`.
-//!   spawned-write   create `<args-blob>` for write. The inner half of "write",
-//!            and never invoked from the outside.
-//!
-//! `<mounts-blob>` is zero or more lines, one per mount, fields separated by
-//! 0x01, the first field always the kind:
-//!   "bind\x01<source>\x01<target>\x01<read_only, 0 or 1>"
-//!   "deny\x01<target>"
-//! `<rules-blob>` is one line per Landlock rule, "<path>\x01<access bits>".
-//! `<env-blob>` is one line per variable, each a complete "KEY=VALUE".
-//! `<args-blob>` is one line per argv element. Lines are separated by "\n" and
-//! an empty blob is the empty string.
-//!
-//! Exit codes, which match `test/sandbox/darwin_probe.zig`:
-//!   0 - the operation succeeded.
-//!   1 - the operation was refused by the kernel.
-//!   2 - the command line is wrong, or the operation is not one this program
-//!       knows.
-//!   3 - this program could not build the config it was given, before any
-//!       sandbox was asked for.
-//!   5 - the operation failed for a reason the design does not predict.
-//!  21 - `spawn` failed for a reason not named below.
-//!  24 - `sandbox_init` refused the profile, so no boundary was ever built.
-//!  25 - the config named a path this platform cannot put where it was asked.
-//!  26 - the profile could not be built at all.
+//! `Sandbox.Config` from the blobs on its command line, calls `chock_sandbox.spawn`,
+//! and reports the kernel's answer as an exit status.
 
 const std = @import("std");
 const sandbox = @import("chock-sandbox");
@@ -52,8 +15,7 @@ const profile_refused: u8 = 24;
 const not_expressible: u8 = 25;
 const profile_unbuildable: u8 = 26;
 
-/// One exit code per cause. Inside a `nix build` the builder already holds a
-/// Seatbelt profile, and `spawn` then answers `LandlockRestrictFailed`.
+/// Inside a `nix build` the builder already holds a Seatbelt profile, and `spawn` answers `LandlockRestrictFailed`.
 fn exitFor(err: anyerror) u8 {
     return switch (err) {
         error.LandlockRestrictFailed => profile_refused,

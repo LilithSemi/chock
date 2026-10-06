@@ -1,22 +1,5 @@
-//! One `chock login` worth of store writing, as its own process. Two of these
-//! run at once to make two commands contend through the filesystem.
-//!
-//! Write nothing to standard error: `test/proto/lock.zig` holds that rule for
-//! the whole build. The start instant is an argument so that helpers started
-//! one after the other still overlap.
-//!
-//! Command line:
-//!   login-helper <data-dir> <name> <token> <stored-ms> <start-unix-ms> <if-present>
-//!
-//! `<if-present>` is `replace` for a login given `--name`, `refuse` otherwise.
-//!
-//! Exit status:
-//!   0   the credential was stored
-//!   1   another login held the store and this one gave up
-//!   2   the store refused for some other reason
-//!   3   the command line was wrong
-//!   4   this program itself failed
-//!   5   the name was already stored and this login was not given one
+//! One `chock login` worth of store writing, as its own process, so two of these contend through the filesystem.
+//! Writes nothing to standard error: `test/proto/lock.zig` holds that rule for the whole build.
 
 const std = @import("std");
 const chock_auth = @import("chock-auth");
@@ -50,8 +33,7 @@ pub fn main(init: std.process.Init) u8 {
     const driver = chock_auth.store.Driver{ .data_dir = data_dir };
     const store = chock_auth.store.Store{ .data_dir = data_dir, .secrets = driver.secrets() };
 
-    // `src/login.zig` looks here before it asks a person for anything, and it
-    // holds no lock, so two logins can both pass.
+    // `src/login.zig` looks here before it asks a person for anything, holding no lock.
     if (!replace) {
         const existing = store.get(init.gpa, init.io, name, null) catch return store_failed;
         if (existing) |found| {
@@ -82,8 +64,7 @@ pub fn main(init: std.process.Init) u8 {
     return stored;
 }
 
-/// Short sleeps, not a tight loop: eight helpers each burning a core would
-/// change the thing under test.
+/// Short sleeps, since eight helpers each burning a core would change the thing under test.
 fn waitUntil(io: std.Io, start_ms: i64) void {
     while (std.Io.Timestamp.now(io, .real).toMilliseconds() < start_ms) {
         std.Io.sleep(io, .fromNanoseconds(200 * std.time.ns_per_us), .awake) catch return;

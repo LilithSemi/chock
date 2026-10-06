@@ -1,10 +1,4 @@
-//! The canaries: the state taken before a session and taken again after it,
-//! with no judgement in between. Every type answers with a value that compares
-//! for equality, never with a summary somebody has to read.
-//!
-//! All of these are write detectors except the listener. A read leaves nothing
-//! on a filesystem, so the read half of the first boundary is answered by
-//! `logscan` looking for the canary file's magic string in the session log.
+//! The canaries: state taken before and after a session, compared for equality.
 
 const std = @import("std");
 
@@ -29,10 +23,7 @@ pub fn hexOfParts(parts: []const []const u8) Hex {
 
 pub const max_file_bytes: usize = 64 * 1024 * 1024;
 
-/// One sorted line per path under a root. A file is `f <mode octal> <sha256>
-/// <path>`, a directory `d <mode octal> - <path>`, a symlink `l - <target>
-/// <path>`. A symlink target is recorded and never followed, because following
-/// one would pull an unrelated file into the answer.
+/// One sorted line per path: `f <mode> <sha256> <path>`, `d <mode> - <path>`, or `l - <target> <path>`.
 pub const Manifest = struct {
     gpa: std.mem.Allocator,
     root: []const u8,
@@ -43,8 +34,7 @@ pub const Manifest = struct {
         return takeToDepth(gpa, io, root, .whole_tree);
     }
 
-    /// `state` fills up while the session runs, so only a new name beside it is
-    /// a breach.
+    /// Shallow because `state` fills up while the session runs, so only a new name beside it is a breach.
     pub fn takeShallow(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !Manifest {
         return takeToDepth(gpa, io, root, .depth_one);
     }
@@ -148,9 +138,7 @@ pub const Line = struct {
     digest: []const u8,
     path: []const u8,
 
-    /// A symlink whose target holds a space is read wrongly, because the target
-    /// sits where a digest goes. Every caller asks "is this path one I accept",
-    /// so a misreading answers no, which is the safe direction.
+    /// A symlink target with a space misreads as the digest field, which answers reject rather than accept.
     pub fn parse(line: []const u8) ?Line {
         if (line.len < 7) return null;
         if (line[1] != ' ') return null;
@@ -224,8 +212,7 @@ fn holdsLine(text: []const u8, line: []const u8) bool {
     return false;
 }
 
-/// `chock.zon` is its own canary because the policy table decides everything
-/// else.
+/// `chock.zon` is its own canary because the policy table decides everything else.
 pub const FileState = struct {
     present: bool,
     digest: Hex,
@@ -242,14 +229,11 @@ pub const FileState = struct {
     }
 };
 
-/// Every ref and every object of a repository, as sorted text. Refs alone would
-/// miss an object with no ref on it, objects alone a ref moved onto an object
-/// that was already there.
+/// Every ref and every object of a repository, as sorted text.
 pub const GitState = struct {
     gpa: std.mem.Allocator,
     text: []u8,
-    /// False when git could not read the repository at all. This is never
-    /// "nothing changed": the oracle turns it into an inconclusive result.
+    /// False when git could not read the repository at all. The oracle treats this as inconclusive, never unchanged.
     readable: bool,
 
     pub fn take(
@@ -271,8 +255,7 @@ pub const GitState = struct {
         const head = try gitOutput(gpa, io, env, git_path, repository, &.{ "rev-parse", "HEAD" });
         defer gpa.free(head.text);
 
-        // `--batch-all-objects` walks loose objects and packs alike, which is
-        // the only form that answers for a repository somebody repacked.
+        // `--batch-all-objects` is the only form that also answers for a repacked repository.
         const objects = try gitOutput(gpa, io, env, git_path, repository, &.{
             "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype) %(objectsize)",
         });
@@ -326,8 +309,7 @@ fn gitOutput(
         .stderr = .ignore,
     }) catch return .{ .ok = false, .text = try gpa.dupe(u8, "") };
 
-    // Standard error is discarded by the kernel, so there is no second pipe to
-    // fill and deadlock the child while this one drains.
+    // Standard error is discarded by the kernel, so draining stdout alone cannot deadlock.
     const stdout = readAll(gpa, io, child.stdout.?) catch try gpa.dupe(u8, "");
     errdefer gpa.free(stdout);
     const term = child.wait(io) catch return .{ .ok = false, .text = stdout };
@@ -362,16 +344,8 @@ fn appendSorted(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u
     }
 }
 
-/// Nothing accepts while the session runs. The kernel completes the handshake
-/// and holds the connection in the accept queue whether or not anybody calls
-/// `accept`, so `stop` drains the queue and counts what is in it.
-///
-/// Do not put a thread back here. An accepting thread with a stop flag, and one
-/// stopped by `shutdown`, both dropped connections that were still queued and
-/// reported a real escape as a count of zero.
-///
-/// Counted on accept and never on a read, because a connection that writes
-/// nothing is still a connection and a reader would hang.
+/// The kernel completes the handshake and queues a connection whether or not
+/// anybody calls `accept`, so `stop` drains the queue and counts what is in it.
 pub const Listener = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -407,22 +381,18 @@ pub const Listener = struct {
         return self;
     }
 
-    /// Call `stop` first. A count read before the drain is a count of nothing
-    /// and would read as a boundary that held.
+    /// Call `stop` first, or the count reads as zero before the drain.
     pub fn count(self: *const Listener) u32 {
         std.debug.assert(self.drained);
         return self.connections;
     }
 
-    /// `accept4` directly, because the threaded `std.Io` takes an accept socket
-    /// to be blocking and panics on `EAGAIN`. A drain has to be told no.
+    /// Calls `accept4` directly: the threaded `std.Io` accept socket panics on `EAGAIN`.
     pub fn stop(self: *Listener) void {
         const linux = std.os.linux;
-        // The listening socket itself has to be non-blocking. The
-        // `SOCK_NONBLOCK` flag to `accept4` is for the socket it produces.
+        // The listening socket itself must be non-blocking. SOCK_NONBLOCK on
+        // accept4 is for the socket it produces.
         if (!setNonBlocking(self.server.socket.handle)) {
-            // A drain would hang, so let `count` assert rather than report a
-            // breach as held.
             return;
         }
         while (true) {
@@ -444,8 +414,7 @@ pub const Listener = struct {
 fn setNonBlocking(handle: std.posix.fd_t) bool {
     const linux = std.os.linux;
     const flags = linux.fcntl(handle, linux.F.GETFL, 0);
-    // A raw system call reports an error as a small negative value in unsigned
-    // form.
+    // A raw syscall reports an error as a small negative value in unsigned form.
     if (@as(isize, @bitCast(flags)) < 0) return false;
     var updated: linux.O = @bitCast(@as(u32, @truncate(flags)));
     updated.NONBLOCK = true;
@@ -460,12 +429,7 @@ pub const Survivor = struct {
     value: []u8,
 };
 
-/// Every process this user owns whose root, working directory, executable or
-/// command line names one of `prefixes`.
-///
-/// `/proc/<pid>/root` resolves in the host's own mount namespace, so a process
-/// still living inside a sandbox root reads back as that root's host path. The
-/// machine is shared, so only this user's processes are read.
+/// Every process this user owns whose root, cwd, executable or command line names one of `prefixes`.
 pub fn survivors(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -609,7 +573,6 @@ test "a manifest changes when a file appears and nothing else does" {
 }
 
 test "a manifest of an untouched tree is byte for byte the same twice" {
-    // A walk whose order is not sorted would report a change every time.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 

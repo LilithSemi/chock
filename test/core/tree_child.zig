@@ -1,27 +1,7 @@
 //! A real agent in a real tree: a process that reads the command line its
-//! parent wrote, keeps a session log of its own, and starts children of its own
-//! the same way its parent started it. The spawn chain, the depth, the width
-//! and the slice are written the way `src/run.zig` writes them, because a
-//! helper that improved on any of them makes a test pass for the wrong reason.
-//!
-//! The task is a script, one instruction per line:
-//!
-//! * `say <text>` writes one turn of this agent's own.
-//! * `promise <action> <ceiling> <reason...>` appends `policy.self`.
-//! * `spend <amount> <currency>` appends a `usage` event.
-//! * `rendezvous <count> [tries]` waits for `count` agents to reach this line.
-//! * `churn <n>` writes `n` turns of its own.
-//! * `report-budget` says what slice this agent was given.
-//! * `report-chain <action>` reports the policy answer for this kind alone and
-//!   for the chain its parent stated.
-//! * `spawn <kind>` starts one child and waits. Its task is the lines below
-//!   that begin with `>`, with one `>` taken off each.
-//! * `background <kind>` starts one child and carries on.
-//! * `join` waits for every background child and appends `agent.complete`.
-//!
-//! Every `report-` line and every `rendezvous` adds a word to one summary, and
-//! the summary is the last thing this agent says, because a parent reads back
-//! the last thing its child said.
+//! parent wrote, keeps its own session log, and starts children the same way
+//! its parent started it. The task is a script of one instruction per line.
+
 const std = @import("std");
 const chock_core = @import("chock-core");
 const chock_cost = @import("chock-cost");
@@ -342,8 +322,7 @@ const Agent = struct {
         } });
     }
 
-    /// End this agent last of all. Every agent writes one line into one order
-    /// file as its very last act, so the lines are a total order of endings.
+    /// Every agent writes one line into one order file as its very last act.
     fn tearDown(self: *Agent) void {
         if (self.table) |table| table.deinit();
         self.table = null;
@@ -387,8 +366,7 @@ const Agent = struct {
         try self.note(try std.fmt.allocPrint(self.arena, "joined={d}", .{finished.len}));
     }
 
-    /// Backed by the page allocator, never this agent's arena. A child's thread
-    /// allocates from it while another may be inside a spawn.
+    /// Backed by the page allocator, never this agent's arena.
     fn childTable(self: *Agent) !*subagent.Table {
         if (self.table) |one| return one;
         const table = try std.heap.page_allocator.create(subagent.Table);

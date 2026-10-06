@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
 
-/// One classic BPF instruction. The kernel reads this layout directly.
 pub const Insn = extern struct {
     code: u16,
     jt: u8,
@@ -16,49 +15,34 @@ pub const Prog = extern struct {
     filter: [*]const Insn,
 
     pub fn init(insns: []const Insn) Prog {
-        // A classic BPF program has a hard limit of 4096 instructions.
+        // Classic BPF has a hard limit of 4096 instructions.
         std.debug.assert(insns.len > 0);
         std.debug.assert(insns.len <= 4096);
         return .{ .len = @intCast(insns.len), .filter = insns.ptr };
     }
 };
 
-// The instruction classes and modes that this filter needs.
-// BPF_LD | BPF_W | BPF_ABS
 pub const LD_W_ABS: u16 = 0x00 | 0x00 | 0x20;
-// BPF_JMP | BPF_JEQ | BPF_K
 pub const JMP_JEQ_K: u16 = 0x05 | 0x10 | 0x00;
-// BPF_JMP | BPF_JGE | BPF_K
 pub const JMP_JGE_K: u16 = 0x05 | 0x30 | 0x00;
-// BPF_JMP | BPF_JA
 pub const JMP_JA: u16 = 0x05 | 0x00;
-// BPF_ALU | BPF_AND | BPF_K
 pub const ALU_AND_K: u16 = 0x04 | 0x50 | 0x00;
-// BPF_RET | BPF_K
 pub const RET_K: u16 = 0x06 | 0x00;
 
-/// An instruction with no jump.
 pub fn stmt(code: u16, k: u32) Insn {
     return .{ .code = code, .jt = 0, .jf = 0, .k = k };
 }
 
-/// A comparison. `jt` is the offset to take when true. `jf` is the offset when false.
-/// Both offsets count instructions from the one after this instruction.
+/// `jt` and `jf` are jump offsets, counted from the instruction after this one.
 pub fn jump(code: u16, k: u32, jt: u8, jf: u8) Insn {
     return .{ .code = code, .jt = jt, .jf = jf, .k = k };
 }
 
-// The layout of `struct seccomp_data`:
-//   int   nr;                       offset 0
-//   __u32 arch;                     offset 4
-//   __u64 instruction_pointer;      offset 8
-//   __u64 args[6];                  offset 16
+// struct seccomp_data: nr at 0, arch at 4, args start at 16.
 pub const offset_of_nr: u32 = 0;
 pub const offset_of_arch: u32 = 4;
 
-/// The offset of the low 32 bits of one argument.
-/// A classic BPF program loads 32 bits at a time, so a 64 bit argument is two loads.
-/// The low half is first on a little endian machine and second on a big endian machine.
+// A 64 bit argument is two 32 bit loads; the low half's position depends on endianness.
 pub fn offsetOfArgLow(index: u32) u32 {
     std.debug.assert(index < 6);
     const base = 16 + index * 8;
@@ -89,7 +73,6 @@ test "stmt sets the jump fields to zero and jump keeps them" {
 }
 
 test "the argument offsets follow the seccomp_data layout" {
-    // seccomp_data is nr, arch, instruction_pointer, then six arguments of eight bytes.
     try std.testing.expectEqual(@as(u32, 0), offset_of_nr);
     try std.testing.expectEqual(@as(u32, 4), offset_of_arch);
     try std.testing.expectEqual(@as(u32, 16), offsetOfArgLow(0));

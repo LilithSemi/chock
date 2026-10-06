@@ -10,8 +10,7 @@ const sandbox = @import("chock-sandbox");
 const Workspace = chock_workspace.Workspace;
 const git = chock_workspace.git;
 
-// Zig 0.16 has no argv a test can read, and the default test runner panics on
-// argv it does not know, so build.zig embeds the probe path at build time.
+// build.zig embeds the probe path, since the default test runner panics on an argv it does not know.
 const tools_probe_path = @import("tools_probe_path").tools_probe_path;
 
 fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
@@ -45,10 +44,7 @@ fn writeFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try file.writeStreamingAll(io, contents);
 }
 
-/// overlayfs leaves its own nested `work` directory behind with mode 0000, and
-/// `std.testing.tmpDir` cannot remove a directory it cannot read. Put the
-/// permission back before `tmpDir.cleanup` runs. Best effort: the directory is
-/// absent when no tool call reached a real overlay mount.
+/// overlayfs leaves its own nested `work` directory behind with mode 0000, which `tmpDir.cleanup` cannot remove.
 fn allowScratchCleanup(allocator: std.mem.Allocator, scratch_path: []const u8) void {
     const kernel_work_dir = std.fs.path.join(allocator, &.{ scratch_path, "work", "work" }) catch return;
     defer allocator.free(kernel_work_dir);
@@ -57,8 +53,7 @@ fn allowScratchCleanup(allocator: std.mem.Allocator, scratch_path: []const u8) v
     _ = linux.chmod(path_z.ptr, 0o700);
 }
 
-/// A project with no git of its own, so `Workspace.open` picks the overlay
-/// kind.
+/// A project with no git of its own, so `Workspace.open` picks the overlay kind.
 const PlainProject = struct {
     allocator: std.mem.Allocator,
     root_path: [:0]const u8,
@@ -94,8 +89,7 @@ const PlainProject = struct {
     }
 };
 
-/// A project that is a real git repository, so `Workspace.open` picks the
-/// worktree kind. Only the git tests need this.
+/// A project that is a real git repository, so `Workspace.open` picks the worktree kind.
 const GitProject = struct {
     allocator: std.mem.Allocator,
     root_path: [:0]const u8,
@@ -216,8 +210,7 @@ fn joinLines(allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// `fault` is set only when the probe could not run the call at all. Every test
-/// below reads that as a hard failure and never as a tool call outcome.
+/// `fault` is set only when the probe could not run the call at all, never for a tool call outcome.
 const ProbeOutcome = struct {
     fault: ?u8,
     is_error: bool,
@@ -253,26 +246,20 @@ const ProbeOptions = struct {
     timeout_ms: ?u64 = null,
     memory_dir: ?[]const u8 = null,
     store_paths: []const []const u8 = &.{},
-    /// Null is a session with no cache, which is the state that made `zig
-    /// build-exe` fail with `AppDataDirUnavailable`.
+    /// Null is a session with no cache, the state that made `zig build-exe` fail with `AppDataDirUnavailable`.
     cache_dir: ?[]const u8 = null,
     cancel_after_ms: ?u64 = null,
-    /// Null is a session with no scratchpad, which is the state that made
-    /// `make` refuse to run.
+    /// Null is a session with no scratchpad, the state that made `make` refuse to run.
     scratch_dir: ?[]const u8 = null,
-    /// Entries added to the `sandbox.Config.env` the workspace built, as
-    /// `KEY=VALUE`. This is how a test stands in for a dev shell.
+    /// Entries added to the `sandbox.Config.env` the workspace built, as `KEY=VALUE`.
     extra_sandbox_env: []const []const u8 = &.{},
-    /// The cap on the tmpfs `TMPDIR` names. A tmpfs page is a memory page, so a
-    /// test that has to fill the area names a small number.
+    /// The cap on the tmpfs `TMPDIR` names, in bytes.
     scratch_bytes: ?u64 = null,
     workspace_dir: ?[]const u8 = null,
     workspace_floor_bytes: ?u64 = null,
     approval_wait_ms: ?u64 = null,
     routed: bool = false,
-    /// One secret the probe grants to every call it makes. What is under test is
-    /// what `runCommand` does with a grant, so the probe answers the seam itself
-    /// rather than reading a policy and a store.
+    /// One secret the probe grants to every call it makes.
     secret: ?Secret = null,
 
     const Secret = struct {
@@ -354,9 +341,7 @@ fn runToolCallWith(
         if (options.routed) "routed" else "", if (options.secret) |one| one.bind else "", if (options.secret) |one| one.variable else "", if (options.secret) |one| one.value else "",
     });
 
-    // `zig build` prints a `failed command:` line for any run step that writes
-    // to standard error, whatever its exit status. Everything a test reads
-    // travels on standard output instead.
+    // `zig build` fails on any run step that writes to standard error, so a test reads standard output only.
     var child = try std.process.spawn(std.testing.io, .{
         .argv = argv.items,
         .stdin = .ignore,
@@ -386,9 +371,7 @@ fn readAllStdout(allocator: std.mem.Allocator, child: *std.process.Child) ![]u8 
     return buf.toOwnedSlice(allocator);
 }
 
-/// A boundary that was never reached is not a boundary that held, so a machine
-/// that gives no sandbox skips here. The CI job named "Sandbox" fails rather
-/// than skips.
+/// A machine that gives no sandbox skips here. The CI job named "Sandbox" fails rather than skips.
 fn parseProbeOutcome(allocator: std.mem.Allocator, term: std.process.Child.Term, stdout: []u8) !ProbeOutcome {
     defer allocator.free(stdout);
 
@@ -472,8 +455,7 @@ fn countField(fields: *std.mem.TokenIterator(u8, .scalar), name: []const u8) !u6
     return std.fmt.parseInt(u64, field[name.len..], 10);
 }
 
-/// A real 1x1 PNG, not a signature with rubbish after it, so these tests ask
-/// what a screenshot would do.
+/// A real 1x1 PNG, so these tests ask what a screenshot would do.
 const png_1x1 = [_]u8{
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
     0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
@@ -683,10 +665,7 @@ test "run_command runs in the workspace and returns what the program wrote" {
 }
 
 test "a routed tool call gives the program a resolver it can read" {
-    // Every ordinary program finds the router's resolver through
-    // `/etc/resolv.conf` and through nothing else. A routed call that leaves it
-    // unreadable fails as "failed to resolve address", several steps from its
-    // cause.
+    // Every ordinary program finds the router's resolver through `/etc/resolv.conf` and nothing else.
     const allocator = std.testing.allocator;
     if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
 
@@ -731,14 +710,10 @@ fn hostHasTrustStore() bool {
 }
 
 test "a routed tool call can read the trust store it was given" {
-    // On a machine with Nix the sandbox binds `/nix/store` and no `/etc`, and
-    // the host bundle resolves into the store, where no dev shell closure names
-    // it. Bind the host path by its resolved name: a mount source is opened
-    // with `O_NOFOLLOW` and the usual path is a link.
+    // The host bundle resolves into the store, so the host path binds by its resolved name, not the link.
     const allocator = std.testing.allocator;
     if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
-    // A Nix build sandbox holds no `/etc/ssl`, so it has no bundle to place and
-    // this test skips there.
+    // A Nix build sandbox holds no `/etc/ssl`, so it has no bundle to place.
     if (!hostHasTrustStore()) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
@@ -772,14 +747,9 @@ test "a routed tool call can read the trust store it was given" {
 
     try std.testing.expectEqual(@as(?u8, null), outcome.fault);
     try std.testing.expect(!outcome.is_error);
-    // The first line of an NSS format bundle is a friendly name, so the header
-    // says this is certificates and not any file that was placed.
     try std.testing.expect(std.mem.indexOf(u8, outcome.output, "BEGIN CERTIFICATE") != null);
 
-    // A client that never heard of `SSL_CERT_FILE` still has to find a bundle
-    // at the conventional path, and a link placed before the `/etc` overlay
-    // would be shadowed. The path is spelled here so that renaming a constant
-    // in the driver cannot rename what this test asks for.
+    // The conventional path is spelled here so that renaming a constant in the driver cannot rename it.
     {
         var conventional_root_tmp = std.testing.tmpDir(.{});
         defer conventional_root_tmp.cleanup();
@@ -808,18 +778,12 @@ test "a routed tool call can read the trust store it was given" {
 }
 
 test "run_command cannot reach the home directory" {
-    // `cat` on a path that exists nowhere fails with the same ENOENT whether or
-    // not `/home` is mounted, so this targets the real `$HOME`. A mounted
-    // `/home` would answer "Is a directory" instead.
+    // This targets the real `$HOME`. A mounted `/home` would answer "Is a directory" instead.
     const allocator = std.testing.allocator;
 
-    // A skip carries no message, here or anywhere else in this suite: `zig
-    // build` prints a `failed command:` line for any run step that wrote to
-    // standard error, whatever its exit status.
+    // A skip carries no message in this suite: `zig build` fails on any run step that writes to standard error.
     const home = std.process.Environ.getPosix(std.testing.environ, "HOME") orelse return error.SkipZigTest;
-    // That `$HOME` exists is the whole premise. A `startsWith(home, "/home/")`
-    // test used to stand here and removed coverage on every host that puts a
-    // home directory somewhere else, so do not put it back.
+    // Do not add a `startsWith(home, "/home/")` check: it removed coverage on hosts that put it elsewhere.
     _ = std.Io.Dir.cwd().statFile(std.testing.io, home, .{}) catch return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
@@ -842,13 +806,11 @@ test "run_command cannot reach the home directory" {
 
     try std.testing.expectEqual(@as(?u8, null), outcome.fault);
     try std.testing.expect(outcome.is_error);
-    // Two layers can refuse this and either answer is right: the path is
-    // outside the mount tree, and Landlock can refuse it before that matters.
+    // Either Landlock or the mount tree can refuse this, and either answer is right.
     const denied = std.mem.indexOf(u8, outcome.output, "No such file or directory") != null or
         std.mem.indexOf(u8, outcome.output, "Permission denied") != null;
     try std.testing.expect(denied);
-    // "Is a directory" would mean the path resolved and was read far enough to
-    // learn its kind.
+    // "Is a directory" would mean the path resolved far enough to learn its kind.
     try std.testing.expect(std.mem.indexOf(u8, outcome.output, "Is a directory") == null);
 }
 
@@ -881,8 +843,7 @@ test "a tool call reaches the toolchain the session named and nothing beside it"
     defer allocator.free(unnamed_file);
     try writeFile(std.testing.io, unnamed_file, "unnamed-marker\n");
 
-    // The Nix store stays in the set because `cat` itself lives there on this
-    // host.
+    // The Nix store stays in the set because `cat` itself lives there on this host.
     const store_paths = [_][]const u8{ "/nix/store", named };
 
     var root_tmp = std.testing.tmpDir(.{});
@@ -920,10 +881,7 @@ test "a tool call reaches the toolchain the session named and nothing beside it"
 }
 
 test "a toolchain path that is one file is bound like any other" {
-    // `landlock_add_rule` refuses a directory right such as `read_dir` over a
-    // regular file and answers EINVAL, so one file in the mount set took the
-    // whole sandbox down. A Nix dev shell closure always holds such paths: the
-    // stdenv setup hooks are single files.
+    // `landlock_add_rule` answers EINVAL for a directory right over a regular file, which a dev shell closure always holds.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1009,8 +967,7 @@ fn findOnHostPath(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     return null;
 }
 
-/// No word given below holds a quotation mark or a backslash, so nothing here
-/// escapes one. A word that did would need a real JSON writer.
+/// No word given below holds a quotation mark or a backslash, so nothing here escapes one.
 fn argvJson(allocator: std.mem.Allocator, words: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -1071,9 +1028,7 @@ test "a launcher with an absolute path to a shell does not produce a shell" {
 }
 
 test "find -exec does not produce a shell, and an ordinary find still runs" {
-    // `find` execs the program in `-exec` itself, so `isShellName`,
-    // `isLauncherName` and `leavesProject` all read `argv[0]`, which is `find`,
-    // and all three say yes.
+    // `find` execs the program in `-exec` itself, so every check reads `argv[0]`, which is `find`.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1106,9 +1061,7 @@ test "find -exec does not produce a shell, and an ordinary find still runs" {
         try std.testing.expect(std.mem.indexOf(u8, outcome.output, "findable.txt") != null);
     }
 
-    // `-ok` and `-okdir` ask on standard input before they run the program. A
-    // tool call has no standard input, so a call that reached `find` would
-    // spend the whole deadline rather than answer.
+    // `-ok` and `-okdir` ask on standard input, which a tool call has none of.
     for ([_][]const u8{ "-exec", "-execdir", "-ok", "-okdir" }) |option| {
         const arguments = try argvJson(allocator, &.{
             "find", ".",                                           "-maxdepth", "0", option, shell,
@@ -1132,9 +1085,7 @@ test "find -exec does not produce a shell, and an ordinary find still runs" {
 }
 
 test "a program built in the workspace runs by its path, and one outside the project does not" {
-    // The program is a file in the workspace with a shebang line naming the
-    // host's own `cat`, which is in the store and so already inside the
-    // sandbox. Running it prints the file itself.
+    // The shebang names the host's own `cat`, already inside the sandbox from the store.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1216,10 +1167,7 @@ test "a program built in the workspace runs by its path, and one outside the pro
     }
 }
 
-/// What is left in the sandbox root on the host, counted from outside the
-/// sandbox. Null when the root directory itself is gone. The root belongs to
-/// the session, not to the call: `src/run.zig` builds it once and every tool
-/// call spawns into it.
+/// What is left in the sandbox root on the host. Null when the root directory itself is gone.
 fn rootEntryCount(root: []const u8) ?usize {
     var dir = std.Io.Dir.openDirAbsolute(std.testing.io, root, .{ .iterate = true }) catch return null;
     defer dir.close(std.testing.io);
@@ -1252,9 +1200,7 @@ test "regression: a tool call that fails in setup leaves the session root fit fo
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_path = try absoluteDirPath(&root_buffer, root_tmp.dir.handle);
 
-    // A toolchain path that is not on this host at all, so the call fails at
-    // the `mount_tree` step before the program runs. A dev shell store path the
-    // Nix garbage collector took away leaves exactly this.
+    // A dev shell store path the Nix garbage collector took away fails at the `mount_tree` step.
     const gone = try std.fs.path.join(allocator, &.{ ov.project, "a-toolchain-path-that-is-not-here" });
     defer allocator.free(gone);
 
@@ -1283,10 +1229,7 @@ test "regression: a tool call that fails in setup leaves the session root fit fo
 }
 
 test "an ordinary tool failure leaves the session root fit for the next call too" {
-    // A program that exits non zero and a program the deadline stops both give
-    // `Sandbox.spawn` a real `Term`, so neither reaches the cleanup path.
-    // `namespace.makePath` treats an existing mount target as already made, so
-    // the call after them builds on that skeleton.
+    // `namespace.makePath` treats an existing mount target as already made, so the next call builds on it.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1532,8 +1475,7 @@ test "a tool result that is too large is truncated and says so" {
     const big_path = try std.fs.path.join(allocator, &.{ ov.project, "big.txt" });
     defer allocator.free(big_path);
 
-    // Comfortably past `max_output_bytes` (64 KiB), and comfortably inside the
-    // 1 MiB pipe `spawnCapturing` grows.
+    // Past `max_output_bytes` (64 KiB), inside the 1 MiB pipe `spawnCapturing` grows.
     const big_size = 200 * 1024;
     {
         var file = try std.Io.Dir.createFileAbsolute(std.testing.io, big_path, .{});
@@ -1560,10 +1502,7 @@ test "a tool result that is too large is truncated and says so" {
 }
 
 test "a command that writes far more than any buffer does not deadlock" {
-    // A program that writes more than the pipe holds blocks on its own write
-    // while the parent waits for it to exit, and neither side ever runs again.
-    // 4 MB is past both the pipe and `max_output_bytes`, which is why the 200
-    // KB test above never found this.
+    // A program that writes more than the pipe holds blocks on its own write while the parent waits to reap it.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1594,10 +1533,7 @@ test "a command that writes far more than any buffer does not deadlock" {
     var root_tmp = std.testing.tmpDir(.{});
     defer root_tmp.cleanup();
 
-    // Returning at all is the whole proof. Zig's own test runner carries no per
-    // test timeout. An assertion on wall clock time adds nothing and reads the
-    // machine and its load: three such tests in this project were removed for
-    // failing on unchanged code.
+    // Returning at all is the proof: Zig's test runner carries no per test timeout.
     var outcome = try runToolCall(allocator, &workspace, root_tmp, "run_command", "{\"argv\":[\"cat\",\"huge.txt\"]}");
     defer outcome.deinit(allocator);
 
@@ -1608,9 +1544,7 @@ test "a command that writes far more than any buffer does not deadlock" {
 }
 
 test "a command that outlives its timeout is stopped and says so" {
-    // 300 ms is comfortably longer than the fork this call needs and
-    // comfortably shorter than the 5 second sleep it kills, so neither end is a
-    // race.
+    // 300 ms is longer than the fork this call needs and shorter than the 5 second sleep it kills.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1636,8 +1570,7 @@ test "a command that outlives its timeout is stopped and says so" {
 
     try std.testing.expectEqual(@as(?u8, null), outcome.fault);
     try std.testing.expect(outcome.is_error);
-    // Only the path that stops the call writes that message. A sleep that ran
-    // to its own end exits zero and produces no such line.
+    // Only the path that stops the call writes that message. A sleep that ran to its end would not.
     try std.testing.expect(std.mem.indexOf(u8, outcome.output, "[chock: command exceeded its 300ms limit and was stopped]") != null);
 }
 
@@ -1754,18 +1687,14 @@ test "run_command can git add and git commit through the scratch object store, a
 }
 
 test "a bare git commit in a run_command tool call works with no identity in the project, and it is Chock's own" {
-    // The project states no identity of its own, the same shape a real project
-    // has: a person keeps theirs in `~/.gitconfig`, which the sandbox has no
-    // `HOME` to find and no mount to reach.
+    // A real project's identity lives in `~/.gitconfig`, which the sandbox has no `HOME` to find.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var project = try GitProject.init(allocator, tmp);
     defer project.deinit();
 
-    // `GitProject.init` has to state an identity to make its first commit, so
-    // taking it away again is what leaves the sandbox as the only source of
-    // one.
+    // `GitProject.init` states an identity to make its first commit. This takes it away again.
     for ([_][]const u8{ "user.email", "user.name" }) |name| {
         var unset = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "config", "--unset", name }, null);
         defer unset.deinit(allocator);
@@ -1851,8 +1780,7 @@ test "read_file on a binary file gives a description, and the session never sees
     const ov = workspace.kind.overlay;
     const blob_path = try std.fs.path.join(allocator, &.{ ov.project, "object.bin" });
     defer allocator.free(blob_path);
-    // The first bytes of a real zlib stream. 0xff can start no UTF-8 sequence
-    // at all.
+    // The first bytes of a real zlib stream. 0xff can start no UTF-8 sequence.
     const compressed = [_]u8{ 0x78, 0x9c, 0x4b, 0xca, 0xc9, 0xff, 0xfe, 0x80, 0x81, 0x00 };
     try writeFile(std.testing.io, blob_path, &compressed);
 
@@ -1880,10 +1808,7 @@ fn readHostFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(1024 * 1024));
 }
 
-/// For the overlay kind a host read of `<project>/<path>` answers with the file
-/// as it was before the session, whatever the agent did, so only the merged
-/// view is an honest answer. A worktree kind is a real checkout the sandbox
-/// binds. The result has `read_file`'s header line taken off.
+/// For the overlay kind a host read of `<project>/<path>` answers with the file as it was before the session.
 fn readThroughSandbox(
     allocator: std.mem.Allocator,
     workspace: *const Workspace,
@@ -2080,8 +2005,7 @@ test "write_file cannot write to an absolute path outside the workspace" {
 }
 
 test "write_file cannot write through a symbolic link that points outside the workspace" {
-    // `cp` follows a symlink at the destination, so the link resolves inside
-    // the sandbox and lands on nothing the mount tree holds.
+    // `cp` follows a symlink at the destination, which resolves inside the sandbox.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2501,8 +2425,7 @@ test "grep that matches nothing is not a failed tool call" {
 }
 
 test "a match inside a binary file never puts the bytes of that file in the result" {
-    // `grep -I` skips a file it reads as binary, so the model is never handed a
-    // run of bytes that would change the shape of the content part on the wire.
+    // `grep -I` skips a file it reads as binary, so the model is never handed raw bytes.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2563,13 +2486,10 @@ test "grep cannot read a file outside the workspace" {
     try std.testing.expect(std.mem.indexOf(u8, outcome.output, "Is a directory") == null);
 }
 
-/// Fails the test when the result carries no hash, rather than returning an
-/// empty string that would read as "no hash given".
+/// Fails the test when the result carries no hash, rather than returning an empty string.
 fn hashFromRead(output: []const u8) ![]const u8 {
     const marker = "file_hash ";
     const start = std.mem.indexOf(u8, output, marker) orelse {
-        // Control reaches here only when `output` holds no `marker`, so this
-        // comparison cannot hold and `expectEqualStrings` prints both sides.
         try std.testing.expectEqualStrings(marker, output);
         return error.ReadResultCarriesNoFileHash;
     };
@@ -2724,9 +2644,7 @@ test "a read that was cut short carries no hash, so an edit cannot be anchored t
     try std.testing.expect(std.mem.indexOf(u8, read.output, "of a larger file") != null);
 }
 
-/// A knowledgebase directory, and a sentinel file in its own parent. A tool
-/// call that reached one path up from where it may write would change the
-/// sentinel, and every test below reads it back.
+/// A knowledgebase directory, with a sentinel file in its own parent that every test below reads back.
 const Knowledgebase = struct {
     allocator: std.mem.Allocator,
     dir: [:0]const u8,
@@ -2924,8 +2842,7 @@ test "a tool call that may write a note still cannot write anywhere else" {
     try kb.expectOutsideUntouched(allocator);
     try std.testing.expectEqual(@as(usize, 1), kb.count());
 
-    // The control comes first: a `touch` that failed because the program is
-    // missing would read exactly like a boundary holding.
+    // The control comes first: a `touch` that failed because the program is missing reads the same way.
     {
         var root_tmp = std.testing.tmpDir(.{});
         defer root_tmp.cleanup();
@@ -3031,9 +2948,7 @@ test "the knowledgebase is not even visible to an ordinary tool call" {
         try std.testing.expect(!wrote.is_error);
     }
 
-    // The control: the same path is reachable from a `read_memory` call with
-    // the same `memory_dir`, so the refusal after this is about which call
-    // carries the mount.
+    // The control: the same path is reachable from a `read_memory` call with the same `memory_dir`.
     {
         var read_tmp = std.testing.tmpDir(.{});
         defer read_tmp.cleanup();
@@ -3336,8 +3251,7 @@ test "an instruction file that says the agent may push changes neither the polic
     defer pushed.deinit(allocator);
     try std.testing.expectEqual(@as(?u8, null), pushed.fault);
     try std.testing.expect(pushed.is_error);
-    // A refusal because the program was missing, or because `run_command` is
-    // broken, would read the same from `is_error` alone.
+    // A refusal because the program was missing would read the same from `is_error` alone.
     try std.testing.expect(std.mem.indexOf(u8, pushed.output, "was not found on the host PATH") == null);
     try std.testing.expect(std.mem.indexOf(u8, pushed.output, "unable to access") != null);
 }
@@ -3352,8 +3266,7 @@ test "the count per project counts names, and correcting a note is never refused
     var kb = try Knowledgebase.init(allocator, tmp);
     defer kb.deinit();
 
-    // Fill it to the cap from the host, which is far cheaper than driving the
-    // sandbox once per note and pins the same number.
+    // Fill it to the cap from the host, far cheaper than driving the sandbox once per note.
     var index: usize = 0;
     while (index < chock_core.memory.max_entries) : (index += 1) {
         var name_buffer: [32]u8 = undefined;
@@ -3474,9 +3387,7 @@ test "a note at the version cap is refused, and no version of it is dropped to m
     try std.testing.expect(std.mem.indexOf(u8, after, "ONE TOO MANY") == null);
 }
 
-/// A toolchain cache directory, with a sentinel file in its own parent. A tool
-/// call that reached one path up from where it may write would change the
-/// sentinel, and every test below reads it back.
+/// A toolchain cache directory, with a sentinel file in its own parent that every test below reads back.
 const ToolchainCache = struct {
     allocator: std.mem.Allocator,
     dir: [:0]const u8,
@@ -3542,8 +3453,7 @@ test "run_command writes into the toolchain cache, and a session with no cache h
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
 
-    // `touch` creates no directory, so a call that works here also says the
-    // layout is really there.
+    // `touch` creates no directory, so a call that works here says the layout is really there.
     const marker = chock_core.cache.home_dir ++ "/marker";
     {
         var root_tmp = std.testing.tmpDir(.{});
@@ -3602,9 +3512,7 @@ test "the cache environment reaches the program, and nothing but run_command car
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
 
-    // `printenv` prints what `execve` really carried. `env` prints the same
-    // thing and is refused, because `launcher_names` refuses a program launcher
-    // by name whatever its arguments are.
+    // `env` is refused because `launcher_names` refuses a program launcher by name whatever its arguments are.
     {
         var root_tmp = std.testing.tmpDir(.{});
         defer root_tmp.cleanup();
@@ -3691,13 +3599,7 @@ test "the cache environment reaches the program, and nothing but run_command car
     try cache.expectOutsideUntouched(allocator);
 }
 
-/// True when a program inside the sandbox can reparent a file. No compiler
-/// finishes without this: Zig renames a finished directory from
-/// `<cache>/zig/tmp` into `<cache>/zig/o`, and Cargo, Go and ccache do the same
-/// shape of thing. Landlock governs it with `LANDLOCK_ACCESS_FS_REFER`, which
-/// the sandbox asks for, but some environments answer `EXDEV` for every
-/// reparent inside a Landlock domain anyway. The build sandbox `nix flake
-/// check` runs this package in is one.
+/// True when a program inside the sandbox can reparent a file, which every compiler toolchain needs.
 fn cacheCanReparent(
     allocator: std.mem.Allocator,
     workspace: *const Workspace,
@@ -3712,8 +3614,7 @@ fn cacheCanReparent(
         .{ cache_dir, chock_core.cache.home_leaf },
     );
 
-    // Longest first: the removal below walks this list in order, so a directory
-    // is always empty when it is reached.
+    // Longest first, so the removal below finds each directory already empty.
     var source_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const host_source_dir = try std.fmt.bufPrintZ(&source_dir_buffer, "{s}/from", .{host_root});
     var target_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -3724,8 +3625,7 @@ fn cacheCanReparent(
     const host_target = try std.fmt.bufPrintZ(&target_buffer, "{s}/f", .{host_target_dir});
 
     try makeDir(host_root);
-    // The cache directory must be left exactly as it was found, because the
-    // test that calls this counts what is in it.
+    // The cache directory must be left exactly as it was found: the test counts what is in it.
     defer {
         _ = linux.unlinkat(linux.AT.FDCWD, host_target.ptr, 0);
         _ = linux.unlinkat(linux.AT.FDCWD, host_source.ptr, 0);
@@ -3759,9 +3659,7 @@ fn cacheCanReparent(
     try std.testing.expectEqual(@as(?u8, null), outcome.fault);
     if (!outcome.is_error) return true;
 
-    // Only the one refusal this is about answers no. A broken probe that
-    // answered no would skip the test below on every machine and nobody would
-    // see it.
+    // Only the one refusal this is about answers no, or a broken probe would skip the test below unseen.
     if (std.mem.indexOf(u8, outcome.output, "Invalid cross-device link") != null) return false;
     try std.testing.expectEqualStrings("a hard link between two directories of the cache", outcome.output);
     return error.TheReparentProbeFailedForSomeOtherReason;
@@ -3846,10 +3744,7 @@ test "a real compiler builds inside the sandbox, and a second session reuses wha
     try cache.expectOutsideUntouched(allocator);
 }
 
-/// The dependency package the test below declares, packed into a real tarball.
-/// Built here and not by `tar`, because the test must need no program outside
-/// this project's dev shell and `std.tar.Writer` writes the same bytes on every
-/// machine.
+/// The dependency package the test below declares, packed into a real tarball with `std.tar.Writer`.
 const dep_manifest =
     \\.{
     \\    .name = .dep,
@@ -3875,9 +3770,7 @@ const dep_source =
     \\
 ;
 
-/// The hash Zig computes for that tarball, stable because every header field
-/// here is fixed. A Zig that computes a different one fails with its own
-/// message naming the hash it wants, so the repair is one line.
+/// The hash Zig computes for that tarball, stable because every header field here is fixed.
 const dep_hash = "dep-0.1.0-b7tAH0IBAADnn3sMMU6ZIv4x0MC8pzl33l8zFmR786Hs";
 
 fn writeDependencyTarball(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -3921,9 +3814,7 @@ test "a project with a declared dependency builds inside the sandbox, resolved o
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A git project, so the workspace is a worktree and a real directory on the
-    // host. An overlay workspace's merged view exists only inside the sandbox's
-    // own mount namespace, so the harness cannot run a fetch against one.
+    // A git project, so the workspace is a worktree and a real directory on the host.
     var project = try GitProject.init(allocator, tmp);
     defer project.deinit();
     defer allowScratchCleanup(allocator, project.scratch_path);
@@ -3933,8 +3824,7 @@ test "a project with a declared dependency builds inside the sandbox, resolved o
     var tmp_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = try absoluteDirPath(&tmp_buffer, tmp.dir.handle);
 
-    // The dependency lives outside the project, so the sandbox mounts nothing
-    // that holds it and only the harness on the host can reach the tarball.
+    // The dependency lives outside the project, so only the harness on the host can reach the tarball.
     const tarball_path = try std.fmt.allocPrint(allocator, "{s}/dep.tar", .{tmp_path});
     defer allocator.free(tarball_path);
     try writeDependencyTarball(allocator, tarball_path);
@@ -3992,8 +3882,7 @@ test "a project with a declared dependency builds inside the sandbox, resolved o
             \\
         );
 
-        // A worktree carries committed state and nothing else, so the project
-        // has to be committed before the workspace is built from it.
+        // A worktree carries committed state, so the project is committed before the workspace is built.
         var added = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "add", "-A" }, null);
         defer added.deinit(allocator);
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, added.term);
@@ -4216,8 +4105,7 @@ test "a cancel from a signal handler ends a call that is already running" {
     try std.testing.expect(std.mem.indexOf(u8, outcome.output, "exceeded its") == null);
 }
 
-/// A session scratchpad on the host, in the shape `chock_core.scratchpad`
-/// builds: `scratch/` beside `tasks/`, and a sentinel outside both.
+/// A session scratchpad on the host, in the shape `chock_core.scratchpad` builds.
 const Scratchpad = struct {
     allocator: std.mem.Allocator,
     dir: [:0]const u8,
@@ -4230,9 +4118,7 @@ const Scratchpad = struct {
 
         var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const dir = try std.fmt.bufPrintZ(&dir_buffer, "{s}/scratchpad", .{tmp_path});
-        // The library builds the layout, never this test: a second spelling of
-        // it here is how a test starts passing against a tree production never
-        // makes.
+        // The library builds the layout, never this test.
         try chock_core.scratchpad.makeLayout(std.testing.io, dir, null);
 
         var tasks_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -4262,10 +4148,7 @@ const Scratchpad = struct {
 };
 
 test "a real make reads the TMPDIR a tool call is given, and refuses the one a dev shell states" {
-    // A dev shell exports `TMPDIR=/tmp/nix-shell.XXXX`, `src/run.zig` copies
-    // every dev shell variable into the sandbox environment, and the sandbox
-    // mounts no such path, so `make` refuses to run. Both halves below run a
-    // real `make` against a real Makefile.
+    // A dev shell exports `TMPDIR=/tmp/nix-shell.XXXX`, and the sandbox mounts no such path.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4297,8 +4180,7 @@ test "a real make reads the TMPDIR a tool call is given, and refuses the one a d
     );
     defer without.deinit(allocator);
     try std.testing.expectEqual(@as(?u8, null), without.fault);
-    // `make` names the variable in every language it prints in, so this holds
-    // whatever locale the machine has.
+    // `make` names the variable in every language it prints in, so this holds in any locale.
     try std.testing.expect(std.mem.indexOf(u8, without.output, "TMPDIR") != null);
 
     var root_tmp = std.testing.tmpDir(.{});
@@ -4357,15 +4239,11 @@ test "the scratchpad is writable, the task directory is not, and the harness sti
     defer allocator.free(record);
     const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, record, allocator, .limited(4096));
     defer allocator.free(written);
-    // A background task runs its tool call after the call that started it has
-    // answered, so no exit status carries a machine that gives no sandbox this
-    // far. What the harness wrote into the task's own file does.
+    // A background task runs its tool call after the call that started it has answered.
     if (std.mem.indexOf(u8, written, "NamespaceFailed") != null) return error.SkipZigTest;
     try std.testing.expectEqualStrings("the build failed\n", written);
 
-    // `cp` is a real program in the real sandbox, so what refuses this is the
-    // read only bind mount and the Landlock rule over it, and not a check in
-    // Chock's own code.
+    // `cp` is a real program in the real sandbox. The read only bind mount and its Landlock rule refuse this.
     const forge = try std.fmt.allocPrint(
         allocator,
         "{{\"argv\":[\"cp\",\"forged.txt\",\"{s}/task-01.out\"]}}",
@@ -4421,9 +4299,7 @@ test "the scratchpad is writable, the task directory is not, and the harness sti
 }
 
 test "a real command that fills the capped area is stopped, and the message says the disk is not full" {
-    // A program that fills a capped tmpfs gets `ENOSPC` and prints "No space
-    // left on device", and a person who reads only that goes and looks at their
-    // own disk and finds it fine.
+    // A program that fills a capped tmpfs gets `ENOSPC` and prints "No space left on device".
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4436,9 +4312,7 @@ test "a real command that fills the capped area is stopped, and the message says
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
 
-    // Four mebibytes of source against a one mebibyte cap. Bytes and never a
-    // number of files: a file costs a whole page whatever is in it, and the
-    // machines this runs on have 64 KiB, 16 KiB and 4 KiB pages.
+    // Four mebibytes of source against a one mebibyte cap, counted in bytes and never a file count.
     const cap_bytes: u64 = 1 << 20;
     const source_bytes: usize = 4 << 20;
     const ov = workspace.kind.overlay;
@@ -4531,10 +4405,7 @@ test "a real command that fills the capped area is stopped, and the message says
 }
 
 test "a note survives the call that wrote it and a temporary file does not" {
-    // The notes half is a bind mount of a host directory, so what one call
-    // writes there is still there for the next. The capped half is a tmpfs
-    // mounted for one call, so what a call writes there goes with the mount
-    // namespace it lived in.
+    // The notes half is a bind mount of a host directory. The capped half is a tmpfs mounted for one call.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4636,9 +4507,7 @@ test "a session with no scratchpad gets no capped area, exactly as before the sp
 }
 
 test "a writing tool call is refused when the workspace filesystem is under its floor" {
-    // The floor is `maxInt`, so every real machine is under it whatever its
-    // disk holds. A number taken from the machine's own free space would pass
-    // or fail with the disk.
+    // The floor is `maxInt`, so every real machine is under it regardless of its disk.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4754,8 +4623,7 @@ test "a background command finishes past the bound that stops a foreground one" 
     try std.testing.expect(stopped.is_error);
     try std.testing.expect(std.mem.indexOf(u8, stopped.output, "exceeded its 300ms limit") != null);
 
-    // A task is bounded by `tasks.default_timeout_ns` instead. The probe waits
-    // for it, so the file below is there only if the command really finished.
+    // The probe waits for the task's own timeout, so the file below is there only if the command really finished.
     var root_tmp = std.testing.tmpDir(.{});
     defer root_tmp.cleanup();
     var backgrounded = try runToolCallWith(
@@ -4782,10 +4650,7 @@ test "a background command finishes past the bound that stops a foreground one" 
 }
 
 test "a routed background command keeps its trust store until its own thread builds the sandbox" {
-    // The call that starts a task stages the bundle under `TMPDIR` and binds
-    // it, and that frame deleted the file the moment `start` answered. The
-    // task's own thread then found no source, so the first background command
-    // of any session with a network rule died before it ran anything.
+    // The call that stages the bundle under `TMPDIR` deleted the file the moment `start` answered.
     const allocator = std.testing.allocator;
     if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
     if (!hostHasTrustStore()) return error.SkipZigTest;
@@ -4828,8 +4693,7 @@ test "a routed background command keeps its trust store until its own thread bui
     const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, record, allocator, .limited(4096));
     defer allocator.free(written);
 
-    // A sandbox that did not build says so in the file, and `grep -c` on a
-    // real bundle answers a count above zero.
+    // A sandbox that did not build says so in the file. `grep -c` on a real bundle answers above zero.
     try std.testing.expect(std.mem.indexOf(u8, written, "did not start") == null);
     const counted = std.fmt.parseInt(
         usize,
@@ -4951,8 +4815,7 @@ test "a secret bound as a file is in the sandbox, and the variable names its pat
 
         try std.testing.expectEqual(@as(?u8, null), outcome.fault);
         try std.testing.expect(!outcome.is_error);
-        // The file is there and holds the value, which is the whole point of the
-        // binding: a program that will not read a variable opens this instead.
+        // The file is there and holds the value, for a program that will not read a variable.
         try std.testing.expect(std.mem.indexOf(u8, outcome.output, value) != null);
     }
 
@@ -4960,8 +4823,7 @@ test "a secret bound as a file is in the sandbox, and the variable names its pat
         var root_tmp = std.testing.tmpDir(.{});
         defer root_tmp.cleanup();
 
-        // `printenv` and not `env`: `env` runs a program of its own, so it is on
-        // the launcher denylist.
+        // `printenv` and not `env`: `env` runs a program of its own, so it is on the launcher denylist.
         const printing = try std.fmt.allocPrint(
             allocator,
             "{{\"argv\":[\"printenv\",\"{s}\"]}}",
@@ -4977,8 +4839,7 @@ test "a secret bound as a file is in the sandbox, and the variable names its pat
         try std.testing.expectEqual(@as(?u8, null), outcome.fault);
         try std.testing.expect(!outcome.is_error);
 
-        // The variable names the path and never the value, which is what makes a
-        // file binding different from an env one.
+        // The variable names the path and never the value, unlike an env binding.
         try std.testing.expect(std.mem.indexOf(u8, outcome.output, inside) != null);
         try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, outcome.output, value));
     }
@@ -5062,9 +4923,7 @@ test "the secret file belongs to one call, and the next call cannot read it" {
         var root_tmp = std.testing.tmpDir(.{});
         defer root_tmp.cleanup();
 
-        // The same path, the same command, and no grant. Nothing is mounted
-        // there, so the value from the call before it is not reachable. A file
-        // that outlived its call would be readable by every later one.
+        // The same path, the same command, and no grant: nothing is mounted there any more.
         var ungranted = try runToolCallWith(allocator, &workspace, root_tmp, "run_command", arguments, .{});
         defer ungranted.deinit(allocator);
 

@@ -1,53 +1,4 @@
-//! `chock migrate`: read another AI coding harness's configuration and write
-//! a `chock.zon` for it. One shot and offline: no session, no model, no
-//! network, no sandbox.
-//!
-//! ```
-//! chock migrate [--from <harness>] [--project <dir>] [--print]
-//! ```
-//!
-//! This file builds the command, the `Found` value every harness reader hands
-//! back, the writer that turns one into `chock.zon` text, and the report a
-//! person reads on every run. `readers` below names the five harnesses this
-//! build reads, and every other `--from` is refused against that list.
-//!
-//! ## The translation, which is the whole point
-//!
-//! A foreign permission is read against a threat model this build never
-//! measured, so nothing it allowed becomes an allow here:
-//!
-//! - a `deny` carries as `.deny`. A deny only narrows, in any threat model.
-//! - an `allow` carries as `.ask`, never `.allow`.
-//! - an `ask` carries as `.ask`, which is the same row an allow gets but not
-//!   the same fact: the report separates the two.
-//! - an MCP server becomes an `.mcp_servers` entry, and an `.ask` row beside
-//!   it: running a third party program is exactly the kind of act an allow
-//!   must not carry silently.
-//! - an instruction file becomes a relative path in `.instructions`.
-//! - a hook, a plugin, a skill and a slash command are never carried. Each
-//!   goes into `Found.refused` with the reason, because Chock has no
-//!   mechanism that would run one safely.
-//! - a secret's value is never carried. Only an environment variable's own
-//!   name is: see `envName`.
-//!
-//! ## `--sessions` and `--memory`
-//!
-//! Both are off unless named, and both read the user's home directory
-//! directly, which every reader above deliberately does not: a transcript
-//! and a notebook are the user's own and live nowhere else, unlike a
-//! project's configuration. `--sessions` copies a transcript in as a new
-//! session log; `--memory` copies notes in as knowledgebase entries. See
-//! `migrate/transcript.zig` and `importMemory` below.
-//!
-//! ## Provenance
-//!
-//! A generated `chock.zon` is worth nothing to somebody checking it unless
-//! they can tell what it came from, and whether that source has since
-//! changed. So every reader names every file it read, in `Found.sources`,
-//! with the SHA-256 of the bytes it read: see `hashBytes`. `render` writes
-//! that list into a header comment before any block, so the file carries its
-//! own provenance wherever it travels, and `chock migrate` prints the same
-//! list in its report so it is visible even when the header is trimmed.
+//! `chock migrate`: read another AI coding harness's configuration and write a `chock.zon` for it.
 
 const std = @import("std");
 const chock_core = @import("chock-core");
@@ -100,36 +51,22 @@ const usage_text =
     \\
 ++ tty.options_text;
 
-/// One instruction file another harness named, and the harness that named
-/// it.
 pub const Source = struct {
     path: []const u8,
     harness: []const u8,
 };
 
-/// One file a reader read, relative to the project root, and the SHA-256 of
-/// the bytes it read, as 64 lower case hex characters. What lets somebody
-/// check a generated `chock.zon` against the project that produced it: run
-/// `sha256sum` on the same path, and compare.
 pub const ReadSource = struct {
     path: []const u8,
     hash: [64]u8,
 };
 
-/// The SHA-256 of `bytes`, as 64 lower case hex characters.
-///
-/// **Every reader calls this on every file it reads**, and puts the result in
-/// `Found.sources`. That is what makes provenance a property of `Found`
-/// rather than a habit one reader might keep and another forget.
 pub fn hashBytes(bytes: []const u8) [64]u8 {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-/// One MCP server another harness ran. `env` holds variable names only: a
-/// reader must call `envName` on whatever the source wrote and never keep
-/// the value half.
 pub const McpServer = struct {
     name: []const u8,
     command: []const u8,
@@ -138,25 +75,12 @@ pub const McpServer = struct {
     source_file: []const u8 = "",
 };
 
-/// What a foreign source said about one action. Kept as the source said it,
-/// so the report can tell an act that was narrowed from one that was already
-/// this narrow upstream.
 pub const Said = enum { allow, ask, deny };
 
-/// The policy row a foreign permission becomes. `.allow` is reachable only
-/// through `--permission`, which is a person saying in as many words that they
-/// read the source's grants and accept them. Nothing carries one by default.
 pub const Decision = enum { deny, ask, allow };
 
-/// A class of permission `--permission` can carry as `.allow`.
-///
-/// **`net.fetch` is here because `ask` is a refusal for a fetch.** Only
-/// `allow` reads a host, so a fetch rule written at `ask` is the same as no
-/// rule, and carrying one would be the inert output this file exists to avoid.
-/// See `docs/configure/actions.md`.
 pub const carryable = [_][]const u8{"net.fetch"};
 
-/// Whether `action` sits under one of the classes named on the command line.
 pub fn isCarried(action: []const u8, carry: []const []const u8) bool {
     for (carry) |class| {
         if (std.mem.eql(u8, action, class)) return true;
@@ -167,14 +91,11 @@ pub fn isCarried(action: []const u8, carry: []const []const u8) bool {
     return false;
 }
 
-/// One permission line a foreign source carried.
 pub const Hint = struct {
     action: []const u8,
     said: Said,
     source_file: []const u8,
 
-    /// `carry` holds the classes `--permission` named. An allow under one of
-    /// them is the only way a row reaches `.allow`.
     pub fn decision(self: Hint, carry: []const []const u8) Decision {
         return switch (self.said) {
             .deny => .deny,
@@ -183,22 +104,16 @@ pub const Hint = struct {
         };
     }
 
-    /// Whether this build wrote something narrower than the source did. An
-    /// `ask` upstream lands on `ask` here, so it was carried and not narrowed.
-    /// An allow the command line carried is not narrowed either.
     pub fn wasNarrowed(self: Hint, carry: []const []const u8) bool {
         return self.said == .allow and !isCarried(self.action, carry);
     }
 };
 
-/// Something a foreign source had that carries into no field here.
 pub const Refusal = struct {
     what: []const u8,
     reason: []const u8,
 };
 
-/// The neutral value every harness reader hands back. Nothing in this file
-/// reads a harness's own files; a reader does that and builds one of these.
 pub const Found = struct {
     sources: []const ReadSource = &.{}, // every file read, and the sha256 of its bytes
     instructions: []const Source = &.{}, // a path, plus which harness named it
@@ -207,8 +122,6 @@ pub const Found = struct {
     refused: []const Refusal = &.{}, // what was not carried and why
 };
 
-/// Every action name this build defines, as `docs/configure/actions.md` lists
-/// them. A `.*` entry stands for itself and for every name under it.
 const known_actions = [_][]const u8{
     "device.*",            "exec.devshell.*",  "exec.nix.store.*", "exec.path.*",
     "exec.unparsed",       "exec.workspace.*", "file.write",       "git.branch.delete",
@@ -219,13 +132,6 @@ const known_actions = [_][]const u8{
     "workspace.integrate",
 };
 
-/// Whether `action` is a name this build decides anything by.
-///
-/// **A row naming an action nothing here defines is worse than no row.** It
-/// reads as a carried stance and matches nothing, and a name carrying a `*`
-/// anywhere but the end is refused outright by the policy reader, so the whole
-/// generated file then fails to load. A reader that finds no equivalent must
-/// refuse instead: see `Refusal`.
 pub fn isKnownAction(action: []const u8) bool {
     for (known_actions) |known| {
         if (std.mem.eql(u8, action, known)) return true;
@@ -237,12 +143,6 @@ pub fn isKnownAction(action: []const u8) bool {
     return false;
 }
 
-/// Move every hint naming an action this build does not define into
-/// `refused`, so no reader can put an inert or unloadable row in the file.
-///
-/// A reader should refuse these itself and say something useful about the
-/// source's own spelling. This is the net under that, and it runs on every
-/// read: a reader added later cannot reintroduce the fault by forgetting.
 pub fn vet(arena: std.mem.Allocator, found: Found) std.mem.Allocator.Error!Found {
     var kept: std.ArrayList(Hint) = .empty;
     var refused: std.ArrayList(Refusal) = .empty;
@@ -265,14 +165,11 @@ pub fn vet(arena: std.mem.Allocator, found: Found) std.mem.Allocator.Error!Found
     return out;
 }
 
-/// One harness this build can read a configuration from.
 pub const Reader = struct {
     name: []const u8,
     read: *const fn (arena: std.mem.Allocator, io: std.Io, project_root: []const u8) anyerror!Found,
 };
 
-/// Every harness this build reads. Both `--from` and the bare command refuse
-/// against this list, and the refusal names every entry in it.
 pub const readers = [_]Reader{
     .{ .name = "claude-code", .read = @import("migrate/claude_code.zig").read },
     .{ .name = "codex", .read = @import("migrate/codex.zig").read },
@@ -281,9 +178,6 @@ pub const readers = [_]Reader{
     .{ .name = "oh-my-pi", .read = @import("migrate/oh_my_pi.zig").read },
 };
 
-/// The variable name half of a `NAME=value` pair a harness's own file wrote.
-/// The value is never returned. A pair with no `=` is already a bare name
-/// and comes back unchanged.
 pub fn envName(pair: []const u8) []const u8 {
     const split = std.mem.indexOfScalar(u8, pair, '=') orelse return pair;
     return pair[0..split];
@@ -359,8 +253,6 @@ pub fn main(
     );
 }
 
-/// Report, then write or print. Split from `main` so a test can drive it
-/// with a `Found` it built by hand, with no command line and no harness.
 fn finish(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -395,8 +287,7 @@ fn finish(
             .{path},
         );
         tty.out(.plain, "{s}", .{text});
-        // Never `finished`: a command that wrote nothing must not report
-        // success. See `src/main.zig`'s own top comment.
+        // Never finished: a command that wrote nothing must not report success.
         return Exit.usage.code();
     }
 
@@ -404,11 +295,6 @@ fn finish(
     return Exit.finished.code();
 }
 
-/// Create `path` and write `text` into it, unless it is already there.
-///
-/// **One call, not a check and then a create.** Two runs of `chock migrate`
-/// started together would otherwise both pass a check that ran before
-/// either wrote, and the second would overwrite what the first just made.
 fn writeChockZon(io: std.Io, path: []const u8, text: []const u8) !bool {
     var file = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true }) catch |err| switch (err) {
         error.PathAlreadyExists => return false,
@@ -419,9 +305,6 @@ fn writeChockZon(io: std.Io, path: []const u8, text: []const u8) !bool {
     return true;
 }
 
-/// The report every run prints, in three parts: what was carried as is,
-/// what was carried narrowed, and what was refused. `--sessions` and
-/// `--memory` each add their own heading, only when the flag was given.
 fn report(
     found: Found,
     carry: []const []const u8,
@@ -501,15 +384,6 @@ fn report(
     }
 }
 
-/// Turn a `Found` into `chock.zon` text, with a provenance header before any
-/// block. Every block a foreign source gave nothing for is left out, so a
-/// project that named one instruction file gets an `.instructions` block and
-/// nothing else.
-///
-/// `generated_on` is the date the migration ran, as `YYYY-MM-DD`, and
-/// nothing else: not a full timestamp, so two runs on one day render the same
-/// header. Both it and `version` are given rather than read here, so a test
-/// can pin them and this function never touches the clock itself.
 pub fn render(
     arena: std.mem.Allocator,
     found: Found,
@@ -544,10 +418,6 @@ pub fn render(
     return text.toOwnedSlice(arena);
 }
 
-/// The comment block that gives a generated `chock.zon` its provenance: the
-/// version that wrote it, the date, and every file it was read from with the
-/// SHA-256 of the bytes as read. `sha256sum` on the same paths, in the
-/// project this file came from, is the whole of what checking it takes.
 fn renderHeader(
     arena: std.mem.Allocator,
     text: *std.ArrayList(u8),
@@ -580,8 +450,7 @@ fn renderMcpServer(arena: std.mem.Allocator, text: *std.ArrayList(u8), server: M
     try text.appendSlice(arena, " } }");
     if (server.source_file.len != 0) try text.print(arena, ", // from {s}", .{server.source_file});
     try text.appendSlice(arena, "\n");
-    // Names only. The value half of whatever the source wrote never reaches
-    // this file: see `envName`.
+    // Names only: the value half of whatever the source wrote never reaches this file. See envName.
     for (server.env) |name| try text.print(arena, "        // reads the environment variable {s}\n", .{name});
 }
 
@@ -601,9 +470,6 @@ fn renderPolicy(
         });
     }
 
-    // Every narrowed row is grouped here, each naming the file its allow
-    // came from, so a reader sees at a glance what this build would not
-    // carry as an allow.
     var wrote_heading = false;
     for (hints) |hint| {
         if (hint.decision(carry) != .ask) continue;
@@ -617,9 +483,6 @@ fn renderPolicy(
         });
     }
 
-    // Last, and grouped with the reason, because this is the one shape that
-    // carries another tool's grant unchanged. It is here only because the
-    // command line asked for it by class.
     var wrote_carried = false;
     for (hints) |hint| {
         if (hint.decision(carry) != .allow) continue;
@@ -657,8 +520,6 @@ const Options = struct {
     from: []const u8 = "",
     project: ?[]const u8 = null,
     print: bool = false,
-    /// Every class `--permission` named. A grant is carried only under one of
-    /// these, and the list is empty unless a person wrote it out.
     permission: []const []const u8 = &.{},
     sessions: bool = false,
     memory: bool = false,
@@ -713,9 +574,6 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
             carried.append(arena, class) catch return error.BadArguments;
             continue;
         }
-        // Naming the option is the whole of the message. A usage page alone
-        // leaves a person unable to tell a typo from an option this build
-        // does not have.
         tty.print(.err, "chock migrate: there is no option named {s}.\n", .{argument});
         return error.BadArguments;
     }
@@ -730,8 +588,6 @@ fn isCarryable(class: []const u8) bool {
     return false;
 }
 
-/// The classes this build carries, for a refusal to name. One today, so this
-/// is a literal rather than a join that allocates.
 fn carryableList() []const u8 {
     comptime var text: []const u8 = "";
     inline for (carryable, 0..) |one, index| {
@@ -740,10 +596,6 @@ fn carryableList() []const u8 {
     return text;
 }
 
-/// The project this command is about, as an absolute path. The same two
-/// calls `chock run` and `chock memory` make, for the same reason: a path
-/// resolved differently here than at `chock run` would write `chock.zon`
-/// beside a project the next session never sees.
 fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]const u8 {
     if (given) |path| {
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -755,23 +607,14 @@ fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]c
     return std.process.currentPathAlloc(io, arena);
 }
 
-/// What `--memory` did: how many notes were carried, and why any were not.
 pub const MemoryResult = struct {
     harness: []const u8,
     carried: usize = 0,
     refused: []const Refusal = &.{},
 };
 
-/// At most this many notes are carried in one run. The knowledgebase's own
-/// cap is the natural bound: carrying more than a project can ever keep
-/// would only be refused note by note further down.
 const max_memory_import = chock_core.memory.max_entries;
 
-/// `harness`'s own notes for `project_root`, brought into Chock's
-/// knowledgebase as data. Each note becomes its own entry, named after the
-/// source file; a name `--memory` finds a second time adds a version rather
-/// than a second entry, so a later run of `--memory` updates what it
-/// already carried.
 fn importMemory(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -803,8 +646,6 @@ fn importMemory(
     var names: std.ArrayList([]const u8) = .empty;
     {
         var dir = std.Io.Dir.openDirAbsolute(io, notes_dir, .{ .iterate = true }) catch {
-            // No such directory is not a fault: most projects have no notes
-            // from this harness at all.
             return .{ .harness = harness };
         };
         defer dir.close(io);
@@ -889,9 +730,6 @@ fn importOneNote(
     try file.writeStreamingAll(io, text);
 }
 
-/// `file_name` with its extension dropped, lower cased, and every character
-/// `chock_core.memory.checkName` would refuse turned into `-`. A leading `-`
-/// or `_` is trimmed, because a name may not begin with either.
 fn noteName(arena: std.mem.Allocator, file_name: []const u8) ![]const u8 {
     const stem = if (std.mem.endsWith(u8, file_name, ".md")) file_name[0 .. file_name.len - 3] else file_name;
     const bound = @min(stem.len, chock_core.memory.max_name_bytes);
@@ -914,14 +752,10 @@ fn lessThanBytes(_: void, a: []const u8, b: []const u8) bool {
 
 const testing = std.testing;
 
-/// A fixed version and date, so a test of `render` pins a header without
-/// reading the real version or the real clock.
 const test_version = "0.1.0-test";
 const test_date = "2026-09-24";
 
 test "the command line takes a harness, a project and a print flag" {
-    // The refusals below name the option on standard error, and a passing
-    // test must not write there.
     var said: tty.Capture = undefined;
     said.start(testing.io, testing.allocator);
     defer said.stop(testing.io);
@@ -941,7 +775,6 @@ test "the command line takes a harness, a project and a print flag" {
 }
 
 test "an env value is never rendered while its name is" {
-    // What a harness's own file wrote: a name and a value on one line.
     const declared = "OPENAI_API_KEY=sk-live-do-not-leak";
     const name = envName(declared);
     try testing.expectEqualStrings("OPENAI_API_KEY", name);
@@ -961,7 +794,6 @@ test "an env value is never rendered while its name is" {
     try testing.expect(std.mem.indexOf(u8, text, "OPENAI_API_KEY") != null);
     try testing.expect(std.mem.indexOf(u8, text, "sk-live-do-not-leak") == null);
 
-    // A bare name with no `=` is already what a reader wants, unchanged.
     try testing.expectEqualStrings("ANTHROPIC_API_KEY", envName("ANTHROPIC_API_KEY"));
 }
 
@@ -977,8 +809,7 @@ test "render puts a foreign deny at .deny and a foreign allow at .ask" {
 
     try testing.expect(std.mem.indexOf(u8, text, "\"git.push\", .decision = .deny") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"net.fetch.*\", .decision = .ask") != null);
-    // An allow is never carried as an allow: that would widen under a threat
-    // model this build never measured. See this file's own top comment.
+    // An allow is never carried as an allow: that would widen under a threat model this build never measured.
     try testing.expect(std.mem.indexOf(u8, text, ".decision = .allow") == null);
 }
 
@@ -989,9 +820,6 @@ test "hashBytes gives the sha256 of what it was given, as 64 lower case hex char
         &empty,
     );
 
-    // Different bytes, a different digest, and still 64 hex characters: the
-    // property `render`'s header depends on is that every hash is full length
-    // and never a prefix somebody could not check independently.
     const one_byte = hashBytes("x");
     try testing.expect(!std.mem.eql(u8, &empty, &one_byte));
     try testing.expectEqual(@as(usize, 64), one_byte.len);
@@ -1008,8 +836,6 @@ test "the rendered header names every source and carries a full 64 character has
     const text = try render(testing.allocator, found, test_version, test_date, &.{});
     defer testing.allocator.free(text);
 
-    // The version and the date come from the caller, and never from a second
-    // idea of either kept in this file: see `render`'s own doc comment.
     try testing.expect(std.mem.indexOf(u8, text, "Generated by chock " ++ test_version ++ " on " ++ test_date ++ ".") != null);
 
     for (found.sources) |one| {
@@ -1020,8 +846,6 @@ test "the rendered header names every source and carries a full 64 character has
         try testing.expectEqual(@as(usize, 64), one.hash.len);
     }
 
-    // With no source at all the header still names the version and the date,
-    // and asks for nothing that is not there.
     const bare = try render(testing.allocator, Found{}, test_version, test_date, &.{});
     defer testing.allocator.free(bare);
     try testing.expect(std.mem.indexOf(u8, bare, "Generated by chock") != null);
@@ -1056,14 +880,11 @@ test "an existing chock.zon is never overwritten" {
     };
     const code = try finish(arena, testing.io, project_root, found, false, &.{}, null, null);
 
-    // Never `finished`: nothing was written. See `src/main.zig`'s own top
-    // comment.
     try testing.expect(code != Exit.finished.code());
 
     const still_there = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, arena, .limited(4096));
     try testing.expectEqualStrings(kept_before, still_there);
 
-    // The row it would have added is printed instead of written.
     try testing.expect(std.mem.indexOf(u8, said.out(), "git.push") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "already exists") != null);
 }
@@ -1095,8 +916,6 @@ test "a project with no chock.zon gets one, once" {
     const written = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, arena, .limited(4096));
     try testing.expect(std.mem.indexOf(u8, written, "AGENTS.md") != null);
 
-    // A second run must not overwrite the first: the reader path is fixed
-    // above, but this asserts the write step itself is one shot.
     said.clear();
     try testing.expect(
         (try finish(arena, testing.io, project_root, found, false, &.{}, null, null)) != Exit.finished.code(),
@@ -1143,8 +962,6 @@ test "a harness this build reads is found, and one it does not is refused by nam
     }
     try testing.expect(findReader("emacs") == null);
 
-    // The refusal names every harness, so a person who spelled one wrong is
-    // told what this build does read.
     const known = try knownHarnesses(gpa);
     defer gpa.free(known);
     for ([_][]const u8{ "claude-code", "codex", "opencode", "zed", "oh-my-pi" }) |name| {
@@ -1166,9 +983,6 @@ test "a hint naming an action this build does not define never reaches a row" {
     const found = Found{
         .policy_hints = &.{
             .{ .action = "git.push", .said = .deny, .source_file = "a.json" },
-            // Claude Code spells a rule as a tool and an argument pattern. The
-            // policy reader refuses an interior `*` outright, so a row carrying
-            // one would stop the whole file loading.
             .{ .action = "Bash(cargo test:*)", .said = .allow, .source_file = "a.json" },
             .{ .action = "sandbox.write", .said = .deny, .source_file = "b.toml" },
         },
@@ -1182,8 +996,6 @@ test "a hint naming an action this build does not define never reaches a row" {
 }
 
 test "every action the guard admits is one the policy reader can carry" {
-    // A name this build offers but the table refuses would be a file that
-    // cannot load, which is the fault the guard exists to stop.
     for (known_actions) |action| {
         try testing.expect(isKnownAction(action));
         try testing.expect(chock_policy.table.patternIsWellFormed(action));
@@ -1209,7 +1021,6 @@ test "a fetch grant is ask until --permission names its class" {
     const opened = try render(arena, found, test_version, test_date, &.{"net.fetch"});
     try testing.expect(std.mem.indexOf(u8, opened, "\"net.fetch.com.example\", .decision = .allow") != null);
 
-    // The flag names one class and widens nothing else.
     try testing.expect(std.mem.indexOf(u8, opened, "\"git.push\", .decision = .allow") == null);
 }
 
@@ -1304,8 +1115,6 @@ test "memory files are carried as data, with a bound on how many by size" {
     try testing.expectEqual(@as(usize, 1), result.refused.len);
     try testing.expectEqualStrings("too-big.md", result.refused[0].what);
 
-    // Each note landed as data in the knowledgebase's own file format, under
-    // a name the source file name turned into, never as pasted instructions.
     const dest_dir = try session.memoryDir(arena, &env, project_root);
     const note_text = try std.Io.Dir.cwd().readFileAlloc(
         testing.io,

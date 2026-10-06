@@ -14,8 +14,7 @@ pub const leaf_secret = hex("52bfb777ed365c094caa8d4b02bf839b55964aa447b368f480b
 
 /// Hexadecimal, because that is what `openssl` prints, so a reader can compare.
 fn hex(comptime text: []const u8) [text.len / 2]u8 {
-    // The standard library decoder takes one branch a byte, which is past the
-    // compiler's default budget for a certificate.
+    // The standard library decoder takes one branch a byte, past the compiler's default budget.
     @setEvalBranchQuota(text.len * 8);
     var out: [text.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, text) catch unreachable;
@@ -151,14 +150,12 @@ pub const rogue_leaf_der = hex("308201e93082018fa003020102021421bee52f5091611d8d
 /// SHA-256 of "chock pcsc transcript".
 pub const transcript_digest = hex("a14f4bfd6bdd8c2fd8d1fea079911c68d252a639847324bdf4fdd10e261e88d9");
 
-/// Made by `openssl`, so checking it shows the decoding is right rather than
-/// that Chock agrees with itself.
+/// Made by `openssl`, so checking it shows the decoding is right rather than Chock agreeing with itself.
 pub const transcript_signature_der = hex("304402200facb9e0c03ad59db784de07e1958adc456d174105c1d317" ++
     "ed114755d8e153ff022012ec5c10e2ef0fde57e166ec9b8b37177d41" ++
     "c4c127a93e7676d4c909c955973c");
 
-/// Made once with `ssh-keygen -t rsa -b 2048 -m PEM`. The private half is here
-/// because a card never gives its key up, and a recording must sign with it.
+/// Made once with `ssh-keygen -t rsa -b 2048 -m PEM`. The private half is here because a card never gives its key up.
 pub const rsa_modulus = hex("9509dfd16e1418d7f321af6642275d2ad7544e7ceeb561a9c612c058" ++
     "fcffa394780f67dd2df0c54c5696bd1e3cc58484ad45da750035b14c" ++
     "e36abcdd6f99a5fea31bce1a45ab2fa76f0179241714f891493d1fc2" ++

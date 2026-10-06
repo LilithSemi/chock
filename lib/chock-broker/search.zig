@@ -1,96 +1,4 @@
-//! Answers a `web_search` call for the `self_hosted`, `api`, and `scrape`
-//! search kinds. `self_hosted` is backed by a SearXNG instance and needs no
-//! credential. `api` is backed by a keyed vendor named in
-//! `chock_policy.search.Provider`, `brave` or `kagi`, and reads a credential
-//! the caller hands it. `scrape` is backed by `duckduckgo`, reads a results
-//! page instead of an API, and carries no credential.
-//!
-//! ## The seam this fills
-//!
-//! `lib/chock-core/search.zig` defines the `Searcher` vtable and states why it
-//! exists: `chock-core` imports no `chock-broker`, so `src/run.zig` wires this
-//! session into that vtable, the same way `lib/chock-broker/fetch.zig` is
-//! wired into `chock_core.fetch.Fetcher`. The loop has already asked the
-//! arbiter under the action `web.search` and been told yes by the time this
-//! file runs. Nothing here decides policy, and nothing here reads a
-//! credential out of the store: `src/run.zig` already read it and hands this
-//! file the value.
-//!
-//! ## SearXNG's own API, verified against its source
-//!
-//! `GET {base_url}/search?q=<query>&format=json` is SearXNG's JSON search
-//! route, documented at https://docs.searxng.org/dev/search_api.html. That
-//! `json` format is off by default: an instance answers 403 until its own
-//! `search.formats` setting in `settings.yml` lists `json` alongside `html`.
-//! Whenever a response does not parse as JSON, this file names that as the
-//! likely cause, because "no results" and "this instance will not speak
-//! JSON" read the same to an agent otherwise.
-//!
-//! The body is a JSON object with a `results` array, built by
-//! `searx/webutils.py`'s `get_json_response` from each result's own
-//! `as_dict()`. A plain web result's fields come from
-//! `searx/result_types/_base.py`'s `MainResult`: `title`, `url`, and
-//! `content` are the three this file reads, and `content` is the snippet.
-//! Every other field a result or the envelope carries is ignored.
-//!
-//! ## Brave's own API, verified against its published reference
-//!
-//! `GET {base_url}/res/v1/web/search?q=<query>&count=<n>` is the endpoint,
-//! documented at Brave's published API reference. The credential goes in the
-//! `X-Subscription-Token` request header. A reply is a JSON object with a
-//! `web` object holding a `results` array; each result's `title`, `url`, and
-//! `description` are the three this file reads, and `description` is the
-//! snippet. Every other field is ignored. Brave documents a query bound of
-//! 600 characters and 75 words, over which it answers 422, so this file
-//! refuses an over-bound query itself before sending one. Brave does not
-//! document a status for a bad or missing credential; a 401 is only what
-//! third parties report in practice, so this file only ever says "check the
-//! credential" for a 401 or 403, never that the credential is wrong.
-//!
-//! ## Kagi's own API, verified against its published OpenAPI specification
-//!
-//! `POST {base_url}/search` with a JSON body `{"query": ..., "limit": ...}`
-//! is the endpoint, unlike SearXNG and Brave which are both GET. The
-//! credential goes in an `Authorization` header. The reply is a JSON object
-//! with a `data` object holding several named arrays; the plain web results
-//! are `data.search`, and every other `data.*` key is ignored. Kagi
-//! documents its error statuses, so this file's Kagi statuses are worded
-//! definitely where Brave's stay a hedge: Brave never documented what a bad
-//! credential answers with, and Kagi does.
-//!
-//! ## DuckDuckGo's own HTML endpoint, verified against a live fetch
-//!
-//! `GET {base_url}/html/?q=<query>` answers HTTP 202 with an anti-bot
-//! challenge on the first request from a cold client, reproducibly. Only
-//! `POST {base_url}/html/` with `q` in a url-encoded form body answers with
-//! real results, so this is the one engine here that sends a form body on a
-//! plain search. A result's title and link come from `<a
-//! class="result__a">`, and its `href` is verified to be the real target URL
-//! with no redirect wrapper, contrary to what is commonly written about this
-//! endpoint. The snippet comes from `<a class="result__snippet">`, which is
-//! verified to carry `<b>` markup around matched terms.
-//!
-//! A scrape engine reads a page built for a browser, not a contract, so a
-//! reply can fail three distinct ways: a bot challenge, a page shape this
-//! build no longer reads, or genuinely no results. `answerFromDuckDuckGo`
-//! tells all three apart, because a broken parser that reads as "no results"
-//! is worse than no scrape engine at all.
-//!
-//! ## A result is written by a stranger
-//!
-//! Same rule as a fetched page, stated in `lib/chock-core/fetch.zig`:
-//! control characters go, bytes that are not text are replaced, and the
-//! result is cut at a bound with the cut marked. `chock-broker` cannot import
-//! `chock-core`, so `cleanField` calls the treatment through the `Clean`
-//! function pointer that `src/run.zig` fills. It is one check reached across a
-//! seam, and not a second copy of one.
-//!
-//! ## The HTTP call is one narrow function
-//!
-//! `request` is the only place `std.http.Client` is named. Everything above
-//! it, building the query, parsing the JSON, bounding the results, cleaning
-//! the text, takes bytes and a status code, not a client. That is also what
-//! lets the tests below drive the parsing and cleaning with no socket.
+//! Answers a `web_search` call for the `self_hosted`, `api`, and `scrape` search kinds.
 
 const std = @import("std");
 
@@ -100,55 +8,31 @@ const actions = @import("actions.zig");
 
 pub const Error = std.mem.Allocator.Error;
 
-/// What the loop wants searched.
 pub const Ask = struct {
     query: []const u8,
 };
 
-/// What came back. Matches `chock_core.search.Answer` in shape, so
-/// `src/run.zig` carries it across the seam with no translation.
 pub const Answer = struct {
     text: []u8,
     is_error: bool,
 };
 
-/// The most results that reach the agent for one call. OpenCode's own web
-/// search tool defaults to 8 and caps at 20; this seam takes no per-call
-/// count from the agent, so it holds the default.
 pub const max_results: usize = 8;
 
-/// A title or a snippet, cut at this many bytes, so neither can push the
-/// results list out of the context.
 pub const max_title_bytes: usize = 400;
 pub const max_snippet_bytes: usize = 400;
 
-/// A URL is meant to be one line of ASCII, and 2048 bytes is the common
-/// browser bound for one.
 pub const max_url_bytes: usize = 2048;
 
-/// The most the SearXNG response body is read to, the same bound
-/// `lib/chock-broker/fetch.zig` reads a page to.
 pub const max_body_bytes: usize = 1 << 20;
 
-/// Takes text a stranger wrote and gives back text a model may read.
-///
-/// **A seam and not a copy.** `chock-broker` cannot import `chock-core`, and
-/// repeating the cleaning here would be a second copy of a security check,
-/// which is the thing `network.zig` already refuses to allow for the address
-/// check. `src/run.zig` imports both and fills this with
-/// `chock_core.mcp.textForModel`, the same function a third party tool result
-/// goes through.
 pub const Clean = *const fn (gpa: std.mem.Allocator, text: []const u8) Error![]u8;
 
 pub const Session = struct {
     kind: chock_policy.search.Kind,
     base_url: []const u8,
     clean: Clean,
-    /// Which vendor an `api` or `scrape` session talks to. Unused by `self_hosted`.
     provider: ?chock_policy.search.Provider = null,
-    /// The credential's VALUE, already read out of the credential store by
-    /// `src/run.zig`. This is not `chock_policy.search.Search.credential`,
-    /// which holds the store entry's NAME.
     credential: ?[]const u8 = null,
 
     pub fn search(self: *const Session, gpa: std.mem.Allocator, io: std.Io, ask: Ask) Error!Answer {
@@ -195,9 +79,7 @@ fn searchSelfHosted(
 }
 
 fn searchApi(gpa: std.mem.Allocator, io: std.Io, self: *const Session, query: []const u8) Error!Answer {
-    // This seam is reached across a vtable, and a caller added later could
-    // forget to fill these. The policy reader already refuses both at parse
-    // time, so refuse rather than trust that a second time here.
+    // Refuse rather than trust the policy reader already checked this; reached across a vtable.
     const provider = self.provider orelse return .{
         .is_error = true,
         .text = try std.fmt.allocPrint(
@@ -216,14 +98,10 @@ fn searchApi(gpa: std.mem.Allocator, io: std.Io, self: *const Session, query: []
         ),
     };
 
-    // The switch is what makes a new vendor a compile error until it is
-    // handled.
     return switch (provider) {
         .brave => searchBrave(gpa, io, self.base_url, query, credential, self.clean),
         .kagi => searchKagi(gpa, io, self.base_url, query, credential, self.clean),
         .exa => searchExa(gpa, io, self.base_url, query, credential, self.clean),
-        // duckduckgo is a scrape provider. The policy parser already refuses
-        // it on an api engine, so this arm only keeps the switch exhaustive.
         .duckduckgo => .{
             .is_error = true,
             .text = try std.fmt.allocPrint(
@@ -236,9 +114,6 @@ fn searchApi(gpa: std.mem.Allocator, io: std.Io, self: *const Session, query: []
 }
 
 fn searchScrape(gpa: std.mem.Allocator, io: std.Io, self: *const Session, query: []const u8) Error!Answer {
-    // Same defensive reasoning as searchApi's own provider check: the parser
-    // already refuses a missing provider, so refuse rather than trust that a
-    // second time here.
     const provider = self.provider orelse return .{
         .is_error = true,
         .text = try std.fmt.allocPrint(
@@ -250,9 +125,6 @@ fn searchScrape(gpa: std.mem.Allocator, io: std.Io, self: *const Session, query:
 
     return switch (provider) {
         .duckduckgo => searchDuckDuckGo(gpa, io, self.base_url, query, self.clean),
-        // brave, kagi and exa are api providers. The policy parser already
-        // refuses any of them on a scrape engine, so this arm only keeps the
-        // switch exhaustive.
         .brave, .kagi, .exa => .{
             .is_error = true,
             .text = try std.fmt.allocPrint(
@@ -264,13 +136,9 @@ fn searchScrape(gpa: std.mem.Allocator, io: std.Io, self: *const Session, query:
     };
 }
 
-/// Brave's own documented bounds on a query, not a choice Chock makes: over
-/// either one Brave answers 422.
 pub const max_brave_query_chars: usize = 600;
 pub const max_brave_query_words: usize = 75;
 
-/// Told to the agent before any request, because "your query is 82 words and
-/// the bound is 75" is something it can act on and a 422 is not.
 fn braveQueryBoundRefusal(gpa: std.mem.Allocator, query: []const u8) Error!?Answer {
     if (query.len > max_brave_query_chars) {
         return .{
@@ -369,8 +237,6 @@ fn isUnreservedByte(byte: u8) bool {
 
 const hex_digits = "0123456789ABCDEF";
 
-/// Every byte outside the unreserved set becomes `%XX`, so a query holding
-/// `&` or `=` cannot be read as a second parameter.
 fn appendPercentEncoded(gpa: std.mem.Allocator, out: *std.ArrayList(u8), raw: []const u8) Error!void {
     for (raw) |byte| {
         if (isUnreservedByte(byte)) {
@@ -383,11 +249,6 @@ fn appendPercentEncoded(gpa: std.mem.Allocator, out: *std.ArrayList(u8), raw: []
     }
 }
 
-/// Kagi's own scheme word for its `Authorization` header. Kagi's own docs
-/// disagree with themselves: the OpenAPI specification and quick start show
-/// `Bearer`, the Search API and portal pages show `Bot`. `Bearer` is the
-/// authoritative choice, and if that turns out wrong, this is the one line
-/// to change.
 pub const kagi_auth_scheme = "Bearer";
 
 fn searchKagi(
@@ -404,9 +265,7 @@ fn searchKagi(
     const body = try buildKagiRequestBody(gpa, query);
     defer gpa.free(body);
 
-    // The header value holds the credential, so it is wiped before it is
-    // freed, the same rule `lib/chock-provider/Client.zig` keeps for its own
-    // Authorization buffer.
+    // Wiped before free, the same rule `Client.zig` keeps for its Authorization buffer.
     const auth_value = try std.fmt.allocPrint(gpa, "{s} {s}", .{ kagi_auth_scheme, credential });
     defer {
         std.crypto.secureZero(u8, auth_value);
@@ -446,18 +305,8 @@ fn searchKagi(
     return answerFromKagi(gpa, base_url, query, fetched.status, fetched.body, clean);
 }
 
-/// Exa accepts the key in `x-api-key` and, by its own specification, in
-/// `Authorization: Bearer`. The second one is sent, so this reuses the header
-/// every other vendor here already wipes before freeing.
 pub const exa_auth_scheme = "Bearer";
 
-/// The search mode this build asks for, and the modes it therefore cannot ask
-/// for.
-///
-/// **`deep` and `deep-reasoning` are Exa running an agent of its own**: a
-/// multi-step search whose work is unbounded, outside this session's budget, its
-/// policy table and its log. So the mode is a constant here rather than a
-/// setting, and there is no way to spell one of them.
 pub const exa_search_type = "auto";
 
 fn searchExa(
@@ -474,9 +323,6 @@ fn searchExa(
     const body = try buildExaRequestBody(gpa, query);
     defer gpa.free(body);
 
-    // The header value holds the credential, so it is wiped before it is freed,
-    // the same rule `lib/chock-provider/Client.zig` keeps for its own
-    // Authorization buffer.
     const auth_value = try std.fmt.allocPrint(gpa, "{s} {s}", .{ exa_auth_scheme, credential });
     defer {
         std.crypto.secureZero(u8, auth_value);
@@ -525,21 +371,6 @@ fn buildExaSearchUrl(gpa: std.mem.Allocator, base_url: []const u8) Error![]u8 {
     return url.toOwnedSlice(gpa);
 }
 
-/// What is asked for, and the two things that are deliberately not.
-///
-/// `highlights` is asked for because a result with no extract is a link and not
-/// a search result: Brave and Kagi both answer with a snippet, and this is Exa's
-/// equivalent. A highlight is the page's own words, which is what a snippet is.
-///
-/// **`text` is never asked for.** It is the whole page. A search is approved
-/// under `web.search`, and reading a page is approved under `net.fetch` for the
-/// host the agent named. Full page text arriving inside a search result would
-/// put a stranger's page in front of the model under an approval that was given
-/// for something else.
-///
-/// **`summary` is never asked for.** It is written by a model at the vendor, so
-/// it is text with no source to attribute it to. Everything the model reads from
-/// a search must be something a person could go and check.
 fn buildExaRequestBody(gpa: std.mem.Allocator, query: []const u8) Error![]u8 {
     return std.json.Stringify.valueAlloc(gpa, .{
         .query = query,
@@ -562,9 +393,7 @@ fn buildKagiRequestBody(gpa: std.mem.Allocator, query: []const u8) Error![]u8 {
     return std.json.Stringify.valueAlloc(gpa, .{ .query = query, .limit = max_results }, .{});
 }
 
-/// A GET here answers 202 with a bot challenge, reproducibly. Only a POST
-/// with this form body reaches real results, so this is the one caller here
-/// that sends a body on a plain search.
+/// A GET here answers 202 with a bot challenge; only this POST form reaches real results.
 fn searchDuckDuckGo(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -578,9 +407,7 @@ fn searchDuckDuckGo(
     const body = try buildDuckDuckGoRequestBody(gpa, query);
     defer gpa.free(body);
 
-    // Chock sends its own `actions.user_agent`. Whether DuckDuckGo accepts
-    // that UA was not tested; a bot challenge is the correct, honest failure
-    // here, not a reason to send a fake browser User-Agent.
+    // A bot challenge here is correct, not a reason to fake a browser User-Agent.
     const fetched = request(
         gpa,
         io,
@@ -631,8 +458,7 @@ fn buildDuckDuckGoRequestBody(gpa: std.mem.Allocator, query: []const u8) Error![
     return body.toOwnedSlice(gpa);
 }
 
-// Each was observed in a real response fetched live, not read from
-// documentation.
+// Observed in a real response fetched live, not read from documentation.
 const duckduckgo_anomaly_marker = "anomaly-modal";
 const duckduckgo_links_marker = "id=\"links\"";
 const duckduckgo_no_result_marker_a = "result--no-result";
@@ -640,11 +466,7 @@ const duckduckgo_no_result_marker_b = "no-results__message";
 const duckduckgo_result_link_class = "class=\"result__a\"";
 const duckduckgo_result_snippet_class = "class=\"result__snippet\"";
 
-/// Turns a DuckDuckGo HTML body into an `Answer`, with no client and no
-/// socket: this is what the tests below drive directly. The order matters:
-/// a bot challenge, then a page shape this build does not read, then a
-/// genuinely empty page, then real results, then a shape change caught by
-/// zero results parsed from a page that named neither.
+/// Checked in order: bot challenge, unread page shape, empty page, then real results.
 fn answerFromDuckDuckGo(
     gpa: std.mem.Allocator,
     base_url: []const u8,
@@ -694,8 +516,7 @@ fn answerFromDuckDuckGo(
     };
 }
 
-// This is the "broken" answer, and it must never read as zero results: a
-// class rename on DuckDuckGo's side must not become a silent empty page.
+// The "broken" answer must never read as zero results, hiding a DuckDuckGo class rename.
 fn duckduckgoShapeChangedRefusal(gpa: std.mem.Allocator) Error!Answer {
     return .{
         .is_error = true,
@@ -722,9 +543,7 @@ fn freeDuckDuckGoResults(gpa: std.mem.Allocator, results: []DuckDuckGoResult) vo
     gpa.free(results);
 }
 
-/// Walks the body by bounded string search, never scanning past it and never
-/// assuming a closing tag exists. `url` is borrowed from `body`; `title` and
-/// `snippet` are owned copies, cleaned by `stripAndDecode`.
+/// `url` borrows `body`; `title`/`snippet` are owned copies cleaned by `stripAndDecode`.
 fn parseDuckDuckGoResults(gpa: std.mem.Allocator, body: []const u8) Error![]DuckDuckGoResult {
     var out: std.ArrayList(DuckDuckGoResult) = .empty;
     errdefer {
@@ -767,10 +586,7 @@ const Anchor = struct {
     end: usize,
 };
 
-/// `class_at` is where `class="result__a"` or `class="result__snippet"`
-/// matched. `href` is read forward from there to the tag's own closing `>`,
-/// the order the verified response holds it in. A missing `>`, a missing
-/// `href`, or a missing `</a>` ends the walk with `null`.
+/// `class_at` is where the class attribute matched; a missing `>`, `href`, or `</a>` ends with `null`.
 fn extractAnchor(body: []const u8, class_at: usize) ?Anchor {
     const tag_end = std.mem.indexOfScalarPos(u8, body, class_at, '>') orelse return null;
 
@@ -790,17 +606,14 @@ fn extractAnchor(body: []const u8, class_at: usize) ?Anchor {
     };
 }
 
-/// Removing markup and decoding entities is parsing HTML, not editing a
-/// vendor's own content, which is why this differs from how Brave and Kagi's
-/// JSON text is treated further down this file.
+/// Parses HTML rather than edits vendor content, unlike Brave/Kagi's JSON text.
 fn stripAndDecode(gpa: std.mem.Allocator, raw: []const u8) Error![]u8 {
     const stripped = try stripTags(gpa, raw);
     defer gpa.free(stripped);
     return decodeEntities(gpa, stripped);
 }
 
-// The `<b>` markup DuckDuckGo wraps around a matched term is verified
-// present in a snippet, so this removes a known thing rather than guessing.
+// DuckDuckGo's `<b>` markup around a match is verified present, so this removes a known thing.
 fn stripTags(gpa: std.mem.Allocator, raw: []const u8) Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -827,8 +640,7 @@ const duckduckgo_entities = [_]DuckDuckGoEntity{
     .{ .name = "&#x27;", .value = "'" },
 };
 
-/// Decodes the six entities named above and leaves any other entity as
-/// written, rather than guessing at it.
+/// Decodes only the six entities above; any other entity is left as written.
 fn decodeEntities(gpa: std.mem.Allocator, raw: []const u8) Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -859,14 +671,9 @@ const Fetched = struct {
     body: []u8,
 };
 
-/// The one place `std.http.Client` is named. See this file's own top comment.
-/// `authorization` is its own parameter because `std.http.Client.Request`
-/// treats it as a first class header: a vendor whose credential header is
-/// literally `Authorization`, like Kagi, must set it there and not through
-/// `extra_headers`, or the request would carry the header twice. `content_type`
-/// is a parameter rather than an assumed `application/json` because
-/// DuckDuckGo's form body needs `application/x-www-form-urlencoded`; a
-/// bodiless caller passes `.default`.
+/// The one place `std.http.Client` is named. `authorization` is its own
+/// param since Kagi names its credential header `Authorization` itself;
+/// `content_type` is one since DuckDuckGo needs form encoding.
 fn request(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -875,9 +682,7 @@ fn request(
     extra_headers: []const std.http.Header,
     authorization: std.http.Client.Request.Headers.Value,
     content_type: std.http.Client.Request.Headers.Value,
-    /// Mutable, because `sendBodyComplete` writes through it. Every caller
-    /// that sends a body allocated it, and the type says so rather than a
-    /// comment asserting it.
+    /// Mutable since `sendBodyComplete` writes through it; the type says ownership, not a comment.
     body: ?[]u8,
 ) RequestError!Fetched {
     const uri = std.Uri.parse(url) catch return error.RequestFailed;
@@ -906,8 +711,7 @@ fn request(
     var head_buffer: [4 * 1024]u8 = undefined;
     var response = http_request.receiveHead(&head_buffer) catch return error.RequestFailed;
 
-    // `std.http.Client` advertises gzip and deflate on every request, so a
-    // reply may come back compressed even though nobody asked for that.
+    // Advertises gzip/deflate on every request, so a reply may come back compressed unasked.
     const decompress_buffer: []u8 = switch (response.head.content_encoding) {
         .identity => &.{},
         .gzip, .deflate => try gpa.alloc(u8, std.compress.flate.max_window_len),
@@ -937,18 +741,14 @@ const SearxResponse = struct {
     results: []SearxResult = &.{},
 };
 
-/// One cleaned result, in the shape both engines' list writer shares. Each
-/// engine's own result type names its snippet field differently, so this is
-/// the seam that lets one function write the list for both.
+/// One cleaned result, the shape every list writer shares; vendors name the snippet field differently.
 const ResultFields = struct {
     title: []const u8,
     url: []const u8,
     snippet: []const u8,
 };
 
-/// The numbered list body, and the `[chock: ...]` line above it, both
-/// engines share verbatim. That line is a security control: it tells the
-/// model the results are a stranger's text, not an instruction.
+/// `[chock: ...]` is a security control: tells the model these results are a stranger's text.
 fn writeResultList(
     gpa: std.mem.Allocator,
     base_url: []const u8,
@@ -980,8 +780,6 @@ fn writeResultList(
     return out.toOwnedSlice(gpa);
 }
 
-/// Turns a SearXNG response body into an `Answer`, with no client and no
-/// socket: this is what the tests below drive directly.
 fn answerFromResponse(
     gpa: std.mem.Allocator,
     base_url: []const u8,
@@ -1026,10 +824,7 @@ fn notJsonRefusal(gpa: std.mem.Allocator, base_url: []const u8, status: u16) Err
     };
 }
 
-// Whether `description` can carry markup such as `<strong>` around a
-// matched term is not documented either way, and no parameter is documented
-// to turn it off. This treats it as ordinary text: stripping tags that may
-// not be there would corrupt a snippet that legitimately holds `<` or `>`.
+// Treated as ordinary text: stripping tags that may not be there would corrupt a real `<`/`>`.
 const BraveResult = struct {
     title: []const u8 = "",
     url: []const u8 = "",
@@ -1044,10 +839,7 @@ const BraveResponse = struct {
     web: BraveWeb = .{},
 };
 
-/// Turns a Brave response body into an `Answer`, with no client and no
-/// socket: this is what the tests below drive directly. 429 and 422 are
-/// handled by status before the body is even parsed, since Brave documents
-/// both for this endpoint.
+/// 429 and 422 are handled by status before parsing, since Brave documents both here.
 fn answerFromBrave(
     gpa: std.mem.Allocator,
     base_url: []const u8,
@@ -1101,9 +893,7 @@ fn answerFromBrave(
     };
 }
 
-// Brave does not document a status for a bad or missing credential. A 401 is
-// only what third parties report in practice, so this warns to check the
-// credential rather than claiming it is wrong.
+// No documented status for a bad credential, so this warns to check it, not claims it's wrong.
 fn braveNotJsonRefusal(gpa: std.mem.Allocator, status: u16) Error!Answer {
     const credential_note = if (status == 401 or status == 403)
         " Check the credential first."
@@ -1119,18 +909,14 @@ fn braveNotJsonRefusal(gpa: std.mem.Allocator, status: u16) Error!Answer {
     };
 }
 
-// Kagi's own examples carry `&#39;` and `&amp;` in titles and snippets, and
-// no documented parameter turns entity decoding off. They reach the model
-// as written, the same choice this file already makes for Brave's markup.
+// Kagi's examples carry `&#39;`/`&amp;`; reach the model as written, like Brave's markup.
 const KagiResult = struct {
     title: []const u8 = "",
     url: []const u8 = "",
     snippet: []const u8 = "",
 };
 
-// `data` also holds `related_search`, `image`, `video`, and more, each a
-// different thing wearing the same field names as a result. Reading only
-// `search` keeps those out of the model's results.
+// `data` also holds unrelated fields; reading only `search` keeps those out.
 const KagiData = struct {
     search: []KagiResult = &.{},
 };
@@ -1147,8 +933,6 @@ const KagiErrorBody = struct {
     @"error": []KagiErrorItem = &.{},
 };
 
-/// Turns a Kagi response body into an `Answer`, with no client and no
-/// socket: this is what the tests below drive directly.
 fn answerFromKagi(
     gpa: std.mem.Allocator,
     base_url: []const u8,
@@ -1184,14 +968,12 @@ fn answerFromKagi(
 const ExaResult = struct {
     title: ?[]const u8 = null,
     url: ?[]const u8 = null,
-    /// The page's own words, the parts a model at the vendor picked. Absent when
-    /// the page gave none.
+    /// The page's own words, picked by a vendor model; absent when the page gave none.
     highlights: []const []const u8 = &.{},
 };
 
 const ExaResponse = struct {
-    /// Absent on the synthesis shape, which is the other half of the response's
-    /// `oneOf`. See `answerFromExa`.
+    /// Absent on the synthesis shape, the other half of the `oneOf`; see `answerFromExa`.
     results: ?[]ExaResult = null,
 };
 
@@ -1200,14 +982,8 @@ const ExaErrorBody = struct {
     message: ?[]const u8 = null,
 };
 
-/// Turns an Exa response body into an `Answer`, with no client and no socket:
-/// this is what the tests below drive directly.
-///
-/// **The response is a `oneOf`.** Exa answers either with results or with a
-/// synthesis, and the two have different shapes. The request pins the fields that
-/// choose, so the results shape is what comes back; a body with no `results` is
-/// refused rather than half read, because a parser that quietly found nothing
-/// would report "no results" for an answer that was really the wrong shape.
+/// Exa answers with results or a synthesis; no `results` is refused, not
+/// read as zero, to avoid hiding the wrong shape.
 fn answerFromExa(
     gpa: std.mem.Allocator,
     base_url: []const u8,
@@ -1240,14 +1016,11 @@ fn answerFromExa(
     var fields: [max_results]ResultFields = undefined;
     var count: usize = 0;
     for (kept) |one| {
-        // A result with no address is nothing a person can go and check, so it
-        // is left out rather than listed.
+        // Nothing a person can check without an address, so it's left out.
         const address = one.url orelse continue;
         fields[count] = .{
             .title = one.title orelse "",
             .url = address,
-            // The first highlight alone. `writeResultList` cuts it to the same
-            // bound every other vendor's snippet is cut to.
             .snippet = if (one.highlights.len != 0) one.highlights[0] else "",
         };
         count += 1;
@@ -1285,10 +1058,7 @@ fn exaErrorRefusal(gpa: std.mem.Allocator, status: u16, body: []const u8, clean:
     return .{ .is_error = true, .text = try out.toOwnedSlice(gpa) };
 }
 
-/// What the engine said, cleaned. Null when it said nothing this can read.
-///
-/// The body is a stranger's text and it reaches a model, so it goes through the
-/// same cleaner every result goes through.
+/// What the engine said, cleaned like any result; null when nothing readable.
 fn exaErrorMessage(gpa: std.mem.Allocator, body: []const u8, clean: Clean) Error!?[]u8 {
     const parsed = std.json.parseFromSlice(
         ExaErrorBody,
@@ -1341,8 +1111,7 @@ fn kagiErrorRefusal(gpa: std.mem.Allocator, status: u16, body: []const u8, clean
     return .{ .is_error = true, .text = try out.toOwnedSlice(gpa) };
 }
 
-/// The error body's `message` is a stranger's text like any other, so it is
-/// cleaned and bounded through `cleanField` before it reaches the refusal.
+/// A stranger's text like any other, so cleaned and bounded through `cleanField` first.
 fn kagiErrorMessage(gpa: std.mem.Allocator, body: []const u8, clean: Clean) Error!?[]u8 {
     const parsed = std.json.parseFromSlice(
         KagiErrorBody,
@@ -1367,9 +1136,7 @@ fn kagiNotJsonRefusal(gpa: std.mem.Allocator, status: u16) Error!Answer {
     };
 }
 
-/// One field of one result, cleaned by the caller's own cleaner and then cut
-/// to the bound this file sets. The cut is a size bound and not a safety
-/// check, which is why it lives here and the cleaning does not.
+/// Cleaned by the caller, then cut to this file's bound; a size bound, not a safety check.
 fn cleanField(
     gpa: std.mem.Allocator,
     clean: Clean,
@@ -1386,17 +1153,14 @@ fn cleanField(
 fn cutToCharacter(text: []const u8, limit: usize) []const u8 {
     if (text.len <= limit) return text;
     var at = limit;
-    // A continuation byte is 0b10xxxxxx, so walking back over them lands on
-    // the first byte of the character the cut fell inside.
+    // A continuation byte is 0b10xxxxxx; walking back over them lands on the character's first byte.
     while (at > 0 and text[at] & 0xC0 == 0x80) at -= 1;
     return text[0..at];
 }
 
 const testing = std.testing;
 
-/// Stands in for `chock_core.mcp.textForModel`, which the tests here cannot
-/// import. It is deliberately the same rule: a control character goes and a
-/// newline and a tab stay.
+/// Stands in for `chock_core.mcp.textForModel`: control chars go, newline and tab stay.
 fn testClean(gpa: std.mem.Allocator, text: []const u8) Error![]u8 {
     var kept: std.ArrayList(u8) = .empty;
     defer kept.deinit(gpa);
@@ -2005,9 +1769,6 @@ test "a realistic Exa body parses into a numbered list, with unknown fields igno
 test "an Exa synthesis body is refused rather than read as no results" {
     const gpa = testing.allocator;
 
-    // The response is a `oneOf`: results or a synthesis. A parser that took a
-    // missing `results` for an empty list would report "no results found" for an
-    // answer that was really the other shape.
     const synthesis =
         \\{"requestId":"abc","answer":"Zig is a programming language.","citations":[]}
     ;
@@ -2025,8 +1786,7 @@ test "an empty Exa results array is zero results, not an error" {
     const answer = try answerFromExa(gpa, "https://api.exa.ai", "zig", 200, "{\"results\":[]}", testClean);
     defer gpa.free(answer.text);
 
-    // An engine that found nothing and an engine that failed must not read the
-    // same to a model: one means look elsewhere, the other means try again.
+    // Found-nothing and failed must not read the same: one means look elsewhere, the other try again.
     try testing.expect(!answer.is_error);
 }
 
@@ -2065,8 +1825,7 @@ test "an Exa result count over the bound is cut" {
 
     try testing.expect(!answer.is_error);
     try testing.expect(std.mem.indexOf(u8, answer.text, "https://example.org/0") != null);
-    // The bound holds whatever the engine sent, which is what stops one answer
-    // filling the context.
+    // Bounds whatever the engine sent, stopping one answer from filling the context.
     try testing.expect(std.mem.indexOf(u8, answer.text, "https://example.org/8") == null);
 }
 
@@ -2086,8 +1845,7 @@ test "Exa 401, 402 and 429 each refuse with their own distinct message" {
         try seen.append(gpa, answer.text);
     }
 
-    // 402 is Exa's own: it bills each search, and running out of credit is not
-    // the same fact as a bad key or a rate limit.
+    // 402 is Exa's own: out of credit isn't the same fact as a bad key or rate limit.
     try testing.expect(std.mem.indexOf(u8, seen.items[2], "out of credit") != null);
 }
 
@@ -2114,7 +1872,6 @@ test "the Exa request asks for highlights and never for page text or a summary" 
     const body = try buildExaRequestBody(gpa, "zig \"quoted\" and a \\ backslash");
     defer gpa.free(body);
 
-    // It is JSON, and a query holding a quote and a backslash survives.
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings(
@@ -2126,14 +1883,11 @@ test "the Exa request asks for highlights and never for page text or a summary" 
     const contents = parsed.value.object.get("contents").?.object;
     try testing.expect(contents.get("highlights").?.bool);
 
-    // Neither of these is ever asked for. `text` is the whole page, which
-    // `net.fetch` gates and `web.search` does not. `summary` is written by a
-    // model at the vendor, so it has no source to attribute it to.
+    // `text` is the whole page, gated by `net.fetch` not `web.search`; `summary` has no source to attribute.
     try testing.expect(contents.get("text") == null);
     try testing.expect(contents.get("summary") == null);
 
-    // The mode is a constant, so the deep modes cannot be reached: each one is
-    // Exa running an agent of its own, outside this session's budget and policy.
+    // Deep modes run an Exa agent outside this session's budget and policy, so the mode stays constant.
     try testing.expectEqualStrings("auto", parsed.value.object.get("type").?.string);
     for ([_][]const u8{ "deep", "deep-reasoning", "deep-lite" }) |never| {
         try testing.expect(!std.mem.eql(u8, exa_search_type, never));
@@ -2159,7 +1913,6 @@ test "the [chock: ...] prefix marking a stranger's text is present on an Exa ans
     const answer = try answerFromExa(gpa, "https://api.exa.ai", "q", 200, body, testClean);
     defer gpa.free(answer.text);
 
-    // The line that tells the model these are a stranger's words and not an
-    // instruction. Every vendor's answer carries it.
+    // Tells the model these are a stranger's words, not an instruction; every vendor's answer carries it.
     try testing.expect(std.mem.startsWith(u8, answer.text, "[chock:"));
 }

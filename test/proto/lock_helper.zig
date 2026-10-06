@@ -1,16 +1,5 @@
-//! A real second process for the log lock test. test/proto/lock.zig starts this
-//! program, and build.zig passes its path to that test. flock locks an open file
-//! description and not a path, so only a second process can prove the lock holds.
-//!
-//! Protocol over the caller's pipes: take the lock, write one byte to standard
-//! output, block on one byte from standard input, then close and exit 0. The
-//! caller must not try its own lock before the ready byte arrives.
-//!
-//! Exit codes:
-//!   0 - the lock was taken and later released in the order above.
-//!   3 - opening the log failed.
-//!   4 - taking the lock failed.
-//!   5 - the ready byte could not be sent.
+//! A real second process for test/proto/lock.zig's log lock test.
+//! It takes the lock, signals the caller over stdout, then waits for stdin before exiting.
 
 const std = @import("std");
 const chock_proto = @import("chock-proto");
@@ -46,9 +35,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return 4;
     };
 
-    // These must go through `std.Io`. A raw Linux syscall number reaches the
-    // macOS kernel but names a different call there, so the ready byte never
-    // arrives and the caller waits for ever.
+    // These must go through `std.Io`, since a raw Linux syscall number names a different call on macOS.
     std.Io.File.stdout().writeStreamingAll(io, "r") catch |err| {
         std.debug.print("lock-helper: could not send the ready byte: {s}\n", .{@errorName(err)});
         return 5;

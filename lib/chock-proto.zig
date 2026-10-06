@@ -7,8 +7,6 @@ pub const event = @import("chock-proto/event.zig");
 pub const log = @import("chock-proto/log.zig");
 pub const storage = @import("chock-proto/storage.zig");
 pub const state = @import("chock-proto/state.zig");
-/// Named `ship` because `export` is a keyword in Zig. The option a person types
-/// is `--export-dir`.
 pub const ship = @import("chock-proto/ship.zig");
 
 test {

@@ -6,46 +6,22 @@ const table = @import("table.zig");
 
 const Decision = table.Decision;
 
-/// One thing an agent has promised not to do, or not to do unasked.
-///
-/// Three members, and the comptime block at the end of this file allows no
-/// fourth. A member that named a clause, a document or a principle would be the
-/// route by which a tier that enforces nothing became the warrant for a rule
-/// that enforces something.
 pub const Restriction = struct {
-    /// Required, and never a way to name everything. An agent that could
-    /// restrict every action in one call could end its own session in one call.
-    /// A class such as `git.*` is as wide as one restriction goes.
     action: []const u8,
     ceiling: Decision,
     reason: []const u8 = "",
 };
 
-/// Every act is checked against all of them, so an unbounded list would be an
-/// unbounded cost on every decision.
 pub const max_restrictions: usize = 32;
 
 pub const max_action_bytes: usize = 64;
 
 pub const max_reason_bytes: usize = 500;
 
-/// This is the whole of the release valve. A widening is judged by the
-/// acceptance modes, which already work for any action a project writes a rule
-/// for, so there is no second approval path here.
-/// An authorised widening writes one `policy.self` event with `authorised` set,
-/// which the fold applies as a replacement by exact name. `Loop.runWiden` is the
-/// only writer of that flag and refuses a proposal that does not name a promise
-/// this session wrote under exactly that string. An older reader drops the
-/// field and keeps the narrower promise.
-///
-/// Two places read the policy once, before the loop runs, so a promise made
-/// during the session comes too late: `provisionDecision` for `nix.build`, and
-/// the `admit` calls for which third party tools exist. Only a `deny` is spent
-/// there, so the starting tool list can be narrower and never wider.
+/// The one way a widening may be authorised: a `policy.self` event with
+/// `authorised` set, applied as a replacement by exact name.
 pub const widen_action = "policy.widen";
 
-/// Built from `Decision` itself, so a member that is added cannot be missing
-/// from either.
 pub const ceiling_names_text = blk: {
     var text: []const u8 = "";
     for (@typeInfo(Decision).@"enum".fields) |field| {
@@ -55,8 +31,6 @@ pub const ceiling_names_text = blk: {
     break :blk text;
 };
 
-/// For a name a model wrote. A misspelling must be reported and never guessed
-/// at. `ceilingFromLog` answers the same question differently on purpose.
 pub fn ceilingNamed(text: []const u8) ?Decision {
     inline for (@typeInfo(Decision).@"enum".fields) |field| {
         if (std.mem.eql(u8, field.name, text)) return @field(Decision, field.name);
@@ -64,29 +38,11 @@ pub fn ceilingNamed(text: []const u8) ?Decision {
     return null;
 }
 
-/// A name this build does not know answers `deny`, which is the whole
-/// difference from `ceilingNamed`. A ceiling already in the log was written by
-/// something that meant it, and this build cannot tell how much it permits, so
-/// it reads as narrower than everything this build knows.
 pub fn ceilingFromLog(text: []const u8) Decision {
     return ceilingNamed(text) orelse .deny;
 }
 
-/// The most `restrictions` leave for `subject`. `allow` when none covers it.
-///
-/// A minimum, which is what makes the ratchet a ratchet. Only a restriction
-/// that covers the whole of `subject` answers, so an agent that promised
-/// `git.push` and asks about `git.*` gets `allow` for the class. Nothing is
-/// lost, because `narrow` is asked about one concrete action at the moment of
-/// the act, and lifting a promise then means naming exactly what was promised.
-/// Three facts make a promise unliftable, and no one of them is enough alone.
-/// This is a minimum, there is no event that removes a restriction, and
-/// `classify` refuses a proposal asking for more than the agent holds before
-/// anything is written. The agent does not enforce any of it on itself:
-/// `lib/chock-broker/Broker.zig` reads the folded restrictions in the one
-/// process the agent cannot reach, and `src/run.zig`'s `promisesFor` folds
-/// every ancestor's log too, out of the logs and never off the child's command
-/// line, or one spawn would undo a promise.
+/// Only a restriction covering the whole of `subject` answers.
 pub fn ceilingFor(restrictions: []const Restriction, subject: []const u8) Decision {
     var held: Decision = .allow;
     for (restrictions) |one| {
@@ -96,9 +52,6 @@ pub fn ceilingFor(restrictions: []const Restriction, subject: []const u8) Decisi
     return held;
 }
 
-/// The order of the two is not a choice. Both are ceilings and the result is
-/// the minimum, so this is the spawn chain's own intersection with one more
-/// member in it.
 pub fn narrow(
     answer: Decision,
     restrictions: []const Restriction,
@@ -107,28 +60,19 @@ pub fn narrow(
     return answer.intersect(ceilingFor(restrictions, action));
 }
 
-/// Three members and not a boolean: a caller has to tell "you already promised
-/// this" from "you are asking to be allowed more".
 pub const Proposal = enum {
     narrows,
     no_change,
     widens,
 };
 
-/// `held` is the self imposed ceiling and never the policy table's answer. The
-/// two are separate ceilings that `narrow` intersects, so a project that denies
-/// `git.push` does not stop an agent promising `ask` for it. Judging a proposal
-/// against the table would let an agent's promise look like a widening of a
-/// rule it cannot reach.
+/// `held` is the self imposed ceiling, never the policy table's answer.
 pub fn classify(held: Decision, proposed: Decision) Proposal {
     if (proposed.rank() < held.rank()) return .narrows;
     if (proposed.rank() == held.rank()) return .no_change;
     return .widens;
 }
 
-/// Why this restriction cannot be recorded, or null when it can. The bounds are
-/// here, in the one place that decides what may be written, and not in the fold,
-/// which reads logs that are already written.
 pub fn refusalFor(restriction: Restriction) ?[]const u8 {
     if (restriction.action.len == 0) {
         return "nothing was promised: name the action you are giving up, for example " ++
@@ -155,9 +99,7 @@ pub fn refusalFor(restriction: Restriction) ?[]const u8 {
     return null;
 }
 
-// This fails the build if a member is added to `Decision` without a place in
-// that order being decided, because a new member would change what `narrows`
-// means for every proposal already in every log.
+// Fails the build if `Decision` gains a member with no place in this order.
 comptime {
     const fields = @typeInfo(Decision).@"enum".fields;
     if (fields.len != 5) @compileError(
@@ -172,9 +114,7 @@ comptime {
     }
 }
 
-// A fourth member is the route a constitution clause would travel into a rule
-// that enforces something, so this fails the build rather than trusting a later
-// author to have read a comment.
+// A fourth member is a route into a rule that enforces something.
 comptime {
     const fields = @typeInfo(Restriction).@"struct".fields;
     const wanted = [_][]const u8{ "action", "ceiling", "reason" };
@@ -189,8 +129,6 @@ comptime {
         );
     }
 }
-
-// Every test below is over values built in the test binary.
 
 const testing = std.testing;
 

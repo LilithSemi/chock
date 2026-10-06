@@ -1,17 +1,4 @@
 //! `chock cache`: look at the toolchain cache, and empty it.
-//!
-//! **A cache a user cannot inspect is a cache a user cannot trust.** The
-//! directory is written by whatever compiler the agent ran, it is kept
-//! between sessions on purpose, and it survives the sandbox by construction,
-//! because outliving the sandbox is the whole reason it exists. So there has
-//! to be a way to look at what is there, and emptying it has to be one
-//! obvious step.
-//!
-//! The same shape `src/memory.zig` has, and deliberately not a second shape:
-//! the two directories carry the same class of state, so a user who has
-//! learned one command has learned both. Nothing here starts a session, opens
-//! a sandbox, or touches the project. It reads and empties one directory of
-//! Chock's own, the one `lib/chock-core/cache.zig` describes.
 
 const std = @import("std");
 const chock_core = @import("chock-core");
@@ -85,20 +72,11 @@ pub fn main(
 
 fn listCache(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !u8 {
     if (!cache.exists(io, dir)) {
-        // Standard error, because there is no cache and therefore no row. A
-        // `chock cache > sizes.txt` that found nothing leaves an empty file,
-        // which is what "nothing" reads as.
         tty.print(.plain, "chock cache: this project has no toolchain cache ({s})\n", .{dir});
         return Exit.finished.code();
     }
 
-    // The whole size, not the bound: this command is what a user reads to
-    // decide whether to empty it, and a number that stopped counting early
-    // would answer a different question.
     const size = cache.measure(arena, io, dir, std.math.maxInt(u64));
-    // A `--verbose` line. The size is the answer; the path is where a person
-    // would go only after reading it, and `chock cache clear` empties it
-    // without anybody typing a path.
     tty.detail("{s}\n\n", .{dir});
     tty.out(.plain, "{d} bytes in {d} files, of at most {d} bytes\n", .{
         size.bytes,
@@ -114,14 +92,11 @@ fn listCache(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !u8 {
 fn clearCache(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !u8 {
     if (!cache.exists(io, dir)) {
         tty.print(.warn, "chock cache: this project has no toolchain cache ({s})\n", .{dir});
-        // Never `finished`: a command that did nothing must not report
-        // success. See `src/main.zig`'s own top comment.
         return Exit.usage.code();
     }
 
-    // **`gpa` and not `arena`.** The message holds a copy of a path the
-    // library built in a frame of its own, and the allocator named here is
-    // the one that releases it.
+    // gpa, not arena: the diagnostic holds a path the library built in a
+    // frame of its own, and gpa is the allocator that releases it.
     var diag: ?chock_core.Diagnostic = null;
     defer if (diag) |*fault| fault.deinit(gpa);
     const went = cache.clear(arena, io, dir, cache.sinkOf(gpa, &diag)) catch |err| {
@@ -165,11 +140,6 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
     return options;
 }
 
-/// The project this command is about, as an absolute path. **The same two
-/// calls `chock run` and `chock memory` make**, for the same reason: a cache
-/// is keyed by the project's real path, so a spelling this command resolved
-/// differently would read a different directory from the one the session
-/// wrote.
 fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]const u8 {
     if (given) |path| {
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -192,8 +162,6 @@ test "the command line names an action and nothing else" {
     try testing.expectEqualStrings("/somewhere", with_project.project.?);
     try testing.expectEqual(Action.clear, with_project.action);
 
-    // A word this command does not know is never read as an action, and a
-    // second action is a mistake rather than a silent last-one-wins.
     try testing.expectError(error.BadArguments, parseOptions(&.{"empty-everything"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "clear", "clear" }));
     try testing.expectError(error.BadArguments, parseOptions(&.{"--project"}));
@@ -201,14 +169,6 @@ test "the command line names an action and nothing else" {
 }
 
 test "clearing a project that has no cache does not report success, and names the directory" {
-    // A command that did nothing must not exit 0: the fault that made the
-    // Darwin cross compile check hollow for weeks. See `src/main.zig`.
-    //
-    // **And it says which directory it looked in**, because "there is no
-    // cache" is unactionable on its own: the whole question a person has is
-    // whether Chock looked where they think it did. Captured rather than let
-    // through, so the line is read here instead of scrolling past in a build
-    // log: see `tty.Capture` and `test/proto/lock.zig`.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -225,11 +185,8 @@ test "clearing a project that has no cache does not report success, and names th
 
     try testing.expect((try clearCache(arena, testing.allocator, testing.io, missing)) != Exit.finished.code());
     try testing.expect(std.mem.indexOf(u8, said.err(), missing) != null);
-    // A refusal is a diagnostic and never a row a pipe reads.
     try testing.expectEqualStrings("", said.out());
 
-    // And a listing of the same directory is not an error: a project that
-    // never built anything is an ordinary state, not a fault.
     said.clear();
     try testing.expectEqual(Exit.finished.code(), try listCache(arena, testing.io, missing));
     try testing.expect(std.mem.indexOf(u8, said.err(), missing) != null);
@@ -261,14 +218,9 @@ test "clearing a cache that holds something empties it and reports what went" {
     defer said.stop(testing.io);
 
     try testing.expectEqual(Exit.finished.code(), try clearCache(arena, testing.allocator, testing.io, dir));
-    // **What went, and from where.** Removing something and saying nothing
-    // about it is how a person loses a cache they wanted. Mutation check: drop
-    // the count from the line and the first expectation fails.
     try testing.expect(std.mem.indexOf(u8, said.err(), "32 bytes") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), dir) != null);
 
     try testing.expectEqual(@as(u64, 0), cache.measure(arena, testing.io, dir, cache.max_bytes).bytes);
-    // Emptied, not removed: the next session must find the layout the
-    // sandbox environment names.
     try testing.expect(cache.exists(testing.io, dir));
 }

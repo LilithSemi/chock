@@ -16,8 +16,7 @@ const Skip = iface.Skip;
 const ChangeReport = iface.ChangeReport;
 const NestedMount = iface.NestedMount;
 
-/// `reason` is copied, not borrowed, because callers build it in a frame that
-/// ends.
+/// `reason` is copied, not borrowed, since callers build it in a frame that ends.
 fn recordSkip(
     skipped: *std.ArrayList(Skip),
     allocator: std.mem.Allocator,
@@ -57,8 +56,7 @@ pub fn create(
     return .{ .project = project_owned, .upper = upper, .work = work, .merged = merged };
 }
 
-/// Rebuild the scratch layout of an overlay already on disk. Makes no upper
-/// layer and copies nothing, so a failure leaves every file where it was.
+/// Makes no upper layer and copies nothing.
 pub fn adopt(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -94,14 +92,10 @@ fn removeScratchDir(io: std.Io, absolute_path: []const u8) void {
     std.Io.Dir.deleteDirAbsolute(io, absolute_path) catch {};
 }
 
-/// Read the upper layer and report every path that changed. A file the agent
-/// changed and then changed back to its original bytes is still reported as
-/// modified: this driver reads the upper layer and never the content.
-/// A deletion is a whiteout and not a removal: overlayfs leaves a character
-/// device with major and minor 0 in the upper layer. A directory that replaces
-/// a deleted lower path is marked opaque instead, because a directory cannot be
-/// a character device, and without that check `rm x && mkdir x` loses the
-/// deletion from the diff.
+/// Reads the upper layer only, never file content, so a reverted edit
+/// still counts as modified. A deletion is a whiteout: a character device
+/// with major and minor 0. A directory that replaces a deleted path is
+/// marked opaque instead, since a directory cannot be a character device.
 pub fn changedFiles(
     self: Overlay,
     allocator: std.mem.Allocator,
@@ -137,8 +131,7 @@ pub fn changedFiles(
         const absolute = std.fs.path.join(allocator, &.{ self.upper, entry.path }) catch return error.OutOfMemory;
         defer allocator.free(absolute);
 
-        // entry.kind comes from the directory listing's own d_type, which
-        // a filesystem may not fill in.
+        // entry.kind comes from d_type, which a filesystem may not fill in.
         const kind = resolveKind(allocator, absolute, entry.kind, diag) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |e| {
@@ -149,8 +142,6 @@ pub fn changedFiles(
 
         switch (kind) {
             .character_device => {
-                // A character device that is not overlayfs's own whiteout is an
-                // ordinary file the agent made.
                 if (try isWhiteout(allocator, absolute, diag)) {
                     const path_copy = allocator.dupe(u8, entry.path) catch return error.OutOfMemory;
                     changed.append(allocator, .{ .path = path_copy, .kind = .deleted }) catch return error.OutOfMemory;
@@ -204,12 +195,7 @@ pub fn changedFiles(
     };
 }
 
-/// Find every directory under `project` that is itself the mount point of a
-/// separate filesystem, which the merged view cannot show.
-/// A nested mount inside the project is invisible to the merged view, which
-/// shows whatever plain directory sits at that path on the lower filesystem. An
-/// agent shown an empty directory where the user has files can act on that
-/// wrong belief, so a caller tells the user before the session starts.
+/// A nested mount's directory shows empty in the merged view, so a caller warns the user first.
 pub fn nestedMounts(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -310,8 +296,7 @@ fn existsInProject(
     return true;
 }
 
-/// True if `absolute_path`, already known to be a character device, is
-/// overlayfs's own whiteout: major and minor both zero.
+/// True if `absolute_path`, a known character device, is overlayfs's own whiteout.
 fn isWhiteout(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?Diagnostic) Error!bool {
     const path_z = allocator.dupeZ(u8, absolute_path) catch return error.OutOfMemory;
     defer allocator.free(path_z);
@@ -329,12 +314,7 @@ fn isWhiteout(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?
     return stx.rdev_major == 0 and stx.rdev_minor == 0;
 }
 
-/// `userxattr` is required, and its absence looked like a kernel fault. Without
-/// it, overlayfs keeps this bookkeeping in `trusted.overlay.*`, which only
-/// `CAP_SYS_ADMIN` over the host can write, so the kernel returned `EIO` for
-/// `rm x && mkdir x`, for `rm -rf` of a project directory, and for replacing a
-/// file with a directory. An earlier version recorded that as an unfixable
-/// kernel limitation. `userxattr` moves it into `user.overlay.*`.
+/// `userxattr` is required, or overlayfs keeps this bookkeeping in `trusted.overlay.*`, needing `CAP_SYS_ADMIN`.
 fn isOpaqueDir(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?Diagnostic) Error!bool {
     const path_z = allocator.dupeZ(u8, absolute_path) catch return error.OutOfMemory;
     defer allocator.free(path_z);
@@ -343,11 +323,8 @@ fn isOpaqueDir(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*
     const rc = linux.lgetxattr(path_z.ptr, "user.overlay.opaque", &value, value.len);
     switch (linux.errno(rc)) {
         .SUCCESS => {},
-        // No such attribute at all: an ordinary directory.
         .NODATA => return false,
         .RANGE => return false,
-        // The filesystem underneath the upper layer does not support
-        // extended attributes, so it can hold no opaque marker either.
         .OPNOTSUPP => return false,
         else => |err| {
             diagnostic.noteErrno(diag, .opaque_directory_getxattr, err);
@@ -378,8 +355,6 @@ fn resolveKind(
         else => .unknown,
     };
 }
-
-// Every test below builds its own project directory inside a fresh tmpDir.
 
 const overlay_helper_path = @import("overlay_helper_path").overlay_helper_path;
 
@@ -450,7 +425,6 @@ fn allowScratchCleanup(allocator: std.mem.Allocator, ov: Overlay) void {
 }
 
 /// True if this process can use extended attributes on an ordinary file here.
-/// A filesystem without them can hold no opaque marker.
 fn xattrsSupported(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) bool {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = absoluteDirPath(&buffer, tmp.dir.handle) catch return false;
@@ -544,7 +518,6 @@ test "the upper layer holds only the files that changed" {
 }
 
 test "a file deleted in the overlay is still in the project" {
-    // overlayfs marks a deletion with a whiteout. Prove the original survives.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -661,8 +634,6 @@ test "a new directory the agent made is not reported on its own, only the file i
 }
 
 test "mounts describes an overlay onto the project's own path, with project as the lower layer" {
-    // A reviewer swapped the mount target to prove the test was really
-    // reading the merged view.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -687,7 +658,6 @@ test "mounts describes an overlay onto the project's own path, with project as t
 }
 
 test "regression: a directory that replaces a deleted file is reported as a deletion, not lost" {
-    // The case that made `userxattr` necessary.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -704,8 +674,6 @@ test "regression: a directory that replaces a deleted file is reported as a dele
     var report = try ov.changedFiles(allocator, std.testing.io, null);
     defer report.deinit(allocator);
 
-    // Whether "x" itself is reported deleted depends on reading the opaque
-    // marker, which needs extended attribute support underneath.
     const check_opaque_marker = xattrsSupported(allocator, tmp);
 
     var found_deleted_x = false;
@@ -724,8 +692,6 @@ test "regression: a directory that replaces a deleted file is reported as a dele
 }
 
 test "regression: a project symlink does not let existsInProject see through a replaced directory" {
-    // `existsInProject` used to resolve rel_path in a way that followed a
-    // symbolic link out of the project.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -821,8 +787,6 @@ test "a fifo made inside the overlay is recorded as a skip, not silently dropped
 }
 
 test "resolveKind falls back to statx when the caller reports unknown" {
-    // A filesystem with no d_type reports every entry as unknown, so the walk
-    // must stat rather than trust the listing.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -848,8 +812,7 @@ fn writeUpper(allocator: std.mem.Allocator, ov: Overlay, relative: []const u8, c
     try file.writeStreamingAll(std.testing.io, contents);
 }
 
-/// Make the whiteout overlayfs makes for a deleted path: a character device
-/// with major and minor both zero.
+/// The whiteout overlayfs makes for a deleted path: a character device with major and minor both zero.
 fn makeWhiteout(allocator: std.mem.Allocator, ov: Overlay, relative: []const u8) !void {
     const file_path = try std.fs.path.join(allocator, &.{ ov.upper, relative });
     defer allocator.free(file_path);
@@ -859,8 +822,6 @@ fn makeWhiteout(allocator: std.mem.Allocator, ov: Overlay, relative: []const u8)
     const path_z = try allocator.dupeZ(u8, file_path);
     defer allocator.free(path_z);
     const rc = linux.mknod(path_z.ptr, linux.S.IFCHR | 0o600, 0);
-    // A failure fails the test and never skips it. A machine that cannot make
-    // a whiteout would otherwise pass this silently.
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
     try std.testing.expect(try isWhiteout(allocator, file_path, null));
 }
@@ -952,7 +913,6 @@ test "carryOut brings a changed file and a new one out, and changes nothing in t
     defer allocator.free(added);
     try std.testing.expectEqualStrings("the agent made this\n", added);
 
-    // Nothing of the person's moved.
     const still_there = try readProjectFile(allocator, project, "tracked.txt");
     defer allocator.free(still_there);
     try std.testing.expectEqualStrings("original\n", still_there);
@@ -962,7 +922,6 @@ test "carryOut brings a changed file and a new one out, and changes nothing in t
 }
 
 test "a path the session deleted is named in the deleted file and is still in the project" {
-    // A deletion is work, and it is carried as a name.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1019,8 +978,6 @@ test "the deleted and skipped files are written even when nothing was deleted or
 }
 
 test "carryOut refuses a destination that already holds something, and reads nothing out of the upper layer" {
-    // Not silent, and not a merge. A destination that is already there may
-    // hold files a person edited, and there is no telling those apart.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1076,7 +1033,6 @@ test "a symbolic link the session made is carried as a link, and an executable f
 
     const link_path = try std.fs.path.join(allocator, &.{ ov.upper, "latest" });
     defer allocator.free(link_path);
-    // A relative target, which is what an agent makes.
     try std.Io.Dir.cwd().symLink(std.testing.io, "build.sh", link_path, .{});
 
     const destination = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted" });
@@ -1121,7 +1077,6 @@ test "a fifo the session made is named in the skipped file rather than dropped" 
     defer allocator.free(fifo_path);
     const fifo_z = try allocator.dupeZ(u8, fifo_path);
     defer allocator.free(fifo_z);
-    // A fifo needs no privilege at all, so a failure here fails the test.
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknod(fifo_z.ptr, linux.S.IFIFO | 0o600, 0)));
 
     const destination = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted" });

@@ -21,8 +21,7 @@ test {
 const session_id = "01JZZZZZZZZZZZZZZZZZZZZZZZ";
 const header_line = "{\"chock_log\":1}";
 
-/// Each line carries the digest of the line before it, inside the line, so an
-/// edit changes every line after it and the head with them.
+/// Each line carries the digest of the line before it, so an edit changes every line after it and the head too.
 const Log = struct {
     const max_line = 192;
 
@@ -185,8 +184,7 @@ test "a digest of this project's chain is the width a seal carries" {
     try testing.expect(seal.isDigest(&chain.of("anything at all")));
 }
 
-/// The signature answer is built here, because the digest a seal signs is not
-/// known until the seal's fields are settled.
+/// Built here, because the digest a seal signs is not known until the seal's fields are settled.
 const CardTape = struct {
     body: [64]u8 = undefined,
     request: [128]u8 = undefined,
@@ -379,8 +377,7 @@ const SignatureExchange = struct {
     }
 };
 
-/// `Recorded` refuses a command it has no recording of, so a change to the order
-/// or to one byte fails here.
+/// `Recorded` refuses a command it has no recording of, so a change to the order or to one byte fails here.
 const PathTape = struct {
     probe: SignatureExchange = .{},
     real: SignatureExchange = .{},
@@ -600,8 +597,7 @@ const RsaSignExchange = struct {
 /// A test value: every test below drives `Recorded`, so no card is sent it.
 const recorded_pin = "654321";
 
-/// This slot's PIN policy is `always`, so the card path unlocks it and hands
-/// that unlock to the first seal signature.
+/// This slot's PIN policy is `always`, so the card path unlocks it for the first seal signature.
 const RsaTape = struct {
     metadata_bytes: [14 + rsa_card_key.len]u8 = undefined,
     metadata_request: [8]u8 = undefined,
@@ -618,8 +614,7 @@ const RsaTape = struct {
     signatures: usize = 1,
     /// `90 00` is accepted, and `63 CX` is wrong with X tries left.
     verify_answer: []const u8 = &.{ 0x90, 0x00 },
-    /// The first `VERIFY` goes through `attempt.Attempt.givePin` and every one
-    /// after it through `piv.CardSigner.authorise`.
+    /// The first `VERIFY` goes through `attempt.Attempt.givePin`, every one after through `piv.CardSigner.authorise`.
     second_verify_answer: ?[]const u8 = null,
 
     fn push(self: *RsaTape, made: []const chock_pcsc.Exchange) void {
@@ -674,8 +669,7 @@ const RsaTape = struct {
     }
 };
 
-/// The count is the retry guard: a build that asked twice for one signature
-/// fails on it.
+/// The count is the retry guard: a build that asked twice for one signature fails on it.
 const FixedPin = struct {
     asked: usize = 0,
     shown: [8]chock_pcsc.pin.Tries = undefined,
@@ -833,8 +827,7 @@ test "a card whose PIN is letters gives the same level 2 seal as one whose PIN i
     try testing.expectEqual(@as(usize, 1), typed.asked);
 }
 
-/// Worked out from the request, so a tape and the seal made from it cannot ask
-/// for two different things.
+/// Worked out from the request, so a tape and the seal made from it cannot ask for two different things.
 fn sealDigestFor(request: seal.Request) ![32]u8 {
     return seal.digestOf(.{
         .session = request.session,
@@ -848,8 +841,7 @@ fn sealDigestFor(request: seal.Request) ![32]u8 {
 }
 
 test "a prompt after the first says why it failed, and each answer keeps its own words" {
-    // Two seals, because the second prompt is the one `piv.CardSigner.authorise`
-    // puts up.
+    // Two seals, because the second prompt is the one `piv.CardSigner.authorise` puts up.
     const cases = [_]struct { answer: chock_pcsc.pin.Answer, want: attempt.Outcome }{
         .{ .answer = .nobody, .want = .pin_nobody },
         .{ .answer = .declined, .want = .pin_declined },
@@ -900,8 +892,7 @@ test "a prompt after the first says why it failed, and each answer keeps its own
 }
 
 test "a wrong PIN on a later prompt spends one try, and the run never asks again" {
-    // Three wrong PINs block the card. The recording holds two `VERIFY` commands
-    // and refuses anything else, so a third ask fails here and not on a card.
+    // Three wrong PINs block the card. The recording holds two `VERIFY` commands and refuses a third.
     const log = try Log.build(.{ "first", "second", "third" });
     const request = requestFor(&log, log.head(), .card);
 

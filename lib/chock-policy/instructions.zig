@@ -11,8 +11,7 @@ pub const block_name = "instructions";
 
 pub const max_file_bytes = 1 << 20;
 
-/// Every entry costs a file read and a block in the prompt, so this is a real
-/// bound and not a round number.
+/// Every entry costs a file read and a block in the prompt.
 pub const max_files: usize = 8;
 
 pub const Block = struct {
@@ -236,9 +235,7 @@ fn readFiles(
     return .{ .files = try out.toOwnedSlice(gpa) };
 }
 
-/// The cheap half of the check, which needs no disk. `resolve` does the half
-/// that does: a name that passes here can still be a symbolic link out of the
-/// project.
+/// The cheap half of the check. `resolve` does the half that needs disk.
 fn checkPath(
     gpa: std.mem.Allocator,
     text: []const u8,
@@ -296,10 +293,9 @@ pub fn load(
     return parse(gpa, source, diag);
 }
 
-/// The path on disk, with every link resolved and the answer held inside the
-/// project. **A repository can ship a link**, so a name that reads as ordinary
-/// can point at a key in the user's home, and the prompt is where that would
-/// end up. The caller owns the result.
+/// The path on disk, with every link resolved. A repository can ship a link
+/// that reads as ordinary but points at a key in the user's home. The caller
+/// owns the result.
 pub fn resolve(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -419,7 +415,6 @@ test "a link out of the project is refused, because a repository can ship one" {
     const root_length = try project.dir.realPath(testing.io, &root_buffer);
     const root = root_buffer[0..root_length];
 
-    // The name is ordinary and the parse accepts it. Only the disk says no.
     var block = try parse(gpa, ".{ .instructions = .{ \"notes.md\" } }", null);
     defer block.deinit(gpa);
 

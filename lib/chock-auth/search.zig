@@ -1,28 +1,12 @@
 //! Where a web search engine's vendor key is kept.
-//!
-//! An engine of the `api` kind needs a key, but the key is not a provider
-//! instance: it has no model list and no base URL of its own in
-//! `store.Store`'s index, and nothing looks it up through `lookup.zig`. It
-//! goes straight to the `store.Secrets` driver under a reserved name, the way
-//! `signing.zig` keeps the seal key.
 
 const std = @import("std");
 const store = @import("store.zig");
 
-/// What the driver keeps a search credential under, before the user's own
-/// name.
 pub const name_prefix = store.reserved_prefix ++ "search:";
 
-/// The longest name this file accepts.
 pub const max_name_bytes: usize = 128;
 
-/// Whether `name` is safe to join to `name_prefix`.
-///
-/// The stored key is `name_prefix ++ name`, built by concatenation and not
-/// by a structured record. A name holding a colon could be spelled to reach
-/// past its own prefix into another reserved key, so a colon is refused here
-/// rather than trusted to never appear. Refusing it is what makes the
-/// prefix a namespace instead of string concatenation that usually works.
 pub fn nameIsAcceptable(name: []const u8) bool {
     if (name.len == 0 or name.len > max_name_bytes) return false;
     for (name) |c| {
@@ -37,10 +21,6 @@ pub fn nameIsAcceptable(name: []const u8) bool {
 
 pub const KeyNameError = error{ OutOfMemory, NameNotAcceptable };
 
-/// The full driver key for `name`. Caller owns the result.
-///
-/// Validation happens here rather than only in `load` and `save`, so a
-/// caller added later cannot reach the driver with an unchecked name.
 pub fn keyName(gpa: std.mem.Allocator, name: []const u8) KeyNameError![]u8 {
     if (!nameIsAcceptable(name)) return error.NameNotAcceptable;
     return std.mem.concat(gpa, u8, &.{ name_prefix, name });
@@ -48,12 +28,6 @@ pub fn keyName(gpa: std.mem.Allocator, name: []const u8) KeyNameError![]u8 {
 
 pub const Error = store.Error || error{NameNotAcceptable};
 
-/// The credential the driver holds for this search engine, or null when it
-/// holds none. Caller owns the result and must `secureZero` it before
-/// freeing.
-///
-/// Null means the user named this engine in their config and has not run
-/// the login for it yet. That is the ordinary first run, and not a fault.
 pub fn load(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -66,11 +40,6 @@ pub fn load(
     return secrets.get(gpa, io, key, diag);
 }
 
-/// Keep `value` under this search engine's name, replacing whatever was
-/// there.
-///
-/// `value` is opaque bytes to this layer: a vendor key is not trimmed,
-/// decoded, or otherwise transformed.
 pub fn save(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -86,12 +55,10 @@ pub fn save(
 
 const testing = std.testing;
 
-/// A driver that holds a small list of name/value pairs in memory.
 const FakeSecrets = struct {
     const Entry = struct { name: []const u8, value: []const u8 };
 
     entries: std.ArrayList(Entry) = .empty,
-    /// The last name a caller asked this driver to get or put.
     last_name: []const u8 = "",
 
     fn secrets(self: *FakeSecrets) store.Secrets {

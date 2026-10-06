@@ -9,15 +9,12 @@ const chock_proto = @import("chock-proto");
 const event = chock_proto.event;
 const subagent = chock_core.subagent;
 
-// Zig 0.16's test runner panics on argv it does not know, so build.zig embeds
-// the helper path at build time.
+// build.zig embeds the helper path at build time, since the test runner panics on unknown argv.
 const child_path = @import("subagent_child_path").subagent_child_path;
 
 const testing = std.testing;
 
-/// A real child works its log path out through `src/session.zig`, which is
-/// program code and not library code, so the helper is told through the
-/// environment instead.
+/// The real child is told its log path through the environment, not the command line.
 const log_path_variable = "CHOCK_TEST_CHILD_LOG";
 
 const Tree = struct {
@@ -103,8 +100,7 @@ fn startAndRead(
     prepared: subagent.Prepared,
     parent_kind: []const u8,
 ) !subagent.Report {
-    // One agent above, or none when the caller asked for a child at the top of
-    // a tree. `test/core/tree.zig` drives a longer chain.
+    // One agent above, or none for a child at the top of a tree.
     const above = [_]event.SpawnLink{.{ .agent_kind = parent_kind, .reason = request.reason }};
     const argv = try subagent.commandLine(gpa, .{
         .exe_path = child_path,
@@ -123,8 +119,7 @@ fn startAndRead(
         .environ_map = &env,
         .stdin = .ignore,
         .stdout = .ignore,
-        // A child that aborts prints a trace, which would read as a failure of
-        // this suite.
+        // A child that aborts prints a trace, which would read as a failure of this suite.
         .stderr = .ignore,
     });
     _ = child.wait(testing.io) catch {};
@@ -451,9 +446,7 @@ const RealSpawner = struct {
 };
 
 test "a real child runs while its parent works, and the parent records it afterwards" {
-    // No clock is involved. A `WAIT` child does not end until the parent puts
-    // a file in the project, and the parent does that only after it writes its
-    // own work, so a parent blocked inside `start` never reaches that line.
+    // A `WAIT` child does not end until the parent puts a file in the project.
     const gpa = testing.allocator;
     var tree = try Tree.init(gpa);
     defer tree.deinit(gpa);

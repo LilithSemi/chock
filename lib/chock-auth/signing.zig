@@ -1,90 +1,16 @@
 //! Where the software seal key's secret is kept.
-//!
-//! `lib/chock-pcsc/software.zig` holds a P-256 key pair in this process and
-//! says, in its own top comment, that where the secret lives between runs is
-//! not its business: `toSecret` and `fromSecret` are the whole of its storage
-//! interface. This is the other end of those two calls.
-//!
-//! ## Neither library learns about the other
-//!
-//! **`chock-pcsc` must never import `chock-auth`**, because a verifier must not
-//! need a credential store to check a signature. That is the half an auditor
-//! uses, and an auditor has no store.
-//!
-//! **`chock-auth` imports no other Chock library either**, which is the rule
-//! `lib/chock-auth.zig` already keeps: `chock login` runs before a session, a
-//! workspace or a sandbox exists.
-//!
-//! So this file knows a secret is `secret_len` bytes and knows nothing else
-//! about it. It never builds a key, never signs, and never reads a public part.
-//! The caller holds both halves and joins them:
-//!
-//! ```
-//! const secret = try signing.load(gpa, io, secrets, null) orelse fresh: {
-//!     const made = software.Key.generate(io).toSecret();
-//!     try signing.save(gpa, io, secrets, made, null);
-//!     break :fresh made;
-//! };
-//! var key = try software.Key.fromSecret(secret);
-//! ```
-//!
-//! **The caller makes the key, not this file.** Not every 32 bytes is a valid
-//! P-256 scalar, and only the curve knows which are. A generator here would
-//! either duplicate that rule or hand back a secret that cannot be used.
-//!
-//! ## The driver, and not the index
-//!
-//! This goes through `store.Secrets` and never through `store.Store`. A
-//! `Store` entry is a provider instance, with a kind and a base URL, and it is
-//! listed by `chock login`. A signing key is none of those things, so it gets
-//! no index entry and appears in no listing of providers.
-//!
-//! It still gets the platform's own protection, which is the whole reason to
-//! use the driver: a file at mode `0600` on Linux, the Keychain on macOS, and
-//! whatever a later driver makes of those. Nothing here changes when the
-//! driver does.
-//!
-//! ## Losing this secret loses no log and forges nothing
-//!
-//! A lost secret means the next seal is signed by a new key, so seals written
-//! before it verify against a key nothing holds any more. **They still
-//! verify**: a seal carries the public key that signed it. What is lost is the
-//! proof that the same signer made the old and the new one.
 
 const std = @import("std");
 const store = @import("store.zig");
 
-/// How many bytes a stored secret is. The same width
-/// `chock-pcsc/software.zig`'s `secret_len` is, which is P-256's own scalar
-/// width. **Written here rather than imported**: see this file's own top
-/// comment on why the two libraries do not know about each other.
 pub const secret_len: usize = 32;
 
-/// The secret itself, as it is handed over.
 pub const Secret = [secret_len]u8;
 
-/// What the driver keeps the secret under. The prefix is
-/// `store.reserved_prefix`, so `store.Store.put` refuses to store a provider
-/// instance over it.
-///
-/// **The version is in the name.** A later key of a different width or a
-/// different curve gets a different name, so a build that reads this one can
-/// never mistake it for something else and no migration has to guess.
 pub const key_name = store.reserved_prefix ++ "seal-key-v1";
 
-/// How the secret is written: lowercase hexadecimal, `secret_len * 2`
-/// characters. A driver's value is text, so raw bytes with a zero in them
-/// would not survive the trip through either driver.
 pub const stored_len = secret_len * 2;
 
-/// The secret the driver holds, or null when it holds none.
-///
-/// **Null is "this machine has not signed yet" and not a fault.** A machine
-/// that has never sealed a log has no key, and that is the ordinary first run.
-/// A value that is there and is not `stored_len` characters of lowercase
-/// hexadecimal **is** a fault: it is a store somebody edited, and reading it
-/// back as "no key" would quietly make a new one and orphan every seal the old
-/// one wrote.
 pub fn load(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -98,9 +24,7 @@ pub fn load(
     }
 
     if (text.len != stored_len) return error.StoreCorrupt;
-    // Lower case only, and checked here: `std.fmt.hexToBytes` takes either
-    // case, so a value written in upper case would read back as the same
-    // secret under a second spelling. One value, one spelling.
+    // Lower case only, checked here: std.fmt.hexToBytes takes either case, so a value written upper case would read back as the same secret under a second spelling.
     for (text) |c| {
         const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
         if (!ok) return error.StoreCorrupt;
@@ -110,7 +34,6 @@ pub fn load(
     return secret;
 }
 
-/// Keep `secret`, replacing whatever was there.
 pub fn save(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -126,12 +49,9 @@ pub fn save(
 
 const testing = std.testing;
 
-/// A driver that holds one name and one value in memory. Neither a file nor a
-/// Keychain, which is the reason `store.Secrets` is a vtable.
 const FakeSecrets = struct {
     name: []const u8 = "",
     value: []const u8 = "",
-    /// Set when `get` should fail the way a driver with a bad file does.
     unreadable: bool = false,
 
     fn secrets(self: *FakeSecrets) store.Secrets {
@@ -180,9 +100,6 @@ const FakeSecrets = struct {
 };
 
 test "a secret saved is the same secret loaded, byte for byte" {
-    // The property every seal already written depends on. A secret that did not
-    // come back would give a new key on the next run, and a reader would find
-    // two signers where there was one.
     var fake = FakeSecrets{ .name = try testing.allocator.dupe(u8, ""), .value = try testing.allocator.dupe(u8, "") };
     defer fake.deinit(testing.allocator);
 
@@ -192,8 +109,6 @@ test "a secret saved is the same secret loaded, byte for byte" {
     const loaded = (try load(testing.allocator, testing.io, fake.secrets(), null)).?;
     try testing.expectEqualSlices(u8, &secret, &loaded);
 
-    // And the mutation check: another secret gives another answer, so `load` is
-    // not returning a constant.
     const other: Secret = [_]u8{0x77} ** secret_len;
     try save(testing.allocator, testing.io, fake.secrets(), other, null);
     try testing.expectEqualSlices(u8, &other, &(try load(testing.allocator, testing.io, fake.secrets(), null)).?);

@@ -63,8 +63,7 @@ const NonToolAction = struct {
     why: []const u8 = "",
 };
 
-/// Never guessed from the shape of a name, so an act added to Chock later reads
-/// as unchecked rather than as checked against a tool name invented here.
+/// Never guessed from the shape of a name, so an act added later reads as unchecked rather than falsely checked.
 const non_tool_actions = [_]NonToolAction{
     .{
         .action = chock_broker.actions.Kind.workspace_apply.wireName(),
@@ -85,9 +84,7 @@ fn nonToolAction(action: []const u8) ?NonToolAction {
     return null;
 }
 
-/// Every boundary is reached by a tool call and by nothing else, so a session
-/// that called no tool leaves canaries that look like those of a session the
-/// sandbox held. A session that errored partway through is inconclusive too.
+/// A session that called no tool looks like one the sandbox held. An errored session is inconclusive too.
 pub const Measured = struct {
     turns: u64 = 0,
     tool_calls: u64 = 0,
@@ -124,8 +121,7 @@ pub const Scan = struct {
 
 pub const Error = std.mem.Allocator.Error || error{Unexpected};
 
-/// A null `policy_table` turns the re-derivation off and records why, which a
-/// caller with no readable `chock.zon` must do rather than skip the check.
+/// A null `policy_table` turns the re-derivation off and records why, rather than silently skipping it.
 pub fn scan(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -143,8 +139,7 @@ pub fn scan(
     var walkarounds: std.ArrayList(Walkaround) = .empty;
     var inconclusive: std.ArrayList([]const u8) = .empty;
 
-    // `Log.open` creates the file it cannot find, and a harness that made the log
-    // it was about to read would report a clean session.
+    // `Log.open` creates a missing file, so a missing log must be checked for first.
     _ = std.Io.Dir.cwd().statFile(io, log_path, .{}) catch {
         return .{
             .arena = arena_holder,
@@ -228,8 +223,7 @@ pub fn scan(
         );
     }
 
-    // Before the literal below, which copies `arena_holder` into its first field:
-    // an allocation after that copy lands in an arena the copy no longer tracks.
+    // Must run before the return literal copies arena_holder, or the allocation lands in an untracked arena.
     const nothing = try nothingMeasured(arena, session_id, events, &state);
 
     return .{
@@ -476,8 +470,7 @@ const Fold = struct {
         out: *std.ArrayList(PolicyFinding),
         inconclusive: *std.ArrayList([]const u8),
     ) std.mem.Allocator.Error!void {
-        // A child's answer is the intersection down the chain, so judging it as a
-        // root would be too permissive. The log says the chain, or nothing does.
+        // A child's answer is the intersection down the chain, so judging it as a root would be too permissive.
         if (self.parent_session.len > 0 and !self.chainRecorded()) {
             try inconclusive.append(arena, try std.fmt.allocPrint(
                 arena,
@@ -635,8 +628,7 @@ const Fold = struct {
         return .{ .parts = .{ .agent_kind = kind, .tool = tool, .chain = chain } };
     }
 
-    /// Counts rather than pairs by id, because a `policy.self` carries no tool
-    /// call id. That makes this an undercount and never an overcount.
+    /// Counts rather than pairs by id, since `policy.self` carries no tool call id. This undercounts, never overcounts.
     fn judgeWidenings(
         self: *const Fold,
         arena: std.mem.Allocator,
@@ -760,8 +752,7 @@ fn agrees(decision: event.ApprovalDecision, expected: table.Decision) bool {
 
 const testing = std.testing;
 
-/// A real log written through the same storage `chock run` writes one with. A
-/// hand written log would show only that the scan can read what a test invented.
+/// A real log written through the same storage `chock run` writes one with.
 const TestLog = struct {
     gpa: std.mem.Allocator,
     tmp: std.testing.TmpDir,
@@ -927,8 +918,7 @@ const TestLog = struct {
         } });
     }
 
-    /// The shape `Broker.request` writes when `SessionGrants` already holds a yes:
-    /// `request_id` zero, and the action and tool call id filled in directly.
+    /// The shape `Broker.request` writes when `SessionGrants` already holds a yes.
     fn grantServed(
         self: *TestLog,
         io: std.Io,

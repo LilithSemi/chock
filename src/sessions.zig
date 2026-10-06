@@ -1,6 +1,5 @@
-//! `chock sessions`: what this project's sessions were, which of them is
-//! running right now, and how to be rid of one. Removing one destroys the only
-//! account of what an agent did, which is why `remove` asks first.
+//! `chock sessions`: lists this project's sessions and verifies, seals,
+//! exports, removes, or prunes a session's log.
 
 const std = @import("std");
 const chock_auth = @import("chock-auth");
@@ -121,8 +120,6 @@ pub fn main(
 ) anyerror!u8 {
     _ = exe_path;
 
-    // `.environ` is what `Threaded` resolves a bare `argv[0]` against, and the
-    // remove path spawns a bare `git`. Left out, a Nix machine finds no `git`.
     var threaded = std.Io.Threaded.init(arena, .{ .environ = environ });
     defer threaded.deinit();
     const io = threaded.io();
@@ -344,26 +341,20 @@ pub const Liveness = enum {
     unknown,
 };
 
-/// Whether the session whose log is at `log_path` is running. The lock answers
-/// this and a timestamp cannot: a killed session leaves a log written a moment
-/// ago and no process, and the kernel drops the lock when the last descriptor
-/// closes.
+// A timestamp cannot answer this: a killed session leaves a log written a moment ago and no process, so the lock is what is checked.
 pub fn livenessOf(io: std.Io, log_path: [:0]const u8) Liveness {
     var one = probe(io, log_path) orelse return .unknown;
     defer one.release(io);
     return if (one.acquired) .idle else .live;
 }
 
-/// Shared, and the choice is load bearing: two probes must not contend.
+// Shared, and the choice is load bearing: two probes must not contend.
 const probe_lock: std.Io.File.Lock = .shared;
 
 const Probe = struct {
     file: std.Io.File,
     acquired: bool,
 
-    /// The close alone would do it, since the kernel drops a description's locks
-    /// when its last descriptor goes. The unlock is written out so the release
-    /// does not depend on that.
     fn release(self: *Probe, io: std.Io) void {
         if (self.acquired) self.file.unlock(io);
         self.file.close(io);
@@ -470,8 +461,6 @@ pub fn fold(
     var one = Session{
         .id = try allocator.dupe(u8, id),
         .started_ms = session_paths.startedMs(id),
-        // Read before the log is opened, because opening it in this process
-        // would make the answer "the lock is free" whatever anybody else holds.
         .live = livenessOf(io, path),
         .has_work = holdsAnything(io, work),
         .has_root = holdsAnything(io, root),
@@ -594,10 +583,6 @@ fn dupeReason(
     };
 }
 
-/// Every session of `dir`, oldest first. A session identifier starts with the
-/// millisecond it was made, in an alphabet that sorts in the same order, so the
-/// directory listing is already sorted and no index is kept. Caller owns the
-/// slice and everything in it.
 pub fn list(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -665,8 +650,6 @@ pub fn titleText(
     var kept: std.ArrayList(u8) = .empty;
     defer kept.deinit(allocator);
     for (raw) |byte| {
-        // Only ASCII control characters are checked byte by byte, which is safe
-        // over UTF-8: every byte of a multi byte character is 0x80 or above.
         const drives_the_terminal = byte < 0x20 or byte == 0x7F;
         try kept.append(allocator, if (drives_the_terminal) '?' else byte);
     }
@@ -1200,8 +1183,6 @@ fn sealMain(
         tty.print(.err, "chock sessions seal: the data directory is unknown: {s}\n", .{@errorName(err)});
         return Exit.usage.code();
     };
-    // The seal key lives wherever the credentials do, so a machine using the
-    // keystore does not leave this one key in a file beside it.
     const config_dir = chock_auth.paths.configDir(arena, env) catch |err| {
         tty.print(.err, "chock sessions seal: the configuration directory is unknown: {s}\n", .{@errorName(err)});
         return Exit.usage.code();
@@ -1212,8 +1193,7 @@ fn sealMain(
         .env = env,
     };
 
-    // It must not move, because the attempt below points at it and the signer
-    // points at the attempt.
+    // It must not move: the attempt below points at it, and the signer points at the attempt.
     var transport = chock_pcsc.default(io);
     defer transport.deinit();
     var scratch: [chock_pcsc.piv.max_object_len]u8 = undefined;
@@ -1343,7 +1323,6 @@ const TerminalPin = struct {
         out: *chock_pcsc.pin.Buffer,
     ) chock_pcsc.pin.Answer {
         const self: *TerminalPin = @ptrCast(@alignCast(ptr));
-        // Before a byte is written. A prompt on a pipe is a hang.
         if (!self.at_terminal) return .nobody;
         self.asked += 1;
 
@@ -1424,9 +1403,6 @@ fn signingKey(
         return null;
     }) |secret| {
         return chock_pcsc.software.Key.fromSecret(secret) catch {
-            // A stored value of the right width that is not a scalar on the
-            // curve, so a store somebody edited. Never a reason to make a new
-            // key: that would quietly orphan every seal the old one wrote.
             tty.print(
                 .err,
                 "chock sessions seal: the stored signing key is not a key on the curve. " ++

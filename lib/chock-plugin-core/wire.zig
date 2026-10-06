@@ -1,57 +1,4 @@
-//! The metadata format, as pure functions over bytes, in both directions.
-//!
-//! Nothing here parses wasm, starts an engine, or touches a guest's linear
-//! memory. `serialize` turns a `Metadata` into bytes, `parse` turns bytes back
-//! into a `Metadata`, and a host that has the bytes learns what a plugin is
-//! without running one instruction of it.
-//!
-//! ## Why bytes and not the struct
-//!
-//! A guest could export the memory image of its `Metadata` instead. That
-//! couples the host to the guest's wasm32 layout: field order, alignment, and
-//! a four byte pointer chased into the data segment for every string. It
-//! breaks on any added field, and it breaks worst on the compatibility field,
-//! because a host cannot read the field that decides the layout if reading it
-//! already needs that layout. A length prefixed blob has the same no execution
-//! property with none of the coupling.
-//!
-//! ## The prefix never moves
-//!
-//! The first twelve bytes are the same in every ABI, forever:
-//!
-//! ```text
-//! offset 0   u32 little endian   the magic word, `Magic.word`
-//! offset 4   u32 little endian   the ABI version of the body
-//! offset 8   u32 little endian   the length of the whole blob, prefix included
-//! ```
-//!
-//! Everything after byte twelve belongs to one ABI and may change with it.
-//! Holding several ABIs later is then a matter of adding a body reader, not of
-//! touching the code that decides which reader to call.
-//!
-//! **The magic is checked before any length prefixed read.** A blob that is
-//! not ours must never hand this reader a length to trust.
-//!
-//! ## Two failures, two messages
-//!
-//! A host meets two different problems and must not confuse them.
-//!
-//! - The guest exports no `chock_plugin_magic` symbol at all, or its blob does
-//!   not start with `Magic.word`. That file is not a Chock plugin. The symbol
-//!   name is the magic, so its absence is the whole answer.
-//! - The symbol is there and the ABI version is a number this build does not
-//!   know. That is a Chock plugin built for another Chock. The answer names
-//!   both numbers and asks the author to rebuild, which is the answer that is
-//!   actually useful, because this is the failure that happens constantly.
-//!
-//! `abiVersion` answers `null` rather than trapping for the second case, and
-//! `Refusal` carries both numbers into the message.
-//!
-//! ## Bounds
-//!
-//! A blob comes from a file somebody else wrote, so every count and every
-//! length in it is untrusted. This reader refuses anything above the bounds
-//! below with a named error, and the message says which bound it passed.
+//! Metadata format: serialize to bytes, parse back.
 
 const std = @import("std");
 const metadata = @import("metadata.zig");
@@ -64,59 +11,16 @@ const LocaleField = metadata.LocaleField;
 const ToolDescriptor = metadata.ToolDescriptor;
 const VersionConstraint = metadata.VersionConstraint;
 
-/// The largest metadata blob this reader accepts. A plugin describes itself in
-/// a few kilobytes. A larger blob is a mistake or an attack.
 pub const max_blob_bytes: u32 = 1 << 20;
-
-/// The largest single string: a name, an author, a locale tag, a description,
-/// or a capability name.
 pub const max_string_bytes: u32 = 8 << 10;
-
-/// The largest number of translations of one piece of text.
 pub const max_locales: u32 = 64;
-
-/// The largest number of tools one plugin may offer.
 pub const max_tools: u32 = 256;
-
-/// The largest number of capabilities one tool may declare.
 pub const max_capabilities: u32 = 64;
-
-/// The largest number of fields one argument object may hold.
-///
-/// **Every one of them is read by the model on every turn of the session.** A
-/// tool that took more separate values than this is a tool nobody can call
-/// correctly, and a blob that states more is a blob that wants the host to
-/// allocate on its say so.
 pub const max_properties: u32 = 32;
-
-/// How deeply one argument schema may nest.
-///
-/// A property's own shape is depth one, the item shape of an array is depth
-/// two, and a field of that item is depth three. The deepest shape the mapping
-/// in `schema.zig` can build is a list of records, which reaches depth three,
-/// so this leaves room and still stops a blob that asks this reader to recurse
-/// until the stack runs out. **The check is on the way in, before any memory
-/// is spent**, which is the only place it does any good.
 pub const max_schema_depth: u32 = 8;
 
-/// The magic word, and the symbol whose name carries the same claim.
-///
-/// `word` is a constant of the format and never changes with the ABI.
-/// Changing it per ABI would collapse "this is not a Chock plugin" into "this
-/// plugin is older than this Chock", and the second failure is the one with a
-/// useful answer.
 pub const Magic = struct {
-    /// In file order the bytes are `'C'`, `'H'`, `'K'`, `0x9E`. The high bit
-    /// of the last byte is set on purpose: a blob that went through a channel
-    /// that strips the eighth bit stops matching. The value is far from zero
-    /// and far from all ones, so neither a zeroed page nor an erased flash
-    /// page reads as a plugin.
     pub const word: u32 = 0x9E4B_4843;
-
-    /// The guest symbol whose presence says "this module is a Chock plugin"
-    /// and whose `u32` value is the ABI version it was built for. The name is
-    /// the magic. The number is the version. A host that finds no such symbol
-    /// is holding something that is not a plugin at all.
     pub const symbol = "chock_plugin_magic";
 
     pub fn matches(read_word: u32) bool {
@@ -124,47 +28,26 @@ pub const Magic = struct {
     }
 };
 
-/// The ABI versions this build of Chock knows how to read.
-///
-/// Exhaustive on purpose. `abiVersion` uses `std.enums.fromInt`, which answers
-/// null for a number that is not a member, and null is what turns an unknown
-/// ABI into a message instead of a trap. A non exhaustive enum would accept
-/// every `u32` and throw that answer away.
-///
-/// Numbering starts at one. Zero is never a valid ABI version, so a zeroed
-/// region of memory fails on the ABI field as well as on the magic.
 pub const AbiVersion = enum(u32) {
-    /// The first ABI. Its tool records carry a name, a description and a
-    /// capability set, and nothing about what the tool takes.
     v1 = 1,
-    /// v1 with an argument schema on every tool record. See
-    /// `lib/chock-plugin-core/schema.zig`.
     v2 = 2,
 
-    /// The ABI this build writes and the one it prefers to read.
     pub const current: AbiVersion = .v2;
-
-    /// Whether a tool record in this ABI carries an argument schema. A v1
-    /// plugin still loads, and every tool of it takes nothing, which is what
-    /// that plugin already meant.
     pub fn carriesSchema(self: AbiVersion) bool {
         return self != .v1;
     }
 };
 
-/// The ABI version `word` names, or null when this build does not know that
-/// number. Null is an answer a caller can put in a message. It is not a fault
-/// in this code, so it is not an assertion.
+/// Null, not an assertion.
 pub fn abiVersion(word: u32) ?AbiVersion {
     return std.enums.fromInt(AbiVersion, word);
 }
 
-/// The fixed prefix of every blob, in every ABI.
+/// Stable across every ABI.
 pub const Prefix = struct {
-    /// The raw number, kept as written rather than as an `AbiVersion`, so a
-    /// caller can name it in a message even when this build does not know it.
+    /// Kept as written, so an unknown number can still be named.
     abi_version: u32,
-    /// The length of the whole blob, this prefix included.
+    /// The whole blob's length, prefix included.
     total_len: u32,
 
     pub const len: u32 = 12;
@@ -173,18 +56,11 @@ pub const Prefix = struct {
     pub const total_len_offset: u32 = 8;
 
     comptime {
-        // The prefix is a promise to every future ABI. If a field is added it
-        // goes after byte twelve, never inside these three.
+        // A field added later goes after byte twelve, never inside these three.
         if (total_len_offset + 4 != len) @compileError("the fixed prefix changed width");
     }
 
-    /// Read the prefix, and nothing else. `bytes` needs to hold only `len`
-    /// bytes, so a host reads the head of a section and learns from it how
-    /// much more to fetch. Whether the rest is really there is `parse`'s
-    /// question, not this one.
-    ///
-    /// The magic is checked first, so a blob that is not ours never gets to
-    /// state a length.
+    /// Magic first, so a foreign blob never states a length.
     pub fn read(bytes: []const u8, refusal: ?*?Refusal) PrefixError!Prefix {
         if (bytes.len < len) {
             return note(refusal, .{ .truncated = .{
@@ -215,44 +91,38 @@ pub const Prefix = struct {
         return .{ .abi_version = declared_abi, .total_len = total };
     }
 
-    /// The ABI this prefix names, or null when this build does not know it.
     pub fn known(self: Prefix) ?AbiVersion {
         return abiVersion(self.abi_version);
     }
 };
 
-/// What can go wrong before a single body byte is read.
+/// Before a single body byte is read.
 pub const PrefixError = error{
-    /// The bytes do not start with `Magic.word`. This is not a Chock plugin.
+    /// The bytes do not start with `Magic.word`.
     NotAPlugin,
-    /// The magic is right and the ABI number is one this build does not know.
-    /// Name both numbers and ask the author to rebuild.
+    /// Right magic, unknown ABI number.
     UnknownAbiVersion,
-    /// Fewer bytes are present than the format or the prefix itself says are
-    /// needed.
     Truncated,
-    /// A count or a length above a bound this file keeps.
+    /// Above a bound this file keeps.
     TooLarge,
 };
 
-/// What can go wrong reading a whole blob.
+/// Reading a whole blob.
 pub const ParseError = PrefixError || error{
     OutOfMemory,
-    /// The prefix is well formed and the body behind it is not.
+    /// Prefix well formed; body is not.
     MalformedBody,
 };
 
-/// What can go wrong writing one.
+/// Writing one.
 pub const SerializeError = error{
-    /// The destination is smaller than `serializedLen` said it needs to be.
+    /// Smaller than `serializedLen` said it needs.
     BufferTooSmall,
-    /// The record would not survive `parse`, because some part of it is above
-    /// a bound this file keeps.
+    /// Some part is above a bound this file keeps.
     TooLarge,
 };
 
-/// The detail behind a refusal, for the message a user reads. No part of this
-/// allocates, so there is nothing to release.
+/// Allocates nothing.
 pub const Refusal = union(enum) {
     not_a_plugin: NotAPlugin,
     unknown_abi_version: UnknownAbiVersion,
@@ -265,12 +135,11 @@ pub const Refusal = union(enum) {
         expected: u32,
     };
 
-    /// Both numbers, always. A message that names only one of them sends an
-    /// author to look for the wrong problem.
+    /// Both numbers, always.
     pub const UnknownAbiVersion = struct {
         /// The ABI the plugin was built for.
         found: u32,
-        /// The ABI this build of Chock writes and reads.
+        /// The ABI this build speaks.
         speaks: u32,
     };
 
@@ -322,11 +191,7 @@ fn note(slot: ?*?Refusal, refusal: Refusal, err: anytype) @TypeOf(err) {
     return err;
 }
 
-/// The number of bytes `serialize` writes for `record`, prefix included.
-///
-/// Every addition saturates. A record big enough to wrap a `usize` gives back
-/// a length above `max_blob_bytes`, which `serializeInto` refuses, so the
-/// arithmetic here can never produce a small number for a large record.
+/// Saturates, so an overlarge record still exceeds `max_blob_bytes`.
 pub fn serializedLen(record: Metadata) usize {
     var total: usize = Prefix.len;
     total +|= stringLen(record.name);
@@ -391,9 +256,7 @@ fn localesLen(fields: []const LocaleField) usize {
     return total;
 }
 
-/// Write `record` into `out` in the current ABI, and answer how many bytes it
-/// took. Refuses any record `parse` would refuse, so a guest can never emit a
-/// blob that this same file will not read back.
+/// Refuses any record `parse` would refuse.
 pub fn serializeInto(record: Metadata, out: []u8) SerializeError!usize {
     const total = serializedLen(record);
     if (total > max_blob_bytes) return error.TooLarge;
@@ -424,8 +287,7 @@ pub fn serializeInto(record: Metadata, out: []u8) SerializeError!usize {
     return at;
 }
 
-/// Write `record` into memory the caller owns. For a host or a test. The guest
-/// uses `serializeComptime`, which needs no allocator at all.
+/// The guest uses `serializeComptime` instead, with no allocator.
 pub fn serializeAlloc(gpa: std.mem.Allocator, record: Metadata) (SerializeError || error{OutOfMemory})![]u8 {
     const total = serializedLen(record);
     if (total > max_blob_bytes) return error.TooLarge;
@@ -436,12 +298,7 @@ pub fn serializeAlloc(gpa: std.mem.Allocator, record: Metadata) (SerializeError 
     return out;
 }
 
-/// The guest's own path: the blob as a fixed array, built while the plugin
-/// compiles. There is no allocator in a wasm guest and there does not need to
-/// be one, because the metadata is known in full at compile time.
-///
-/// A record above a bound fails the build with the name of the bound, rather
-/// than shipping a plugin whose metadata no host will read.
+/// A record above a bound fails the build, naming the bound.
 pub fn serializeComptime(comptime record: Metadata) [serializedLen(record)]u8 {
     comptime {
         var out: [serializedLen(record)]u8 = undefined;
@@ -471,14 +328,7 @@ fn checkBounds(record: Metadata) SerializeError!void {
     }
 }
 
-/// **A writer refuses everything the reader refuses.** A guest that could
-/// serialise a schema this same file will not read back would ship a plugin no
-/// host loads, and the author would learn it from a user rather than from the
-/// build.
-///
-/// The depth is checked by `checkShape` and not here. Every road into this
-/// function has already passed through that one at the same depth, so a check
-/// here would never fire.
+/// Depth is checked by `checkShape`, not here.
 fn checkProperties(properties: []const Property, depth: u32) SerializeError!void {
     if (properties.len > max_properties) return error.TooLarge;
     for (properties) |property| {
@@ -577,9 +427,7 @@ fn putProperties(out: []u8, at: *usize, properties: []const Property) void {
     }
 }
 
-/// One shape: the kind byte, then whatever that kind carries. An array writes a
-/// presence byte before its item shape, because an array with no item shape and
-/// an array of strings are different declarations.
+/// A presence byte distinguishes no items from an item of strings.
 fn putShape(out: []u8, at: *usize, shape: Shape) void {
     out[at.*] = @intFromEnum(shape.kind);
     at.* += 1;
@@ -607,27 +455,20 @@ fn putLocales(out: []u8, at: *usize, fields: []const LocaleField) void {
     }
 }
 
-/// A parsed record and the memory behind it. Every string in `record` is a
-/// copy, so the caller may release the blob as soon as this returns.
+/// Every string is a copy, so the caller may free the blob right away.
 pub const Parsed = struct {
     arena: std.heap.ArenaAllocator,
-    /// The ABI the blob declared, which this build knows because `parse`
-    /// refused it otherwise.
+    /// The ABI the blob declared; `parse` refuses any ABI this build does not know.
     abi_version: AbiVersion,
     record: Metadata,
 
-    /// Release everything the record holds. `record` is not valid after this.
+    /// Releases everything; `record` is invalid after.
     pub fn deinit(self: Parsed) void {
         self.arena.deinit();
     }
 };
 
-/// Read a whole blob. `refusal` is optional: a caller that passes null pays
-/// nothing and learns only the error, and a caller that passes a slot gets the
-/// detail for the message.
-///
-/// The order of the checks is part of the format. The magic comes first, then
-/// the ABI version, and only then does this reader trust a length.
+/// The checks run in order: magic, then ABI version, only then a length.
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, refusal: ?*?Refusal) ParseError!Parsed {
     const prefix = try Prefix.read(bytes, refusal);
     const known = prefix.known() orelse return note(refusal, .{ .unknown_abi_version = .{
@@ -680,10 +521,7 @@ fn readBody(arena: std.mem.Allocator, reader: *Reader, abi: AbiVersion) ParseErr
         for (capabilities) |*capability| {
             capability.* = try arena.dupe(u8, try reader.string("a capability name"));
         }
-        // **A v1 plugin still loads, and its tools take nothing.** That is
-        // what a v1 plugin already meant: the ABI it was built for had no way
-        // to say a tool takes an argument, so an empty schema is the truth
-        // about it and not a guess.
+        // A v1 ABI had no way to say a tool takes an argument, so an empty schema is the truth about it.
         const parameters = if (abi.carriesSchema())
             try reader.properties(arena, 0)
         else
@@ -721,8 +559,7 @@ fn dupeVersion(arena: std.mem.Allocator, version: std.SemanticVersion) error{Out
     };
 }
 
-/// A cursor over the body. Every read states what it was reading, so a
-/// refusal can say which field ran out of bytes rather than only where.
+/// States what it reads, so a refusal can name the field.
 const Reader = struct {
     bytes: []const u8,
     at: usize,
@@ -764,7 +601,7 @@ const Reader = struct {
         return value;
     }
 
-    /// Borrowed from the blob, never copied. `readBody` copies what it keeps.
+    /// Borrowed, never copied; `readBody` copies what it keeps.
     fn string(self: *Reader, what: []const u8) ParseError![]const u8 {
         const length = try self.count(what, max_string_bytes);
         return self.take(length, what);
@@ -777,8 +614,7 @@ const Reader = struct {
         };
     }
 
-    /// A presence byte is exactly zero or exactly one. Any other value is a
-    /// blob this reader will not guess about.
+    /// Exactly 0 or 1.
     fn tag(self: *Reader, what: []const u8) ParseError!bool {
         const raw = try self.take(1, what);
         return switch (raw[0]) {
@@ -828,10 +664,7 @@ const Reader = struct {
         };
     }
 
-    /// One argument object's fields. `depth` is how far this reader has already
-    /// nested, and `shape` is what checks it: every road into this function has
-    /// passed through that one at the same depth, so a check here would never
-    /// fire.
+    /// `depth` is checked by `shape`, not here.
     fn properties(self: *Reader, arena: std.mem.Allocator, depth: u32) ParseError![]const Property {
         const total = try self.count("an argument field count", max_properties);
         const fields = try arena.alloc(Property, total);
@@ -848,8 +681,7 @@ const Reader = struct {
         return fields;
     }
 
-    /// One value's shape. The kind byte is checked against the set before it
-    /// decides anything, so a byte nobody wrote is a refusal and never a jump.
+    /// The kind byte is checked before it decides anything.
     fn shape(self: *Reader, arena: std.mem.Allocator, depth: u32) ParseError!Shape {
         if (depth > max_schema_depth) {
             return note(self.refusal, .{ .too_large = .{
@@ -894,9 +726,7 @@ const Reader = struct {
 
 const testing = std.testing;
 
-/// A record that uses every part of the format at once: an optional that is
-/// present, an optional that is absent, several locales, several tools, and a
-/// tool with no capabilities beside one with two.
+/// A record that uses every part of the format at once.
 const sample: Metadata = .{
     .name = "sample",
     .version = .{ .major = 1, .minor = 2, .patch = 3, .pre = "rc.1", .build = "abcdef" },
@@ -933,10 +763,7 @@ test "a record survives serialize and parse unchanged" {
     try testing.expect(sample.eql(parsed.record));
     try testing.expectEqual(AbiVersion.current, parsed.abi_version);
 
-    // Named by hand as well, because `sample.eql` is one function and a test
-    // that rests on it alone says nothing the moment that function is wrong.
-    // A serialiser that wrote a locale where its value belongs, or dropped a
-    // capability, passes `eql` if `eql` is broken and fails here either way.
+    // Named by hand too, so a bug in sample.eql itself cannot hide a real fault.
     try testing.expectEqualStrings("sample", parsed.record.name);
     try testing.expectEqualStrings("rc.1", parsed.record.version.pre.?);
     try testing.expectEqualStrings("abcdef", parsed.record.version.build.?);
@@ -955,8 +782,7 @@ test "the parsed record owns its bytes, so the blob may go" {
     const bytes = try serializeAlloc(testing.allocator, sample);
     var parsed = try parse(testing.allocator, bytes, null);
     defer parsed.deinit();
-    // Overwrite the blob before reading the record. A parser that handed back
-    // slices into the blob would answer with this filler.
+    // A parser that handed back slices into the blob would answer with this filler.
     @memset(bytes, 0xAA);
     testing.allocator.free(bytes);
     try testing.expectEqualStrings("sample", parsed.record.name);
@@ -964,9 +790,7 @@ test "the parsed record owns its bytes, so the blob may go" {
 }
 
 test "an all zero buffer is not a plugin" {
-    // The reason `Magic.word` is not zero. A zeroed page, an erased flash
-    // page, or a file of the right length full of nothing must be refused at
-    // the first field, before any length in it is trusted.
+    // A zeroed page or erased flash page must be refused at the first field.
     var zeros: [64]u8 = @splat(0);
     var refusal: ?Refusal = null;
     try testing.expectError(error.NotAPlugin, parse(testing.allocator, &zeros, &refusal));
@@ -975,9 +799,6 @@ test "an all zero buffer is not a plugin" {
 }
 
 test "an unknown ABI version is refused with both numbers in the message" {
-    // The failure that happens constantly: a plugin built for another Chock.
-    // The answer must name the plugin's ABI and this build's ABI, or the
-    // author has nothing to act on.
     const bytes = try serializeAlloc(testing.allocator, sample);
     defer testing.allocator.free(bytes);
     std.mem.writeInt(u32, bytes[Prefix.abi_version_offset..][0..4], 7, .little);
@@ -999,8 +820,6 @@ test "an unknown ABI version is refused with both numbers in the message" {
 }
 
 test "a wrong magic is a different refusal from a wrong ABI version" {
-    // Two failures, two messages. Collapsing them sends an author to check
-    // whether the file is corrupt when the file is merely old.
     const bytes = try serializeAlloc(testing.allocator, sample);
     defer testing.allocator.free(bytes);
     std.mem.writeInt(u32, bytes[Prefix.magic_offset..][0..4], 0xDEAD_BEEF, .little);
@@ -1018,10 +837,7 @@ test "a wrong magic is a different refusal from a wrong ABI version" {
 }
 
 test "the magic is checked before the declared length is trusted" {
-    // A blob that is not ours must never hand this reader a length. The
-    // length field here says four gigabytes minus one, which is far above
-    // `max_blob_bytes`, so a reader that read the length first would answer
-    // TooLarge and tell the user the wrong thing about the wrong file.
+    // A reader that read the length first would answer TooLarge about the wrong file.
     var blob: [Prefix.len]u8 = @splat(0);
     std.mem.writeInt(u32, blob[Prefix.magic_offset..][0..4], Magic.word ^ 1, .little);
     std.mem.writeInt(u32, blob[Prefix.total_len_offset..][0..4], std.math.maxInt(u32), .little);
@@ -1029,8 +845,6 @@ test "the magic is checked before the declared length is trusted" {
 }
 
 test "a blob shorter than the fixed prefix is refused before any field is read" {
-    // Eleven bytes carry a magic and an ABI version but not a length. A
-    // reader that checked the prefix field by field would read past the end.
     var blob: [Prefix.len - 1]u8 = @splat(0);
     std.mem.writeInt(u32, blob[Prefix.magic_offset..][0..4], Magic.word, .little);
     var refusal: ?Refusal = null;
@@ -1040,9 +854,6 @@ test "a blob shorter than the fixed prefix is refused before any field is read" 
 }
 
 test "a blob cut short of its own declared length is refused" {
-    // The prefix is intact and says how long the blob is. Fewer bytes than
-    // that is a truncated file, not a malformed body, and the reader must not
-    // start reading the body to find that out.
     const bytes = try serializeAlloc(testing.allocator, sample);
     defer testing.allocator.free(bytes);
 
@@ -1056,9 +867,6 @@ test "a blob cut short of its own declared length is refused" {
 }
 
 test "a body cut short inside a string is refused rather than read past" {
-    // Shorten the declared total length so the prefix and the buffer agree,
-    // but the body runs out in the middle of a field. This is the case a
-    // reader that trusted its own lengths would walk off the end of.
     const bytes = try serializeAlloc(testing.allocator, sample);
     defer testing.allocator.free(bytes);
 
@@ -1071,8 +879,7 @@ test "a body cut short inside a string is refused rather than read past" {
 }
 
 test "a declared string length above the bound is refused before the bytes are taken" {
-    // The first field of the body is the plugin name. Claim a name of one
-    // gigabyte inside a blob of a few hundred bytes.
+    // Claims a name of one gigabyte inside a blob of a few hundred bytes.
     const bytes = try serializeAlloc(testing.allocator, sample);
     defer testing.allocator.free(bytes);
     std.mem.writeInt(u32, bytes[Prefix.len..][0..4], 1 << 30, .little);
@@ -1084,13 +891,10 @@ test "a declared string length above the bound is refused before the bytes are t
 }
 
 test "a declared tool count above the bound is refused before the tools are allocated" {
-    // A count is an allocation request from a file somebody else wrote. Four
-    // billion tools must cost nothing to refuse.
     const bytes = try serializeAlloc(testing.allocator, sample);
     defer testing.allocator.free(bytes);
 
-    // Walk the body to the tool count rather than writing an offset by hand,
-    // so this test keeps working when a field ahead of it changes width.
+    // Walked rather than offset by hand, so this keeps working if a field ahead changes width.
     var reader: Reader = .{ .bytes = bytes, .at = Prefix.len, .refusal = null };
     _ = try reader.string("name");
     _ = try reader.version("version");
@@ -1108,8 +912,6 @@ test "a declared tool count above the bound is refused before the tools are allo
 }
 
 test "a presence byte that is neither zero nor one is refused" {
-    // The optional pre release tag of the plugin version. A reader that took
-    // any non zero byte as present would accept a blob it cannot round trip.
     const bytes = try serializeAlloc(testing.allocator, sample);
     defer testing.allocator.free(bytes);
 
@@ -1124,9 +926,6 @@ test "a presence byte that is neither zero nor one is refused" {
 }
 
 test "a blob whose declared length leaves bytes over is refused" {
-    // The body must account for every byte the prefix claimed. Extra bytes
-    // inside the declared length are a blob this reader does not understand,
-    // and reading it anyway would let a later ABI's fields pass unnoticed.
     const bytes = try serializeAlloc(testing.allocator, sample);
     defer testing.allocator.free(bytes);
 
@@ -1140,8 +939,7 @@ test "a blob whose declared length leaves bytes over is refused" {
 }
 
 test "bytes after the declared length are ignored" {
-    // The other side of the rule above. A blob read out of a larger buffer,
-    // such as a wasm section with padding after it, still parses.
+    // A blob read out of a larger buffer, such as a wasm section with padding, still parses.
     const bytes = try serializeAlloc(testing.allocator, sample);
     defer testing.allocator.free(bytes);
 
@@ -1156,9 +954,7 @@ test "bytes after the declared length are ignored" {
 }
 
 test "the prefix is at the offsets the format promises" {
-    // The prefix is a promise to every ABI that comes later. Read the three
-    // fields out of a real blob by hand, at the documented offsets and
-    // widths, rather than through the reader that wrote them.
+    // Reads the three fields by hand, at the documented offsets, rather than through the reader.
     const bytes = try serializeAlloc(testing.allocator, sample);
     defer testing.allocator.free(bytes);
 
@@ -1172,9 +968,7 @@ test "the prefix is at the offsets the format promises" {
 }
 
 test "abiVersion answers null for a number this build does not know" {
-    // The whole reason the version is separate from the magic: an unknown ABI
-    // is a message, never a trap. `@enumFromInt` on this input would be
-    // undefined behaviour.
+    // An unknown ABI is a message, never a trap; @enumFromInt here would be undefined behavior.
     try testing.expectEqual(AbiVersion.v1, abiVersion(1).?);
     try testing.expectEqual(@as(?AbiVersion, null), abiVersion(0));
     try testing.expectEqual(@as(?AbiVersion, null), abiVersion(7));
@@ -1182,9 +976,7 @@ test "abiVersion answers null for a number this build does not know" {
 }
 
 test "serializedLen agrees with what serializeInto writes" {
-    // The guest sizes its exported array with `serializedLen` and fills it
-    // with `serializeInto`. A disagreement between the two is a buffer
-    // overrun in every plugin ever built.
+    // A disagreement between the two is a buffer overrun in every plugin ever built.
     var buffer: [4096]u8 = undefined;
     const written = try serializeInto(sample, &buffer);
     try testing.expectEqual(serializedLen(sample), written);
@@ -1197,8 +989,6 @@ test "serializeInto refuses a buffer one byte short" {
 }
 
 test "serialize refuses a record parse would refuse" {
-    // The guest and the host share one set of bounds. A plugin must fail to
-    // build rather than ship metadata no host will read.
     const long = "x" ** (max_string_bytes + 1);
     const oversized: Metadata = .{
         .name = long,
@@ -1211,8 +1001,6 @@ test "serialize refuses a record parse would refuse" {
 }
 
 test "serializeComptime builds the same bytes at compile time" {
-    // The guest never allocates, so its blob is built while it compiles. It
-    // must be the very same blob the host side path produces.
     const compiled = comptime serializeComptime(sample);
     const allocated = try serializeAlloc(testing.allocator, sample);
     defer testing.allocator.free(allocated);
@@ -1220,9 +1008,6 @@ test "serializeComptime builds the same bytes at compile time" {
 }
 
 test "an empty record still carries a readable prefix" {
-    // The smallest thing a plugin can say about itself. A plugin with no
-    // tools and no description must still round trip, because the host reads
-    // the metadata of every module before it decides anything.
     const bare: Metadata = .{
         .name = "",
         .version = .{ .major = 0, .minor = 0, .patch = 0 },
@@ -1238,8 +1023,7 @@ test "an empty record still carries a readable prefix" {
     try testing.expectEqual(@as(usize, 0), parsed.record.tools.len);
 }
 
-/// A schema that uses every part of the format: a required string, an optional
-/// flag, a list of strings, and a list of records.
+/// A schema that uses every part of the format.
 const schema_sample: []const Property = &.{
     .{ .name = "who", .description = "Who to greet.", .required = true, .shape = .{ .kind = .string } },
     .{ .name = "loudly", .description = "True to shout.", .required = false, .shape = .{ .kind = .boolean } },
@@ -1262,9 +1046,6 @@ const schema_sample: []const Property = &.{
 };
 
 test "an argument schema survives the round trip field for field" {
-    // The schema is what the model writes its arguments against. A field that
-    // was dropped, reordered, or read back with the wrong requirement would
-    // leave the model told something the plugin does not mean.
     var record = sample;
     var tools: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = schema_sample }};
     record.tools = &tools;
@@ -1288,9 +1069,6 @@ test "an argument schema survives the round trip field for field" {
 }
 
 test "a schema with more fields than the bound is refused, and the bound is named" {
-    // The count comes out of a file somebody else wrote, and every field of it
-    // is read by the model on every turn. A reader that allocated on the
-    // count's say so would allocate whatever the file asked for.
     var many: [max_properties + 1]Property = @splat(.{
         .name = "f",
         .description = "A field.",
@@ -1301,12 +1079,9 @@ test "a schema with more fields than the bound is refused, and the bound is name
     var record = sample;
     record.tools = &tools;
 
-    // The writer refuses what the reader refuses, so a guest cannot ship a
-    // blob this same file will not read back.
+    // The writer refuses the same record; the reader is tested on a hand-crafted blob instead.
     try testing.expectError(error.TooLarge, serializeAlloc(testing.allocator, record));
 
-    // And the reader refuses it, measured by writing the count by hand into a
-    // blob that is otherwise well formed.
     var small: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = &.{} }};
     record.tools = &small;
     const bytes = try serializeAlloc(testing.allocator, record);
@@ -1322,11 +1097,7 @@ test "a schema with more fields than the bound is refused, and the bound is name
 }
 
 test "a schema that nests past the bound is refused before it is followed" {
-    // A blob that asked this reader to recurse a thousand levels would run the
-    // stack out before anything noticed. The check is on the way in.
-    // Each slot points at the one before it, so the nesting is real and the
-    // walk is finite. A slot that pointed at itself would be a test that hangs
-    // rather than one that measures the bound.
+    // Each slot points at the one before it, so the nesting is real and the walk is finite.
     var holder: [max_schema_depth + 2]Shape = undefined;
     holder[0] = .{ .kind = .string };
     for (holder[1..], 0..) |*slot, before| {
@@ -1345,13 +1116,7 @@ test "a schema that nests past the bound is refused before it is followed" {
 }
 
 test "a blob that nests deeper than the bound is refused before it is followed" {
-    // **The reader's own guard, against bytes rather than against a record.**
-    // The writer refuses what the reader refuses, so a blob this deep cannot be
-    // built by serialising one: it is spliced together here, which is exactly
-    // how a hostile one would arrive.
-    //
-    // Mutation check: take the depth check out of `Reader.shape` and this runs
-    // the stack out instead of answering.
+    // Spliced together by hand rather than serialized, the way a hostile blob would arrive.
     var tools: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = &.{.{
         .name = "argv",
         .description = "The words.",
@@ -1370,8 +1135,7 @@ test "a blob that nests deeper than the bound is refused before it is followed" 
     try testing.expectEqual(@as(u8, 1), bytes[shape_at + 1]);
     try testing.expectEqual(@intFromEnum(schema.Kind.string), bytes[shape_at + 2]);
 
-    // One more array level is two bytes: the kind, then the present byte of
-    // the item that follows.
+    // One more array level is two bytes: the kind, then the item's present byte.
     const levels = max_schema_depth + 4;
     const deeper = try testing.allocator.alloc(u8, bytes.len + levels * 2);
     defer testing.allocator.free(deeper);
@@ -1390,8 +1154,6 @@ test "a blob that nests deeper than the bound is refused before it is followed" 
 }
 
 test "a field type byte this Chock does not have is refused rather than read" {
-    // The byte decides what is read next. A reader that indexed with it would
-    // take a number nobody wrote as a shape.
     var tools: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = &.{.{
         .name = "who",
         .description = "Who to greet.",
@@ -1404,8 +1166,7 @@ test "a field type byte this Chock does not have is refused rather than read" {
     const bytes = try serializeAlloc(testing.allocator, record);
     defer testing.allocator.free(bytes);
 
-    // The kind byte is the last one of the blob: name, description, the
-    // requirement byte, then the shape.
+    // The kind byte is the last one: name, description, requirement, then shape.
     try testing.expectEqual(@intFromEnum(schema.Kind.string), bytes[bytes.len - 1]);
     bytes[bytes.len - 1] = 200;
 
@@ -1418,9 +1179,6 @@ test "a field type byte this Chock does not have is refused rather than read" {
 }
 
 test "a plugin built for the first ABI still loads, and its tools take nothing" {
-    // The reason the ABI number went up rather than the body changing under
-    // it. A v1 plugin said nothing about what its tools take, because its ABI
-    // had no way to, so an empty schema is the truth about it.
     var tools: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = &.{} }};
     var record = sample;
     record.tools = &tools;
@@ -1428,8 +1186,7 @@ test "a plugin built for the first ABI still loads, and its tools take nothing" 
     const bytes = try serializeAlloc(testing.allocator, record);
     defer testing.allocator.free(bytes);
 
-    // A v2 blob whose tools carry an empty schema is a v1 blob with four zero
-    // bytes on the end of each tool record. Take them off and call it v1.
+    // A v2 blob with an empty schema is a v1 blob plus four zero bytes per tool record.
     const shortened = try testing.allocator.alloc(u8, bytes.len - 4);
     defer testing.allocator.free(shortened);
     @memcpy(shortened, bytes[0 .. bytes.len - 4]);

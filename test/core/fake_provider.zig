@@ -9,21 +9,18 @@ pub const Chunk = struct {
     delay: std.Io.Duration = .zero,
 };
 
-/// Plain atomics because `std.Io.Mutex` needs an `Io` and this waits on a
-/// thread of the server's own.
+/// Plain atomics, because this waits on a thread of the server's own.
 pub const Gate = struct {
     allowed: std.atomic.Value(usize) = .init(0),
     open: std.atomic.Value(bool) = .init(false),
 
-    /// A release valve, not an assertion. Counted in operations, not seconds.
     pub const give_up_yields: usize = 10_000_000;
 
     pub fn release(self: *Gate) void {
         _ = self.allowed.fetchAdd(1, .release);
     }
 
-    /// A test must call this before it joins the server. A client that has all
-    /// it needs stops asking, and the pieces left would wait for ever.
+    /// A test must call this before it joins the server, or leftover pieces wait for ever.
     pub fn openAll(self: *Gate) void {
         self.open.store(true, .release);
     }
@@ -139,8 +136,7 @@ pub const FakeProvider = struct {
             writer.writeAll(piece.bytes) catch return;
             writer.flush() catch return;
         }
-        // Falling off the end closes the stream. A script that stopped short of
-        // its declared length ends exactly the way a dropped connection does.
+        // Falling off the end closes the stream, like a dropped connection.
     }
 };
 

@@ -14,12 +14,10 @@ const testing = std.testing;
 const chock_path = @import("chock_path").chock_path;
 const git_path = @import("chock_path").git_path;
 
-/// A run of characters no ordinary text holds, so finding it in a log proves a
-/// leak and not a coincidence.
+/// A run of characters no ordinary text holds, so finding it in a log proves a leak.
 const the_password = "ghp_zzqqxx0123456789abcdefghijklmnopqrstuv";
 
-/// In the remote URL on purpose. `askpass.Asker` answers a password and never a
-/// user name, and `git` puts a user name in the URL of every request.
+/// In the remote URL on purpose, since `askpass.Asker` answers a password and never a user name.
 const the_user = "ross";
 
 /// The host labels are reversed, which is what `askpass.actionInto` builds.
@@ -48,9 +46,7 @@ const Pushed = struct {
     }
 };
 
-/// There are three requests and not two. `curl` answers the first challenge by
-/// itself, out of the user name in the remote URL and an empty password, before
-/// `git` writes a prompt.
+/// Three requests, not two: `curl` answers the first challenge itself, with an empty password.
 const Server = struct {
     net_server: std.Io.net.Server,
     io: std.Io,
@@ -73,8 +69,7 @@ const Server = struct {
         self.net_server.deinit(self.io);
     }
 
-    /// Polled and not blocked on. The same loop answers the askpass socket while
-    /// `git` runs, and a block on `accept` would leave the helper unread.
+    /// Polled and not blocked on, since a block on `accept` would leave the askpass helper unread.
     fn serve(self: *Server, timeout_ms: i32) bool {
         if (!chock_broker.socket.readable(self.net_server.socket.handle, timeout_ms)) return false;
 
@@ -89,8 +84,7 @@ const Server = struct {
         self.requests += 1;
 
         if (headerIn(request, "authorization: ")) |value| {
-            // The challenge stands until a password arrives. Without this,
-            // `git` sends `ross:`, takes the refusal, and exits.
+            // The challenge stands until a password arrives, or `git` sends `ross:` and gives up.
             if (carriesPassword(value)) {
                 const room = @min(value.len, self.authorization.len);
                 @memcpy(self.authorization[0..room], value[0..room]);
@@ -98,8 +92,7 @@ const Server = struct {
             }
         }
 
-        // A `401` with no challenge makes `git` give up without ever running
-        // the helper.
+        // A `401` with no challenge makes `git` give up without ever running the helper.
         const reply = if (self.authorization_len == 0)
             "HTTP/1.1 401 Unauthorized\r\n" ++
                 "WWW-Authenticate: Basic realm=\"chock\"\r\n" ++
@@ -234,9 +227,7 @@ fn push(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Pushed {
         .stderr = .{ .file = said_file },
     });
 
-    // `git` waits on the helper and the helper waits on this socket, so a
-    // caller that blocked on `git` would deadlock. `std.process.Child` has no
-    // `tryWait` in Zig 0.16, so the blocking `wait` comes after the loop.
+    // A caller that blocked on `git` would deadlock, since `git` waits on the helper.
     var settled = false;
     var looks: usize = 0;
     while (looks < 400) : (looks += 1) {

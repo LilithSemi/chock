@@ -1,7 +1,5 @@
-//! A dynamically linked program, for the two things `test/sandbox/probe.zig`
-//! cannot be: it runs a dynamic loader, and it resolves through glibc, which is
-//! the only thing that reads `/etc/resolv.conf`, `/etc/nsswitch.conf` and the
-//! nscd socket.
+//! A dynamically linked program that resolves names through glibc, unlike
+//! `test/sandbox/probe.zig`.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -10,11 +8,8 @@ const c = std.c;
 /// The one path nothing in the sandbox configuration grants. `probe.zig` uses the same spelling.
 const named_ungranted = "/etc/chock-probe-secret";
 
-/// `getaddrinfo` found nothing.
 const not_resolved: u8 = 20;
-/// `getaddrinfo` found an address, and it is not the one the caller named.
 const wrong_address: u8 = 21;
-/// The arguments do not name an operation this program has.
 const bad_arguments: u8 = 22;
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -29,8 +24,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 0;
     }
 
-    // The address is the test and not the success. A lookup answered from the host's own view
-    // of the network would succeed too, with a different address.
+    // The address is the test, since a lookup answered from the host's own view would also succeed.
     if (args.len == 4 and std.mem.eql(u8, args[1], "resolve")) {
         const name = fixed.allocator().dupeZ(u8, args[2]) catch return bad_arguments;
         const wanted = parseDotted(args[3]) orelse return bad_arguments;

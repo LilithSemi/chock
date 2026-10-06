@@ -1,55 +1,24 @@
-//! Chock's two directories, and the two rules that decide whether a file in
-//! one of them is safe to read or safe to write.
-//!
-//! **The split of directory is the split of ownership.** Everything under the
-//! configuration directory belongs to the user, or to home-manager, and Chock
-//! only reads it. Everything Chock writes goes under the data directory,
-//! where home-manager does not look. A user can give home-manager the whole
-//! configuration directory and `chock login` still works, because the two
-//! never touch the same file.
-//!
-//! | | Default | Owner |
-//! |---|---|---|
-//! | configuration | `~/.config/chock` | the user, or home-manager |
-//! | data | `~/.local/share/chock` | Chock, always |
+//! Chock's two directories, and the rules that decide whether a file in one
+//! of them may be read.
 
 const std = @import("std");
 
-/// The directory name Chock uses inside both XDG directories.
 pub const dir_name = "chock";
 
-/// The prefix a Nix store path starts with. A constant, because the store
-/// location is fixed on every machine Chock supports, and reading it from
-/// the environment would let a caller turn the check off.
 pub const nix_store_prefix = "/nix/store/";
 
 pub const DirError = std.mem.Allocator.Error || error{
-    /// Neither the XDG variable nor `HOME` says where the directory is, so
-    /// Chock cannot name a path at all. Reported rather than guessed: a
-    /// guessed path is a credential written somewhere the user cannot find.
     NoHomeDirectory,
 };
 
-/// The configuration directory: `$XDG_CONFIG_HOME/chock`, or
-/// `$HOME/.config/chock`. **Chock only ever reads this.** Caller owns the
-/// result.
 pub fn configDir(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) DirError![]u8 {
     return xdgDir(gpa, env, "XDG_CONFIG_HOME", &.{".config"});
 }
 
-/// The data directory: `$XDG_DATA_HOME/chock`, or
-/// `$HOME/.local/share/chock`. **Chock alone writes this.** Caller owns the
-/// result.
 pub fn dataDir(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) DirError![]u8 {
     return xdgDir(gpa, env, "XDG_DATA_HOME", &.{ ".local", "share" });
 }
 
-/// The state directory, where a session log goes: `$XDG_STATE_HOME/chock`,
-/// or `$HOME/.local/state/chock`. This holds no credential, so it has no
-/// mode rule of its own. It is here, and not in `chock-proto`, because it is
-/// the same XDG question the two directories above answer and a second
-/// answer to one question is how two answers drift apart. Caller owns the
-/// result.
 pub fn stateDir(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) DirError![]u8 {
     return xdgDir(gpa, env, "XDG_STATE_HOME", &.{ ".local", "state" });
 }
@@ -74,17 +43,10 @@ fn xdgDir(
     return std.fs.path.join(gpa, parts.items);
 }
 
-/// Why a path was refused, and the facts the error alone throws away.
-///
-/// **This owns nothing and allocates nothing.** `path` points at the caller's
-/// own argument, and `target` points into the buffer the caller gives
-/// `refuseNixStore`, so both live as long as the caller's own memory does.
 pub const Diagnostic = union(enum) {
     stat_failed: StatFailed,
     readable_by_others: ReadableByOthers,
     in_the_nix_store: []const u8,
-    /// The path is a symbolic link into the Nix store, which is what
-    /// home-manager writes.
     links_into_the_nix_store: LinksIntoTheNixStore,
 
     pub const StatFailed = struct {
@@ -128,11 +90,6 @@ pub const Diagnostic = union(enum) {
     }
 };
 
-/// Fill `out` when the caller asked for one.
-///
-/// **The first fault is kept, not the last.** A path is checked once here, so
-/// this only matters to a caller that reuses one slot over several paths: the
-/// first refusal is the one that stopped the run.
 fn note(out: ?*?Diagnostic, value: Diagnostic) void {
     const slot = out orelse return;
     if (slot.* != null) return;
@@ -140,36 +97,11 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) void {
 }
 
 pub const PrivateError = error{
-    /// Somebody other than the owner can read this file. Pass a `Diagnostic`
-    /// to learn the mode that was found. A wrong mode is a fault, never a
-    /// warning.
     CredentialFileIsReadable,
-    /// There is no such file. Its own member, and silent, because "this
-    /// source holds nothing" is the ordinary case for two of the three lookup
-    /// sources: a user who never wrote a token file must not be told about it
-    /// on every run.
     CredentialFileMissing,
-    /// The file is there and could not be inspected. Pass a `Diagnostic` to
-    /// learn why. Never folded into `CredentialFileMissing`: a file Chock
-    /// cannot look at is not a file that is not there.
     StatFailed,
 };
 
-/// Refuse `path` when any class other than the owner can read it.
-///
-/// This is the one check that makes an inline `token` safe, so it runs over
-/// every one of the three lookup sources, not only over the store Chock
-/// writes itself.
-///
-/// Three answers, and each one is a different fact. A file that is not there
-/// is `error.CredentialFileMissing`, quietly, because two of the three lookup
-/// sources are ordinarily absent. A file that is there and cannot be
-/// inspected is `error.StatFailed`, with the reason in `diag`, because a
-/// credential file Chock cannot look at is not a credential file that may be
-/// read. Neither is ever success.
-///
-/// `diag` borrows `path`, so it stays valid as long as the caller's own
-/// argument does. A caller that passes null pays nothing.
 pub fn requirePrivate(io: std.Io, path: []const u8, diag: ?*?Diagnostic) PrivateError!void {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return error.CredentialFileMissing,
@@ -185,28 +117,9 @@ pub fn requirePrivate(io: std.Io, path: []const u8, diag: ?*?Diagnostic) Private
 }
 
 pub const NixStoreError = error{
-    /// The path is in the Nix store, or is a symbolic link into it. Pass a
-    /// `Diagnostic` to learn which of the two, and where the link goes.
     PathIsInTheNixStore,
 };
 
-/// Refuse to write `path` when it is in the Nix store, or is a symbolic link
-/// into it.
-///
-/// The Nix store is world readable and every file in it is read only, and
-/// home-manager replaces its symbolic links on each activation. So a write
-/// here either fails, or succeeds and is lost on the next `home-manager
-/// switch`. Both are worth one `readlink` and a message that says which of
-/// the two the user is looking at.
-///
-/// A path that does not exist yet is fine: there is no link to follow, so
-/// there is nothing to refuse.
-///
-/// **`link_buffer` is the caller's, and it must hold `std.fs.max_path_bytes`
-/// bytes.** The link is read into it, and a diagnostic that names the target
-/// points into it, so it belongs to the caller for the same reason `path`
-/// does: this function allocates nothing and a diagnostic that borrowed a
-/// buffer of this function's own would dangle the moment it returned.
 pub fn refuseNixStore(
     io: std.Io,
     path: []const u8,
@@ -242,8 +155,6 @@ fn writeWithMode(path: []const u8, mode: std.posix.mode_t, contents: []const u8)
     });
     defer file.close(testing.io);
     try file.writeStreamingAll(testing.io, contents);
-    // The process umask narrows the mode `createFileAbsolute` asks for, so a
-    // test that wants a wide mode has to widen it again after the fact.
     try file.setPermissions(testing.io, .fromMode(mode));
 }
 
@@ -255,8 +166,6 @@ test "a credential file others can read is refused, and the message names the mo
     const path = try tmpPath(&buffer, tmp, "wide");
     try writeWithMode(path, 0o644, "sk-not-a-real-key\n");
 
-    // The mode itself is the fact this pins. A test that only checked for an
-    // error would pass against a version that refused every file.
     try testing.expectError(error.CredentialFileIsReadable, requirePrivate(testing.io, path, null));
 
     var narrow_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -266,9 +175,6 @@ test "a credential file others can read is refused, and the message names the mo
 }
 
 test "a group readable credential file is refused too, not only a world readable one" {
-    // 0640 is the mode a user reaches for when they want their own group to
-    // share a key. It is still a credential another account can read, so the
-    // rule is "the owner only", never "not everybody".
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -297,9 +203,7 @@ test "a symbolic link into the Nix store is refused for writing, and a plain fil
     try writeWithMode(plain, 0o600, ".{}\n");
     try refuseNixStore(testing.io, plain, &scratch_link_buffer, null);
 
-    // A link to a path under the store prefix. The target does not have to
-    // exist: home-manager's own links point at paths this test cannot make,
-    // and `readlink` reads the link and never the target.
+    // A link to a path under the store prefix: the target need not exist, since readlink reads the link itself and never the target it points at.
     var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const link = try tmpPath(&link_buffer, tmp, "managed.zon");
     try tmp.dir.symLink(
@@ -315,9 +219,6 @@ test "a symbolic link into the Nix store is refused for writing, and a plain fil
         refuseNixStore(testing.io, nix_store_prefix ++ "aaaa-chock/config.zon", &scratch_link_buffer, null),
     );
 
-    // A path that does not exist yet has no link to follow, so there is
-    // nothing to refuse. `chock login` writes a store that was never there
-    // before, and this is that case.
     var absent_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const absent = try tmpPath(&absent_buffer, tmp, "not-yet.zon");
     try refuseNixStore(testing.io, absent, &scratch_link_buffer, null);
@@ -337,10 +238,6 @@ test "the two directories come from XDG when it is set and from HOME otherwise, 
         defer gpa.free(data);
         try testing.expectEqualStrings("/home/somebody/.config/chock", config);
         try testing.expectEqualStrings("/home/somebody/.local/share/chock", data);
-        // Nothing Chock writes ever lands under the configuration
-        // directory. Different directories, not merely
-        // different files, because a user who points home-manager at a
-        // directory gets the whole directory managed.
         try testing.expect(!std.mem.startsWith(u8, data, config));
     }
 
@@ -387,10 +284,6 @@ test "the mode a credential file holds reaches the caller, and no longer only a 
 }
 
 test "a link target is borrowed from the caller's own buffer, so it outlives the call" {
-    // `refuseNixStore` reads the link into the buffer its caller gives it,
-    // which is the reason that buffer is a parameter: a diagnostic that
-    // named a buffer of the function's own would dangle the moment it
-    // returned.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -414,7 +307,6 @@ test "the first fault is kept, and a caller that wants none pays nothing" {
     note(&diag, .{ .readable_by_others = .{ .path = "/other", .mode = 0o644 } });
     try testing.expectEqualStrings("/nix/store/aaaa-x/config.zon", diag.?.in_the_nix_store);
 
-    // A caller that asked for no diagnostic must reach no store at all.
     note(null, .{ .in_the_nix_store = "/nix/store/aaaa-x/config.zon" });
 }
 

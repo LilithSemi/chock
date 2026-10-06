@@ -10,10 +10,6 @@ pub const worktree = @import("chock-workspace/worktree.zig");
 pub const overlay = @import("chock-workspace/overlay.zig");
 pub const Workspace = @import("chock-workspace/Workspace.zig").Workspace;
 
-// The Darwin overlay driver is not re-exported here. It calls `clonefile(2)`,
-// a macOS call no other libc has, so `refAllDecls` below would ask a Linux
-// link for a symbol that is not there.
-
 test {
     @import("std").testing.refAllDecls(@This());
 }

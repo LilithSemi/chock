@@ -1,8 +1,5 @@
-//! The events that make up a session log.
-//!
-//! Wire rule: a reader keeps what it does not know and writes it back out. An
-//! unknown field goes to `extra`. An unknown event kind or enum member becomes
-//! `unknown` and keeps its raw name. A writer never removes or renames a field.
+//! The events that make up a session log. An unknown field goes to `extra`;
+//! an unknown kind or enum member becomes `unknown` and keeps its raw name.
 
 const std = @import("std");
 
@@ -76,8 +73,7 @@ fn ForwardCompatible(comptime T: type) type {
                 }
                 if (matched) continue;
 
-                // `alloc_if_needed` can give a slice into the scanner buffer,
-                // which the next token overwrites, so copy the name.
+                // `alloc_if_needed` can give a slice the next token overwrites, so copy the name.
                 try extras.append(allocator, .{
                     .name = try allocator.dupe(u8, name),
                     .value = try std.json.innerParse(std.json.Value, allocator, source, options),
@@ -232,46 +228,26 @@ pub const SessionStart = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
-/// What a person put on the command line, and the content of the file the
-/// session read its policy from. Together these are the part of a session's
-/// configuration that its own log would not otherwise hold: a flag leaves no
-/// trace in `chock.zon`, and a `chock.zon` that is edited but never committed
-/// leaves none in git.
-///
-/// A field nobody set is left out, so a reader sees what the session had and
-/// never a list of what it did not. `config_hash` is the one exception: it is
-/// always written, because its absence is the fact worth recording.
+/// Config git and `chock.zon` can't show. Unset fields are omitted;
+/// `config_hash` is always written, even null, since absence matters.
 pub const SessionConfig = struct {
-    /// SHA-256 of `chock.zon`, lower case hex. Null means the project has no
-    /// `chock.zon`, so the session ran under the built in rules alone.
+    /// SHA-256 of `chock.zon`, lower case hex; null means no `chock.zon`, so built-in rules applied.
     config_hash: ?[]const u8 = null,
-    /// SHA-256 over what the sandbox of this run lets a tool call reach: its
-    /// mounts, its rules, its scratch areas, its limits, its network mode and
-    /// its devices. Two runs of one session that differ here did not run the
-    /// same sandbox, which is the alteration this event exists to show.
+    /// SHA-256 of what this sandbox lets a tool call reach; differs means a different sandbox.
     sandbox_hash: []const u8 = "",
-    /// Every file `--instructions` named, in the order given.
     instructions: []const []const u8 = &.{},
-    /// Every `--policy-rule`, as the person wrote it.
     policy_rules: []const []const u8 = &.{},
-    /// The `devShells` attribute this session read, from `--dev-shell` or
-    /// from the `nix` block.
+    /// The `devShells` attribute read, from `--dev-shell` or the `nix` block.
     dev_shell: []const u8 = "",
-    /// True when `--allow-dirty` put uncommitted work in the workspace.
     allow_dirty: bool = false,
-    /// How many tokens this session's model holds, when anybody said. Null when
-    /// nobody did, and then no reader may guess: `lib/chock-core/compaction.zig`
-    /// compacts nothing without it, and a gauge against a number nobody wrote
-    /// would read as full or empty by accident.
+    /// The model's token limit, if said; null skips compaction in `lib/chock-core/compaction.zig`.
     context_limit_tokens: ?u64 = null,
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
     pub const jsonParse = forward.jsonParse;
 
-    /// Not `ForwardCompatible.jsonStringify`, which writes every field. A
-    /// reader of this event asks what the session was given, and a row of
-    /// empty strings answers a question nobody asked.
+    /// Not `ForwardCompatible.jsonStringify`: writes what was given, not a row of empty strings.
     pub fn jsonStringify(self: SessionConfig, jw: *std.json.Stringify) std.json.Stringify.Error!void {
         try jw.beginObject();
 
@@ -316,9 +292,7 @@ pub const SessionEndReason = union(enum) {
     turn_limit,
     handed_over,
     empty_response,
-    /// The provider answered with `stop_reason` `refusal`. A retry gets the
-    /// same refusal: the platform refuses again unless the session is reset.
-    /// Chock does not retry, change model, or reword what the provider said.
+    /// `stop_reason` `refusal`: Chock never retries, swaps model, or rewords it.
     refused_by_model,
     rate_limited,
     unknown: []const u8,
@@ -352,8 +326,7 @@ pub const SessionSpawn = struct {
 };
 
 pub const SessionTitle = struct {
-    /// Untrusted text put in front of a person. A reader must cut it to length
-    /// and take out the bytes that drive a terminal.
+    /// Untrusted: a reader must cut it to length and strip terminal-driving bytes.
     title: []const u8,
     extra: Extra = .{},
 
@@ -362,39 +335,24 @@ pub const SessionTitle = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
-/// A new session log records that a transcript from another harness was
-/// brought in as context. It never claims Chock witnessed the imported work,
-/// only that on this date this machine read these bytes from that source. The
-/// imported turns are not written as `message` events; this row and its hash
-/// are the whole record.
-///
-/// `from`, `source_path`, `content_hash` and `imported_ms` are always written,
-/// because an import missing any of them is not a record of anything. A field
-/// nobody set is left out.
+/// A transcript read from another harness; claims only that these bytes were read, not that Chock witnessed the work.
 pub const SessionImported = struct {
-    /// The harness it came from, as this build names it.
     from: []const u8,
-    /// Where it was read on the machine that ran the import.
     source_path: []const u8,
-    /// SHA-256 of the imported bytes, lower case hex. The chain covers this
-    /// event, so this is what ties it to exactly what was read.
+    /// SHA-256 of the imported bytes; the chain ties this event to exactly what was read.
     content_hash: []const u8,
-    /// When the import ran. Not when the work happened.
+    /// When the import ran, not the work.
     imported_ms: i64,
-    /// The time range the source claims for the work. The source's word, not
-    /// this machine's observation. Zero when the source stated none.
+    /// The source's own claimed time range, not this machine's observation; zero means none stated.
     source_started_ms: i64 = 0,
     source_ended_ms: i64 = 0,
-    /// How many turns the transcript held.
     messages: usize = 0,
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
     pub const jsonParse = forward.jsonParse;
 
-    /// Not `ForwardCompatible.jsonStringify`. `from`, `source_path`,
-    /// `content_hash` and `imported_ms` are always written; the rest appear
-    /// only when the import set them.
+    /// `from`, `source_path`, `content_hash`, `imported_ms` always write; the rest only if set.
     pub fn jsonStringify(self: SessionImported, jw: *std.json.Stringify) std.json.Stringify.Error!void {
         try jw.beginObject();
 
@@ -428,8 +386,7 @@ pub const SessionImported = struct {
     }
 };
 
-/// `signature` must be kept exactly as given. A changed or dropped signature
-/// makes the provider treat the block as forged on the next turn.
+/// Keep `signature` exactly as given, or the provider treats the block as forged next turn.
 pub const Reasoning = struct {
     text: []const u8,
     signature: []const u8,
@@ -465,9 +422,7 @@ pub const ToolResultPart = struct {
 pub const ImagePart = struct {
     call_id: []const u8,
     media_type: []const u8,
-    /// Base64, padded, with no line breaks. `std.json.Stringify` writes a
-    /// `[]const u8` that is not valid UTF-8 as an array of integers, and image
-    /// bytes are never valid UTF-8.
+    /// Base64, padded, no line breaks: `std.json.Stringify` writes non-UTF-8 bytes as an integer array otherwise.
     data: []const u8,
     extra: Extra = .{},
 
@@ -567,8 +522,7 @@ pub const ImageRef = struct {
     media_type: []const u8,
     byte_count: u64,
     content_hash: []const u8,
-    /// `jsonStringify` below leaves this out, so it never reaches the log and
-    /// a value parsed back from a log is always empty.
+    /// Left out by `jsonStringify`, so a value parsed back from the log is always empty.
     data: []const u8 = "",
     extra: Extra = .{},
 
@@ -598,8 +552,7 @@ pub const ToolResult = struct {
     is_error: bool,
     /// A reader must not treat a truncated `output` as the complete result.
     truncated: bool,
-    /// Chock's own sentence to the person watching. It never reaches the
-    /// model, which reads `output` alone.
+    /// Chock's sentence to the person watching; never reaches the model.
     note: []const u8 = "",
     image: ?ImageRef = null,
     extra: Extra = .{},
@@ -643,15 +596,13 @@ pub const ApprovalDecision = union(enum) {
     allowed_by_policy,
     denied_by_policy,
     approved_by_user,
-    /// Kept only for the life of this process. It can narrow how often a
-    /// person is asked, and never widen what the policy table permits.
+    /// Lives only this process; narrows how often a person is asked, never widens the table.
     approved_by_user_for_session,
     refused_by_user,
     expired,
     approved_by_review,
     refused_by_review,
-    /// The policy asked for a review and there was none to be had. It is a
-    /// refusal. A review that could not run is never permission.
+    /// No reviewer available: a review that can't run is a refusal, never permission.
     review_unavailable,
     unknown: []const u8,
 
@@ -661,16 +612,14 @@ pub const ApprovalDecision = union(enum) {
 };
 
 pub const ApprovalResponse = struct {
-    /// Zero when the policy table answered on its own. An id is a byte offset,
-    /// and byte zero is inside the header line, so no event can have id zero.
+    /// Zero means the table answered alone; byte zero sits inside the header line, so no event has id zero.
     request_id: u64,
     decision: ApprovalDecision,
     responder: []const u8,
     action: []const u8 = "",
     tool_call_id: []const u8 = "",
     review: ReviewVerdict = .none,
-    /// It never travels back to the agent that asked, because the reviewer is
-    /// told why the policy is what it is.
+    /// Never travels back to the agent that asked.
     review_note: []const u8 = "",
     extra: Extra = .{},
 
@@ -679,8 +628,7 @@ pub const ApprovalResponse = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
-/// Git or SSH asked for a credential. The answer never enters the log. It
-/// travels straight to the broker over the control channel.
+/// Git or SSH asked for a credential; the answer skips the log, going straight to the broker.
 pub const PromptPassword = struct {
     correlation_id: []const u8,
     prompt: []const u8,
@@ -820,8 +768,7 @@ pub const PlanStep = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
-/// `steps` is what changed, and not always the whole list. A reader merges
-/// each step in by identifier.
+/// Changed steps only, not the whole list; a reader merges by identifier.
 pub const PlanUpdate = struct {
     steps: []const PlanStep,
     extra: Extra = .{},
@@ -831,8 +778,7 @@ pub const PlanUpdate = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
-/// A reader must read a name it does not know as `deny`, which is the
-/// narrowest reading there is.
+/// An unknown name reads as `deny`, the narrowest reading.
 pub const PolicyCeiling = union(enum) {
     deny,
     agent_then_human,
@@ -859,8 +805,7 @@ pub const SelfRestriction = struct {
 
 pub const PolicySelf = struct {
     restrictions: []const SelfRestriction,
-    /// A reader that drops this field folds the older, narrower promise, which
-    /// is the safe direction.
+    /// A reader that drops this field folds back to the narrower promise.
     authorised: bool = false,
     extra: Extra = .{},
 
@@ -884,8 +829,7 @@ pub const WorkspaceOpen = struct {
     /// Fresh for each invocation, and never the session identifier.
     attempt: []const u8,
     path: []const u8,
-    /// The commit the work is compared to. Empty for the overlay kind. A next
-    /// owner that reads `HEAD` again gets a commit the session made itself.
+    /// The commit the work is compared to. Empty for the overlay kind.
     base_commit: []const u8,
     extra: Extra = .{},
 
@@ -906,8 +850,7 @@ pub const WriteExecuteRule = union(enum) {
 
 pub const WorkspaceIntegrate = struct {
     ref: []const u8,
-    /// A row from a build before 2026-09-14 can carry `ref`, or `ask`, and
-    /// neither of those is a landing.
+    /// Before 2026-09-14 a row could carry `ref` or `ask`; neither is a landing.
     mode: []const u8,
     decision: []const u8,
     branch: []const u8,
@@ -945,14 +888,13 @@ pub const SandboxOpen = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
-/// The supervisor holds the provider credential, and it goes on without a
-/// layer rather than end the caller's program.
+/// Holds the provider credential; runs without a layer rather than end the caller.
 pub const SandboxSupervisor = struct {
     process: []const u8,
     layer: []const u8,
     fail_mode: []const u8 = "",
     confined: u64 = 0,
-    /// Above zero means a process holding the credential ran without this layer.
+    /// Above zero means a process ran without this layer.
     unconfined: u64 = 0,
     unreported: u64 = 0,
     reason: []const u8 = "",
@@ -974,9 +916,7 @@ pub const SyscallCount = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
-/// This is telemetry and it is not audit evidence. The supervisor lets the
-/// held call run, so a process can write one path and then open another. The
-/// counts on `SyscallCount` come from the kernel and cannot be forged.
+/// Telemetry, not evidence: a process can write one path then open another before this reads.
 pub const UnverifiedPaths = struct {
     granted: u64 = 0,
     ungranted: u64 = 0,
@@ -1013,8 +953,7 @@ pub const DeviceExposed = struct {
     attempt: []const u8,
     action: []const u8,
     decision: []const u8,
-    /// Whether this machine's driver can act on `decision` at all. A policy
-    /// answer of `allow` does not prove the device was placed.
+    /// Whether this driver can act on `decision`; `allow` doesn't prove the device was placed.
     enforced: bool = false,
     extra: Extra = .{},
 
@@ -1023,15 +962,9 @@ pub const DeviceExposed = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
-/// A secret was given to a tool call.
-///
-/// **The value is never here.** This records that a grant was acted on, so a
-/// person reading the log afterwards can see which secret reached which tool
-/// and when, which is the whole point of granting one narrowly.
+/// A secret reached a tool call; the value is never recorded, only which secret, which tool, and when.
 pub const SecretUsed = struct {
-    /// The secret's own name, as the project's `secrets` block spells it.
     name: []const u8,
-    /// The action it was given to, which is what the grant matched.
     action: []const u8,
     /// How it arrived: `env` or `file`.
     bind: []const u8 = "env",
@@ -1055,8 +988,7 @@ pub const NetworkSummary = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
-/// `value` is a float, because one turn costs less than a currency's minor
-/// unit. `currency` is ISO 4217.
+/// Float, since a turn can cost less than a currency's minor unit; `currency` is ISO 4217.
 pub const Amount = struct {
     value: f64,
     currency: []const u8,
@@ -1130,8 +1062,7 @@ pub const Cost = union(enum) {
 pub const Usage = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
-    /// Anthropic reports these apart from `input_tokens` and bills them
-    /// differently. A cache write costs more, and a cache read costs less.
+    /// Anthropic bills these apart from `input_tokens`: a cache write costs more, a read less.
     cache_creation_input_tokens: u64 = 0,
     cache_read_input_tokens: u64 = 0,
     cost: Cost = .unknown,
@@ -1140,8 +1071,7 @@ pub const Usage = struct {
     model_alias: []const u8 = "",
     request_id: []const u8 = "",
     inference_ms: u64 = 0,
-    /// Not always the effort that was asked for. Some models fall back to a
-    /// supported level, and the billed reasoning tokens are that level's.
+    /// Not always what was asked: a model may fall back to a supported level, and billing follows that level.
     reasoning_effort_applied: []const u8 = "",
     extra: Extra = .{},
 
@@ -1241,8 +1171,7 @@ pub const Event = union(Kind) {
     }
 };
 
-/// The session log never holds a secret. A tool result is redacted before it
-/// reaches this type, because `chockd` serves the log to other clients.
+/// Never holds a secret: a tool result is redacted before reaching this type, since `chockd` serves the log to others.
 pub const Envelope = struct {
     /// The byte offset of this line in the log. Zero for an event not yet written.
     id: u64,
@@ -1250,9 +1179,7 @@ pub const Envelope = struct {
     time_ms: i64,
     event: Event,
     version: u32 = 1,
-    /// The hash of the whole line before this one, in lowercase hexadecimal,
-    /// without that line's closing newline. The first event hashes the header
-    /// line. Empty means no chain, and a reader must accept that.
+    /// The previous line's hash, lowercase hex, no newline; the first event hashes the header. Empty means no chain.
     prev: []const u8 = "",
     extra: Extra = .{},
 
@@ -1263,16 +1190,14 @@ pub const Envelope = struct {
 
 pub const EncodeError = std.mem.Allocator.Error;
 
-/// Serialize an envelope to one line of JSON. The result holds no newline,
-/// because the log format uses a line break to end an event.
+/// One line of JSON, no newline: the log format uses the line break to end an event.
 pub fn toJson(allocator: std.mem.Allocator, envelope: Envelope) EncodeError![]u8 {
     return std.json.Stringify.valueAlloc(allocator, envelope, .{});
 }
 
 pub const DecodeError = std.json.ParseError(std.json.Scanner);
 
-/// `ignore_unknown_fields` must stay on. Without it, `std.json` rejects the
-/// whole line with `error.UnknownField` for one field this reader has not got.
+/// Must stay on, or `std.json` rejects the whole line over one field this reader lacks.
 pub fn fromJson(allocator: std.mem.Allocator, text: []const u8) DecodeError!std.json.Parsed(Envelope) {
     return std.json.parseFromSlice(Envelope, allocator, text, .{ .ignore_unknown_fields = true });
 }
@@ -1670,9 +1595,7 @@ test "a session grant round trips as its own decision, and an older reader keeps
 test "no serialized envelope contains a raw newline, whatever the Kind, and every field round trips" {
     const allocator = std.testing.allocator;
 
-    // A field that skips the standard string encoder leaks a raw newline into
-    // the line, which breaks the one event, one line rule that the byte offset
-    // ids depend on.
+    // A raw newline here would break the one event, one line rule the byte offset ids depend on.
     const nl = "line one\nline two";
 
     const spawn_chain = [_]SpawnLink{.{ .agent_kind = nl, .reason = nl }};
@@ -2277,8 +2200,6 @@ test "a resumed run whose sandbox changed writes a different session.config" {
     const second = try std.json.Stringify.valueAlloc(gpa, after, .{});
     defer gpa.free(second);
 
-    // The same chock.zon, a different sandbox. A reader of the log sees the
-    // second run was not the first one's sandbox.
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expect(std.mem.indexOf(u8, second, "bb22") != null);
 }
@@ -2294,8 +2215,6 @@ test "session.config writes what the session had, and never a row of empty field
         text,
     );
 
-    // A project with no chock.zon says so, rather than leaving the reader to
-    // guess between that and a writer too old to hold the field.
     const none = Event{ .session_config = .{} };
     const said = try std.json.Stringify.valueAlloc(gpa, none, .{});
     defer gpa.free(said);
@@ -2328,8 +2247,6 @@ test "every part of a session's configuration reaches the log, and reads back" {
     try std.testing.expectEqualStrings("ci", back.dev_shell);
     try std.testing.expect(back.allow_dirty);
 
-    // Two sessions given different rules write different bytes, which is what
-    // makes the chain over them worth reading.
     const other = Event{ .session_config = .{
         .config_hash = "ff00",
         .sandbox_hash = "aa11",
@@ -2410,7 +2327,6 @@ test "two imports of different bytes produce different JSON" {
     const second_text = try std.json.Stringify.valueAlloc(gpa, second, .{});
     defer gpa.free(second_text);
 
-    // A swapped transcript hashes differently, so the chain over it says so.
     try std.testing.expect(!std.mem.eql(u8, first_text, second_text));
 }
 
@@ -2431,8 +2347,7 @@ test "a secret use records what reached which tool and never the value" {
     try std.testing.expect(std.mem.indexOf(u8, text, "GITHUB_TOKEN") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "exec.path.gh") != null);
 
-    // The struct carries no field a value could travel in, so this asserts the
-    // shape rather than one example of it.
+    // Asserts the shape has no field a value could travel in, across every case.
     inline for (@typeInfo(SecretUsed).@"struct".fields) |field| {
         try std.testing.expect(!std.mem.eql(u8, field.name, "value"));
         try std.testing.expect(!std.mem.eql(u8, field.name, "secret"));
@@ -2440,8 +2355,7 @@ test "a secret use records what reached which tool and never the value" {
 }
 
 test "every event kind has a wire name and reads back as itself" {
-    // `secret.used` is new, and this is what stops a kind being added to the
-    // enum and forgotten in the name table.
+    // Catches a kind added to the enum and forgotten in the name table.
     inline for (@typeInfo(Kind).@"enum".fields) |field| {
         const kind: Kind = @enumFromInt(field.value);
         if (kind == .unknown) continue;

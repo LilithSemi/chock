@@ -1,6 +1,5 @@
 //! The policy action for a device, named by its identity and never by its
-//! path. `/dev/ttyUSB0` changes with plug order and after a reboot, so a rule
-//! written against it stops being true the next time the device is plugged in.
+//! path, because a path changes with plug order and after a reboot.
 
 const std = @import("std");
 const testing = std.testing;
@@ -8,9 +7,6 @@ const table = @import("table.zig");
 
 pub const labelIsUsable = table.labelIsUsable;
 
-/// Many USB-to-serial chips share one vendor and product id across every unit a
-/// factory made, so the serial is what tells two of them apart when the bus
-/// gives one.
 pub const Subsystem = enum { usb, tty };
 
 pub const Identity = struct {
@@ -27,20 +23,10 @@ const serial_segment = "serial";
 
 pub const policy_tool = "device";
 
-/// `usb` and a tty with no serial both spell `device.<bus>.<vendor>.<product>`,
-/// two labels. A tty with a serial spells one. The first shape is longer.
 pub const max_action_bytes = action_prefix.len + 1 +
     @max(usb_segment.len, tty_segment.len) + 1 +
     table.max_label_bytes + 1 + table.max_label_bytes;
 
-/// The policy action for `id`, written into `buffer`. Null when a field the
-/// name needs is not a name `labelIsUsable` accepts, or when the name does not
-/// fit.
-///
-/// A tty with a serial is named by the serial alone, so `id.vendor` and
-/// `id.product` are not read into the name and need not be usable names.
-///
-/// Allocates nothing, so a caller can build a key inside a loop.
 pub fn actionInto(buffer: []u8, id: Identity) ?[]const u8 {
     switch (id.subsystem) {
         .usb => {
@@ -87,8 +73,6 @@ test "a device's action name is its identity and never its path" {
 }
 
 test "bytes that cannot be one label of a rule get no action name" {
-    // Null is a refusal and never a pass. A dot separates segments and a `*`
-    // names a class, so either would let a device name rules nobody wrote.
     var buffer: [max_action_bytes]u8 = undefined;
     try testing.expectEqual(@as(?[]const u8, null), actionInto(&buffer, .{
         .subsystem = .usb,

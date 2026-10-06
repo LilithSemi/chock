@@ -1,52 +1,15 @@
 //! The check before storing. A provider with a model catalogue, such as ai&'s
-//! `/v1/models`, gives a cheap call that proves the key works. A user who
-//! mistypes a key learns at login and not on their first turn. Chock stores
-//! the key only after the check passes, and says which provider answered.
-//!
-//! **This library reaches a provider and no other one does.** It talks HTTP
-//! through `std.http.Client` directly rather than through
-//! `chock-provider`, because a model catalogue is not a chat completion and
-//! nothing in the adapters describes one. That keeps `chock-auth` free of
-//! every other Chock library, which is what lets `chock login` run before a
-//! session, a workspace, or a sandbox exists.
-//!
-//! **The credential is in a header and never in a URL.** A URL reaches a
-//! proxy log, a redirect target, and a provider's own access log. The same
-//! rule `lib/chock-provider/Client.zig` already keeps for a request body.
 
 const std = @import("std");
 const config = @import("config.zig");
 
-/// The largest answer this reader keeps. A model catalogue is a small
-/// document and a refusal is a sentence. This bounds a provider that answers
-/// with something else entirely.
 pub const max_body_bytes: usize = 1024 * 1024;
 
-/// What this reader puts in `Accept-Encoding`. **The bytes as they are.**
-///
-/// `std.http.Client` offers `gzip, deflate` by itself unless the caller
-/// overrides this header, and `Response.reader` gives back exactly what
-/// arrived: only `Response.readerDecompressing` unpacks it. So a provider
-/// that takes the offer leaves this file counting models in compressed bytes,
-/// which reads as a catalogue it cannot count, and printing a refusal that is
-/// not text. The same fault, measured against the same endpoint, made every
-/// live Anthropic session end as a truncated stream: see
-/// `lib/chock-provider/Client.zig`'s own `identity_encoding`.
-///
-/// Asked for rather than merely not asked for: a request with no
-/// `Accept-Encoding` at all leaves every coding acceptable, per RFC 9110.
 const identity_encoding = "identity";
 
-/// What the provider said.
 pub const Outcome = union(enum) {
     ok: Ok,
-    /// The provider answered and refused. The credential is wrong, or it is
-    /// not allowed to read a catalogue.
     rejected: Rejected,
-    /// The provider was not reached at all: a refused connection, a name
-    /// that does not resolve, a TLS failure. The value is the name of the
-    /// underlying fault. **This is not proof that the credential is wrong**,
-    /// so a caller says so rather than blaming the key.
     not_reached: []const u8,
 
     pub fn deinit(self: *Outcome, gpa: std.mem.Allocator) void {
@@ -59,27 +22,16 @@ pub const Outcome = union(enum) {
 };
 
 pub const Ok = struct {
-    /// How many models the catalogue listed, or null when the answer did not
-    /// have a shape this reader could count. Null is never a zero: section
-    /// 10.1.3's rule that an absent answer is never a permissive answer, and
-    /// never a number either.
     model_count: ?usize,
 };
 
 pub const Rejected = struct {
     status: std.http.Status,
-    /// Whatever the provider said, capped at `max_body_bytes`. A provider
-    /// spends real words explaining a refusal and throwing them away wastes
-    /// them. Owned by the caller.
     body: []u8,
 };
 
 pub const Error = std.mem.Allocator.Error;
 
-/// Ask `base_url`'s model catalogue whether `token` works.
-///
-/// An empty `token` sends no credential at all, which is the case a local
-/// llama.cpp server needs: see `lib/chock-auth/lookup.zig`.
 pub fn credential(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -94,9 +46,7 @@ pub fn credential(
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
 
-    // Built once, wiped before it is freed. A credential sitting freed but
-    // unzeroed in the heap is still readable in a crash dump or a swapped
-    // page: the same care `lib/chock-provider/Client.zig` takes.
+    // Built once and wiped before it is freed: a credential sitting freed but unzeroed in the heap is still readable in a crash dump or a swapped page.
     const header_value = try switch (kind) {
         .anthropic => gpa.dupe(u8, token),
         .aiand, .openai_compat => std.fmt.allocPrint(gpa, "Bearer {s}", .{token}),
@@ -106,8 +56,6 @@ pub fn credential(
         gpa.free(header_value);
     }
 
-    // Anthropic reads `x-api-key` and requires its own version header.
-    // Everything OpenAI compatible reads `Authorization`.
     var extra: [2]std.http.Header = undefined;
     var extra_count: usize = 0;
     var authorization: std.http.Client.Request.Headers.Value = .omit;
@@ -127,14 +75,10 @@ pub fn credential(
 
     var request = http.request(.GET, uri, .{
         .keep_alive = false,
-        // The same refusal `lib/chock-provider/Client.zig` makes: a provider
-        // that answers a catalogue with a redirect is not one to follow
-        // blindly, and a redirect carries the credential to wherever it
-        // points.
+        // A provider that answers a catalogue with a redirect is not followed: a redirect would carry the credential wherever it points.
         .redirect_behavior = .not_allowed,
         .headers = .{
             .authorization = authorization,
-            // **The bytes as they are.** See `identity_encoding`.
             .accept_encoding = .{ .override = identity_encoding },
         },
         .extra_headers = extra[0..extra_count],
@@ -160,11 +104,6 @@ pub fn credential(
     return .{ .ok = .{ .model_count = countModels(gpa, body) } };
 }
 
-/// How many entries the catalogue's own `data` array holds, or null when the
-/// answer did not have that shape. Every OpenAI compatible catalogue uses
-/// `data`, and so does a local llama.cpp server. An answer this reader cannot
-/// count is still an answer that accepted the credential, which is the fact
-/// the caller asked about.
 fn countModels(gpa: std.mem.Allocator, body: []const u8) ?usize {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return null;
     defer parsed.deinit();
@@ -194,8 +133,6 @@ test "a catalogue with a data array is counted, and one without is null rather t
 }
 
 test "a provider that cannot be reached is not reported as a wrong credential" {
-    // The two are different facts and a user acts on them differently. A
-    // port nothing listens on gives the first one.
     const gpa = testing.allocator;
     var outcome = try credential(gpa, testing.io, .openai_compat, "http://127.0.0.1:1/v1", "sk-not-a-real-key");
     defer outcome.deinit(gpa);

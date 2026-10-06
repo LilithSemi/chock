@@ -1,6 +1,5 @@
-//! The interface bare `chock` brings up: one widget tree over phantom's
-//! terminal and window backends, driven as a second `chock_core.Loop.Observer`.
-//! The transcript is `src/run.zig`'s `Printer` buffer, so there is one writer.
+//! The interface bare `chock` brings up: one widget tree over phantom's terminal and window backends.
+//! It runs as a second `chock_core.Loop.Observer`, and the transcript is `src/run.zig`'s own buffer.
 
 const std = @import("std");
 const phantom = @import("phantom");
@@ -32,9 +31,6 @@ pub fn decide(backend: phantom.app.Backend, terminal_can_draw: bool) Plan {
     };
 }
 
-/// How long the probe waits for the compositor's keymap, in milliseconds. Five
-/// milliseconds was enough against weston, so nearly all of this is margin.
-/// Silence is not proof, so a probe that finds no keymap pays the whole budget.
 const keymap_wait_ms: u32 = 100;
 
 const Compositor = struct {
@@ -48,13 +44,7 @@ const Compositor = struct {
         ready,
     };
 
-    /// `phantom.window.open` and not `phantom.window.available`: the compositor
-    /// sends its keymap after the keyboard is bound, so the connection has to
-    /// stay up for a moment. No surface is committed, so no window is shown.
     fn look(self: Compositor) Compositor.Answer {
-        // The comptime `if` keeps every lattice type out of analysis on a target
-        // where lattice is a `void`. An early return would not: the rest of the
-        // body sits at function scope and is analyzed either way.
         if (phantom.backend.prism.builds_here) {
             var opened = phantom.window.open(self.gpa, self.io, self.env, .{}) orelse
                 return .none;
@@ -91,11 +81,6 @@ const Compositor = struct {
     }
 };
 
-/// A screen is not enough. `phantom.window.available` said yes on an Apple M1
-/// running cosmic-comp and the pipeline then failed with `NotImplemented`, so
-/// prism's own rasterizer probe is asked instead. A keymap lattice cannot read
-/// gives a window that draws every frame and takes no key, so the keyboard is
-/// refused with the drawing half.
 fn windowPossible(can_draw: bool, compositor: anytype) Compositor.Answer {
     if (!can_draw) return .none;
     return compositor.look();
@@ -118,8 +103,6 @@ pub fn logMessage(
     std.log.defaultLog(level, scope, format, args);
 }
 
-/// Wide on the words on purpose. A false match drops a window to the terminal,
-/// which works; a miss puts up a window a person cannot type in.
 fn saysKeymapFailed(level: std.log.Level, format: []const u8) bool {
     if (level != .warn and level != .err) return false;
     return std.mem.indexOf(u8, format, "keymap") != null;
@@ -267,10 +250,6 @@ pub fn split(rows: u16, wanted: u16) Split {
     };
 }
 
-/// A row a band has no room for must not be drawn. A band is a surface exactly
-/// `rows` line boxes tall and the next band is painted after it, so a row past
-/// the end is covered rather than clipped and shows as glyphs cut by a straight
-/// edge.
 const Rows = struct {
     into: std.ArrayList(phantom.Widget) = .empty,
     left: u16,
@@ -286,11 +265,6 @@ const Rows = struct {
     }
 };
 
-/// Every control character becomes a space: the cell writer sends a codepoint
-/// straight at the terminal, so an escape byte in a tool's output would write a
-/// sequence this file never composed. Every byte that is not valid UTF-8 becomes
-/// a question mark, because phantom gives a line it cannot decode no size at all
-/// and the whole line would vanish.
 const Drawn = struct {
     point: u21,
     length: usize,
@@ -417,14 +391,8 @@ const first_printable: u21 = ' ';
 const last_printable: u21 = '~';
 const printable_count = last_printable - first_printable + 1;
 
-/// `phantom.tui.term.logical_cell_h` is a nominal 16 and is the divisor that
-/// turns a reported cell height into a device pixel ratio. It is not a line box:
-/// both bundled faces measure 1.2 em, so a row at size 16 wants 19.2 and a band
-/// built as `rows * 16` cuts every glyph.
 pub const Measure = struct {
     metrics: phantom.text.mono.TextMetrics,
-    /// The mono metrics are in physical pixels and every size given to a widget
-    /// is logical, so the two are divided apart here and nowhere else.
     dpr: f32,
     font: *phantom.text.Font,
     size: f32,
@@ -533,7 +501,6 @@ pub const Measure = struct {
 const grid_measure: Measure = .{
     .metrics = .{ .mono = .{ .advance = 1, .line = 1, .ascent = 0.8 } },
     .dpr = 1,
-    // Never read: every `.mono` answer comes from the cell and needs no face.
     .font = undefined,
     .size = 1,
 };
@@ -574,9 +541,7 @@ fn countIn(room: f32, step: f32) u16 {
     return @intFromFloat(whole);
 }
 
-/// Every frame goes through `src/tty.zig`, the same way every other line does.
-/// The buffer is zero length, so a frame reaches `tty`'s own standard output
-/// buffer at once and nothing is left behind when `Loop.run` forks.
+// The buffer is zero length, so a frame reaches tty's own buffer at once and nothing is left behind when Loop.run forks.
 const Frames = struct {
     writer: std.Io.Writer = .{ .vtable = &vtable, .buffer = &.{} },
 
@@ -585,8 +550,6 @@ const Frames = struct {
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         _ = w;
         var written: usize = 0;
-        // The contract in `std.Io.Writer.VTable.drain`: each slice of `data` in
-        // order, and the last slice repeated `splat` times.
         for (data[0 .. data.len - 1]) |slice| {
             _ = tty.writeOut(slice);
             written += slice.len;
@@ -605,10 +568,7 @@ const Frames = struct {
     }
 };
 
-/// Where a line written to standard error goes while a display is up. It must
-/// not draw: `tty.print` holds `src/tty.zig`'s one lock across a message and a
-/// frame takes the same lock, so a frame built here would wait on its own
-/// caller. The line is folded into rows and the next frame shows it.
+// Must not draw: tty.print holds src/tty.zig's one lock across a message, and a frame taking the same lock here would wait on its own caller.
 const Diagnostics = struct {
     writer: std.Io.Writer = .{ .vtable = &vtable, .buffer = &.{} },
     ui: ?*Ui = null,
@@ -616,9 +576,6 @@ const Diagnostics = struct {
     held: std.ArrayList(u8) = .empty,
     escape: Escape = .none,
 
-    /// Three states and not a flag. `[` is itself in the final byte range, so a
-    /// flag cleared on the first byte of that range would end `\x1b[33m` at the
-    /// `[` and put `33m` in the row.
     const Escape = enum { none, after_esc, in_csi };
 
     const vtable: std.Io.Writer.VTable = .{ .drain = drain };
@@ -970,8 +927,6 @@ pub fn spread(
 ) std.mem.Allocator.Error![]const u8 {
     if (right.len == 0) return visibleLine(arena, left, room);
     const pinned = room.measure.widthOf(right);
-    // Cut even here: a row past the edge would wrap, and the wrapped part starts
-    // at column 0, where only Chock draws.
     if (pinned >= room.width) return visibleLine(arena, right, room);
 
     const gap = room.measure.advanceOf(' ');
@@ -1274,7 +1229,6 @@ pub fn countLines(text: []const u8) usize {
 pub fn backOne(text: []const u8) usize {
     if (text.len == 0) return 0;
     var at = text.len - 1;
-    // Every byte of a multi byte character after the first is 0b10xxxxxx.
     while (at != 0 and text[at] & 0b1100_0000 == 0b1000_0000) at -= 1;
     return at;
 }
@@ -1323,12 +1277,6 @@ pub fn ctrlCPresses(bytes: []const u8) usize {
     return std.mem.count(u8, bytes, &.{0x03});
 }
 
-/// The terminal's own settings with the echo taken out. `ISIG` and `ECHO` are
-/// independent bits of `c_lflag` and `Term.leaveRaw` restores every bit it
-/// saved, so a turn used to run with the echo on: a scroll wheel on the
-/// alternate screen sends arrow escape sequences, which wrote `^[[A` across the
-/// transcript. `ECHONL` goes too, because a canonical terminal echoes a newline
-/// with `ECHO` off and a newline moves the whole screen.
 pub fn quietOf(was: std.posix.termios) std.posix.termios {
     var quiet = was;
     quiet.lflag.ECHO = false;
@@ -1355,8 +1303,7 @@ pub const Answer = union(enum) {
 fn keepText(gpa: std.mem.Allocator, into: *std.ArrayList(u8), text: []const u8) void {
     var at: usize = 0;
     while (at < text.len) {
-        // A whole escape sequence goes, and never its first byte alone: keeping
-        // the rest turns a colour code into a literal `[0m` in the message.
+        // A whole escape sequence goes, and never its first byte alone: keeping the rest turns a colour code into a literal [0m.
         if (text[at] == 0x1b) {
             at += escapeLength(text[at..]);
             continue;
@@ -1381,9 +1328,6 @@ fn keepText(gpa: std.mem.Allocator, into: *std.ArrayList(u8), text: []const u8) 
     }
 }
 
-/// How many bytes the escape sequence at the front of `text` takes. `ESC [` runs
-/// to the first byte in `0x40` to `0x7e`; `ESC ]` is an operating system command
-/// and runs to a `BEL` or to `ESC \`. Everything else after `ESC` is two bytes.
 fn escapeLength(text: []const u8) usize {
     if (text.len < 2) return text.len;
     switch (text[1]) {
@@ -1662,14 +1606,6 @@ pub const Ui = struct {
                 const size = terminal.size orelse try device.size();
                 self.fixed_size = terminal.size != null;
 
-                // Raw mode spans the probe and the first message: a terminal
-                // that is not raw answers a read only when the person presses
-                // return. The probe reads its own reply, so a device that never
-                // answers eats what is typed for its whole budget, about three
-                // seconds. `isTty` is asked first because `tcgetattr` on
-                // `/dev/null` answers `ENODEV` on Darwin, which Zig does not
-                // know, so `unexpectedErrno` writes a stack trace before the
-                // error comes back.
                 var was: ?std.posix.termios = null;
                 var held: ?std.posix.termios = null;
                 if (terminal.in.isTty(io) catch false) device.enterRaw() catch {};
@@ -1690,8 +1626,6 @@ pub const Ui = struct {
                 var options = terminalOptions(self, terminal);
                 options.size = size;
                 options.query_capabilities = raw;
-                // `Session.init` unwinds everything it did on an error, so a
-                // caller that gets one must not call `deinit`.
                 try session.init(
                     gpa,
                     io,
@@ -1752,8 +1686,6 @@ pub const Ui = struct {
             .title = "chock",
             .width = attach.width,
             .height = attach.height,
-            // Zero, because every `step` runs inside an observer call on the
-            // thread that also runs the session.
             .poll_ms = 0,
         };
     }
@@ -2113,9 +2045,6 @@ pub const Ui = struct {
         self.phase = .message;
     }
 
-    /// `when` is `.FLUSH` where a field or a question opens, so a key already in
-    /// flight cannot answer it, and `.NOW` for the pump, which keeps what a
-    /// person typed between two of its own looks.
     fn takeKeys(self: *Ui, when: std.posix.TCSA) void {
         const keys = if (self.keys) |*one| one else return;
         if (keys.raw) return;
@@ -2129,9 +2058,6 @@ pub const Ui = struct {
         return keys.raw;
     }
 
-    /// Gives `ISIG` back and keeps the echo off. The flag falls before the
-    /// write, so a device that cannot be written still leaves this file
-    /// believing it holds no keyboard.
     fn giveKeys(self: *Ui, when: std.posix.TCSA) void {
         const keys = if (self.keys) |*one| one else return;
         if (!keys.raw) return;
@@ -2217,7 +2143,6 @@ pub const Ui = struct {
             const keys = &self.keys.?;
             var buffer: [read_bytes]u8 = undefined;
             const read = keys.device.in.readStreaming(self.io, &.{&buffer}) catch |err| switch (err) {
-                // Nothing arrived. `VTIME 1` reads that as the end of the read.
                 error.EndOfStream => 0,
                 else => 0,
             };
@@ -2409,8 +2334,6 @@ pub const Ui = struct {
     }
 
     pub fn stop(self: *Ui) void {
-        // Idempotent: two callers ask for this and neither can know whether the
-        // other did.
         if (self.stopped) return;
         self.stopped = true;
         self.endInput();
@@ -2535,9 +2458,6 @@ pub const Ui = struct {
                     .{opened.decision},
                 ),
             },
-            // The detail is the whole of what this line is worth. Every path
-            // that ends a session writes a sentence saying what happened, and
-            // printing the reason alone told a reader "errored" and no more.
             .session_end => |ended| if (ended.detail.len == 0)
                 self.sayFmt(.chock, "session ended, {s}", .{ended.reason.wireName()})
             else
@@ -2730,9 +2650,6 @@ pub const Ui = struct {
 
     const shown_line_bytes = 400;
 
-    /// How much of a session end detail reaches the screen. A status error's
-    /// detail carries the provider's whole response body, which has its own
-    /// far larger bound, and the log keeps all of it either way.
     const shown_detail_bytes = 240;
 
     const kept_lines = 512;
@@ -2753,10 +2670,6 @@ pub const Ui = struct {
 
     fn sayFmt(self: *Ui, voice: Voice, comptime fmt: []const u8, args: anytype) void {
         var buffer: [shown_line_bytes + 128]u8 = undefined;
-        // A format that does not fit leaves the tail of `buffer` untouched, so
-        // the whole of it is not a string. `bufPrint` writes from the start and
-        // fails only once it runs out, which makes the buffer minus the room it
-        // needed for the rest the most that can be read back.
         const said = std.fmt.bufPrint(&buffer, fmt, args) catch said: {
             @memset(buffer[buffer.len - 3 ..], '.');
             break :said buffer[0..];
@@ -3042,8 +2955,6 @@ pub const Ui = struct {
             ctx.new(phantom.Expanded(.{ .child = focused })).widget(),
             ctx.new(phantom.SizedBox{ .width = side, .child = beside }).widget(),
         });
-        // The row is given its height, because a flex fills the axis it does not
-        // lay out along.
         return ctx.new(phantom.SizedBox{
             .height = bandHeight(measure, rows),
             .child = ctx.new(phantom.Row(.{ .children = both })).widget(),
@@ -5824,8 +5735,6 @@ test "a clock pinned to the right hand end is pinned again when the window narro
 }
 
 test "in pixels the right hand value is a run of its own, pinned at the true edge" {
-    // PIXELS mode cannot be driven through tmux, which carries no kitty graphics,
-    // so the proportional face is checked here.
     const gpa = testing.allocator;
     const h = try openWide(gpa, 140, 16);
     defer h.close();
@@ -7206,8 +7115,6 @@ test "Enter and Esc answer nothing, and neither does a letter that is not one of
         try testing.expect(h.screen.approval != null);
     }
 
-    // Escape clears the focus in phantom's own traversal rules, before any
-    // listener is offered it.
     try testing.expectEqual(Look.waiting, h.screen.awaitAnswer(50));
     try testing.expect(h.screen.approval_focused);
     try pressKeys(h, "y");
@@ -7806,8 +7713,6 @@ test "a list longer than the transcript takes the rows it has and never one more
         try testing.expect(h.screen.paint());
         try testing.expectEqual(@as(f32, 0), drawnPastBands(h));
         const shown = try screenText(h);
-        // The row writes `\u{25b8}` and a cell backend paints `\u{25b6}`, which
-        // is phantom's spelling of the same mark.
         const wanted = try std.fmt.allocPrint(gpa, "{s} session {d}", .{ "\u{25b6}", at });
         defer gpa.free(wanted);
         try testing.expect(std.mem.indexOf(u8, shown, wanted) != null);

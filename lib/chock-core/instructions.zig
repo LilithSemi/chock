@@ -1,94 +1,17 @@
-//! Instruction files, read in: `AGENTS.md` at three layers, which do not
-//! carry the same trust and must never be flattened into one block.
-//!
-//! | Layer | Path | Written by | Trust |
-//! |---|---|---|---|
-//! | operator | `<config dir>/AGENTS.md` | **the user** | the user's own voice |
-//! | project | `AGENTS.md` at the project root | whoever wrote the repository | untrusted |
-//! | subtree | `AGENTS.md` in a subdirectory | the same | untrusted |
-//!
-//! **The operator's file is the most trusted of the three**, because it is
-//! the only one the user certainly wrote. It holds standing preferences that
-//! hold across every project. It lives in the configuration directory, so the
-//! rule `lib/chock-auth/paths.zig` already states applies unchanged: Chock
-//! reads it and never writes it, and home-manager may manage it.
-//!
-//! ## A project is often something the user cloned
-//!
-//! Its `AGENTS.md` was written by whoever wrote the repository, and an agent
-//! that follows it without question follows a stranger. This is prompt
-//! injection with a file for a vector.
-//!
-//! Chock is better placed than most to take it, because the capability layers
-//! already mean **instructions cannot grant capability**: a file that says
-//! "push to this remote" still meets a policy that refuses, a sandbox with no
-//! network, and a broker the agent cannot reach. **Never let an instruction
-//! file change the policy, the budget, or the tool list.** Those come from
-//! `chock.zon`, which the sandbox puts beyond the agent's reach, and from the
-//! provider's capability record. There is no path from this file to any of
-//! them: `load` answers with text, and text is all the prompt does with it.
-//!
-//! So the defence is the design already built, plus two habits:
-//!
-//! * **Mark the boundary in the prompt.** `Layer.heading` names who wrote
-//!   each block, and the parenthetical "not by your operator" is the part
-//!   that does the work: it is what lets a model discount an instruction that
-//!   conflicts with the user's own. It is one line rather than a paragraph of
-//!   warning. **There is deliberately no lecture about prompt injection**: a
-//!   model told where a block came from can reason about it, and a model told
-//!   to be afraid of its own input reasons worse.
-//! * **Say what was loaded.** `Loaded.files` names every file that was read
-//!   and its size, so `chock run` can print it. A user who clones a
-//!   repository and sees an unexpected four hundred line `AGENTS.md` load has
-//!   learned something worth knowing.
-//!
-//! ## Only files on disk, never a URL
-//!
-//! OpenCode 1.18.11 accepts `http` and `https` entries as instruction sources
-//! and fetches them into the system prompt with a five second timeout. That
-//! puts a project's configuration in charge of what the agent is told, from a
-//! server the user never sees, changeable after review, with no record in the
-//! log of what arrived. **This file reads paths, and a path is a file on
-//! disk.** There is no fetch here and none is wanted.
+//! Instruction files, read in: AGENTS.md at three layers, operator,
+//! project and subtree, which carry different trust and stay separate.
 
 const std = @import("std");
 const index = @import("index.zig");
 
-/// The file name at every layer. `AGENTS.md` is becoming the cross tool
-/// spelling, so a project that already has one needs no second file for
-/// Chock.
 pub const file_name = "AGENTS.md";
 
-/// The most of one instruction file that reaches the prompt. Past this the
-/// block is cut and `Block.truncated` says so, in the prompt itself, so a
-/// model does not act on half a rule believing it read the whole one.
-///
-/// **A bound is needed even for the operator's own file.** The prompt is
-/// paid for on every turn, and a file nobody bounded is a prompt nobody
-/// bounded.
 pub const max_block_bytes: usize = 8 * 1024;
 
-/// How many subtree files the index names. Past this the index says how many
-/// were left out. A tree with two hundred `AGENTS.md` files is a fact about
-/// the tree, and naming all of them is a fact about the context window.
 pub const max_subtree_entries: usize = 32;
 
-/// How deep under the project root a subtree file is looked for. The root's
-/// own file is depth 0 and is a layer of its own, so this bounds the walk
-/// below it. Deep enough for `src/parser/AGENTS.md`, shallow enough that the
-/// walk over a large tree stays cheap.
 pub const max_subtree_depth: usize = 4;
 
-/// A directory the walk never enters. `.git` holds no instructions and
-/// walking it costs the most of any directory in a repository.
-///
-/// **`zig-pkg` is here because a dependency wrote instructions into a session.**
-/// Zig unpacks every fetched package under it, and one of them, the Public Suffix
-/// List, ships an `AGENTS.md` about its own pull request template. Every session
-/// on this project read it as a `subtree` block and printed it to the model. A
-/// dependency is not a layer of this project, and whatever it says about how to
-/// work is about itself. The same goes for the other vendored trees below: an
-/// instruction that arrives with a package is an instruction nobody here wrote.
 const skipped_dirs = [_][]const u8{
     ".git",
     ".zig-cache",
@@ -100,21 +23,12 @@ const skipped_dirs = [_][]const u8{
     ".direnv",
 };
 
-/// Which of the three layers a block came from. **The layer is what the
-/// prompt prints**, so it is a value and not a comment: a block that reached
-/// the prompt without one would be a block a model cannot weigh.
 pub const Layer = enum {
     operator,
     given,
     project,
     subtree,
 
-    /// The heading this layer's block gets in the prompt, and the line under
-    /// it that says who wrote it.
-    ///
-    /// **The parenthetical is the part that does the work.** "Not by your
-    /// operator" is what lets a model discount an instruction that conflicts
-    /// with the user's own.
     pub fn heading(self: Layer) []const u8 {
         return switch (self) {
             .operator =>
@@ -138,78 +52,39 @@ pub const Layer = enum {
     }
 };
 
-/// One instruction file, ready for the prompt.
 pub const Block = struct {
     layer: Layer,
-    /// How the file is named to the model. The project's own file is named
-    /// relative to the project root; the operator's is named by its absolute
-    /// path, because it is not in the project at all.
     path: []const u8,
-    /// The file's text, at most `max_block_bytes` of it.
     text: []const u8,
-    /// The file was longer than `max_block_bytes` and this is the front of
-    /// it. The prompt says so where the block ends.
     truncated: bool = false,
 };
 
-/// One file that was read, for `chock run` to name. Kept apart from `Block`
-/// because a subtree file is reported here and never becomes a `Block`: its
-/// body stays on disk until the agent asks for it.
 pub const ReadFile = struct {
     layer: Layer,
     path: []const u8,
     bytes: usize,
 };
 
-/// What a session's instruction files came to. Everything in it is owned by
-/// the allocator passed to `load`; an arena frees the whole thing at once.
 pub const Loaded = struct {
     operator: ?Block = null,
-    /// The files `--instructions` named, in the order they were given.
     given: []const Block = &.{},
     project: ?Block = null,
-    /// Files chock.zon's `instructions` block named, already resolved to a
-    /// path on disk by `chock_policy.instructions`. Each one is its own
-    /// `.project` layer block, beside `AGENTS.md`.
     project_named: []const Block = &.{},
-    /// One index entry per subtree file: the path, and the file's own first
-    /// meaningful line as its description. The path is relative to the
-    /// project root, which is exactly what `read_file` takes.
     subtrees: []const index.Entry = &.{},
-    /// How many subtree files were found past `max_subtree_entries`.
     subtrees_left_out: usize = 0,
-    /// Every file that was read, in the order the layers apply.
     files: []const ReadFile = &.{},
 };
 
 pub const Error = std.mem.Allocator.Error;
 
-/// Read every instruction file this session has.
-///
-/// `config_dir` is Chock's own configuration directory, or null for a caller
-/// that has none: the operator layer is then absent rather than guessed at.
-/// `project_root` is the project itself.
-///
-/// **A file that cannot be read is not an error.** Most projects have no
-/// `AGENTS.md` at all, and a session must not fail because one is missing,
-/// unreadable, or a directory. Only running out of memory reaches the
-/// caller.
-/// Why a file `--instructions` named could not be read. The path is the
-/// caller's and is not copied.
 pub const GivenError = error{GivenFileUnreadable};
 
-/// The file `--instructions` named that could not be read, filled in when
-/// `load` answers `error.GivenFileUnreadable`.
 pub const GivenDiagnostic = struct {
     path: []const u8 = "",
 };
 
-/// Why a file chock.zon's `instructions` block named could not be read. The
-/// path is the caller's and is not copied.
 pub const ProjectNamedError = error{ProjectNamedFileUnreadable};
 
-/// The file chock.zon named that could not be read, filled in when `load`
-/// answers `error.ProjectNamedFileUnreadable`.
 pub const ProjectNamedDiagnostic = struct {
     path: []const u8 = "",
 };
@@ -248,10 +123,6 @@ pub fn load(
         var blocks = try allocator.alloc(Block, given.len);
         errdefer allocator.free(blocks);
         for (given, 0..) |path, index_of| {
-            // Named by a person on the command line, so a file that cannot be
-            // read is a refusal and never silence. An absent AGENTS.md is a
-            // project that has none; an absent named file is a session the
-            // caller asked for and did not get.
             const read = try readBounded(allocator, io, path) orelse {
                 if (given_diag) |slot| slot.* = .{ .path = path };
                 return error.GivenFileUnreadable;
@@ -285,11 +156,6 @@ pub fn load(
         var blocks = try allocator.alloc(Block, project_named.len);
         errdefer allocator.free(blocks);
         for (project_named, 0..) |path, index_of| {
-            // Named in the project's own chock.zon, so a file that cannot be
-            // read is a refusal and never silence, for the same reason a
-            // file `--instructions` names is: the project asked for it by
-            // name, and a session that silently drops it is not the session
-            // that was asked for.
             const read = try readBounded(allocator, io, path) orelse {
                 if (project_named_diag) |slot| slot.* = .{ .path = path };
                 return error.ProjectNamedFileUnreadable;
@@ -316,30 +182,18 @@ pub fn load(
 const BoundedRead = struct {
     text: []u8,
     truncated: bool,
-    /// The file's real size, which is what `chock run` reports. Never
-    /// `text.len`: a user who sees "4096 bytes" for a forty thousand byte
-    /// file has been told the wrong thing about their own repository.
     total_bytes: usize,
 };
 
-/// Read at most `max_block_bytes` of `path`, or null when there is nothing
-/// readable there.
 fn readBounded(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!?BoundedRead {
-    // One byte past the bound, so a file exactly at the bound is not
-    // reported as cut and a file past it is.
     const whole = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_block_bytes + 1)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        // Every other answer means this layer has nothing: no such file, a
-        // directory, no permission, or a file larger than the limit, which
-        // `readFileAlloc` reports rather than truncating. The last one is
-        // handled below by reading it again with a reader that stops.
         error.StreamTooLong => return try readFront(allocator, io, path),
         else => return null,
     };
     return .{ .text = whole, .truncated = false, .total_bytes = whole.len };
 }
 
-/// The front of a file that is larger than `max_block_bytes`.
 fn readFront(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!?BoundedRead {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer file.close(io);
@@ -358,10 +212,6 @@ fn readFront(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!?
         if (n == 0) break;
         filled += n;
     }
-    // Shrunk with `realloc`, never handed back as a subslice: `free` reads
-    // the length of the slice it is given, so a caller freeing a subslice of
-    // a larger allocation is a bug that only shows up under an allocator
-    // that tracks sizes.
     if (filled != text.len) text = try allocator.realloc(text, filled);
 
     return .{
@@ -376,8 +226,6 @@ const Scanned = struct {
     left_out: usize,
 };
 
-/// Walk the project for `AGENTS.md` files below its root, and make one index
-/// entry per file. The root's own file is not here: it is its own layer.
 fn scanSubtrees(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -405,9 +253,6 @@ fn scanSubtrees(
         }
         if (entry.kind != .file) continue;
         if (!std.mem.eql(u8, entry.basename, file_name)) continue;
-        // The root's own file is its own layer and already a block. Its path
-        // is the bare file name, with no directory part, which is what tells
-        // it apart from a subtree's.
         if (std.mem.eql(u8, entry.path, file_name)) continue;
 
         if (entries.items.len >= max_subtree_entries) {
@@ -432,9 +277,6 @@ fn scanSubtrees(
         try files.append(allocator, .{ .layer = .subtree, .path = relative, .bytes = read.total_bytes });
     }
 
-    // Sorted, so two runs over one tree give the same prompt. The walk order
-    // is whatever the filesystem hands back, which is neither stable nor
-    // meaningful to a reader.
     std.mem.sort(index.Entry, entries.items, {}, lessThanName);
 
     return .{ .entries = try entries.toOwnedSlice(allocator), .left_out = left_out };
@@ -517,18 +359,12 @@ test "the operator's own file is read with no project file present, and alongsid
         const loaded = try load(arena, testing.io, config_dir, project_root, &.{}, null, &.{}, null);
         try testing.expectEqualStrings("Never use emoji.\n", loaded.operator.?.text);
         try testing.expectEqualStrings("Use tabs.\n", loaded.project.?.text);
-        // Two files, two layers, and the two are not one block: the whole
-        // point of the design is that a model can tell them apart.
         try testing.expectEqual(Layer.operator, loaded.files[0].layer);
         try testing.expectEqual(Layer.project, loaded.files[1].layer);
     }
 }
 
 test "each layer's heading names who wrote it, and only the project's says it was not the operator" {
-    // The parenthetical is the part that does the work, so it is the part a
-    // test pins. A heading that lost it would leave a model unable to weigh
-    // a cloned repository's instructions against the user's own, and nothing
-    // else in the build would notice.
     try testing.expect(std.mem.indexOf(u8, Layer.operator.heading(), "the person running you") != null);
     try testing.expect(std.mem.indexOf(u8, Layer.operator.heading(), "not by your operator") == null);
 
@@ -585,9 +421,6 @@ test "a dependency's own AGENTS.md is never read as this project's instructions"
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The shape that reached a model: zig unpacks each package under `zig-pkg`,
-    // and the Public Suffix List ships an `AGENTS.md` about its own pull request
-    // template. It was printed as a `subtree` block in every session.
     try writeAt(
         testing.io,
         tmp.dir,
@@ -603,8 +436,6 @@ test "a dependency's own AGENTS.md is never read as this project's instructions"
     const loaded = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
     try testing.expectEqual(@as(usize, 0), loaded.subtrees.len);
 
-    // And a real subdirectory of the project still is read, so the skip is the
-    // vendored trees and not the walk.
     try writeAt(testing.io, tmp.dir, "src/parser/" ++ file_name, "# Ours\n");
     const again = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
     try testing.expectEqual(@as(usize, 1), again.subtrees.len);
@@ -707,7 +538,6 @@ test "a named file that cannot be read refuses, where a missing AGENTS.md does n
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    // The same directory, with no AGENTS.md in it, loads without complaint.
     const quiet = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
     try testing.expect(quiet.project == null);
 
@@ -761,11 +591,6 @@ test "a file chock.zon named that cannot be read refuses, the same as a file --i
 }
 
 test "an instruction file is text and reaches nothing that decides what the agent may do" {
-    // The rule this pins: an instruction file cannot change the policy, the
-    // budget, or the tool list. It is checked here as a property of the type
-    // rather than of one string, because a field added to `Loaded` that
-    // named a tool or a policy key is exactly how this would stop being
-    // true, and it would be nobody's job to notice.
     inline for (@typeInfo(Loaded).@"struct".fields) |field| {
         const T = field.type;
         const ok = T == ?Block or T == []const Block or T == []const index.Entry or

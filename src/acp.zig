@@ -1,36 +1,4 @@
 //! `chock acp`: an editor drives Chock over the agent client protocol.
-//!
-//! ## It owns nothing, the same way `chock serve` owns nothing
-//!
-//! An editor launches this as a subprocess and talks to it on standard input and
-//! output. `chock daemon` still owns every session. So this is a second frontend
-//! beside `chock serve`, written to the same rule: **would this still work if the
-//! daemon were on another machine?** It reads no session log, takes no lock, and
-//! builds no path from a session identifier.
-//!
-//! ## Why a frontend and not the loop itself
-//!
-//! `chock_core.tools.Registry.dispatch` forks, and a fork carries only the
-//! calling thread, so the process that runs a tool call must be single threaded.
-//! This process has to read standard input while a turn is running, because
-//! `session/cancel` and the answer to a permission request both arrive there. A
-//! frontend may have threads because it never forks; the loop may not. That is
-//! the whole reason this is a client of the daemon rather than a loop with a
-//! protocol bolted onto it.
-//!
-//! ## Nothing but a protocol message reaches standard output
-//!
-//! The transport says so, in those words. `tty.print` already writes to standard
-//! error, which the transport permits for logging, and nothing here calls
-//! `tty.out` except the usage text, which is printed before a client exists.
-//!
-//! ## One consumer, two producers
-//!
-//! A thread reads standard input and a thread tails the session log, and both
-//! push onto one queue that the main thread alone drains. So every write to
-//! standard output happens on one thread, in one order, with no lock around the
-//! writer, and a cancel that arrives in the middle of a turn is read rather than
-//! waited on.
 
 const std = @import("std");
 
@@ -48,11 +16,8 @@ const Exit = @import("main.zig").Exit;
 const session_paths = @import("session.zig");
 const tty = @import("tty.zig");
 
-/// What this agent tells a client it is.
 const agent_name = "chock";
 
-/// The longest message this reads. The transport has no length header, so a peer
-/// writing more than this with no newline is one this cannot frame.
 const max_line_bytes: usize = 1024 * 1024;
 
 const usage_text =
@@ -167,8 +132,6 @@ fn projectPath(arena: std.mem.Allocator, io: std.Io, named: ?[]const u8) ![]cons
         if (std.fs.path.isAbsolute(text)) return arena.dupe(u8, text);
         return std.fs.path.resolve(arena, &.{text});
     }
-    // `std.Io.Dir.cwd()` carries `AT_FDCWD`, which is not a descriptor, so the
-    // directory is opened to be named. The same thing `chock serve` does.
     var here = try std.Io.Dir.cwd().openDir(io, ".", .{});
     defer here.close(io);
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -176,15 +139,10 @@ fn projectPath(arena: std.mem.Allocator, io: std.Io, named: ?[]const u8) ![]cons
     return arena.dupe(u8, buffer[0..length]);
 }
 
-/// One thing for the main thread to do.
 const Item = union(enum) {
-    /// A protocol message, as the line it arrived as. Owned.
     line: []u8,
-    /// One log event of the session whose turn is running. Owned.
     record: Record,
-    /// The log tail ended. A turn that ends this way wrote no session end.
     watch_ended,
-    /// Standard input closed, which is the editor going away.
     input_closed,
 
     const Record = struct { id: u64, payload: []u8 };
@@ -198,11 +156,6 @@ const Item = union(enum) {
     }
 };
 
-/// A queue with one consumer and two producers.
-///
-/// Uncancelable throughout: a cancel of this process is standard input closing,
-/// which arrives as an item, and a wait that could be cancelled would lose the
-/// item a producer had already pushed.
 const Queue = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -214,8 +167,6 @@ const Queue = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.items.append(self.gpa, item) catch {
-            // Dropping it beats ending a session over one allocation, and the
-            // log keeps the event either way.
             item.deinit(self.gpa);
             return;
         };
@@ -235,26 +186,12 @@ const Queue = struct {
     }
 };
 
-/// A session this process has told a client about.
 const Live = struct {
-    /// Chock's own identifier, which is also the one the client was given. There
-    /// is no second numbering to keep in step.
     id: [session_paths.id_length]u8,
     project: []u8,
-    /// The log offset everything up to has been sent. A turn tails from here, so
-    /// nothing is sent twice and nothing is missed.
     seen: u64 = 0,
-    /// How many tokens this session's model holds, out of `session.config`. Null
-    /// when nobody said, and then no context gauge is sent: ACP requires the size
-    /// beside the use, and a gauge against a number nobody wrote reads as full or
-    /// empty by accident.
     window: ?u64 = null,
-    /// The merged plan. ACP plan entries carry no identifier, so a client cannot
-    /// merge one and the whole plan goes every time.
     plan: std.ArrayList(Step) = .empty,
-    /// Tool calls this session has opened, so a result can name the tool its call
-    /// was for. ACP wants a kind and a title on the call and only an identifier
-    /// on the update.
     calls: std.ArrayList(Call) = .empty,
 
     const Step = struct {
@@ -282,8 +219,6 @@ const Live = struct {
         self.calls.deinit(gpa);
     }
 
-    /// Merge one plan step in by identifier, the way Chock's own plan updates
-    /// are meant to be read.
     fn mergeStep(
         self: *Live,
         gpa: std.mem.Allocator,
@@ -325,11 +260,9 @@ const Live = struct {
     }
 };
 
-/// What one daemon exchange answered.
 const Answered = struct {
     ok: ?[]const u8 = null,
     failed: ?[]const u8 = null,
-    /// A fault reaching the daemon at all, which is not the same as a refusal.
     unreachable_reason: ?[]const u8 = null,
 
     fn refusal(self: Answered) ?[]const u8 {
@@ -342,34 +275,24 @@ const Agent = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     daemon: control.Address,
-    /// The project a `session/new` that names no directory of its own uses.
     project: []const u8,
 
-    /// Null until `initialize` agrees one. Nothing else is answered before it.
     version: ?chock_acp.Version = null,
     sessions: std.ArrayList(Live) = .empty,
     queue: Queue = undefined,
     turn: ?Turn = null,
     out: *std.Io.Writer = undefined,
-    /// The next id for a request this agent makes of the client.
     next_ask: u64 = 1,
     stopping: bool = false,
 
-    /// The `session/prompt` waiting for a stop reason, and what is running for it.
     const Turn = struct {
         request: jsonrpc.Id,
         session: usize,
-        /// Set when the log says a permission is waiting on the client.
         pending: ?Pending = null,
-        /// True once a cancel has been sent to the daemon, so a second one does
-        /// not go and the stop reason is the cancelled one whatever the log says.
         cancelled: bool = false,
 
         const Pending = struct {
-            /// The id this agent sent the client, as the token it will echo.
             ask: []u8,
-            /// The log offset of the approval request, which is what the daemon's
-            /// `answer` verb names.
             request_id: u64,
         };
     };
@@ -393,8 +316,6 @@ const Agent = struct {
             tty.print(.err, "chock acp: the input reader could not be started.\n", .{});
             return Exit.faulted.code();
         };
-        // Detached: standard input closing is what ends this process, and that
-        // arrives as an item rather than as a thread to wait for.
         input_thread.detach();
 
         while (!self.stopping) {
@@ -414,10 +335,6 @@ const Agent = struct {
         }
     }
 
-    // --- writing ---
-
-    /// One notification. A failure to write is the editor going away, which ends
-    /// this process rather than being reported to it.
     fn notify(self: *Agent, arena: std.mem.Allocator, method: []const u8, params: []const u8) void {
         const body = jsonrpc.notificationBody(arena, method, params) catch return;
         jsonrpc.writeFrame(arena, self.out, body) catch {
@@ -445,7 +362,6 @@ const Agent = struct {
         };
     }
 
-    /// The name of a client method in the version that was agreed.
     fn clientMethod(self: *const Agent, which: ClientMethod) []const u8 {
         const version = self.version orelse return switch (which) {
             .session_update => "session/update",
@@ -473,16 +389,12 @@ const Agent = struct {
         self.notify(arena, self.clientMethod(.session_update), params);
     }
 
-    // --- reading ---
-
     fn handleLine(self: *Agent, text: []const u8) void {
         var state = std.heap.ArenaAllocator.init(self.gpa);
         defer state.deinit();
         const arena = state.allocator();
 
         const any = jsonrpc.parseAny(arena, text) catch |err| {
-            // A message with no readable id cannot be answered at all, so it is
-            // said on standard error, which the transport keeps for exactly this.
             tty.print(.err, "chock acp: a message could not be read: {t}\n", .{err});
             return;
         };
@@ -501,8 +413,6 @@ const Agent = struct {
             return;
         };
 
-        // Nothing but `initialize` runs before the versions agree. A client that
-        // skipped it is told so rather than served a guess.
         if (self.version == null and method != .initialize) {
             if (incoming.id) |id| {
                 self.fail(arena, id, .invalid_request, "initialize has not been sent yet");
@@ -523,17 +433,12 @@ const Agent = struct {
         }
     }
 
-    /// A reply to a `session/request_permission` this agent sent.
     fn handleReply(self: *Agent, arena: std.mem.Allocator, reply: jsonrpc.Reply) void {
-        // `if (self.turn) |*turn|` and never `&(self.turn orelse ...)`: the
-        // second takes the address of a copy of the payload, so every write to
-        // it is lost. That bug made every permission time out as a refusal.
+        // Never &(self.turn orelse ...): that form takes the address of a copy, so a write to it would be lost.
         const turn = if (self.turn) |*one| one else return;
         const pending = turn.pending orelse return;
         if (!std.mem.eql(u8, pending.ask, reply.id.raw)) return;
 
-        // A refused request and a rejected option are the same thing to the
-        // session: nobody permitted it.
         const permitted = if (reply.failed()) false else permittedBy(arena, reply.result);
 
         self.tellDaemon(arena, pending.request_id, permitted);
@@ -542,11 +447,6 @@ const Agent = struct {
         turn.pending = null;
     }
 
-    /// Whether the option the client chose permits the action.
-    ///
-    /// An `outcome` of `cancelled` is the client saying nobody answered, which is
-    /// a refusal: `lib/chock-policy` reads an unanswered question as `deny`, and
-    /// this is the same reading.
     fn permittedBy(arena: std.mem.Allocator, result: []const u8) bool {
         const parsed = std.json.parseFromSlice(std.json.Value, arena, result, .{}) catch return false;
         const object = switch (parsed.value) {
@@ -565,14 +465,10 @@ const Agent = struct {
             .string => |text| text,
             else => return false,
         };
-        // The option identifiers are this agent's own, named after the kind they
-        // carry, so the answer reads without a table.
         const kind = chock_acp.common.PermissionKind.fromWireName(chosen) orelse return false;
         return kind.permits();
     }
 
-    /// Tell the daemon what was decided. The answer never travels back to the
-    /// agent that asked: it reads the outcome out of its own log.
     fn tellDaemon(self: *Agent, arena: std.mem.Allocator, request_id: u64, permitted: bool) void {
         const turn = self.turn orelse return;
         const live = &self.sessions.items[turn.session];
@@ -584,9 +480,6 @@ const Agent = struct {
         } });
     }
 
-    // --- the daemon ---
-
-    /// One request, one answer. Every verb but `watch` is this shape.
     fn ask(self: *Agent, arena: std.mem.Allocator, request: control.Request) Answered {
         const stream = self.daemon.connect(self.io) catch |err| {
             return .{ .unreachable_reason = @errorName(err) };
@@ -612,8 +505,6 @@ const Agent = struct {
                         self_take.out.failed = try self_take.arena.dupe(u8, text);
                         return false;
                     },
-                    // A record here belongs to a verb that streams, and `ask` is
-                    // not used for one.
                     .record => return true,
                 }
             }
@@ -639,11 +530,6 @@ const Agent = struct {
         return answered;
     }
 
-    /// Tail one session's log onto the queue, on a thread of its own.
-    ///
-    /// The offset is what makes this safe to start after the turn: `watch` streams
-    /// from a byte offset, so an event written before this connected is still
-    /// delivered, and none is delivered twice.
     const Watcher = struct {
         agent: *Agent,
         project: []u8,
@@ -675,8 +561,6 @@ const Agent = struct {
                             const owned = self_take.agent.gpa.dupe(u8, one.payload) catch return false;
                             self_take.agent.queue.push(.{ .record = .{ .id = one.id, .payload = owned } });
                         },
-                        // The daemon says why it stopped on standard error's own
-                        // channel; here it just ends the tail.
                         .ok, .failed => return false,
                     }
                     return true;
@@ -721,8 +605,6 @@ const Agent = struct {
         return true;
     }
 
-    // --- sessions this process knows ---
-
     fn find(self: *Agent, given: []const u8) ?usize {
         if (!session_paths.isValidId(given)) return null;
         for (self.sessions.items, 0..) |one, index| {
@@ -741,7 +623,6 @@ const Agent = struct {
         return self.sessions.items.len - 1;
     }
 
-    /// The session identifier out of a `params` object, and the session it names.
     fn sessionOf(
         self: *Agent,
         arena: std.mem.Allocator,
@@ -759,12 +640,6 @@ const Agent = struct {
         };
     }
 
-    // --- the methods ---
-
-    /// Agree a version and say what this agent can do.
-    ///
-    /// The version is the newest both sides speak, and never the newest this one
-    /// has: see `chock_acp.negotiate`.
     fn handleInitialize(self: *Agent, arena: std.mem.Allocator, incoming: jsonrpc.Incoming) void {
         const id = incoming.id orelse return;
 
@@ -782,12 +657,6 @@ const Agent = struct {
         self.answer(arena, id, result);
     }
 
-    /// Chock holds no credential of its own to log in with.
-    ///
-    /// Its provider credentials come from `chock login`, which is a person at a
-    /// terminal and not a method on this wire. So no authentication method is
-    /// declared, and one asked for anyway is refused by name rather than by
-    /// silence.
     fn handleAuthenticate(self: *Agent, arena: std.mem.Allocator, incoming: jsonrpc.Incoming) void {
         const id = incoming.id orelse return;
         self.fail(
@@ -799,10 +668,6 @@ const Agent = struct {
         );
     }
 
-    /// A session, with no turn running in it.
-    ///
-    /// `cwd` is the client's, and it is used as the project. `mcpServers` is
-    /// refused rather than honoured: see `mcpRefusal`.
     fn handleSessionNew(self: *Agent, arena: std.mem.Allocator, incoming: jsonrpc.Incoming) void {
         const id = incoming.id orelse return;
 
@@ -827,8 +692,6 @@ const Agent = struct {
             return;
         };
 
-        // `create` answers with the identifier and the log path, tab separated.
-        // The path is the daemon's business and this frontend does not keep it.
         const tab = std.mem.indexOfScalar(u8, said, '\t') orelse said.len;
         const new_id = said[0..tab];
         if (!session_paths.isValidId(new_id)) {
@@ -845,11 +708,6 @@ const Agent = struct {
         self.answer(arena, id, result);
     }
 
-    /// Take up a session that already exists, and replay what it holds.
-    ///
-    /// The protocol says a client is sent the whole conversation as updates before
-    /// this answers, so the client ends up with what it would have had if it had
-    /// been there. `session/resume` in version 2 is the same method renamed.
     fn handleSessionLoad(self: *Agent, arena: std.mem.Allocator, incoming: jsonrpc.Incoming) void {
         const id = incoming.id orelse return;
 
@@ -868,8 +726,6 @@ const Agent = struct {
             return;
         };
 
-        // Read rather than watched: a load wants what is there now and then
-        // answers. A watch would never answer, because it tails.
         const answered = self.replay(arena, known);
         if (answered) |text| {
             self.fail(arena, id, .resource_not_found, text);
@@ -878,7 +734,6 @@ const Agent = struct {
         self.answer(arena, id, "");
     }
 
-    /// One turn. Answers when the log says how it ended, and not before.
     fn handleSessionPrompt(self: *Agent, arena: std.mem.Allocator, incoming: jsonrpc.Incoming) void {
         const id = incoming.id orelse return;
 
@@ -895,8 +750,6 @@ const Agent = struct {
 
         const live = &self.sessions.items[known];
 
-        // The watcher first, so nothing between here and the prompt is missed.
-        // It tails from `seen`, so starting it early delivers nothing twice.
         if (!self.startWatching(live)) {
             self.fail(arena, id, .internal_error, "the session could not be watched");
             return;
@@ -912,8 +765,6 @@ const Agent = struct {
             return;
         }
 
-        // The id outlives this arena, because the reply to it is written when the
-        // log says the turn ended, so it is held on the agent's own allocator.
         const held = self.gpa.dupe(u8, id.raw) catch {
             self.fail(arena, id, .internal_error, "out of memory");
             return;
@@ -927,9 +778,6 @@ const Agent = struct {
 
         if (self.turn) |*one| one.cancelled = true;
 
-        // An interrupt, so the session writes its own end. Nothing is answered:
-        // `session/cancel` is a notification, and the stop reason travels on the
-        // reply to `session/prompt`.
         _ = self.ask(arena, .{ .cancel = .{
             .project = live.project,
             .session = &live.id,
@@ -961,9 +809,6 @@ const Agent = struct {
                     .record => |one| {
                         const named = listedSessionIn(self_take.arena, one.payload) orelse return true;
                         if (self_take.found.items.len != 0) try self_take.found.append(self_take.arena, ',');
-                        // `cwd` as well as the identifier: the schema requires
-                        // both, and every session this lists is under the one
-                        // project the daemon was asked about.
                         try self_take.found.print(
                             self_take.arena,
                             "{{\"sessionId\":\"{s}\",\"cwd\":{f}}}",
@@ -994,13 +839,6 @@ const Agent = struct {
         self.answer(arena, id, result);
     }
 
-    /// Chock keeps a session's log on purpose, and this frontend does not delete
-    /// one.
-    ///
-    /// The log is the audit trail: `docs/security/threat-model.md` is written on
-    /// the basis that it is kept. Removing one is `chock sessions remove`, which
-    /// is gated by the `session.remove` action, and an editor is not where that
-    /// decision belongs.
     fn handleSessionDelete(self: *Agent, arena: std.mem.Allocator, incoming: jsonrpc.Incoming) void {
         const id = incoming.id orelse return;
         self.fail(
@@ -1013,11 +851,6 @@ const Agent = struct {
         );
     }
 
-    /// Forget a session, which is not the same as ending it.
-    ///
-    /// The daemon owns the session and its log outlives this process. So this
-    /// drops what this frontend held and answers, and the session is still there
-    /// for a `session/load` later.
     fn handleSessionClose(self: *Agent, arena: std.mem.Allocator, incoming: jsonrpc.Incoming) void {
         const id = incoming.id orelse return;
         const known = self.sessionOf(arena, incoming) orelse return;
@@ -1031,17 +864,12 @@ const Agent = struct {
 
         var live = self.sessions.orderedRemove(known);
         live.deinit(self.gpa);
-        // Every turn holds an index into the list, and removing an entry moves
-        // the ones after it.
         if (self.turn) |*one| {
             if (one.session > known) one.session -= 1;
         }
         self.answer(arena, id, "");
     }
 
-    // --- the log, as a client reads it ---
-
-    /// One log event, as whatever the client should be told about it.
     fn handleRecord(self: *Agent, one: Item.Record) void {
         var state = std.heap.ArenaAllocator.init(self.gpa);
         defer state.deinit();
@@ -1096,9 +924,6 @@ const Agent = struct {
                 if (one.context_limit_tokens) |held| live.window = held;
             },
             .usage => |one| {
-                // The same measure `chock_proto.state.Session` keeps and
-                // `lib/chock-core/compaction.zig` decides on, so the gauge a
-                // client draws agrees with when Chock actually compacts.
                 const used = one.input_tokens +
                     one.cache_creation_input_tokens + one.cache_read_input_tokens;
                 const size = live.window orelse return;
@@ -1108,8 +933,6 @@ const Agent = struct {
                         .size = size,
                         .cost = switch (one.cost) {
                             .known => |money| money.value,
-                            // Free is a number and unknown is not, and collapsing
-                            // the two is what `lib/chock-cost` exists to stop.
                             .free => 0,
                             .unknown, .unrecognized => null,
                         },
@@ -1122,9 +945,6 @@ const Agent = struct {
             },
             .approval_request => |one| self.askPermission(arena, which, one, offset),
             .session_end => |one| self.endTurn(stopReasonFor(one.reason)),
-            // Everything else is Chock's own record keeping. A client that wanted
-            // the sandbox's mount list would be reading the log, which is what
-            // `chock serve` is for.
             else => {},
         }
     }
@@ -1137,14 +957,10 @@ const Agent = struct {
                 else => {},
             },
             .reasoning => |thinking| {
-                // Only the assistant reasons, and a thought is its own variant so
-                // a client can hide reasoning without hiding the answer.
                 if (one.role == .assistant and thinking.text.len != 0) {
                     self.send(arena, .{ .agent_thought = .{ .text = thinking.text } });
                 }
             },
-            // A tool use part is reported through `tool_call`, which carries the
-            // identifier a client needs; sending it twice would draw it twice.
             else => {},
         };
     }
@@ -1158,13 +974,6 @@ const Agent = struct {
         self.send(arena, .{ .plan = steps.items });
     }
 
-    /// Put one approval to the client, and remember what its answer belongs to.
-    ///
-    /// The options are the four the protocol has. `allow_always` and
-    /// `reject_always` are offered because a client draws them, and both are
-    /// answered for this call alone: a standing permission is a policy rule, and
-    /// `lib/chock-policy` will not take one from a socket. See
-    /// `docs/configure/policy.md` on the ratchet.
     fn askPermission(
         self: *Agent,
         arena: std.mem.Allocator,
@@ -1173,8 +982,6 @@ const Agent = struct {
         offset: u64,
     ) void {
         const turn = if (self.turn) |*held| held else return;
-        // One at a time: the loop asks about one action and waits, so a second
-        // request before the first is answered would be the log going wrong.
         if (turn.pending != null) return;
 
         const live = &self.sessions.items[which];
@@ -1189,9 +996,6 @@ const Agent = struct {
                 .title = one.summary,
                 .kind = toolKindFor("").wireName(),
                 .status = "pending",
-                // The whole effect goes on the call, because the request itself
-                // carries no content member. Chock never puts a command string
-                // here: see `lib/chock-broker`.
                 .content = .{.{
                     .type = "content",
                     .content = .{ .type = "text", .text = one.detail },
@@ -1216,7 +1020,6 @@ const Agent = struct {
         };
     }
 
-    /// Answer the `session/prompt` that is waiting, and clear the turn.
     fn endTurn(self: *Agent, reason: chock_acp.common.StopReason) void {
         var state = std.heap.ArenaAllocator.init(self.gpa);
         defer state.deinit();
@@ -1224,15 +1027,10 @@ const Agent = struct {
 
         const turn = self.turn orelse return;
 
-        // A cancel that was sent wins over what the log says. A turn can finish
-        // between the signal and the handler, and telling the client `end_turn`
-        // for a turn it cancelled would make its own state wrong.
+        // A cancel that was sent wins over what the log says: the turn can finish between the signal and the handler.
         const said = if (turn.cancelled) chock_acp.common.StopReason.cancelled else reason;
 
         if (turn.pending) |pending| {
-            // Nobody answered, and the protocol says a client marks a pending
-            // request cancelled when a turn ends. The daemon already read the
-            // silence as a refusal.
             self.gpa.free(pending.ask);
         }
 
@@ -1245,7 +1043,6 @@ const Agent = struct {
         self.turn = null;
     }
 
-    /// Everything a session's log already holds, as updates. Null when it worked.
     fn replay(self: *Agent, arena: std.mem.Allocator, which: usize) ?[]const u8 {
         const live = &self.sessions.items[which];
 
@@ -1259,8 +1056,6 @@ const Agent = struct {
         var write_buffer: [8 * 1024]u8 = undefined;
         var stream_writer = stream.writer(self.io, &write_buffer);
 
-        // A replay is a turn for the length of it, so `send` has somewhere to
-        // read the session from. It answers nothing: there is no prompt waiting.
         const held = self.turn;
         self.turn = .{ .request = .{ .raw = "null" }, .session = which };
         defer self.turn = held;
@@ -1279,8 +1074,6 @@ const Agent = struct {
                         const parsed = std.json.parseFromSlice(event.Envelope, each, one.payload, .{
                             .ignore_unknown_fields = true,
                         }) catch return true;
-                        // An end in the replay is the end of a past turn, not of
-                        // this load, so it is not translated.
                         if (parsed.value.event == .session_end) return true;
                         self_take.agent.translate(each, self_take.which, parsed.value.event, one.id);
                         const live_now = &self_take.agent.sessions.items[self_take.which];
@@ -1313,18 +1106,9 @@ const Agent = struct {
     }
 };
 
-/// What this agent declares it can do, in the version that was agreed.
-///
-/// Version 1 and version 2 shape this differently: version 1 has four capability
-/// objects beside each other, and version 2 has two. What is declared is the same
-/// either way, and neither one declares a file or terminal capability, because
-/// those are the client's and Chock calls neither.
 fn capabilities(arena: std.mem.Allocator, version: chock_acp.Version) ![]u8 {
     const info = .{ .name = agent_name, .version = @import("chock-version").text };
 
-    // A capability with no settings of its own is an empty JSON object. An empty
-    // anonymous literal is a tuple, which serializes as `[]`, and a real client
-    // reads that as neither present nor absent.
     const Present = struct {};
 
     return switch (version) {
@@ -1334,14 +1118,9 @@ fn capabilities(arena: std.mem.Allocator, version: chock_acp.Version) ![]u8 {
                 .loadSession = true,
                 .promptCapabilities = .{
                     .image = true,
-                    // A resource a client embeds arrives as text in the prompt,
-                    // which is what Chock reads.
                     .embeddedContext = true,
-                    // Nothing in Chock reads audio.
                     .audio = false,
                 },
-                // A server is named in the project's own `chock.zon`, not by a
-                // client, so neither transport is offered here. See `mcp_refusal`.
                 .mcpCapabilities = .{ .http = false, .sse = false },
                 .sessionCapabilities = .{
                     .list = Present{},
@@ -1365,13 +1144,6 @@ fn capabilities(arena: std.mem.Allocator, version: chock_acp.Version) ![]u8 {
     };
 }
 
-/// Why an MCP server a client names is refused rather than run.
-///
-/// An editor naming a server is an editor asking Chock to run a program, inside
-/// the sandbox, with the project's own policy over it. Chock reads its servers
-/// from the project's `chock.zon`, which the workspace binds back read only so the
-/// agent cannot edit it. Taking a list from a socket would put that decision
-/// where nobody reviewed it.
 const mcp_refusal = "chock does not take an MCP server from a client. A server is named in the " ++
     "project's own chock.zon, where it is reviewable and the agent cannot change it. Start this " ++
     "session again with no mcpServers, and add the server to that file instead.";
@@ -1415,11 +1187,6 @@ fn numberField(arena: std.mem.Allocator, params: []const u8, name: []const u8) ?
     };
 }
 
-/// The session identifier out of one row of the daemon's `list`.
-///
-/// A listing row is a summary of a session and not a log envelope, so the
-/// identifier is `id` rather than `session`. Reading the envelope's name here
-/// found nothing and listed no sessions at all.
 fn listedSessionIn(arena: std.mem.Allocator, payload: []const u8) ?[]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, arena, payload, .{}) catch return null;
     const object = switch (parsed.value) {
@@ -1432,11 +1199,6 @@ fn listedSessionIn(arena: std.mem.Allocator, payload: []const u8) ?[]const u8 {
     };
 }
 
-/// Every text block of a prompt, joined.
-///
-/// A prompt is a list of content blocks. Chock's own message is text, so a text
-/// block and the text of a resource are read and an image block is not: Chock
-/// reads an image a tool gives it, and a prompt is not a tool result.
 fn promptText(arena: std.mem.Allocator, params: []const u8) !?[]const u8 {
     if (params.len == 0) return null;
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, params, .{});
@@ -1471,12 +1233,6 @@ fn promptText(arena: std.mem.Allocator, params: []const u8) !?[]const u8 {
     return joined.items;
 }
 
-/// What a client should draw a tool call as.
-///
-/// Chock's own tools, by name. A tool this does not know is `other`, which is
-/// what the protocol has the value for, and an MCP tool or a plugin tool is one of
-/// those: its name is the server's to choose and guessing a kind from it would be
-/// drawing a shape nobody declared.
 fn toolKindFor(tool: []const u8) chock_acp.common.ToolKind {
     const known = [_]struct { []const u8, chock_acp.common.ToolKind }{
         .{ "read_file", .read },
@@ -1499,8 +1255,6 @@ fn toolKindFor(tool: []const u8) chock_acp.common.ToolKind {
     return .other;
 }
 
-/// What a person reads for a tool call. The tool's name, and the first argument
-/// worth showing when there is one.
 fn titleFor(arena: std.mem.Allocator, one: event.ToolCall) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, arena, one.arguments, .{}) catch
         return one.tool;
@@ -1530,35 +1284,20 @@ fn stepStatusFor(status: event.PlanStatus) updates.StepStatus {
         .in_progress => .in_progress,
         .done => .done,
         .abandoned => .abandoned,
-        // A status this version does not know is not progress, and reading it as
-        // done would tell a client a step finished that may not have.
         .unknown => .pending,
     };
 }
 
-/// Why a turn ended, in the five words the protocol has.
-///
-/// Chock has eleven reasons and ACP has five, so three of Chock's map onto
-/// `refusal`, which the protocol defines as the agent declining to continue. That
-/// is what a budget cap and a stall are: Chock declining. Calling either
-/// `end_turn` would say the model finished, which it did not.
 fn stopReasonFor(reason: event.SessionEndReason) chock_acp.common.StopReason {
     return switch (reason) {
         .finished, .handed_over, .empty_response => .end_turn,
         .canceled_by_user => .cancelled,
         .turn_limit => .max_turn_requests,
         .refused_by_model, .budget_reached, .no_progress, .rate_limited, .errored => .refusal,
-        // A reason this version does not know stopped the turn for a reason this
-        // cannot name, which is nearer declining than finishing.
         .unknown => .refusal,
     };
 }
 
-/// The methods this agent answers, folded across both versions.
-///
-/// Each version spells some of these differently and version 2 renamed three, so
-/// `fromWireName` reads the spelling of whichever version was agreed. Nothing
-/// below it branches on a version to know what it was asked.
 const Method = enum {
     initialize,
     authenticate,
@@ -1571,8 +1310,6 @@ const Method = enum {
     session_close,
 
     fn fromWireName(version: ?chock_acp.Version, name: []const u8) ?Method {
-        // Before `initialize` there is no version, and the only thing that may be
-        // asked is `initialize`, which both versions spell alike.
         const which = version orelse {
             return if (std.mem.eql(u8, name, "initialize")) .initialize else null;
         };
@@ -1593,7 +1330,6 @@ const Method = enum {
                 .initialize => .initialize,
                 .auth_login => .authenticate,
                 .session_new => .session_new,
-                // Version 2 renamed `session/load` to `session/resume`.
                 .session_resume => .session_load,
                 .session_prompt => .session_prompt,
                 .session_cancel => .session_cancel,
@@ -1606,8 +1342,6 @@ const Method = enum {
     }
 };
 
-/// Reads standard input and pushes each line onto the queue. Its own thread,
-/// because the main thread has to keep answering while a turn runs.
 const InputReader = struct {
     agent: *Agent,
 
@@ -1630,32 +1364,24 @@ const InputReader = struct {
 const testing = std.testing;
 
 test "a method is read in the spelling of the version that was agreed" {
-    // Before `initialize` there is no version, and only `initialize` is answered.
     try testing.expectEqual(Method.initialize, Method.fromWireName(null, "initialize").?);
     try testing.expectEqual(@as(?Method, null), Method.fromWireName(null, "session/new"));
 
-    // Version 1 spells these three one way.
     try testing.expectEqual(Method.authenticate, Method.fromWireName(.v1, "authenticate").?);
     try testing.expectEqual(Method.session_load, Method.fromWireName(.v1, "session/load").?);
 
-    // Version 2 renamed all three, and the old spellings reach nothing there. A
-    // client on version 2 that sent `session/load` is told the method does not
-    // exist rather than served the method it meant.
     try testing.expectEqual(Method.authenticate, Method.fromWireName(.v2, "auth/login").?);
     try testing.expectEqual(Method.session_load, Method.fromWireName(.v2, "session/resume").?);
     try testing.expectEqual(@as(?Method, null), Method.fromWireName(.v2, "authenticate"));
     try testing.expectEqual(@as(?Method, null), Method.fromWireName(.v2, "session/load"));
     try testing.expectEqual(@as(?Method, null), Method.fromWireName(.v2, "session/set_mode"));
 
-    // And a client method is never answered as though this side implemented it.
     for ([_][]const u8{ "session/update", "session/request_permission", "fs/read_text_file" }) |theirs| {
         try testing.expectEqual(@as(?Method, null), Method.fromWireName(.v1, theirs));
     }
 }
 
 test "every reason a session can end has a stop reason, and none of them lies" {
-    // Eleven of Chock's reasons map onto five of the protocol's, so this is the
-    // test that no mapping claims the model finished when it did not.
     const finished = [_]event.SessionEndReason{ .finished, .handed_over, .empty_response };
     for (finished) |reason| try testing.expectEqual(
         chock_acp.common.StopReason.end_turn,
@@ -1665,8 +1391,6 @@ test "every reason a session can end has a stop reason, and none of them lies" {
     try testing.expectEqual(chock_acp.common.StopReason.cancelled, stopReasonFor(.canceled_by_user));
     try testing.expectEqual(chock_acp.common.StopReason.max_turn_requests, stopReasonFor(.turn_limit));
 
-    // Chock declining to carry on. The protocol has no word for a budget cap or
-    // a stall, and `refusal` is what it calls an agent that will not continue.
     const declined = [_]event.SessionEndReason{
         .refused_by_model,                                 .budget_reached, .no_progress, .rate_limited, .errored,
         .{ .unknown = "something a later version knows" },
@@ -1676,8 +1400,6 @@ test "every reason a session can end has a stop reason, and none of them lies" {
         stopReasonFor(reason),
     );
 
-    // Nothing maps onto `max_tokens`: Chock compacts rather than running out, so
-    // claiming it would describe a thing that does not happen.
     inline for (@typeInfo(event.SessionEndReason).@"union".fields) |field| {
         const reason: event.SessionEndReason = if (field.type == void)
             @unionInit(event.SessionEndReason, field.name, {})
@@ -1694,8 +1416,6 @@ test "a tool is drawn as what it does, and one nobody knows is other" {
     try testing.expectEqual(chock_acp.common.ToolKind.search, toolKindFor("web_search"));
     try testing.expectEqual(chock_acp.common.ToolKind.fetch, toolKindFor("web_fetch"));
 
-    // An MCP tool's name is the server's to choose, so guessing a kind from it
-    // would draw a shape nobody declared.
     try testing.expectEqual(chock_acp.common.ToolKind.other, toolKindFor("create_issue"));
     try testing.expectEqual(chock_acp.common.ToolKind.other, toolKindFor(""));
 }
@@ -1704,8 +1424,6 @@ test "an abandoned step stays abandoned, and an unknown status is not progress" 
     try testing.expectEqual(updates.StepStatus.done, stepStatusFor(.done));
     try testing.expectEqual(updates.StepStatus.abandoned, stepStatusFor(.abandoned));
     try testing.expectEqual(updates.StepStatus.in_progress, stepStatusFor(.in_progress));
-    // Reading a status this version does not know as done would tell a client a
-    // step finished that may not have.
     try testing.expectEqual(updates.StepStatus.pending, stepStatusFor(.{ .unknown = "later" }));
 }
 
@@ -1723,8 +1441,6 @@ test "a prompt's text blocks are read and its other blocks are not" {
     )).?;
     try testing.expectEqualStrings("first\nsecond", said);
 
-    // A prompt with nothing readable is null rather than an empty message, so the
-    // call is refused instead of starting a turn that says nothing.
     try testing.expectEqual(
         @as(?[]const u8, null),
         try promptText(arena, "{\"prompt\":[{\"type\":\"image\",\"data\":\"x\"}]}"),
@@ -1742,15 +1458,12 @@ test "an mcp server a client names is noticed, and an empty list is not one" {
         \\{"cwd":"/p","mcpServers":[{"name":"x","command":"/bin/true","args":[],"env":[]}]}
     ));
 
-    // An empty list is a client saying it wants none, which is the ordinary case
-    // and must not be refused.
     try testing.expect(!namesMcpServers(arena, "{\"cwd\":\"/p\",\"mcpServers\":[]}"));
     try testing.expect(!namesMcpServers(arena, "{\"cwd\":\"/p\"}"));
     try testing.expect(!namesMcpServers(arena, ""));
 }
 
 test "the refusal for an mcp server says where a server is named instead" {
-    // A refusal that did not say where to put it would leave somebody stuck.
     try testing.expect(std.mem.indexOf(u8, mcp_refusal, "chock.zon") != null);
 }
 
@@ -1764,12 +1477,8 @@ test "a capability answer is the shape of the version it was asked in" {
     try testing.expectEqual(@as(i64, 1), one_parsed.value.object.get("protocolVersion").?.integer);
     const v1_caps = one_parsed.value.object.get("agentCapabilities").?.object;
     try testing.expect(v1_caps.get("loadSession").?.bool);
-    // The client's own methods are never declared here: Chock calls neither, and
-    // a capability is what a side says about itself.
     try testing.expect(v1_caps.get("fs") == null);
     try testing.expect(v1_caps.get("terminal") == null);
-    // A capability with no settings is an empty object. A real client refused an
-    // empty array here, which is what an empty anonymous literal would serialize as.
     try testing.expectEqual(
         @as(usize, 0),
         v1_caps.get("sessionCapabilities").?.object.get("list").?.object.count(),
@@ -1778,8 +1487,6 @@ test "a capability answer is the shape of the version it was asked in" {
     const two = try capabilities(arena, .v2);
     const two_parsed = try std.json.parseFromSlice(std.json.Value, arena, two, .{});
     try testing.expectEqual(@as(i64, 2), two_parsed.value.object.get("protocolVersion").?.integer);
-    // Version 2 renamed both of the members version 1 answers with, and requires
-    // the info rather than leaving it optional.
     try testing.expect(two_parsed.value.object.get("capabilities") != null);
     try testing.expect(two_parsed.value.object.get("info") != null);
     try testing.expect(two_parsed.value.object.get("agentCapabilities") == null);
@@ -1787,8 +1494,6 @@ test "a capability answer is the shape of the version it was asked in" {
 }
 
 test "the version answered is the newest both sides speak" {
-    // The whole of the negotiation this command does, and the reason a released
-    // client is never pushed onto the alpha.
     try testing.expectEqual(chock_acp.Version.v1, chock_acp.negotiate(1).?);
     try testing.expectEqual(chock_acp.Version.v2, chock_acp.negotiate(2).?);
     try testing.expectEqual(@as(?chock_acp.Version, null), chock_acp.negotiate(0));
@@ -1799,7 +1504,6 @@ test "only a selected allow option permits, and anything unreadable refuses" {
     defer state.deinit();
     const arena = state.allocator();
 
-    // The two that permit.
     try testing.expect(Agent.permittedBy(arena,
         \\{"outcome":{"outcome":"selected","optionId":"allow_once"}}
     ));
@@ -1807,7 +1511,6 @@ test "only a selected allow option permits, and anything unreadable refuses" {
         \\{"outcome":{"outcome":"selected","optionId":"allow_always"}}
     ));
 
-    // The two that refuse.
     try testing.expect(!Agent.permittedBy(arena,
         \\{"outcome":{"outcome":"selected","optionId":"reject_once"}}
     ));
@@ -1815,12 +1518,8 @@ test "only a selected allow option permits, and anything unreadable refuses" {
         \\{"outcome":{"outcome":"selected","optionId":"reject_always"}}
     ));
 
-    // A client saying nobody answered. `lib/chock-policy` reads an unanswered
-    // question as deny, and this is the same reading.
     try testing.expect(!Agent.permittedBy(arena, "{\"outcome\":{\"outcome\":\"cancelled\"}}"));
 
-    // Everything unreadable refuses. This is the direction that matters: a reply
-    // this cannot parse must never open an action nobody approved.
     for ([_][]const u8{
         "",
         "null",
@@ -1840,8 +1539,6 @@ test "only a selected allow option permits, and anything unreadable refuses" {
 }
 
 test "the option identifiers offered are the kinds the protocol names" {
-    // `permittedBy` reads the identifier as a kind, so an option offered under
-    // a name that is not one would be refused however the person answered.
     for ([_][]const u8{ "allow_once", "allow_always", "reject_once" }) |offered| {
         try testing.expect(chock_acp.common.PermissionKind.fromWireName(offered) != null);
     }
@@ -1852,16 +1549,12 @@ test "a listing row is read by the name a summary uses, not a log envelope's" {
     defer state.deinit();
     const arena = state.allocator();
 
-    // What `chock daemon`'s `list` really answers with. The first draft looked
-    // for `session`, which is the log envelope's name, and listed nothing.
     const row =
         \\{"id":"01M3F8DT9Z5D43FPM36F1G3556","started_ms":1790439778623,"model":"a-model",
         \\ "live":"idle","end":"errored","turns":1}
     ;
     try testing.expectEqualStrings("01M3F8DT9Z5D43FPM36F1G3556", listedSessionIn(arena, row).?);
 
-    // A row with no identifier, or one that is not an identifier, is skipped
-    // rather than listed as a session nobody can open.
     try testing.expectEqual(@as(?[]const u8, null), listedSessionIn(arena, "{\"id\":\"nonsense\"}"));
     try testing.expectEqual(@as(?[]const u8, null), listedSessionIn(arena, "{\"id\":7}"));
     try testing.expectEqual(@as(?[]const u8, null), listedSessionIn(arena, "{}"));

@@ -13,15 +13,13 @@ const probe_path = @import("probe_path").probe_path;
 /// Read from the real constant, so an edit to the list cannot leave this stale.
 const default_mach_services = chock_sandbox.darwin_driver_for_testing.default_mach_services;
 
-/// 104 on Darwin and 108 on Linux. `std.Io.net.UnixAddress.max_len` is 108 on
-/// every platform but Windows, so it is the wrong number here.
+/// 104 on Darwin, not the 108 that `std.Io.net.UnixAddress.max_len` gives on every platform but Windows.
 const sun_path_len = @typeInfo(@FieldType(std.posix.sockaddr.un, "path")).array.len;
 
 const succeeded: u8 = 0;
 const refused: u8 = 1;
 
-/// Seatbelt matches the path the kernel resolved, so a rule naming `/tmp/x`,
-/// where `/tmp` links to `/private/tmp`, matches nothing.
+/// Seatbelt matches the path the kernel resolved, so a rule naming the `/tmp` link matches nothing.
 const Scratch = struct {
     tmp: std.testing.TmpDir,
     buffer: [std.fs.max_path_bytes]u8 = undefined,
@@ -36,8 +34,7 @@ const Scratch = struct {
     }
 };
 
-/// `F_GETPATH` gives the resolved path. `std.testing.tmpDir` gives a relative
-/// one, which matches nothing in a rule.
+/// `F_GETPATH` gives the resolved path, where `std.testing.tmpDir` gives a relative one.
 fn resolvedPath(handle: std.posix.fd_t, buffer: *[std.fs.max_path_bytes]u8) ![]const u8 {
     if (std.c.fcntl(handle, std.c.F.GETPATH, @as([*]u8, buffer)) != 0) return error.PathNotResolvable;
     return std.mem.sliceTo(buffer, 0);
@@ -75,8 +72,7 @@ fn runProbe(argv: []const []const u8) !u8 {
 }
 
 /// Nix on macOS runs every builder under `sandbox-exec`, and macOS refuses to
-/// nest one profile in another, so `sandbox_init` answers -1 with `EPERM`
-/// there. This must never fire on an ordinary Mac.
+/// nest one profile in another, so this skips there instead of failing.
 fn requireOwnProfile() !void {
     if (chock_sandbox.darwin_driver_for_testing.confinedAlready()) return error.SkipZigTest;
 }
@@ -120,8 +116,7 @@ test "a symlink out of the sandbox is followed to where it points and refused" {
 }
 
 test "a denied file inside a reachable directory is still denied" {
-    // Among two rules that both name a path the later one wins, so a denial
-    // written before the allowance that covers it does nothing, and says nothing.
+    // Among two rules that both name a path, the later one wins.
     try requireOwnProfile();
     var root = try scratch();
     defer root.cleanup();
@@ -152,9 +147,7 @@ test "a sandboxed program cannot reach a unix socket outside it" {
 }
 
 test "the control: a real Mach service resolves with no sandbox at all" {
-    // `bootstrap_look_up` for `com.apple.launchd` answers
-    // `BOOTSTRAP_UNKNOWN_SERVICE` with or without a sandbox, and `com.apple.lsd`
-    // fails the same way, because launchd registers the longer names.
+    // `bootstrap_look_up` for `com.apple.launchd` fails the same way with or without a sandbox.
     try requireOwnProfile();
     var root = try scratch();
     defer root.cleanup();
@@ -187,8 +180,7 @@ test "the opt in list widens exactly the name it grants, and LaunchServices stay
 }
 
 test "a sandboxed program cannot signal a process outside it, and can signal its own child" {
-    // A bare `(deny signal)` takes the second half away. `(deny default)`
-    // already refuses every signal, so the base rule is what enforces this.
+    // `(deny default)` already refuses every signal, so the base rule enforces this.
     try requireOwnProfile();
     var root = try scratch();
     defer root.cleanup();
@@ -217,8 +209,7 @@ test "a sandboxed program cannot attach shared memory the host made" {
 }
 
 test "a descriptor opened before the sandbox does not survive into it" {
-    // Seatbelt checks paths, and a descriptor is not a path. A process read a
-    // file through one opened before `sandbox_init` under a denying profile.
+    // Seatbelt checks paths, and a descriptor is not a path.
     try requireOwnProfile();
     var root = try scratch();
     defer root.cleanup();
@@ -242,8 +233,7 @@ test "a resource limit Darwin really has stops the program that passes it" {
 }
 
 test "a running call can be ended through the handle spawn gave" {
-    // Darwin has no `pidfd`, so the handle is a pipe to a process that holds
-    // the program and does not reap it while a cancel may be in flight.
+    // Darwin has no `pidfd`, so the handle is a pipe to a process that holds the program.
     try requireOwnProfile();
     var root = try scratch();
     defer root.cleanup();

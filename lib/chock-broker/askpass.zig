@@ -1,6 +1,5 @@
-//! The password helper. `git` and `ssh` run a program to get a password, and
-//! this is the half that runs beside the credentials. It prevents a mistake and
-//! it does not prevent an attack: the capability layers are the boundary.
+//! The password helper `git` and `ssh` run to get a password. It prevents a
+//! mistake, not an attack: the capability layers are the boundary.
 
 const std = @import("std");
 const chock_policy = @import("chock-policy");
@@ -20,9 +19,7 @@ pub const env_socket = "CHOCK_ASKPASS_SOCKET";
 
 pub const socket_name = "p";
 
-/// `GIT_ASKPASS` must be one executable path. Against git 2.55,
-/// `GIT_ASKPASS="/path/to/chock askpass"` fails with `cannot exec`: neither git
-/// nor ssh puts a shell in the way. So this name selects the command.
+/// `GIT_ASKPASS` must be one executable path: neither git nor ssh puts a shell in the way.
 pub const link_name = "askpass";
 
 pub const LinkError = error{
@@ -57,10 +54,7 @@ pub const max_action_bytes = action_prefix.len + 1 + max_host_bytes;
 
 pub const policy_tool = "askpass";
 
-/// The two prompts `git` writes when it has no credential helper, read as
-/// prefixes because the rest of each one is the remote URL in quotes. `git`
-/// builds both through `gettext`, so a translated `git` writes a prompt this
-/// file refuses, and a caller sets `LC_ALL=C` for the `git` it starts.
+/// The two prompts `git` writes with no credential helper, read as prefixes; the rest is the quoted URL.
 const password_lead = "Password for ";
 const username_lead = "Username for ";
 
@@ -92,8 +86,7 @@ pub fn readPrompt(text: []const u8) ?Prompt {
     return .{ .want = want, .host = host };
 }
 
-/// Cut the path off first and the user information second. The other way
-/// round, `https://evil.example/x@github.com` reads as the host `github.com`.
+/// Cut the path first, user info second, or `https://evil.example/x@github.com` reads as `github.com`.
 fn hostOf(url: []const u8) ?[]const u8 {
     const scheme_end = std.mem.indexOf(u8, url, "://") orelse return null;
     const scheme = url[0..scheme_end];
@@ -111,8 +104,7 @@ fn hostOf(url: []const u8) ?[]const u8 {
     return authority;
 }
 
-/// The labels are reversed. Without that, a class rule about one domain is
-/// reachable by any host that ends with the right words in the wrong order.
+/// Labels reversed, or a class rule for one domain could be reached by any host ending the same words.
 pub fn actionInto(buffer: []u8, host: []const u8) ?[]const u8 {
     if (buffer.len < max_action_bytes) return null;
     if (host.len > max_host_bytes) return null;
@@ -134,8 +126,7 @@ pub fn actionInto(buffer: []u8, host: []const u8) ?[]const u8 {
     return buffer[0..written];
 }
 
-/// There is no name field and there must never be one. A name is what a
-/// `{{secret:name}}` handle spells, and an agent can put one in a child's env.
+/// No name field, and never one: a name is what a `{{secret:name}}` handle spells, which an agent could write.
 pub const Grant = struct {
     host: []const u8,
     secret: []const u8,
@@ -217,8 +208,7 @@ pub const Asker = struct {
         const prompt = readPrompt(prompt_text) orelse return .{ .refused = .prompt_not_read };
         if (prompt.want == .username) return .{ .refused = .prompt_wants_a_user_name };
 
-        // The policy first and the credential second. A refusal that depended
-        // on which credentials are held would report which are held.
+        // Policy first, credential second, or a refusal could reveal which credentials are held.
         if (self.mayPrompt(prompt.host)) |refusal| return .{ .refused = refusal };
 
         const value = self.grants.find(prompt.host) orelse
@@ -226,8 +216,7 @@ pub const Asker = struct {
         return .{ .secret = value };
     }
 
-    /// Null means the policy lets a person be prompted. One decider, asked from
-    /// two places: a second copy could drift on the meaning of `ask`.
+    /// Null means the policy allows prompting. One decider asked from two places, so a second copy can't drift.
     pub fn mayPrompt(self: Asker, host: []const u8) ?Refusal {
         var buffer: [max_action_bytes]u8 = undefined;
         const action = actionInto(&buffer, host) orelse return .prompt_not_read;
@@ -261,8 +250,7 @@ pub fn askLine(gpa: std.mem.Allocator, prompt: []const u8) std.mem.Allocator.Err
     return std.fmt.allocPrint(gpa, "{s}\n", .{body});
 }
 
-/// Owned by the caller, and the caller wipes it. A freed heap buffer keeps its
-/// bytes until something else reuses that memory.
+/// Owned and wiped by the caller: a freed buffer keeps its bytes until reused.
 pub fn replyLine(gpa: std.mem.Allocator, answer: Answer) std.mem.Allocator.Error![]u8 {
     const reply: Reply = switch (answer) {
         .secret => |value| .{ .secret = value },
@@ -282,8 +270,7 @@ pub fn wipe(bytes: []u8) void {
 
 pub const AppendError = std.mem.Allocator.Error || chock_proto.storage.StorageError;
 
-/// There is no answer in scope: the signature takes no `Grants` and no
-/// `Answer`, and the session log is read by every attached client.
+/// No answer in scope: the signature takes no `Grants`/`Answer`, since every attached client reads the log.
 pub fn appendPrompt(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -299,16 +286,14 @@ pub fn appendPrompt(
     } }, time_ms);
 }
 
-/// `chock_proto.storage.Locked` is not `pub`, so this reaches it through the
-/// return type of `Storage.lock`.
+/// `Locked` is not `pub`; reached through `Storage.lock`'s return type.
 const Locked = @typeInfo(
     @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
 ).error_union.payload;
 
 pub const max_kept_prompts: usize = 8;
 
-/// This holds no credential: `step` takes the `Asker` as an argument, so a
-/// value is in scope for one call and not for a session.
+/// Holds no credential: `Asker` is an argument to `step`, in scope for one call, not a session.
 pub const Endpoint = struct {
     server: std.Io.net.Server,
     socket_path: []const u8,
@@ -317,8 +302,8 @@ pub const Endpoint = struct {
     refused: usize = 0,
     strangers: usize = 0,
     diagnostic: ?Diagnostic = null,
-    /// A caller that polls `step` from the gap in a wait may not append to the
-    /// session log. That caller passes `locked` as null and reads these after.
+    /// A caller polling `step` from a wait's gap may not append to the log;
+    /// it passes `locked` as null and reads these after.
     kept: [max_kept_prompts][max_prompt_bytes]u8 = undefined,
     kept_lens: [max_kept_prompts]usize = @splat(0),
     kept_count: usize = 0,
@@ -935,9 +920,7 @@ test "every refusal names what to do instead, and none of them is a bare no" {
 }
 
 test "the askpass socket binds at exactly the bound and refuses one byte more" {
-    // `std.Io.net.UnixAddress.init` takes anything up to `UnixAddress.max_len`,
-    // which is past the end of Darwin's `sun_path`. Linux binds an unterminated
-    // path that fills the field, so only Darwin ends the process in `listen`.
+    // `UnixAddress.init` accepts a path past Darwin's `sun_path`; only Darwin fails this bound, in `listen`.
     const gpa = testing.allocator;
     const io = testing.io;
 

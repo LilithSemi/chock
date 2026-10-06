@@ -5,13 +5,10 @@
 const std = @import("std");
 const chock_proto = @import("chock-proto");
 
-// The default test runner panics on argv it does not know, so the helper path is
-// embedded at build time through an options module.
+// The default test runner panics on argv it does not know, so build.zig embeds the helper path.
 const lock_helper_path = @import("lock_helper_path").lock_helper_path;
 
-/// Goes through `std.Io`. A raw `std.os.linux.read` sends a Linux syscall number
-/// that means something else on macOS, and answered a plausible count for work
-/// it never did.
+/// Goes through `std.Io`, since a raw `std.os.linux.read` sends a syscall number that means something else on macOS.
 fn readOneByte(io: std.Io, file: std.Io.File) bool {
     var byte: [1]u8 = undefined;
     while (true) {
@@ -59,8 +56,7 @@ test "a second process cannot take the lock while the first holds it" {
 const scanned_roots = [_][]const u8{ "lib", "src", "test" };
 
 const spawned_programs = [_][]const u8{
-    // `main` points `src/tty.zig`'s streams at the descriptors the process started
-    // with, so it is the one file that may name the real standard error.
+    // `main` points `src/tty.zig`'s streams at the process's own descriptors, so it may name standard error.
     "src/main.zig",
     "test/sandbox/probe.zig",
     "test/workspace/escape_probe.zig",
@@ -73,16 +69,13 @@ const spawned_programs = [_][]const u8{
     "test/proto/lock_helper.zig",
 };
 
-/// A closed list of spellings, and the rule is wider: a line that writes there
-/// without naming it walks past. Each string is built from pieces so this file
-/// does not hold the text it looks for.
+/// Each string is built from pieces so this file does not hold the text it looks for.
 const banned_calls = [_][]const u8{
     "std.debug." ++ "print(",
     "stderr" ++ "()",
 };
 
-/// `\\` matters because `test/core/tools.zig` holds the source of a small
-/// program it compiles inside the sandbox, and that program does print.
+/// `\\` matters because `test/core/tools.zig` holds the source of a program that does print.
 fn isCommentOrStringLine(line: []const u8) bool {
     const text = std.mem.trimStart(u8, line, " \t");
     return std.mem.startsWith(u8, text, "//") or std.mem.startsWith(u8, text, "\\\\");

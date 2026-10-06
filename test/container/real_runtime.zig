@@ -1,8 +1,6 @@
 //! `chock-container` against a real container runtime and a real image.
-//!
-//! A test skips when no runtime is installed, or when the image is not on this
-//! machine, because these tests never fetch. Run `docker pull alpine:3.20`
-//! first. The Podman half of `Runtime` has never run against a real Podman.
+//! A test skips when no runtime is installed or the image is not on this machine.
+//! Run `docker pull alpine:3.20` first.
 
 const std = @import("std");
 const chock_container = @import("chock-container");
@@ -135,8 +133,7 @@ test "a real image becomes a tree this user owns, with no privilege at all" {
 }
 
 test "an absolute link inside the image only resolves once the tree is the root" {
-    // Alpine writes `/bin/sh` as a symbolic link to the absolute path
-    // `/bin/busybox`, so the link is broken outside the sandbox and right in it.
+    // Alpine's `/bin/sh` is an absolute symbolic link, broken outside the sandbox.
     var loaded = try loadOrSkip(std.testing.allocator);
     defer loaded.deinit();
 
@@ -156,8 +153,7 @@ test "an absolute link inside the image only resolves once the tree is the root"
 }
 
 test "no set-user-id file reaches the disk out of a real image" {
-    // `std.tar.extract` keeps only the executable bit, so a set-user-id bit in
-    // the tar never reaches the disk. Alpine ships none, so the walk finds none.
+    // `std.tar.extract` keeps only the executable bit, so a set-user-id bit never reaches the disk.
     var loaded = try loadOrSkip(std.testing.allocator);
     defer loaded.deinit();
 

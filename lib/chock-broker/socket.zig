@@ -1,6 +1,5 @@
 //! The approval socket: a `Broker.Waiter` for a session with nobody at its own
-//! keyboard. The socket carries the question and the answer, never a log write:
-//! the process that holds the session lock is still the only writer.
+//! keyboard. It carries the question and the answer, never a log write.
 
 const std = @import("std");
 const chock_proto = @import("chock-proto");
@@ -10,8 +9,7 @@ const diagnostic = @import("diagnostic.zig");
 pub const Diagnostic = diagnostic.Diagnostic;
 const event = chock_proto.event;
 
-/// `chock_proto.storage.Locked` is not `pub`, so this reaches the same type
-/// through the return type of `Storage.lock`, which is public.
+/// `Locked` is not `pub`; reached through `Storage.lock`'s public return type.
 const Locked = @typeInfo(
     @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
 ).error_union.payload;
@@ -20,8 +18,7 @@ pub const max_peers: usize = 4;
 
 pub const max_answer_bytes: usize = 4096;
 
-/// The directory's mode is the gate. A unix socket's own file mode is not
-/// honoured on every unix, and a directory nobody else may enter is.
+/// The directory's mode is the gate: a socket's own file mode isn't honoured everywhere, but a private directory is.
 pub const dir_suffix = ".ctl";
 
 pub const socket_name = "s";
@@ -77,9 +74,8 @@ pub fn ensureDir(io: std.Io, dir_path: []const u8, diag: ?*?Diagnostic) Endpoint
             return error.SocketUnavailable;
         },
     };
-    // The process umask narrows what `createDirAbsolute` asked for, so the mode
-    // is set again after the fact. Without `iterate`, `setPermissions` reaches
-    // the kernel as a bad descriptor.
+    // The umask narrows what `createDirAbsolute` asked for, so the mode is
+    // set again; `setPermissions` needs `iterate` or it's a bad descriptor.
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch |err| {
         _ = diagnostic.note(diag, .{ .socket_dir_not_opened = .{ .path = dir_path, .err = err } });
         return error.SocketUnavailable;
@@ -98,8 +94,7 @@ pub fn readable(handle: std.posix.fd_t, timeout_ms: i32) bool {
     return ready != 0;
 }
 
-/// A short write is not a failure: a socket takes what fits in its buffer and
-/// says how much, so a large question needs more than one write.
+/// A short write isn't a failure: a socket takes what fits and says how much, so a large question needs several.
 pub fn writeAll(handle: std.posix.fd_t, bytes: []const u8) bool {
     var sent: usize = 0;
     while (sent < bytes.len) {
@@ -141,8 +136,7 @@ pub const Endpoint = struct {
         SocketUnavailable,
     };
 
-    /// A stale socket is removed rather than refused, or one crash would wedge
-    /// that session id forever.
+    /// A stale socket is removed rather than refused, or one crash would wedge that session id forever.
     pub fn open(io: std.Io, paths: Paths, diag: ?*?Diagnostic) OpenError!Endpoint {
         const address = try addressFor(paths.socket, diag);
 
@@ -156,9 +150,7 @@ pub const Endpoint = struct {
             },
         };
 
-        // Twice `max_peers`, because at exactly `max_peers` the kernel refuses
-        // the fifth client itself, which reads to that client as a session that
-        // is not listening. On Darwin the queue refuses rather than waits.
+        // Twice `max_peers`: at exactly `max_peers` the kernel itself refuses a fifth client as if unlistened.
         const server = address.listen(io, .{ .kernel_backlog = max_peers * 2 }) catch |err| {
             _ = diagnostic.note(diag, .{ .socket_not_opened = .{ .path = paths.socket, .err = err } });
             return error.SocketUnavailable;
@@ -230,8 +222,7 @@ pub const Endpoint = struct {
     }
 };
 
-/// The answer is appended through `locked`, the same handle the broker writes
-/// the question with, so no lock changes.
+/// Appended through `locked`, the same handle the broker writes the question with: no lock changes.
 pub const Waiter = struct {
     gpa: std.mem.Allocator,
     storage: chock_proto.storage.Storage,
@@ -322,8 +313,7 @@ pub const Waiter = struct {
         var count: usize = 0;
         for (&self.endpoint.peers, 0..) |*peer, index| {
             const handle = peer.handle orelse continue;
-            // Checked here and not after the poll. A peer that filled the
-            // buffer then stops sending, so the poll never names it again.
+            // Checked before the poll: a peer that filled the buffer and stopped sending is never named again.
             if (peer.filled == peer.buffer.len) {
                 self.endpoint.dropPeer(io, peer);
                 continue;
@@ -386,9 +376,7 @@ pub const Waiter = struct {
         return self.decisionFrom(said, request_id);
     }
 
-    /// A client may say only what a person may say. A plain yes is the only
-    /// thing that permits: a client that could write `allowed_by_policy` would
-    /// be claiming the project's own table had permitted the act.
+    /// Only a plain yes permits: writing `allowed_by_policy` would claim the table itself permitted it.
     fn decisionFrom(
         self: *Waiter,
         said: []const u8,
@@ -445,8 +433,7 @@ pub const Waiter = struct {
         return .slept;
     }
 
-    /// A `wait` that comes back at once with nothing waited for turns
-    /// `Broker.request` into a busy loop for the whole deadline.
+    /// A `wait` returning at once with nothing waited turns `Broker.request` into a busy loop for the deadline.
     fn idle(self: *Waiter, budget_ms: u64) void {
         self.nap(budget_ms);
     }
@@ -480,18 +467,14 @@ pub const Pair = struct {
     }
 };
 
-/// Zero when there is nobody to ask, and that is a refusal: a question nobody
-/// can answer must not hold the session lock for five minutes first. Somebody
-/// means a person at this terminal, or a client attached when the question is
-/// asked, never one that might attach later.
+/// Zero when nobody can ask: an unanswerable question must not hold the session lock first.
 pub fn timeoutMs(at_terminal: bool, attached: usize) i64 {
     if (at_terminal or attached > 0) return Broker.default_timeout_ms;
     return 0;
 }
 
-/// `SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on Darwin. The body sits in
-/// `chock-proto` because `src/serve.zig` needs the same check and its own test
-/// fails the build if it imports `chock-broker`.
+/// `SO_PEERCRED`/`LOCAL_PEERCRED`; sits in `chock-proto` since `src/serve.zig`
+/// needs this and can't import `chock-broker`.
 pub const peerUid = chock_proto.control.peerUid;
 
 fn neverStopped() bool {
@@ -511,9 +494,7 @@ fn pollNap(budget_ms: u64) void {
 
 const testing = std.testing;
 
-/// A directory below `TMPDIR`. `std.testing.tmpDir` makes its directory below
-/// the build directory, and on macos inside a Nix build that is already 112
-/// bytes, so a bench built on it cannot reach `max_socket_path` at all.
+/// Below `TMPDIR`: `std.testing.tmpDir`'s directory sits under the build dir, too deep to reach `max_socket_path`.
 pub const BoundBench = struct {
     gpa: std.mem.Allocator,
     parent: std.Io.Dir,
@@ -565,8 +546,7 @@ pub const BoundBench = struct {
     }
 };
 
-/// A test reads the log back after the replay that parsed it has ended, and a
-/// tag outlives that parse where a borrowed string does not.
+/// Read back after the replay ends: a tag outlives that parse where a borrowed string would not.
 const Decision = std.meta.Tag(event.ApprovalDecision);
 
 const Bench = struct {
@@ -787,8 +767,7 @@ test "a whole broker request is answered over the socket, and the outcome permit
         .endpoint = &bench.endpoint,
     };
 
-    // No thread here: the tool path forks, and a forked process carries only
-    // the calling thread. The client answers from inside the broker's wait.
+    // No thread here: a fork carries only the calling thread, so the client answers from inside the wait.
     const Answerer = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -1013,8 +992,7 @@ test "a client that dies mid question leaves a log a fold can still read" {
 }
 
 test "a client that goes away before it is shown anything does not end the session" {
-    // `std.Io.Threaded.init` installs the handler for `SIGPIPE`, so a write to
-    // a dead peer reports `EPIPE`. Do not set a signal disposition here.
+    // `std.Io.Threaded.init` installs the `SIGPIPE` handler, so a dead-peer write reports `EPIPE`; don't set one here.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1159,8 +1137,7 @@ test "the socket sits in a directory this user alone can enter" {
 }
 
 test "the peer credential call answers with this user's own uid" {
-    // Two answers, because either alone is easy to fake: always null refuses
-    // everybody, always this uid accepts everybody.
+    // Two answers: always null refuses everybody, always this uid accepts everybody, either alone is easy to fake.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1188,8 +1165,7 @@ test "the peer credential call answers with this user's own uid" {
 }
 
 test "a peer that is not this user is closed before it is read" {
-    // The endpoint's own owner uid is what moves, not the connecting process,
-    // because a test cannot become another user. The comparison is the same.
+    // The endpoint's owner uid moves, not the connecting process, since a test can't become another user.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -1423,9 +1399,7 @@ test "a socket path longer than a unix socket path may be is refused and says so
 }
 
 test "the approval socket binds at exactly the bound and refuses one byte more" {
-    // The bound is not `std.Io.net.UnixAddress.max_len`. That is a flat 108 on
-    // every platform but Windows, which is past the end of Darwin's `sun_path`.
-    // On Linux a path of 108 still binds.
+    // Not `UnixAddress.max_len`, a flat 108 past Darwin's `sun_path`; a 108 path still binds on Linux.
     const gpa = testing.allocator;
     const io = testing.io;
 

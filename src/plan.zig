@@ -1,17 +1,4 @@
 //! `chock plan`: the task list an agent kept, read back after the session.
-//!
-//! The same shape `src/cache.zig`, `src/memory.zig`, `src/workspace.zig` and
-//! `src/usage.zig` have, and deliberately not a sixth shape: a user who has
-//! learned one of these has learned all five. Nothing here starts a session,
-//! opens a sandbox, or touches the project.
-//!
-//! ## What this command is not
-//!
-//! It is not a report on whether the agent did its job. The list is the
-//! agent's own statement of intent and nothing holds it to it, per
-//! `chock_proto.event.PlanUpdate`. A plan that changed is a plan the agent
-//! changed on purpose, and the log holds every version of it in order for
-//! anybody who wants to read the change rather than the result.
 
 const std = @import("std");
 const chock_proto = @import("chock-proto");
@@ -23,8 +10,6 @@ const tty = @import("tty.zig");
 const state = chock_proto.state;
 const event = chock_proto.event;
 
-/// What a session log is called: the session identifier, then this. The same
-/// name `src/usage.zig` reads, from the same layout `session.zig` builds.
 const log_suffix = ".jsonl";
 
 const usage_text =
@@ -87,15 +72,9 @@ pub fn main(
     };
 }
 
-/// The task list one session kept, folded from its own log.
 pub const Kept = struct {
-    /// The session identifier, which is the log's own name without its suffix.
     id: []const u8,
     plan: state.Plan = .{},
-    /// False when the log could not be read all the way to its end: a torn
-    /// tail from a crash mid write, or a line that would not decode. **The
-    /// list is then the plan as it was part way through**, and the report says
-    /// so, because a partial list that looks whole is worse than none.
     complete: bool = true,
 
     pub fn counts(self: Kept) state.Plan.Counts {
@@ -103,13 +82,6 @@ pub const Kept = struct {
     }
 };
 
-/// Fold every `plan.update` event of one session's log. Null when this project
-/// has no session of that identifier.
-///
-/// **The file is checked before the log is opened**, the same rule
-/// `src/usage.zig` keeps and for the same reason: `chock_proto.log.Log.open`
-/// creates the file and writes a header into it when there is none, so asking
-/// about a session that never existed would otherwise bring one into being.
 pub fn fold(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -118,6 +90,9 @@ pub fn fold(
 ) std.mem.Allocator.Error!?Kept {
     std.debug.assert(session_paths.isValidId(id));
     const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}" ++ log_suffix, .{ dir, id }, 0);
+    // Checked before the log is opened: Log.open creates the file and writes
+    // a header when there is none, so this would otherwise bring one into
+    // being for a session that never existed.
     _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
 
     const log = chock_proto.log.Log.open(io, path, id) catch return null;
@@ -135,33 +110,19 @@ pub fn fold(
 
     while (true) {
         const parsed = replay.next(io) catch {
-            // A line that will not decode stops the fold here. Everything
-            // before it is real, and `complete` is what stops a reader taking
-            // a part of the plan for the whole of it.
             kept.complete = false;
             break;
         } orelse {
-            // A torn tail is a crash mid write, not a clean end of log, and an
-            // update may have gone with it.
             if (replay.truncated()) kept.complete = false;
             break;
         };
         defer parsed.deinit();
         if (parsed.value.event != .plan_update) continue;
-        // **The same `Plan.apply` the running session folds with**, so what
-        // this command reports and what the terminal showed are one fold and
-        // not two. Every string it keeps is duplicated into `allocator`.
         try kept.plan.apply(allocator, parsed.value.event.plan_update);
     }
     return kept;
 }
 
-/// Every session of `dir` that kept a task list, oldest first. Caller owns the
-/// slice and everything in it, which for a real caller is an arena.
-///
-/// **Oldest first**, because a session identifier starts with its own
-/// timestamp: see `session.zig`'s own `newId`. The list a user reads is then in
-/// the order the sessions ran.
 pub fn list(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -178,14 +139,9 @@ pub fn list(
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, log_suffix)) continue;
         const stem = entry.name[0 .. entry.name.len - log_suffix.len];
-        // A name this build did not write is never turned into a path: the
-        // same rule `session.zig` keeps, and the reason `isValidId` exists.
         if (!session_paths.isValidId(stem)) continue;
 
         const kept = try fold(allocator, io, dir, stem) orelse continue;
-        // **A session with no list is counted and not printed.** Most sessions
-        // have none, by design, and a page of "no task list" would bury the
-        // few that do. The count is what keeps that honest.
         if (kept.plan.isEmpty()) {
             without_a_list.* += 1;
             continue;
@@ -202,12 +158,6 @@ fn olderFirst(_: void, a: Kept, b: Kept) bool {
     return std.mem.order(u8, a.id, b.id) == .lt;
 }
 
-/// How a list reads in one line: what is left, what was finished, and what was
-/// given up. Caller owns the result.
-///
-/// **The abandoned steps have a number of their own.** Folding them into
-/// "done" would make a list of given up work read as a list of finished work,
-/// which is the one wrong answer this command must never give.
 pub fn summaryText(
     allocator: std.mem.Allocator,
     counts: state.Plan.Counts,
@@ -248,9 +198,6 @@ fn listSessions(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !u8 {
         return Exit.finished.code();
     }
 
-    // A `--verbose` line. Where the logs are kept answers no question this
-    // command was asked, and a person who ran it knows which project they are
-    // in.
     tty.detail("{s}\n\n", .{dir});
     for (sessions) |one| {
         tty.out(.plain, "{s}  {s}{s}\n", .{
@@ -265,9 +212,6 @@ fn listSessions(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !u8 {
         if (sessions.len == 1) "session" else "sessions",
     });
     if (without != 0) {
-        // Said out loud, because a task list is not mandatory and most work
-        // needs none. A reader who did not know that would read a short list
-        // as a missing one.
         tty.out(.plain, ", and {d} that kept none", .{without});
     }
     tty.out(.plain, ".\n", .{});
@@ -286,19 +230,13 @@ fn showSession(arena: std.mem.Allocator, io: std.Io, dir: []const u8, id: []cons
 
     const kept = try fold(arena, io, dir, id) orelse {
         tty.print(.err, "chock plan show: this project has no session {s} ({s})\n", .{ id, dir });
-        // Never `finished`: a command that did nothing must not report
-        // success. See `src/main.zig`'s own top comment.
         return Exit.usage.code();
     };
 
-    // The identifier is the answer's heading. The log path under it is a
-    // `--verbose` line: `tty.options_text` names the log path as exactly that.
     tty.out(.plain, "{s}\n", .{kept.id});
     tty.detail("{s}/{s}{s}\n", .{ dir, kept.id, log_suffix });
     tty.out(.plain, "\n", .{});
     if (kept.plan.isEmpty()) {
-        // An ordinary answer and not a fault. A task list is not mandatory,
-        // and a one step task with one is noise.
         tty.out(.plain, "  This session kept no task list.\n", .{});
         if (!kept.complete) {
             tty.print(.warn, "  Its log ends mid write, so it may have written one that was lost.\n", .{});
@@ -357,11 +295,6 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
     return options;
 }
 
-/// The project this command is about, as an absolute path. **The same call
-/// `chock run`, `chock cache`, `chock memory`, `chock workspace` and
-/// `chock usage` make**, for the same reason: a session directory is keyed by
-/// the project's real path, so a spelling this command resolved differently
-/// would read a different directory from the one the session wrote.
 fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]const u8 {
     if (given) |path| {
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -387,8 +320,6 @@ test "the command line names an action and at most one session" {
     try testing.expectEqualStrings("/somewhere", with_project.project.?);
     try testing.expectEqualStrings("01JQ" ++ "B" ** 22, with_project.session);
 
-    // `show` needs a session, and a word this command does not know is never
-    // read as one.
     try testing.expectError(error.BadArguments, parseOptions(&.{"show"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{"steps"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "show", "a", "b" }));
@@ -396,9 +327,6 @@ test "the command line names an action and at most one session" {
     try testing.expectError(error.HelpWanted, parseOptions(&.{"--help"}));
 }
 
-/// A session directory holding one log per identifier, each carrying the
-/// events it was given. The events go in by hand, so what comes out is
-/// checkable step by step.
 fn makeLog(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -434,9 +362,6 @@ fn scratchDir(arena: std.mem.Allocator, tmp: *testing.TmpDir, leaf: []const u8) 
 }
 
 test "the list this command reads back is the list the session ended with" {
-    // **The whole point of keeping it in the log.** A list held in the running
-    // process is gone when the process is, so a person reading a night's work
-    // in the morning would have nothing. This folds the file and nothing else.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -463,8 +388,6 @@ test "the list this command reads back is the list the session ended with" {
     try testing.expect(kept.complete);
     try testing.expectEqual(@as(usize, 3), kept.plan.steps.items.len);
 
-    // In the order they were first named, whatever order the later update
-    // named them in.
     try testing.expectEqualStrings("s1", kept.plan.steps.items[0].id);
     try testing.expectEqualStrings("s2", kept.plan.steps.items[1].id);
     try testing.expectEqualStrings("s3", kept.plan.steps.items[2].id);
@@ -476,9 +399,6 @@ test "the list this command reads back is the list the session ended with" {
 }
 
 test "a step that was given up reads as given up, and is never counted as done" {
-    // The fault this command exists to make visible. A summary that folded
-    // `abandoned` into `done` would report finished work nobody did, which is
-    // exactly what a list with a step quietly missing already reads as.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -496,8 +416,6 @@ test "a step that was given up reads as given up, and is never counted as done" 
     try testing.expect(std.mem.indexOf(u8, text, "1 abandoned") != null);
     try testing.expect(std.mem.indexOf(u8, text, "1 left") != null);
 
-    // And a list with nothing given up does not print a zero for it: a column
-    // of zeroes is a column nobody reads.
     var clean = state.Plan{};
     try clean.apply(arena, .{ .steps = &.{
         .{ .id = "s1", .subject = "port the driver", .status = .done },

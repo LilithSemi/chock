@@ -9,7 +9,8 @@
 //! read, because it is not the project's to migrate.
 //!
 //! See `../migrate.zig`'s own top comment for the translation every reader
-//! in this build follows: a deny narrows and carries, an allow narrows to
+//! in this build follows: a deny narrows and carries, and an allow becomes an
+//! ask.
 //! ask, and a secret's value is never carried, only its name.
 //!
 //! Only two of OpenCode's permission keys have a Chock action behind them:

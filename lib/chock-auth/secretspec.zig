@@ -1,39 +1,8 @@
 //! A fourth `store.Secrets` driver: SecretSpec, a secrets tool from Cachix
-//! that fronts many backends of its own (keyring, 1Password, Vault, AWS,
-//! SOPS, and more). Chock talks to one protocol and maintains none of them.
-//!
-//! ## The transport is a child process, and that is the hazard
-//!
-//! The Darwin Keychain driver was rewritten because the command it used to
-//! run could wait on a person, and Chock hung with an empty terminal and no
-//! explanation. Spawning `secretspec serve` is the same hazard, so every
-//! read here goes through `std.posix.poll` with a deadline, the write does
-//! too, and the child is killed and reaped on every path out of `get` and
-//! `put`, success or fault.
-//!
-//! ## The wire
-//!
-//! One JSON-RPC 2.0 object, then one LF, bounded at the specification's own
-//! one mebibyte cap. `get` runs `secretspec serve --read-only`. `put` needs
-//! `resolver.set`, which a read-only server never advertises, so it runs the
-//! server without that flag.
-//!
-//! `undeclared` and `missing` both mean the store holds no such secret, so
-//! `get` returns null rather than an error, the same as every other driver
-//! reading a name nobody stored.
-//!
-//! This driver asks only for `representation: "value"`. A reply that answers
-//! `"path"` anyway is refused rather than read: this driver hands back
-//! bytes, and a file name is not one.
-//!
-//! `store.Diagnostic` has no variant of this driver's own yet, so faults are
-//! read from `Driver.last_fault`, the way `linux/secret_service.zig` does
-//! until its own diagnostic is wired in.
 
 const std = @import("std");
 const store = @import("store.zig");
 
-/// What went wrong talking to SecretSpec.
 pub const Fault = enum {
     not_installed, // the program is not on PATH
     start_failed, // it would not run
@@ -43,8 +12,6 @@ pub const Fault = enum {
     timed_out,
 };
 
-/// One sentence a person can act on. Mirrors `linux/secret_fault.zig` and
-/// `darwin/status.zig`.
 pub fn adviceFor(fault: Fault) ?[]const u8 {
     return switch (fault) {
         .not_installed => "SecretSpec is not installed: put \"secretspec\" on PATH, or choose " ++
@@ -61,15 +28,10 @@ pub fn adviceFor(fault: Fault) ?[]const u8 {
     };
 }
 
-/// How long this driver waits for one exchange with `secretspec serve`. Ten
-/// seconds, because a backend may reach a network.
-/// How much of a refusal reaches a person. It is another program's text, so
-/// it is cut rather than trusted to be short.
 pub const max_refusal_bytes: usize = 240;
 
 pub const request_deadline_ms: i64 = 10_000;
 
-/// The specification's own cap on one frame.
 const max_frame_bytes: usize = 1 << 20;
 
 const program_name = "secretspec";
@@ -81,13 +43,8 @@ const representation_path = "path";
 const purpose_consumer = "chock";
 const purpose_operation = "credential";
 
-/// The driver.
 pub const Driver = struct {
-    /// Read for `PATH` and for whatever SecretSpec needs from the
-    /// environment. Null when the caller has none, and then this driver
-    /// refuses rather than reaching for a program it cannot name.
     env: ?*const std.process.Environ.Map = null,
-    /// Why the last `get` or `put` failed. See this file's own top comment.
     last_fault: ?Fault = null,
 
     pub fn secrets(self: *const Driver) store.Secrets {
@@ -115,9 +72,7 @@ pub const Driver = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return self.fault(.start_failed, true);
         };
-        // Kills and reaps on every path out of this function, the poison
-        // this whole file exists to bound. `Child.kill` closes the pipes
-        // too.
+        // This kills and reaps the child on every path out of this function, closing its pipes too.
         defer child.kill(io);
 
         const deadline = callDeadline(io);
@@ -147,9 +102,6 @@ pub const Driver = struct {
             },
             .path_returned => |lease_id| {
                 defer gpa.free(lease_id);
-                // Best effort: nothing here reads the answer. The fault
-                // below is what this call reports either way, and a lease
-                // this cannot release still expires on its own.
                 const release = buildReleaseRequest(gpa, 2, lease_id) catch null;
                 if (release) |bytes| {
                     defer gpa.free(bytes);
@@ -177,8 +129,6 @@ pub const Driver = struct {
             return self.fault(.not_installed, false);
         defer gpa.free(program);
 
-        // No `--read-only`: `resolver.set` is gated behind capability
-        // negotiation, and a read-only server never advertises it.
         var child = spawnServer(io, program, env, false) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return self.fault(.start_failed, false);
@@ -206,9 +156,6 @@ pub const Driver = struct {
         };
         switch (outcome) {
             .stored => return,
-            // The ordinary reason a `chock login` into SecretSpec fails:
-            // its server is read only, or this name is not declared in the
-            // user's secretspec.toml.
             .refused => |said| {
                 defer if (said) |text| gpa.free(text);
                 return self.faultSaying(gpa, diag, said, .read_only, false);
@@ -220,8 +167,6 @@ pub const Driver = struct {
         return self.faultSaying(null, null, null, kind, unreadable);
     }
 
-    /// The same, with whatever the server said about it. `detail` is borrowed
-    /// and copied into the diagnostic, so the caller frees its own.
     fn faultSaying(
         self: *Driver,
         gpa: ?std.mem.Allocator,
@@ -247,8 +192,6 @@ pub const Driver = struct {
 
 const TransportError = error{ TimedOut, Closed, WriteFailed, FrameTooLarge } || std.mem.Allocator.Error;
 
-/// Turn a transport fault into the store error this call answers with,
-/// keeping `OutOfMemory` as itself.
 fn mapTransportError(self: *Driver, err: TransportError, unreadable: bool) store.Error {
     if (err == error.OutOfMemory) return error.OutOfMemory;
     const kind: Fault = switch (err) {
@@ -260,43 +203,28 @@ fn mapTransportError(self: *Driver, err: TransportError, unreadable: bool) store
 }
 
 fn callDeadline(io: std.Io) std.Io.Clock.Timestamp {
-    // `.awake` and not `.real`, so the deadline does not move when NTP
-    // steps the clock.
     return std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{
         .raw = .fromNanoseconds(request_deadline_ms * std.time.ns_per_ms),
         .clock = .awake,
     });
 }
 
-/// The deadline the request itself carries, as milliseconds since the epoch.
-///
-/// `.real` here and not `.awake`, unlike the deadline this file waits on. The
-/// server reads this one off its own wall clock, so it has to be a wall clock
-/// time and not a reading of ours that only makes sense here.
 fn wallDeadlineMs(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .real).toMilliseconds() + request_deadline_ms;
 }
 
-/// How many milliseconds are left before `deadline`, or null once it has
-/// passed.
 fn remainingMs(io: std.Io, deadline: std.Io.Clock.Timestamp) ?i32 {
     const left = deadline.durationFromNow(io).raw.toMilliseconds();
     if (left <= 0) return null;
     return if (left > std.math.maxInt(i32)) std.math.maxInt(i32) else @intCast(left);
 }
 
-/// Whether `fd` is ready for `events` within `timeout_ms`.
-///
-/// A poll that cannot run says nothing about the child, so an error here
-/// answers true and leaves the real operation that follows to fail on its
-/// own terms rather than being read as the child going quiet.
 fn pollReady(fd: std.posix.fd_t, events: i16, timeout_ms: i32) bool {
     var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
     const ready = std.posix.poll(&fds, timeout_ms) catch return true;
     return ready != 0;
 }
 
-/// Write `bytes` to `file`, never blocking past `deadline`.
 fn writeFramed(file: std.Io.File, io: std.Io, bytes: []const u8, deadline: std.Io.Clock.Timestamp) TransportError!void {
     var index: usize = 0;
     while (index < bytes.len) {
@@ -307,8 +235,6 @@ fn writeFramed(file: std.Io.File, io: std.Io, bytes: []const u8, deadline: std.I
     }
 }
 
-/// Read one whole frame from `file`, never blocking past `deadline`. The
-/// newline is not included.
 fn readFrame(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File, deadline: std.Io.Clock.Timestamp) TransportError![]u8 {
     var frame: Frame = .{};
     defer frame.deinit(gpa);
@@ -326,9 +252,6 @@ fn readFrame(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File, deadline: st
     }
 }
 
-/// Bytes read from the child and not yet a whole line. Bounded at
-/// `max_frame_bytes`, the specification's own cap, so a reply that never
-/// ends cannot grow this process until the machine complains.
 const Frame = struct {
     buffer: std.ArrayList(u8) = .empty,
 
@@ -337,8 +260,6 @@ const Frame = struct {
         try self.buffer.appendSlice(gpa, bytes);
     }
 
-    /// The first whole line, with its newline removed, or null when none has
-    /// arrived yet. What remains stays for the next call.
     fn takeLine(self: *Frame, gpa: std.mem.Allocator) std.mem.Allocator.Error!?[]u8 {
         const end = std.mem.indexOfScalar(u8, self.buffer.items, '\n') orelse return null;
         const line = try gpa.dupe(u8, self.buffer.items[0..end]);
@@ -351,8 +272,6 @@ const Frame = struct {
     }
 };
 
-/// `secretspec` on `PATH`, from `env` and never the ambient environment.
-/// Caller owns the result.
 fn resolveOnPath(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -447,21 +366,12 @@ fn buildReleaseRequest(gpa: std.mem.Allocator, id: i64, path_lease_id: []const u
 const ParseError = error{NotJson} || std.mem.Allocator.Error;
 
 const GetOutcome = union(enum) {
-    /// The value, owned. Caller wipes and frees it.
     value: []u8,
-    /// `undeclared` or `missing`: the store holds no such secret. Not an
-    /// error, the same as every other driver reading a name nobody stored.
     absent,
-    /// The server answered a JSON-RPC error, with whatever it said about it.
-    /// Owned, and the caller frees it.
     refused: ?[]u8,
-    /// A `path` result, though only `"value"` was asked for. The lease id
-    /// is owned. Caller frees it.
     path_returned: []u8,
 };
 
-/// What a JSON-RPC error says, cut to `max_refusal_bytes`. Null when it says
-/// nothing this can read.
 fn refusalText(gpa: std.mem.Allocator, failed: std.json.Value) std.mem.Allocator.Error!?[]u8 {
     if (failed != .object) return null;
     const message = failed.object.get("message") orelse return null;
@@ -481,10 +391,7 @@ fn parseGetReply(gpa: std.mem.Allocator, bytes: []const u8) ParseError!GetOutcom
     const root = parsed.value;
     if (root != .object) return error.NotJson;
 
-    // **What the server said is the useful part.** A secret a project has not
-    // declared, or a provider that would not answer, is named here and nowhere
-    // else: the child's own error stream is not read, because a pipe nobody
-    // drains is its own hazard. Bounded, because it is another program's text.
+    // What the server said is the useful part: a secret a project has not declared, or a provider that would not answer, is named here. The child's own error stream is not read, because draining an unbounded pipe from another program is its own hazard.
     if (root.object.get("error")) |failed| {
         return .{ .refused = refusalText(gpa, failed) catch null };
     }
@@ -516,7 +423,6 @@ fn parseGetReply(gpa: std.mem.Allocator, bytes: []const u8) ParseError!GetOutcom
 
 const SetOutcome = union(enum) {
     stored,
-    /// The server answered a JSON-RPC error, with whatever it said. Owned.
     refused: ?[]u8,
 };
 
@@ -537,10 +443,6 @@ fn parseSetReply(gpa: std.mem.Allocator, bytes: []const u8) ParseError!SetOutcom
 }
 
 const testing = std.testing;
-
-// Every test below needs no child process: it drives the pure framing,
-// building and parsing functions directly. A real exchange with
-// `secretspec serve` needs the program installed and is not exercised here.
 
 const WireGetRequest = struct {
     jsonrpc: []const u8,
@@ -746,7 +648,6 @@ test "what the server said about a refusal reaches the caller" {
         .refused => |text| text,
         else => return error.TestExpectedRefusal,
     };
-    // The name of the secret is the useful part, and only the server knows it.
     try testing.expect(std.mem.indexOf(u8, said.?, "FORGE_TOKEN") != null);
 }
 

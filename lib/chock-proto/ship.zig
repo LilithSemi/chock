@@ -6,8 +6,6 @@ const std = @import("std");
 const chain = @import("chain.zig");
 const storage = @import("storage.zig");
 
-/// A record the sink will not carry is never retried. A retry sends the same
-/// bytes to the same sink, so the shipper would stop for ever on one line.
 pub const Delivery = union(enum) {
     delivered,
     refused: []const u8,
@@ -46,8 +44,7 @@ pub const Sink = struct {
 pub const Record = struct {
     session: []const u8,
     id: u64,
-    /// The bytes exactly as they sit on disk, without the newline. A
-    /// re-encoding makes a sound log read as tampered at the far end.
+    /// Exactly the on-disk bytes, no newline; re-encoding would read as tampering.
     line: []const u8,
     kind: Kind,
 
@@ -111,7 +108,7 @@ pub const Shipper = struct {
     sink: Sink,
     session: []const u8,
     cursor: u64 = 0,
-    /// No replay yields the header. Without it the far end cannot anchor.
+    /// No replay yields the header, which the far end needs to anchor.
     sent_header: bool = false,
     continued: bool = false,
     started: bool = false,
@@ -121,8 +118,7 @@ pub const Shipper = struct {
         if (self.started) return;
         self.started = true;
         const held = self.sink.resumeAt(io) catch |err| {
-            // An absent answer must never read as "the sink has it all
-            // already", which is the reading that makes a silent gap.
+            // An error must never read as "the sink has it all", or the gap stays silent.
             self.note(err, 0);
             self.health.resent_from_start = self.continued;
             return;
@@ -167,9 +163,7 @@ pub const Shipper = struct {
         defer replay.deinit();
 
         while (true) {
-            // Read the position before the call, never after. A `next` that
-            // could not parse has already stepped past the line it choked on,
-            // and one that found a torn fragment goes back to that start.
+            // Before the call: a failed `next` has already stepped past the line it choked on.
             const at = replay.at();
             const parsed = replay.next(io) catch |err| {
                 self.note(err, at);
@@ -192,8 +186,7 @@ pub const Shipper = struct {
         }
     }
 
-    /// The last line is the `session.end`, which is how a far end tells a whole
-    /// record from one that stopped.
+    /// The last line is `session.end`, telling a whole record from a stopped one.
     pub fn finish(self: *Shipper, gpa: std.mem.Allocator, io: std.Io, store: storage.Storage) void {
         self.push(gpa, io, store);
         self.sink.flush(io) catch |err| self.note(err, self.cursor);
@@ -227,9 +220,7 @@ pub const Shipper = struct {
     }
 };
 
-/// The file is byte for byte the log. Write positionally, from the length this
-/// sink keeps: an appending write puts a part write and then the whole line one
-/// after the other, and the far end then reads a broken chain.
+/// The file is byte for byte the log, so writes are positional, not appended.
 pub const FileDrop = struct {
     path: []const u8,
     file: ?std.Io.File = null,
@@ -295,14 +286,10 @@ pub const syslog_severity: u8 = 5;
 
 pub const syslog_priority: u8 = syslog_facility * 8 + syslog_severity;
 
-/// RFC 5424 bounds the application name at 48 characters.
 pub const syslog_app_name = "chock";
 
-/// One RFC 5424 message per log line. A collector cannot verify the chain from
-/// these alone: a daemon may rewrite, reorder, or drop a datagram. `MSGID` is
-/// the session identifier, which RFC 5424 bounds at 32 characters and a session
-/// identifier is a 26 character ULID. The time is `NILVALUE`, so the receiver
-/// stamps its own.
+/// One RFC 5424 message per log line. The timestamp is `NILVALUE`, so the
+/// receiver stamps its own.
 pub const Syslog = struct {
     path: []const u8,
     handle: ?std.posix.fd_t = null,
@@ -341,8 +328,7 @@ pub const Syslog = struct {
         if (self.path.len >= address.path.len) return error.SyslogPathTooLong;
         @memcpy(address.path[0..self.path.len], self.path);
 
-        // These are datagram sockets, and `std.Io.net.UnixAddress` connects a
-        // stream with no datagram mode, so this steps down to `std.posix`.
+        // `std.Io.net.UnixAddress` connects a stream, not a datagram, so this uses `std.posix`.
         const made = std.posix.system.socket(std.posix.AF.UNIX, std.posix.SOCK.DGRAM, 0);
         if (std.posix.errno(made) != .SUCCESS) return error.SyslogSocketRefused;
         const handle: std.posix.fd_t = @intCast(made);
@@ -391,10 +377,9 @@ pub const Syslog = struct {
         const written: isize = @bitCast(@as(usize, @bitCast(rc)));
         if (written >= 0 and @as(usize, @intCast(written)) == message.len) return .delivered;
         return switch (std.posix.errno(rc)) {
-            // The kernel refuses a line larger than one datagram whole and
-            // does not cut it. A truncated line reads as a tampered line.
+            // The kernel refuses an over-size datagram rather than truncating it.
             .MSGSIZE => .{ .refused = "the line is larger than one syslog datagram" },
-            // A datagram goes whole or not at all, so a short write is a fault.
+            // A datagram sends whole or not at all, so a short write is a fault.
             .SUCCESS => error.SyslogWriteFailed,
             else => error.SyslogWriteFailed,
         };
@@ -412,8 +397,6 @@ pub const Syslog = struct {
         return null;
     }
 
-    /// A connect on a unix datagram socket answers: `ENOENT` for a path with
-    /// nothing at it, `EACCES` for a socket this process may not reach.
     fn reachFn(ptr: *anyopaque, io: std.Io) anyerror!void {
         _ = io;
         const self: *Syslog = @ptrCast(@alignCast(ptr));
@@ -509,8 +492,7 @@ const FakeSink = struct {
     };
 };
 
-/// `text` must be comptime. A runtime slice makes `&.{ .{ .text = text } }` a
-/// pointer into this function's frame, which is gone when a caller appends it.
+/// `text` must be comptime, or `&.{...}` points into this frame, which is gone once the caller appends it.
 fn say(comptime text: []const u8) event.Event {
     return .{ .message = .{ .role = .assistant, .content = &.{.{ .text = text }} } };
 }

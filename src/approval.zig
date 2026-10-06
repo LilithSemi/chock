@@ -13,8 +13,6 @@ const ui = @import("ui.zig");
 const event = chock_proto.event;
 const Broker = chock_broker.Broker;
 
-/// `chock_proto.storage.Locked` is not `pub`, so this reaches the same type
-/// through the return type of `Storage.lock`, which is public.
 const Locked = @typeInfo(
     @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
 ).error_union.payload;
@@ -27,8 +25,6 @@ pub fn hasTerminal(io: std.Io) bool {
     return std.Io.File.stdin().isTty(io) catch false;
 }
 
-/// How long one approval waits for an answer. Zero without a terminal, so a
-/// question nobody can answer does not hold the session lock for five minutes.
 pub fn timeoutMs(at_terminal: bool) i64 {
     return if (at_terminal) Broker.default_timeout_ms else 0;
 }
@@ -72,9 +68,6 @@ pub const Stdin = struct {
 
     const vtable = Console.VTable{ .write = writeFn, .read = readFn };
 
-    /// Flushed at once: a question ends with no newline, because the answer is
-    /// typed after it on the same line, so nothing later pushes it out and an
-    /// unflushed question looks like a program that has hung.
     fn writeFn(ptr: *anyopaque, io: std.Io, bytes: []const u8) void {
         _ = ptr;
         if (!tty.writeOut(bytes)) {
@@ -91,8 +84,6 @@ pub const Stdin = struct {
 
         var fds = [_]std.posix.pollfd{.{
             .fd = self.fd,
-            // A closed input is readable too: the read that follows gets the
-            // end of the stream.
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
@@ -142,9 +133,7 @@ pub const Terminal = struct {
     }
 
     pub fn step(self: *Terminal, io: std.Io, budget_ms: u64) Broker.Waiter.Wake {
-        // First, and before anything is shown. `std.posix.poll` retries an
-        // interrupted call itself, so a Ctrl-C never comes back through the
-        // read: the handler sets a flag, and this is where it is read.
+        // std.posix.poll retries an interrupted call itself, so a Ctrl-C never comes back through the read: the flag is checked here first.
         if (self.stop()) return .canceled;
 
         const open = self.openRequest(io) catch |err| {
@@ -212,9 +201,6 @@ pub const Terminal = struct {
         }
     }
 
-    /// Appended through the caller's own handle. If you find yourself opening
-    /// the log a second time here, stop: two handles on one log is the state the
-    /// exclusive lock exists to prevent.
     fn record(
         self: *Terminal,
         io: std.Io,
@@ -484,12 +470,7 @@ pub fn promptText(
     return text.toOwnedSlice(gpa);
 }
 
-/// Write text to a console with the bytes that drive a terminal taken out. The
-/// detail of a request is written by the agent, so an escape sequence in a file
-/// it changed could paint over the question it is being asked about. Tabs and
-/// newlines are kept because a diff is made of them, and bytes at or above 0x80
-/// pass through because a diff of a real file is UTF-8. This does not cover the
-/// characters that reverse a line's direction, which need a Unicode aware pass.
+// This filters escape sequences a changed file might carry, but not the characters that reverse a line's direction.
 pub fn writeFiltered(console: Console, io: std.Io, text: []const u8) void {
     var start: usize = 0;
     for (text, 0..) |byte, index| {

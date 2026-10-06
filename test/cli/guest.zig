@@ -1,45 +1,6 @@
-//! A real guest, booted through the real `chock daemon`, and one real tool call
-//! inside it.
-//!
-//! Every other test of the microVM path drives a piece: the allow list against
-//! Mirage's own exports, the grant set against the offer set, the fault text.
-//! None of them boots a kernel. This one starts the binary that was just built,
-//! speaks the control protocol to it, lets a session fork a guest, and reads the
-//! tool result out of the session log. Several syscall allow list faults on this
-//! path were found by running a session by hand and would have been caught here.
-//!
-//! **It reads no credential and reaches none.** The provider is an
-//! `openai-compat` endpoint this test listens on at `127.0.0.1`, so no key is
-//! needed and the configuration it writes holds none. `HOME`, `TMPDIR` and every
-//! `XDG_*` directory point inside a temporary directory of its own, so the
-//! daemon cannot open the user's own `config.zon` or credential store even by
-//! accident.
-//!
-//! **The call is a routed one**, `wc -c /run/chock/ca-bundle.crt`, and that is
-//! the point of choosing it. A project whose policy states a filtered router
-//! makes the session stage the host trust store into its own staging directory
-//! and bind it at that path inside the sandbox. A byte count coming back means
-//! the staged file was written somewhere the guest was granted and could place,
-//! which a call that only proves a kernel booted would not say.
-//!
-//! **A machine that cannot boot a guest skips.** A skip here must never read as a
-//! pass: that is the rule `namespace.nothing_measured_exit_status` exists for,
-//! and the reason the sandbox escape suites skip on a host that cannot nest
-//! rather than reporting a boundary they never reached. The test runner's own
-//! `(2 skipped)` is what says so, and it never says passed. `whyNoGuest` below
-//! names every fact that can stop it, and the step's description names the two
-//! options a person has to pass, because a test of this project writes nothing
-//! to standard error: see `test/proto/lock.zig`.
-//!
-//! The images are build time constants rather than something hunted for at run
-//! time, so a machine with no guest images skips instead of asserting against a
-//! guess.
-//!
-//! Both halves of the fork in `src/daemon.zig`'s own grant derivation are
-//! covered, because one pass over that code fixed a project with a `flake.nix`
-//! and broke a project without one. What a `flake.nix` here does **not** prove
-//! is a dev shell: these projects state none, so the mount set is this machine's
-//! own toolchain directories and not a closure.
+//! A real guest, booted through the real `chock daemon`, with one real tool call inside it.
+//! It reads no credential and reaches none: the provider is a local fake, and `HOME`, `TMPDIR`
+//! and every `XDG_*` directory point inside a temporary directory of their own.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -47,44 +8,27 @@ const builtin = @import("builtin");
 const control = @import("chock-proto").control;
 
 const gate = @import("guest_gate");
-/// The binary that was just built, as a build time constant: Zig 0.16's test
-/// runner takes no argument, and a `zig-out` hunted for at run time may hold an
-/// older build.
+/// The binary that was just built, as a build time constant, since Zig 0.16's test runner takes no argument.
 const chock_path = gate.chock_path;
-/// Found by `build.zig`, which has an environment to search. Empty strings on a
-/// machine without them, which is a reason to skip and never a path to try.
+/// Found by `build.zig`. An empty string means the machine has none, which is a reason to skip.
 const git_path = gate.git_path;
 const wc_path = gate.wc_path;
-/// `-Dguest-kernel=` and `-Dguest-initrd=`, empty when nobody passed them. They
-/// come from `nix build .#guest-kernel .#guest-initrd`, which needs a Linux
-/// builder, so no default could be honest.
+/// From `-Dguest-kernel=` and `-Dguest-initrd=`, empty when nobody passed them.
 const kernel_path = gate.guest_kernel;
 const initrd_path = gate.guest_initrd;
 
 const testing = std.testing;
 
-/// One accept, one read, one answer. Long enough for a kernel to boot between
-/// the first provider request and the second. A release valve and not a
-/// measurement: a machine slower than this fails with a sentence rather than
-/// hanging a suite.
+/// Long enough for a kernel to boot between the first provider request and the second.
 const step_ms: i32 = 120 * 1000;
 
-/// The most of a session log this reads. Far past any one turn, and it bounds a
-/// watch that keeps growing for a reason this test cannot see.
+/// The most of a session log this reads, far past any one turn.
 const max_events_bytes: usize = 64 * 1024 * 1024;
 
-/// How long to wait for the daemon's socket to appear, in twenty millisecond
-/// steps.
+/// How long to wait for the daemon's socket to appear, in twenty millisecond steps.
 const listen_steps: usize = 1500;
 
 /// Every fact this gate needs, each named. Null when a guest can run here.
-///
-/// **The reason is named here and not printed.** `test/proto/lock.zig` holds this
-/// project to a test that writes nothing to standard error, because `zig build
-/// test` reads a test's own output as a fault, so the facts live in this function
-/// and in the step's own description instead. What a person sees is the test
-/// runner's `(2 skipped)`, which is the build saying it skipped and is never the
-/// build saying it passed.
 fn whyNoGuest(io: std.Io) ?[]const u8 {
     if (builtin.os.tag != .linux) return "a guest is Linux, and this host is not";
     if (chock_path.len == 0) return "no chock binary was named";
@@ -99,17 +43,14 @@ fn whyNoGuest(io: std.Io) ?[]const u8 {
             return "a guest image was named that this machine cannot read";
         if (stat.size == 0) return "a guest image was named that holds nothing";
     }
-    // The decisive one, and the reason this skips rather than fails inside a Nix
-    // builder: that sandbox's /dev holds null, zero, random and little else.
+    // This is why the gate skips rather than fails inside a Nix builder, whose sandbox has no /dev/kvm.
     const kvm = std.Io.Dir.openFileAbsolute(io, "/dev/kvm", .{}) catch
         return "this machine has no /dev/kvm this user may open";
     kvm.close(io);
     return null;
 }
 
-/// An isolated home, state and configuration tree, built from nothing rather
-/// than copied, so nothing of the person running the suite decides the answer
-/// and nothing of theirs is read.
+/// An isolated home, state and configuration tree, built from nothing rather than copied.
 const Home = struct {
     tmp: testing.TmpDir,
     root: []u8,
@@ -131,14 +72,12 @@ const Home = struct {
         try env.put("XDG_DATA_HOME", root);
         try env.put("XDG_STATE_HOME", root);
         try env.put("XDG_CACHE_HOME", root);
-        // `TMPDIR` inside the tree, so a staged file lands where this test can
-        // see it and nowhere near the user's own temporary directory.
+        // `TMPDIR` inside the tree, so a staged file lands nowhere near the user's own.
         const tmpdir = try std.fmt.allocPrint(gpa, "{s}/tmp", .{root});
         defer gpa.free(tmpdir);
         try std.Io.Dir.cwd().createDirPath(io, tmpdir);
         try env.put("TMPDIR", tmpdir);
-        // A test binary has no environment to search, so the two programs a
-        // session really spawns are named by the directories they sit in.
+        // A test binary has no environment to search, so the spawned programs are named by their own directories.
         const path = try std.fmt.allocPrint(gpa, "{s}:{s}", .{
             std.fs.path.dirname(wc_path) orelse "/usr/bin",
             std.fs.path.dirname(git_path) orelse "/usr/bin",
@@ -185,8 +124,7 @@ const Home = struct {
     }
 };
 
-/// A git repository with one commit, a `chock.zon` that allows the call and
-/// states a filtered router, and a `flake.nix` only when asked for one.
+/// A git repository with one commit, a `chock.zon` that allows the call, and a `flake.nix` if asked for.
 fn makeProject(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -202,9 +140,7 @@ fn makeProject(
     defer dir.close(io);
 
     try dir.writeFile(io, .{ .sub_path = "README.md", .data = "a project with one commit\n" });
-    // A filtered router is stated rather than inferred from a rule, because the
-    // staged trust store is what this call reads and a test should not depend on
-    // what a rule set happens to imply.
+    // A filtered router is stated rather than inferred from a rule, since the staged trust store is what this call reads.
     try dir.writeFile(io, .{
         .sub_path = "chock.zon",
         .data =
@@ -220,16 +156,11 @@ fn makeProject(
         ,
     });
     if (with_flake) {
-        // A flake with no dev shell in it. `DevShell.hasFlake` is a file test and
-        // it is what the grant derivation forks on, and a flake this cannot read
-        // still runs a session under the host's own environment, so this covers
-        // the other half of that fork without needing a nix on the machine.
+        // A flake with no dev shell, covering the other half of the fork `DevShell.hasFlake` forks on.
         try dir.writeFile(io, .{ .sub_path = "flake.nix", .data = "{ outputs = { self }: { }; }\n" });
     }
 
-    // `git worktree add` checks a commit out, so the repository needs one. The
-    // identity is on the command line, so no git configuration of anybody's is
-    // read.
+    // The commit identity is on the command line, so no git configuration of anybody's is read.
     try git(gpa, io, &home.env, path, &.{ "init", "--quiet", "." });
     try git(gpa, io, &home.env, path, &.{ "add", "-A" });
     try git(gpa, io, &home.env, path, &.{
@@ -273,8 +204,7 @@ const response_head =
     "Cache-Control: no-cache\r\n" ++
     "Transfer-Encoding: chunked\r\n\r\n";
 
-/// Written as a multiline literal, which has no escape processing, so the
-/// `arguments` field carries the JSON string a provider really sends.
+/// A multiline literal, which has no escape processing, so `arguments` carries the JSON a provider really sends.
 const tool_call_line =
     \\data: {"choices":[{"index":0,"finish_reason":null,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"run_command","arguments":"{\"argv\":[\"wc\",\"-c\",\"/run/chock/ca-bundle.crt\"]}"}}]}}]}
 ;
@@ -293,16 +223,14 @@ const closing_turn = httpChunk(
     ++ "\n\n") ++
     httpChunk("data: [DONE]\n\n") ++ "0\r\n\r\n";
 
-/// Wait for one descriptor to become readable. False when the time ran out,
-/// which is how every step here fails with a sentence instead of hanging.
+/// Wait for one descriptor to become readable. False when the time ran out.
 fn readableWithin(handle: std.posix.fd_t, milliseconds: i32) bool {
     var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
     const ready = std.posix.poll(&fds, milliseconds) catch return false;
     return ready != 0;
 }
 
-/// Answer one chat completion request with `turn`. The request body is read and
-/// dropped: what it holds is already pinned by the tests beside the loop.
+/// Answer one chat completion request with `turn`. The request body is read and dropped.
 fn answerOneRequest(io: std.Io, server: *std.Io.net.Server, turn: []const u8) !void {
     if (!readableWithin(server.socket.handle, step_ms)) return error.ProviderNeverAsked;
     var stream = try server.accept(io);
@@ -330,9 +258,7 @@ fn answerOneRequest(io: std.Io, server: *std.Io.net.Server, turn: []const u8) !v
     try writing.interface.flush();
 }
 
-/// Greet the daemon and send one request, over a connection of its own. The
-/// bytes are composed by `chock_proto.control` rather than spelled here, so a
-/// change to the grammar moves this test with it.
+/// Greet the daemon and send one request, over a connection of its own. The bytes are composed by `chock_proto.control`.
 fn ask(gpa: std.mem.Allocator, io: std.Io, socket: []const u8, request: control.Request) !struct {
     stream: std.Io.net.Stream,
     reply: []u8,
@@ -361,16 +287,14 @@ fn ask(gpa: std.mem.Allocator, io: std.Io, socket: []const u8, request: control.
     return .{ .stream = stream, .reply = try seen.toOwnedSlice(gpa) };
 }
 
-/// The second line of what `ask` read: `ok <session id>\t<log path>`, or an
-/// `error <sentence>` the daemon wrote instead.
+/// The second line of what `ask` read: `ok <session id>\t<log path>`, or an `error <sentence>`.
 fn replyLine(reply: []const u8) []const u8 {
     var lines = std.mem.splitScalar(u8, reply, '\n');
     _ = lines.next();
     return std.mem.trimEnd(u8, lines.next() orelse "", "\r");
 }
 
-/// Read a watch connection to the end. The daemon closes it when the session
-/// ends, so there is nothing to parse for: what comes back is every event line.
+/// Read a watch connection to the end. The daemon closes it when the session ends.
 fn drain(gpa: std.mem.Allocator, handle: std.posix.fd_t, already: []const u8) ![]u8 {
     var seen: std.ArrayList(u8) = .empty;
     errdefer seen.deinit(gpa);
@@ -386,8 +310,7 @@ fn drain(gpa: std.mem.Allocator, handle: std.posix.fd_t, already: []const u8) ![
     return seen.toOwnedSlice(gpa);
 }
 
-/// One whole session: start the daemon, let it fork a guest, and hand back the
-/// session log and everything the daemon printed.
+/// One whole session: start the daemon, let it fork a guest, and hand back the session log and what it printed.
 const Run = struct {
     events: []u8,
     said: []u8,
@@ -407,8 +330,7 @@ fn runOneSession(gpa: std.mem.Allocator, io: std.Io, home: *Home, project: []con
     const socket = try std.fmt.allocPrint(gpa, "{s}/daemon.sock", .{home.root});
     defer gpa.free(socket);
 
-    // Both streams into one file, so a kernel printing twenty kilobytes of boot
-    // log onto the daemon's inherited stdout cannot fill a pipe and stop it.
+    // Both streams into one file, so a kernel's boot log cannot fill a pipe and stop it.
     var said_file = try home.tmp.dir.createFile(io, "daemon.log", .{ .read = true });
     defer said_file.close(io);
 
@@ -443,8 +365,7 @@ fn runOneSession(gpa: std.mem.Allocator, io: std.Io, home: *Home, project: []con
     const rest = line["ok ".len..];
     const session = rest[0 .. std.mem.indexOfScalar(u8, rest, '\t') orelse rest.len];
 
-    // The two provider turns the loop makes: the tool call, then the reply that
-    // ends the turn. The guest boots between them.
+    // The two provider turns the loop makes: the tool call, then the reply that ends it.
     try answerOneRequest(io, &provider, tool_call_turn);
     try answerOneRequest(io, &provider, closing_turn);
 
@@ -464,13 +385,10 @@ fn runOneSession(gpa: std.mem.Allocator, io: std.Io, home: *Home, project: []con
     return .{ .events = events, .said = said };
 }
 
-/// What `run_command` writes in front of a program's output, as the session log
-/// holds it: one JSON string, so the newline is escaped.
+/// What `run_command` writes in front of a program's output, in the session log, with the newline escaped.
 const result_prefix = "exit status: 0\\n";
 
-/// The most of a run that is quoted when something is wrong. A kernel's own boot
-/// log is twenty kilobytes and a session log is more, and the end of each is
-/// where what went wrong is.
+/// The most of a run that is quoted when something is wrong, since the end of each log is where the fault is.
 const quoted_bytes: usize = 4096;
 
 fn tail(text: []const u8) []const u8 {
@@ -478,17 +396,11 @@ fn tail(text: []const u8) []const u8 {
 }
 
 /// Every claim this gate makes, checked against one run.
-///
-/// **One string and then one comparison**, the shape `test/docs/claims.zig` uses:
-/// a run reports everything wrong with it at once, and nothing reaches standard
-/// error, which `test/proto/lock.zig` holds this project to.
 fn expectAGuestRanTheCall(gpa: std.mem.Allocator, run: *const Run) !void {
     var wrong: std.ArrayList(u8) = .empty;
     defer wrong.deinit(gpa);
 
-    // **A native tool call would also exit 0**, so the guest is proven first.
-    // Without these two the whole gate would pass on a session that quietly ran
-    // the call on the host.
+    // A native tool call would also exit 0, so the guest is proven first.
     if (std.mem.indexOf(u8, run.said, "tool calls run in a microVM guest") == null) {
         try wrong.print(gpa, "the session never attached a guest:\n{s}\n", .{tail(run.said)});
     }
@@ -496,14 +408,11 @@ fn expectAGuestRanTheCall(gpa: std.mem.Allocator, run: *const Run) !void {
         try wrong.print(gpa, "no kernel printed a banner:\n{s}\n", .{tail(run.said)});
     }
 
-    // The routed call's own answer, read **after** the exit status and not merely
-    // somewhere in the log: the call's own argv names that path too, so a check
-    // for the path alone would pass on a call that failed.
+    // Read after the exit status, so a check for the path alone cannot pass on a call that failed.
     if (std.mem.indexOf(u8, run.events, result_prefix)) |result| {
         const counted = run.events[result + result_prefix.len ..];
         var digits: usize = 0;
         while (digits < counted.len and std.ascii.isDigit(counted[digits])) digits += 1;
-        // The host's own bundle, so only that it is there and holds something.
         const bytes = std.fmt.parseInt(u64, counted[0..digits], 10) catch 0;
         if (bytes == 0) try wrong.appendSlice(gpa, "wc counted no bytes in the staged bundle\n");
         if (!std.mem.startsWith(u8, counted[digits..], " /run/chock/ca-bundle.crt")) {

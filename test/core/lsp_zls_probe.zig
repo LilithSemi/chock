@@ -7,21 +7,17 @@ const linux = std.os.linux;
 const sandbox = @import("chock-sandbox");
 const chock_core = @import("chock-core");
 
-/// A real server resolves the URIs it is sent inside its own mount namespace,
-/// so every URI is built from this path and never from the host side.
+/// Every URI is built from this path, inside the sandbox, never from the host side.
 const sandbox_project = "/srv/project";
 
 const ascii_source = "const x = 1\n";
 
-/// `zls` counts `character` in UTF-16 code units unless the client asks for
-/// something else, so it reports 26 for the `1` here and 28 when it counts
-/// bytes. The byte column is 29. An all ASCII suite never sees the difference.
+/// `zls` counts `character` in UTF-16 units, so this reports column 26, not the 29th byte.
 const unicode_source = "const a = \"\u{1F363}\"; const x = 1\n";
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     return runOperation(init) catch |err| {
-        // `build.zig` fails the build on any byte a test binary writes to
-        // standard error, and these descriptors are that binary's own.
+        // build.zig fails the build on any byte a test binary writes to stderr.
         if (err == error.NamespaceFailed) return sandbox.namespace.nothing_measured_exit_status;
         return err;
     };
@@ -40,11 +36,9 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     return drive(arena, args[2], args[3], args[4]);
 }
 
-/// `zls` is a path build.zig found on the dev shell's `PATH`. Nothing here
-/// provisions a server or reaches a network.
+/// `zls` is a path build.zig found on the dev shell's `PATH`.
 fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8, zls: []const u8) !u8 {
-    // Asked in a child, the only way to ask without spending this process's
-    // one namespace. The session above cannot tell a silent server apart.
+    // Asked in a child, the only way to ask without spending this process's own namespace.
     if (!sandbox.namespace.probeAvailability().available()) {
         return sandbox.namespace.nothing_measured_exit_status;
     }
@@ -59,8 +53,7 @@ fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8, zls: []co
     try work_dir.writeFile(io, .{ .sub_path = "src/main.zig", .data = ascii_source });
     try work_dir.writeFile(io, .{ .sub_path = "src/unicode.zig", .data = unicode_source });
 
-    // A dev shell server is a dynamically linked binary in the store, so the
-    // store needs an identity bind and not a copy.
+    // A dev shell server is a dynamically linked binary, so the store needs an identity bind.
     const workspace_config = sandbox.Config{
         .root = root,
         .mounts = &.{
@@ -116,8 +109,7 @@ fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8, zls: []co
     };
 
     if (!try check(arena, io, &session, "src/main.zig", "src/main.zig:1:11: error: expected ';'")) return 1;
-    // `zls` publishes an empty diagnostic list for a closed document, and that
-    // message sits in the pipe before this second ask.
+    // zls publishes an empty diagnostic list for a closed document, ahead of this second ask.
     if (!try check(arena, io, &session, "src/main.zig", "src/main.zig:1:11: error: expected ';'")) return 1;
     if (!try check(arena, io, &session, "src/unicode.zig", "src/unicode.zig:1:29: error: expected ';'")) return 1;
 

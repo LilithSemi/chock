@@ -5,7 +5,6 @@
 const std = @import("std");
 const chock_proto = @import("chock-proto");
 
-/// `chock_proto.storage.Locked` is not `pub`. This reaches it anyway.
 pub const Locked = @typeInfo(
     @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
 ).error_union.payload;
@@ -13,7 +12,6 @@ pub const Locked = @typeInfo(
 pub const Ask = struct {
     action: []const u8,
     summary: []const u8,
-    /// The whole effect, never a command string.
     detail: []const u8,
     reason: []const u8,
     tool: []const u8,
@@ -21,8 +19,6 @@ pub const Ask = struct {
     source: []const u8 = "",
 };
 
-/// Every string here is static and comes from an outcome, so a reviewer's own
-/// words have no route back to the agent that asked.
 pub const Answer = struct {
     permitted: bool,
     outcome: []const u8,
@@ -34,8 +30,6 @@ pub const Arbiter = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// This never fails. Every way of not reaching a decision is already
-        /// an `Answer` that does not permit.
         decide: *const fn (
             ptr: *anyopaque,
             gpa: std.mem.Allocator,
@@ -58,7 +52,6 @@ pub const Arbiter = struct {
 
 pub const Asker = struct {
     arbiter: Arbiter,
-    /// The pointer is the loop's own, so whoever stores it never unlocks it.
     locked: ?*Locked = null,
 
     pub fn decide(self: ?Asker, gpa: std.mem.Allocator, io: std.Io, ask: Ask) Answer {
@@ -86,8 +79,6 @@ pub fn refusalText(
     );
 }
 
-/// "Nobody could be asked" and "somebody said no" stay apart. A message that
-/// implied the request had been weighed makes a model argue with it.
 pub const not_asked = Answer{
     .permitted = false,
     .outcome = "this session can ask nobody",

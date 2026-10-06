@@ -1,6 +1,5 @@
-//! The `workspace` block of a project's own `chock.zon`: the paths the agent
-//! sees which the git worktree at HEAD does not carry. A generated
-//! configuration and an automation directory are the two this exists for.
+//! The `workspace` block of a project's own `chock.zon`: the paths the
+//! agent sees which the git worktree at HEAD does not carry.
 
 const std = @import("std");
 
@@ -10,12 +9,8 @@ pub const block_name = "workspace";
 
 pub const max_file_bytes = 1 << 20;
 
-/// Every bind costs a mount or a copy at session start, so this is a real
-/// bound and not a round number.
 pub const max_binds: usize = 32;
 
-/// How a match reaches the agent, and what happens to a change the agent makes
-/// to it.
 pub const Mode = enum {
     /// A bind mount the agent cannot write to.
     read_only,
@@ -30,8 +25,7 @@ pub const Mode = enum {
         return @tagName(self);
     }
 
-    /// Whether the mode carries a change back to the user's own disk. The
-    /// `write` field is meaningful for these two and an error on the rest.
+    /// The `write` field is meaningful for these two, and an error on the rest.
     pub fn reachesTheUsersDisk(self: Mode) bool {
         return switch (self) {
             .write, .copy => true,
@@ -40,28 +34,20 @@ pub const Mode = enum {
     }
 };
 
-/// The same three answers the policy table gives, because this is the same
-/// question asked in the project's own file.
 pub const Write = enum { allow, ask, deny };
 
 pub const Bind = struct {
     name: []const u8,
     mode: Mode,
-    /// `ask` when the file names nothing. A project file cannot grant itself
-    /// the right to write to the user's disk.
+    /// `ask` when the file names nothing: a project file cannot grant
+    /// itself the right to write to the user's disk.
     write: Write = .ask,
-    /// Null is the derived answer, which `isRequired` gives.
     required: ?bool = null,
 
-    /// Whether a name that matches nothing stops the session. A person naming
-    /// `scripts/release` asked for that path, and a pattern matching nothing
-    /// is ordinary.
     pub fn isRequired(self: Bind) bool {
         return self.required orelse !hasGlob(self.name);
     }
 
-    /// The action name the arbiter is asked under, so an organisation can
-    /// refuse the mechanism fleet wide and a person can deny one path.
     pub fn actionName(self: Bind, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fmt.allocPrint(gpa, "{s}{s}", .{ action_prefix, self.name });
     }
@@ -69,8 +55,7 @@ pub const Bind = struct {
 
 pub const action_prefix = "workspace.bind.";
 
-/// The two characters `matchGlob` acts on. A `[` is an ordinary byte here, and
-/// a name holding one is a literal path.
+/// A `[` is an ordinary byte here, so a name holding one is a literal path.
 pub fn hasGlob(name: []const u8) bool {
     return std.mem.indexOfAny(u8, name, "*?") != null;
 }
@@ -85,15 +70,13 @@ pub const Block = struct {
     }
 };
 
-/// One match, with every link resolved. `read_only` and `write_back` are the
-/// caller's own, because the write decision is not this file's to make.
+/// `read_only` and `write_back` are the caller's own: the write decision is
+/// not this file's to make.
 pub const Resolved = struct {
     name: []const u8,
-    /// The path under the project root, which is where the sandbox sees it.
     relative: []const u8,
-    /// The real path on the host. A mount source is opened `O_NOFOLLOW`, so a
-    /// match that is a symbolic link binds as the link and fails. This is the
-    /// path to bind.
+    /// A mount source is opened `O_NOFOLLOW`, so this is already resolved
+    /// past any symbolic link.
     host_path: []const u8,
     mode: Mode,
     is_directory: bool,
@@ -314,9 +297,7 @@ pub fn parseFrom(
     var ast_owned = true;
     defer if (ast_owned) ast.deinit(gpa);
 
-    // `parse_str_lits = true`, the same reason `limits.zig` gives: a name is
-    // read straight off `zoir.string_bytes`, and that pool is left empty when
-    // the option is false.
+    // Left false, `zoir.string_bytes` is empty and a name reads back "".
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = true });
     var zoir_owned = true;
     defer if (zoir_owned) zoir.deinit(gpa);
@@ -503,8 +484,6 @@ fn parseBind(
     };
 }
 
-/// The field name reaches the message through `Fault`'s own two members for
-/// it, so `Enum` is only ever `Mode` or `Write`.
 fn readEnum(
     comptime Enum: type,
     gpa: std.mem.Allocator,
@@ -534,9 +513,8 @@ fn readEnum(
     return error.InvalidWorkspace;
 }
 
-/// The names chock owns inside a workspace. `chock.zon` is bound read only so
-/// the agent works under rules it cannot edit, and the whole of `.git` is the
-/// backing's own.
+/// `chock.zon` is bound read only so the agent works under rules it cannot
+/// edit.
 const reserved_names = [_][]const u8{ "chock.zon", ".git" };
 
 pub fn checkName(
@@ -558,8 +536,6 @@ pub fn checkName(
     var named: usize = 0;
     while (parts.next()) |part| {
         if (std.mem.eql(u8, part, ".")) continue;
-        // A `..` anywhere leaves, whatever came before it, the same rule
-        // `deny.zig` keeps.
         if (std.mem.eql(u8, part, "..")) {
             _ = note(diag, source_name, .{ .name_leaves_project = try gpa.dupe(u8, name) });
             return error.InvalidWorkspace;
@@ -615,13 +591,8 @@ pub fn load(
     return parse(gpa, source, diag);
 }
 
-/// Turn one match into the path to bind. `relative` is the match as the caller
-/// found it under `project_root`, and `project_root` is already a real path.
-///
-/// A match can be a symbolic link, and a mount source is opened `O_NOFOLLOW`,
-/// so the link itself cannot be bound. Every link is resolved here and the
-/// resolved path is what comes back. A path that resolves outside the project
-/// is refused and named.
+/// A mount source is opened `O_NOFOLLOW`, so a symbolic link is resolved
+/// here first. A path that resolves outside the project is refused.
 pub fn resolve(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -678,8 +649,7 @@ pub fn resolve(
     };
 }
 
-/// Whether `path` is `root` or sits under it. Both are real paths, so no
-/// component of either is a link and a textual answer is the true one.
+/// Both are real paths, so a textual answer is the true one.
 pub fn under(path: []const u8, root: []const u8) bool {
     if (root.len == 0 or !std.fs.path.isAbsolute(root)) return false;
     if (!std.mem.startsWith(u8, path, root)) return false;

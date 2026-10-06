@@ -9,9 +9,6 @@ pub const SettingError = limits_mod.SettingError;
 
 pub const BytesError = SettingError || error{PercentNotAllowed};
 
-/// A percentage is refused rather than resolved, because a store object has no
-/// machine quantity to be a share of the way a process count or a memory total
-/// has.
 pub fn parseBytes(text: []const u8) BytesError!u64 {
     return switch (try parseSetting(text)) {
         .absolute => |value| value,
@@ -28,19 +25,14 @@ pub fn reasonText(reason: BytesError) []const u8 {
     };
 }
 
-/// The same number as `chock_nix.backend.default_max_object_bytes`, written
-/// twice because this library imports no other chock library.
 pub const default_max_object_bytes: u64 = 16 << 20;
 
 pub const default_max_session_bytes: u64 = 256 << 20;
 
-/// Every member is optional, so "this file named nothing" is told apart from
-/// "this file named today's default".
 pub const Nix = struct {
     max_object_bytes: ?u64 = null,
     max_session_bytes: ?u64 = null,
-    /// The attribute under `devShells.<system>` the session's tool environment
-    /// comes from. Null is `default`, which is what `nix develop` takes.
+    /// The attribute under `devShells.<system>`. Null is `default`.
     dev_shell: ?[]const u8 = null,
 };
 
@@ -49,8 +41,6 @@ pub const Resolved = struct {
     max_session_bytes: u64,
     max_object_bytes_from_org: bool = false,
     max_session_bytes_from_org: bool = false,
-    /// Null means the flake reference carries no attribute, so Nix takes
-    /// `default` itself.
     dev_shell: ?[]const u8 = null,
 };
 
@@ -63,17 +53,13 @@ pub fn foldLayers(project: Nix, operator: Nix, ceiling: ?Ceiling) Resolved {
     return underCeiling(resolved, ceiling);
 }
 
-/// Text and not a number, because `org.zig` reads the whole bundle through one
-/// `std.zon.parse.fromSliceAlloc` call and a quoted string is the one shape
-/// that reader and `chock.zon`'s own bare integer can both go through.
+/// Text and not a number: a quoted string is the one shape both the org
+/// bundle reader and `chock.zon`'s own bare integer can go through.
 pub const Ceiling = struct {
     max_object_bytes: ?[]const u8 = null,
     max_session_bytes: ?[]const u8 = null,
 };
 
-/// A minimum and never a refusal. A ceiling this build cannot parse is read as
-/// no ceiling: `org.zig` refuses a bundle whose `nix` block does not parse, so
-/// one that fails here can only have been built by hand.
 pub fn underCeiling(resolved: Resolved, ceiling: ?Ceiling) Resolved {
     const bound = ceiling orelse return resolved;
     var held = resolved;
@@ -431,8 +417,6 @@ fn loadFrom(
 
     return parseFrom(gpa, source, source_name, diag);
 }
-
-// Every test below builds its own source in the test binary.
 
 const testing = std.testing;
 

@@ -1,5 +1,4 @@
-//! Which credential a `git push` needs, read on the host. Every doubt answers
-//! `unreadable`, and the caller prompts for a password, which a person can stop.
+//! Which credential a `git push` needs; every doubt answers `unreadable`, so the caller prompts, which a person can stop.
 
 const std = @import("std");
 
@@ -74,8 +73,7 @@ fn isOneOf(needle: []const u8, list: []const []const u8) bool {
 
 /// Runs no program: some configuration values make git run one.
 pub fn remoteUrlIn(text: []const u8, name: []const u8) ?[]const u8 {
-    // `insteadOf` and `include` both change the URL git really uses, and this
-    // file cannot follow either, so a configuration with one is not read.
+    // `insteadOf` and `include` both change the URL git really uses; this file can't follow either.
     if (containsIgnoreCase(text, "insteadof")) return null;
     if (containsIgnoreCase(text, "[include")) return null;
 
@@ -156,8 +154,7 @@ pub fn credentialFor(url: []const u8) Credential {
     return .password;
 }
 
-/// Cut the path off first and the user information second. The other way round,
-/// `https://evil.example/x@github.com` reads as the host `github.com`.
+/// Cut the path first, user info second, or `https://evil.example/x@github.com` reads as `github.com`.
 pub fn hostIn(url: []const u8) ?[]const u8 {
     var rest = url;
 

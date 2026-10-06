@@ -15,8 +15,7 @@ pub const Diagnostic = union(enum) {
         fault: Fault,
     };
 
-    /// Two kinds, because this module reaches a filesystem through `std.Io`
-    /// and reaches some calls raw.
+    /// Two kinds: calls through `std.Io`, and some calls made raw.
     pub const Fault = union(enum) {
         err: anyerror,
         errno: std.posix.E,
@@ -29,13 +28,10 @@ pub const Diagnostic = union(enum) {
         }
     };
 
-    /// Four dangling diagnostics have shipped in this project, so this holds
-    /// the bytes in the value itself and cannot point at a frame that ended.
-    /// The cost is a bound on the message length, stated by `truncated`.
+    /// Holds the bytes in the value itself, since a pointer into a frame could dangle.
     pub const Said = struct {
         bytes: [max_bytes]u8 = undefined,
         len: u16 = 0,
-        /// Whether the reader said more than `max_bytes` and the rest was cut.
         truncated: bool = false,
 
         pub const max_bytes = 256;
@@ -47,8 +43,7 @@ pub const Diagnostic = union(enum) {
         pub fn of(zon_diag: *const std.zon.parse.Diagnostics) Said {
             var said: Said = .{};
             var writer = std.Io.Writer.fixed(&said.bytes);
-            // A message longer than the buffer leaves what fits, because a reader
-            // needs the first error more than the last.
+            // A message longer than the buffer keeps what fits.
             writer.print("{f}", .{zon_diag}) catch {
                 said.truncated = true;
             };
@@ -167,8 +162,7 @@ pub const Diagnostic = union(enum) {
         }
     };
 
-    /// A pointer and not a value, so the `Said` a message reads from is the
-    /// one in the caller's own slot.
+    /// Takes a pointer so a `Said` message reads from the caller's own slot.
     pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.*) {
             .call_failed => |failed| try writer.print(
@@ -210,8 +204,7 @@ pub fn noteErrno(diag: ?*?Diagnostic, call: Diagnostic.Call, errno: std.posix.E)
 const testing = std.testing;
 
 test "the first fault is kept, and a caller that wants none pays nothing" {
-    // The first, not the last. A walk of the upper layer can only fail after
-    // an earlier step already did.
+    // The first fault is kept, not the last.
     var diag: ?Diagnostic = null;
     noteErr(&diag, .upper_layer_open, error.AccessDenied);
     noteErr(&diag, .upper_layer_walk, error.FileNotFound);
@@ -223,8 +216,6 @@ test "the first fault is kept, and a caller that wants none pays nothing" {
 }
 
 test "a diagnostic names the call and the fault, and allocates nothing" {
-    // The two facts `error.Unexpected` throws away. Rendering happens at a
-    // caller, which is where the decision belongs.
     var buffer: [512]u8 = undefined;
     const opening: Diagnostic = .{ .call_failed = .{
         .call = .upper_layer_open,
@@ -245,8 +236,6 @@ test "a diagnostic names the call and the fault, and allocates nothing" {
 }
 
 test "a chock.zon fault names the file and never a block the person did not write" {
-    // `deny.zig` must parse the whole file before it can name a block, so a
-    // syntax error has no block to blame.
     var buffer: [512]u8 = undefined;
     const whole_file: Diagnostic = .{
         .chock_zon_not_valid = Diagnostic.Said.ofText("4:9: error: expected field initializer"),
@@ -266,8 +255,6 @@ test "a chock.zon fault names the file and never a block the person did not writ
 }
 
 test "a message survives the frame the reader built it in" {
-    // Four diagnostics in this project have dangled, so nothing here borrows a
-    // string out of a frame that ends.
     var diag: ?Diagnostic = null;
     fillFromAFrameThatEnds(&diag);
     std.mem.doNotOptimizeAway(dirtyTheFrame());
@@ -299,7 +286,6 @@ fn dirtyTheFrame() u64 {
 }
 
 test "a message longer than the buffer keeps its first line and says it was cut" {
-    // The bound `Said` trades for owning no memory, stated rather than hidden.
     var long: [Diagnostic.Said.max_bytes * 2]u8 = undefined;
     @memset(&long, 'x');
     @memcpy(long[0..4], "1:1:");

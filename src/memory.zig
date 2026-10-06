@@ -1,21 +1,4 @@
 //! `chock memory`: read the knowledgebase, and clear it.
-//!
-//! **Memory a user cannot inspect is memory a user cannot trust.** A note
-//! written in one session is read by every session after it, and it survives
-//! the sandbox by construction, because outliving the sandbox is what memory
-//! is for. So there has to be a way to look at what is there, and clearing it
-//! has to be one obvious step.
-//!
-//! ```
-//! chock memory            # one line per note
-//! chock memory show <name>
-//! chock memory forget <name>
-//! chock memory clear
-//! ```
-//!
-//! Nothing here starts a session, opens a sandbox, or touches the project. It
-//! reads and writes one directory of Chock's own, the same one
-//! `lib/chock-core/memory.zig` describes.
 
 const std = @import("std");
 const chock_core = @import("chock-core");
@@ -92,9 +75,6 @@ fn listNotes(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !u8 {
         tty.print(.plain, "chock memory: this project has no notes ({s})\n", .{dir});
         return Exit.finished.code();
     }
-    // A `--verbose` line. The notes are the answer; where they are kept is not
-    // a question this command was asked, and every other subcommand here takes
-    // a note name and no path.
     tty.detail("{s}\n\n", .{dir});
     for (notes) |note| {
         tty.out(.plain, "{s}  {t}  {s}\n    {s}\n", .{
@@ -103,11 +83,6 @@ fn listNotes(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !u8 {
             note.name,
             note.description,
         });
-        // **Shown here, and not only on request.** A note keeps every version
-        // that was written under its name, and a user who cannot see that a
-        // note has a history has no reason to ask for it. One extra line, and
-        // only for the notes that have one. `chock memory show <name>` prints
-        // the versions themselves, newest first.
         if (note.versions > 1) {
             tty.out(.plain, "    {d} versions, newest shown. \"chock memory show {s}\" for all\n", .{
                 note.versions,
@@ -129,14 +104,9 @@ fn showNote(arena: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const
         return Exit.usage.code();
     };
 
-    // The whole file, which is every version of this note, newest first. That
-    // is what `show` is for: the list above says a note has a history, and
-    // this is where a user reads it.
     const file = try std.fmt.allocPrint(arena, "{s}/{s}" ++ memory.extension, .{ dir, name });
     const text = std.Io.Dir.cwd().readFileAlloc(io, file, arena, .limited(memory.max_entry_bytes)) catch {
         tty.print(.err, "chock memory show: there is no note named \"{s}\"\n", .{name});
-        // Never `finished`: a command that did nothing must not report
-        // success. See `src/main.zig`'s own top comment.
         return Exit.usage.code();
     };
     tty.out(.plain, "{s}", .{text});
@@ -195,15 +165,6 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
     return options;
 }
 
-/// The project this command is about, as an absolute path.
-///
-/// **The same two calls `chock run`'s own `resolveProject` makes**, and that
-/// is not a style choice: a knowledgebase is keyed by the project's real
-/// path, so a spelling this command resolved differently would read a
-/// different directory from the one the session wrote. In particular the
-/// current directory comes from `std.process.currentPathAlloc` and never
-/// from `realPath` on the open working directory, which answers
-/// `error.FileNotFound` on this platform.
 fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]const u8 {
     if (given) |path| {
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -229,8 +190,6 @@ test "the command line names an action and at most one note" {
     try testing.expectEqualStrings("/somewhere", with_project.project.?);
     try testing.expectEqualStrings("stale", with_project.name);
 
-    // `show` and `forget` need a name, and a word this command does not know
-    // is not silently read as one.
     try testing.expectError(error.BadArguments, parseOptions(&.{"show"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{"forget"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{"delete-everything"}));

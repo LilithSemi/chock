@@ -1,16 +1,6 @@
 //! The `skills` block of a project's own `chock.zon`: directories that hold
-//! skill directories. A project that ships skills of its own says where they
-//! are here, and a project that says nothing has none.
-//!
-//! It names directories where `instructions.zig` names files, and the rest is
-//! the same: a relative path only, no `..`, and every link resolved before the
-//! answer is kept, because a repository can ship a link that reads as ordinary
-//! and points at the user's home.
-//!
-//! **The block grants nothing.** It says where to look. What an agent may do
-//! with what is found there is `skill.read.*` in the policy table, and
-//! `lib/chock-core/skills.zig` states why a skill's own `allowed-tools` is
-//! never read as a grant.
+//! skill directories. The block says only where to look; `skill.read.*` in
+//! the policy table says what an agent may do with what is found there.
 
 const std = @import("std");
 const limits_mod = @import("limits.zig");
@@ -21,8 +11,7 @@ pub const block_name = "skills";
 
 pub const max_file_bytes = 1 << 20;
 
-/// Every entry is a directory walk at session start, and a project needs one
-/// of them. More than this is a project that has spread its skills around.
+/// Every entry costs a directory walk at session start.
 pub const max_dirs: usize = 4;
 
 pub const Block = struct {
@@ -246,8 +235,7 @@ fn readDirs(
     return .{ .dirs = try out.toOwnedSlice(gpa) };
 }
 
-/// The cheap half of the check, which needs no disk. `resolve` does the half
-/// that does: a name that passes here can still be a link out of the project.
+/// The cheap half of the check. `resolve` does the half that needs disk.
 fn checkPath(
     gpa: std.mem.Allocator,
     text: []const u8,
@@ -305,8 +293,7 @@ pub fn load(
     return parse(gpa, source, diag);
 }
 
-/// The directory on disk, with every link resolved and the answer held inside
-/// the project. The caller owns the result.
+/// The directory on disk, with every link resolved. The caller owns the result.
 pub fn resolve(
     gpa: std.mem.Allocator,
     io: std.Io,

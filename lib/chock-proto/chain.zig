@@ -96,7 +96,6 @@ pub const Verifier = struct {
         self.previous_id = id;
     }
 
-    /// A break beats every other ending.
     pub fn finish(self: Verifier, ending: Ending, at: u64) Report {
         if (self.found_break) return .{
             .verdict = .broken,

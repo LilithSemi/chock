@@ -1,29 +1,4 @@
 //! `chock usage`: what a session cost.
-//!
-//! The same shape `src/cache.zig`, `src/memory.zig` and `src/workspace.zig`
-//! have, and deliberately not a fourth shape: a user who has learned one of
-//! these commands has learned all four. Nothing here starts a session, opens a
-//! sandbox, or touches the project.
-//!
-//! ## A provider that cannot report a cost is an ordinary answer here
-//!
-//! A capability has more than two states, and `unsupported` is a fact about the
-//! provider that is known before the first request. What that means for the
-//! cost is this: **a provider with no usage capability reports its cost as
-//! unknown, and it does not need a case of its own.** Every turn of such a
-//! session carries an `unknown` cost, so it reaches this command as unknown,
-//! and the report says so plainly and names the models. That is not an error,
-//! it is not an empty report, and it is never an invented number.
-//!
-//! ## What this command is not
-//!
-//! **It does not reconcile against a provider's own analytics, and if that is
-//! ever added here it reconciles and never enforces.** ai&'s analytics API is
-//! rate limited and cached for 120 seconds, and a cap checked against a number
-//! that can be two minutes stale is not a cap. Enforcement stays on the running
-//! total the loop folds from each turn's own cost, which is exact and
-//! immediate, and any reconciliation stays behind a command and off the turn
-//! path.
 
 const std = @import("std");
 const chock_proto = @import("chock-proto");
@@ -35,9 +10,6 @@ const tty = @import("tty.zig");
 const state = chock_proto.state;
 const event = chock_proto.event;
 
-/// What a session log is called: the session identifier, then this. Read from
-/// `session.zig`'s own layout, which is the file that builds the name in the
-/// first place.
 const log_suffix = ".jsonl";
 
 const usage_text =
@@ -98,70 +70,30 @@ pub fn main(
     };
 }
 
-/// What one model spent inside one session. A session mixes models across
-/// turns, so a total that does not say which model spent what cannot be
-/// checked, and the `usage` event carries the model name for that.
 pub const ByModel = struct {
-    /// The model as it went on the wire. Empty for a turn whose event named
-    /// none, which is what a log written before the loop stamped the model
-    /// holds.
     model: []const u8,
     spend: state.Spend = .{},
-    /// Which price table produced the money in `spend`, from the first turn
-    /// that named one. Empty when the provider reported the numbers itself, or
-    /// when nothing here was priced. A wrong price is then a fact somebody can
-    /// find rather than a number nobody can explain.
     price_table_version: []const u8 = "",
 };
 
-/// What one session spent, folded from the `usage` events its own log holds.
 pub const Spent = struct {
-    /// The session identifier, which is the log's own name without its
-    /// suffix.
     id: []const u8,
     spend: state.Spend = .{},
-    /// One entry per model this session used, in the order each was first
-    /// seen.
     models: []const ByModel = &.{},
-    /// False when the log could not be read all the way to its end: a torn
-    /// tail from a crash mid write, or a line that would not decode. **The
-    /// numbers are then a floor and not a total**, and the report says so,
-    /// because a short answer that looks whole is worse than no answer.
+    // False when the log could not be read to its end: the numbers above are then a floor and not a total.
     complete: bool = true,
 };
 
-/// How the money of a `Spend` reads. Six answers and no fewer: the three
-/// states of `Cost`, a session that mixed them, a session nobody measured at
-/// all, and a session whose turns disagreed about the currency.
-///
-/// **`free` and `unknown` are two members and never one.** That is the whole
-/// point of the three state cost, carried up to the place a person reads it.
 pub const Verdict = enum {
-    /// The log holds no `usage` event at all. A session that was started and
-    /// never got a reply looks like this, and it is not a session that cost
-    /// nothing.
     nothing,
-    /// Every turn was free. A measured fact, and a session that can run under
-    /// a cap without trouble.
     free,
-    /// Every turn that was not free had a price, so the money is the whole
-    /// cost.
     priced,
-    /// Some turns were priced or free and at least one was not. The money
-    /// below is real and it is not the total.
     partly_unknown,
-    /// No turn had a price. **Never a zero**: this is what a provider whose
-    /// usage capability is `unsupported` gives, and what a model the price
-    /// table has never heard of gives.
+    // Never a zero: this is what a provider with no usage capability gives, or a model the price table has never heard of.
     unknown,
-    /// Turns reported money in two currencies, so adding them gives a number
-    /// in no currency at all.
     mixed_currency,
 };
 
-/// How the money of `spend` reads. Checked in this order on purpose: a mixed
-/// currency makes `amount` meaningless whatever else is true, and an unknown
-/// turn makes it incomplete whatever else is true.
 pub fn verdictOf(spend: state.Spend) Verdict {
     if (spend.turns == 0) return .nothing;
     if (spend.mixed_currency) return .mixed_currency;
@@ -171,20 +103,10 @@ pub fn verdictOf(spend: state.Spend) Verdict {
     return .priced;
 }
 
-/// "turn" for one and "turns" for any other count. A report a person reads
-/// says "1 turn", and a line that says "1 turns" reads as a program talking.
 fn turnWord(count: u64) []const u8 {
     return if (count == 1) "turn" else "turns";
 }
 
-/// The money in `spend`, with the currency it is in. Caller owns the result.
-///
-/// **A figure with no currency beside it is not money**, and this is not a
-/// hypothetical: ai& sends `X-Cost` and `X-Cost-Currency` apart, so a reply
-/// that carried the first and not the second reaches the log as a value with
-/// an empty currency. Sessions of this project hold such events today. Printed
-/// as a bare number, that reads as dollars to anyone who assumes dollars, so
-/// the number is printed with the fact that nobody named its unit.
 fn moneyText(allocator: std.mem.Allocator, spend: state.Spend) std.mem.Allocator.Error![]u8 {
     if (spend.currency.len == 0) {
         return std.fmt.allocPrint(
@@ -196,12 +118,6 @@ fn moneyText(allocator: std.mem.Allocator, spend: state.Spend) std.mem.Allocator
     return std.fmt.allocPrint(allocator, "{d:.4} {s}", .{ spend.amount, spend.currency });
 }
 
-/// The money of `spend` as one phrase, for a line a person reads. Caller owns
-/// the result.
-///
-/// **A verdict that carries no number prints no number.** Not "0.00", and not
-/// an empty column that a reader fills in with zero: the words say which of
-/// the three states this is.
 pub fn costText(allocator: std.mem.Allocator, spend: state.Spend) std.mem.Allocator.Error![]u8 {
     return switch (verdictOf(spend)) {
         .nothing => allocator.dupe(u8, "no turn recorded"),
@@ -221,16 +137,6 @@ pub fn costText(allocator: std.mem.Allocator, spend: state.Spend) std.mem.Alloca
     };
 }
 
-/// Every session of `dir`, oldest first, with what each one spent. Caller owns
-/// the slice and every string in it, which for a real caller is an arena.
-///
-/// **Oldest first**, because a session identifier starts with its own
-/// timestamp: see `session.zig`'s own `newId`. The list a user reads is then
-/// in the order the sessions ran.
-///
-/// A session directory that cannot be read at all answers an empty list. A
-/// project that never ran a session has no such directory, and that is an
-/// ordinary state rather than a fault.
 pub fn list(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -245,8 +151,6 @@ pub fn list(
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, log_suffix)) continue;
         const stem = entry.name[0 .. entry.name.len - log_suffix.len];
-        // A name this build did not write is never turned into a path: the
-        // same rule `session.zig` keeps, and the reason `isValidId` exists.
         if (!session_paths.isValidId(stem)) continue;
 
         const spent = try fold(allocator, io, dir, stem) orelse continue;
@@ -262,14 +166,6 @@ fn olderFirst(_: void, a: Spent, b: Spent) bool {
     return std.mem.order(u8, a.id, b.id) == .lt;
 }
 
-/// Fold every `usage` event of one session's log. Null when this project has
-/// no session of that identifier.
-///
-/// **The file is checked before the log is opened, and that is not a
-/// nicety.** `chock_proto.log.Log.open` creates the file and writes a header
-/// into it when there is none, which is right for `chock run` and wrong for a
-/// command that only reads: asking about a session that never existed would
-/// otherwise bring one into being, empty, and report that it cost nothing.
 pub fn fold(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -296,25 +192,15 @@ pub fn fold(
 
     while (true) {
         const parsed = replay.next(io) catch {
-            // A line that will not decode stops the fold here. Everything
-            // before it is real, and `complete` is what stops the caller
-            // reading a floor as a total.
             spent.complete = false;
             break;
         } orelse {
-            // A torn tail is a crash mid write, not a clean end of log, and
-            // an event may have gone with it.
             if (replay.truncated()) spent.complete = false;
             break;
         };
         defer parsed.deinit();
         if (parsed.value.event != .usage) continue;
 
-        // The currency, the model name and the table version are borrowed
-        // from the envelope, which is released at the end of this loop body,
-        // so each is copied into the caller's allocator first. `Spend.add`
-        // keeps the currency it is given, exactly as `state.Session.apply`
-        // does, and for the same reason.
         var turn = parsed.value.event.usage;
         if (turn.cost == .known) turn.cost = .{ .known = .{
             .value = turn.cost.known.value,
@@ -334,9 +220,6 @@ pub fn fold(
     return spent;
 }
 
-/// The row for `model`, added at the end when this is the first turn to name
-/// it. The returned pointer is used before anything else is appended, so no
-/// later growth of the list can move the row out from under it.
 fn modelRow(
     allocator: std.mem.Allocator,
     models: *std.ArrayList(ByModel),
@@ -349,9 +232,6 @@ fn modelRow(
     return &models.items[models.items.len - 1];
 }
 
-/// What every session in `sessions` spent together. The currency rule is
-/// `state.Spend.merge`'s, so a project whose sessions were billed in two
-/// currencies gets a total that says it is not one.
 pub fn totalOf(sessions: []const Spent) state.Spend {
     var total = state.Spend{};
     for (sessions) |one| total.merge(one.spend);
@@ -365,8 +245,6 @@ fn listSessions(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !u8 {
         return Exit.finished.code();
     }
 
-    // A `--verbose` line. Where the logs are kept answers no question about
-    // what the sessions cost.
     tty.detail("{s}\n\n", .{dir});
     for (sessions) |one| {
         tty.out(.plain, "{s}  {d:>4} turns  {d:>9} in  {d:>8} out  {s}{s}\n", .{
@@ -406,13 +284,9 @@ fn showSession(arena: std.mem.Allocator, io: std.Io, dir: []const u8, id: []cons
 
     const spent = try fold(arena, io, dir, id) orelse {
         tty.print(.err, "chock usage show: this project has no session {s} ({s})\n", .{ id, dir });
-        // Never `finished`: a command that did nothing must not report
-        // success. See `src/main.zig`'s own top comment.
         return Exit.usage.code();
     };
 
-    // The identifier is the answer's heading. The log path under it is a
-    // `--verbose` line: `tty.options_text` names the log path as exactly that.
     tty.out(.plain, "{s}\n", .{spent.id});
     tty.detail("{s}/{s}{s}\n", .{ dir, spent.id, log_suffix });
     tty.out(.plain, "\n", .{});
@@ -423,9 +297,6 @@ fn showSession(arena: std.mem.Allocator, io: std.Io, dir: []const u8, id: []cons
             turnWord(row.spend.turns),
             try costText(arena, row.spend),
         });
-        // Which table produced the money above, so a wrong price is a fact
-        // somebody can find rather than a number nobody can explain. The
-        // version is recorded, and this is where a person reads it.
         if (row.price_table_version.len != 0) {
             tty.out(.plain, "    priced by table {s}\n", .{row.price_table_version});
         }
@@ -452,11 +323,6 @@ fn showSession(arena: std.mem.Allocator, io: std.Io, dir: []const u8, id: []cons
     return Exit.finished.code();
 }
 
-/// The one sentence a number that is not a total needs beside it.
-///
-/// **Printed for the unknown cases and for nothing else.** A caveat under
-/// every report is a caveat nobody reads, and the cases that carry a real
-/// total do not need one.
 fn printCaveat(spend: state.Spend) void {
     switch (verdictOf(spend)) {
         .unknown, .partly_unknown => tty.print(.warn,
@@ -509,11 +375,6 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
     return options;
 }
 
-/// The project this command is about, as an absolute path. **The same call
-/// `chock run`, `chock cache`, `chock memory` and `chock workspace` make**,
-/// for the same reason: a session directory is keyed by the project's real
-/// path, so a spelling this command resolved differently would read a
-/// different directory from the one the session wrote.
 fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]const u8 {
     if (given) |path| {
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -539,8 +400,6 @@ test "the command line names an action and at most one session" {
     try testing.expectEqualStrings("/somewhere", with_project.project.?);
     try testing.expectEqualStrings("01JQ" ++ "B" ** 22, with_project.session);
 
-    // `show` needs a session, and a word this command does not know is never
-    // read as one.
     try testing.expectError(error.BadArguments, parseOptions(&.{"show"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{"total"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "show", "a", "b" }));
@@ -548,9 +407,6 @@ test "the command line names an action and at most one session" {
     try testing.expectError(error.HelpWanted, parseOptions(&.{"--help"}));
 }
 
-/// A session directory holding one log per identifier, each carrying the usage
-/// events it was given. This is what makes the tests below assert numbers: the
-/// events go in by hand, so what comes out is checkable to the token.
 fn makeLog(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -586,10 +442,6 @@ fn scratchDir(arena: std.mem.Allocator, tmp: *testing.TmpDir, leaf: []const u8) 
 }
 
 test "a free session and an unpriced session are two different answers, and neither is a number" {
-    // The fault the three state cost exists to stop, carried all the way to
-    // what a person reads. Both of these have an `amount` of zero. A report
-    // that printed the amount would show "0.0000 USD" for both, and a user
-    // would read the second one as a session that cost nothing.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -628,9 +480,6 @@ test "a free session and an unpriced session are two different answers, and neit
     try testing.expect(!std.mem.eql(u8, free_text, unknown_text));
     try testing.expectEqualStrings("free", free_text);
 
-    // And the unpriced one carries no figure at all: not "0", not "0.0000".
-    // A digit in that sentence is a number a reader can mistake for a total,
-    // except the turn count, which is a count and not money.
     try testing.expect(std.mem.indexOf(u8, unknown_text, "0.0000") == null);
     try testing.expect(std.mem.indexOf(u8, unknown_text, "not known") != null);
     try testing.expectEqualStrings("cost not known, for all 1 turn", unknown_text);
@@ -663,8 +512,6 @@ test "a priced session reports the money the log holds, model by model" {
             .price_table_version = "2026-08-21",
             .cost = .{ .known = .{ .value = 0.75, .currency = "USD" } },
         },
-        // A second model, free, in the same session. A session may mix models,
-        // and a total that cannot say which model spent what cannot be checked.
         .{ .input_tokens = 50, .model = "qwen3", .cost = .free },
     });
 
@@ -679,8 +526,6 @@ test "a priced session reports the money the log holds, model by model" {
     try testing.expectEqual(@as(u64, 900), spent.spend.cache_read_input_tokens);
     try testing.expectApproxEqAbs(@as(f64, 1.00), spent.spend.amount, 1e-12);
     try testing.expectEqualStrings("USD", spent.spend.currency);
-    // A free turn beside two priced ones does not make the session unpriced,
-    // and the money is still the whole cost.
     try testing.expectEqual(Verdict.priced, verdictOf(spent.spend));
     try testing.expect(spent.spend.enforceable());
     try testing.expectEqualStrings("1.0000 USD", try costText(arena, spent.spend));
@@ -697,9 +542,6 @@ test "a priced session reports the money the log holds, model by model" {
 }
 
 test "one unpriced turn among priced ones leaves the money real and the total incomplete" {
-    // The case a report is most likely to get wrong: there is a figure, and it
-    // is not the cost of the session. This is the same class of fault as a
-    // policy resolving an unnamed action to allow.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -720,9 +562,6 @@ test "one unpriced turn among priced ones leaves the money real and the total in
     try testing.expectEqual(@as(u64, 1), spent.spend.unpriced_turns);
     try testing.expect(!spent.spend.enforceable());
 
-    // The figure is printed, and the sentence beside it says it is not the
-    // whole cost. A report that printed "0.5000 USD" alone would be read as
-    // the cost of the session.
     const text = try costText(arena, spent.spend);
     try testing.expectEqualStrings("0.5000 USD, and 1 turn whose cost is not known", text);
 }
@@ -749,7 +588,6 @@ test "two sessions billed in different currencies give no total, rather than a w
     try testing.expectEqual(@as(usize, 2), sessions.len);
     try testing.expectEqualStrings(dollars, sessions[0].id);
     try testing.expectEqualStrings(euros, sessions[1].id);
-    // Each session on its own is a real total.
     try testing.expectEqual(Verdict.priced, verdictOf(sessions[0].spend));
     try testing.expectEqual(Verdict.priced, verdictOf(sessions[1].spend));
 
@@ -757,16 +595,12 @@ test "two sessions billed in different currencies give no total, rather than a w
     try testing.expectEqual(@as(u64, 2), total.turns);
     try testing.expectEqual(Verdict.mixed_currency, verdictOf(total));
     try testing.expect(!total.enforceable());
-    // 1.25 and 2.00 are not 3.25 of anything, and the report says so instead
-    // of printing that number.
     const text = try costText(arena, total);
     try testing.expect(std.mem.indexOf(u8, text, "3.25") == null);
     try testing.expect(std.mem.indexOf(u8, text, "two currencies") != null);
 }
 
 test "a session that got no reply is told apart from one that cost nothing" {
-    // A log with a start and no usage event at all. Reading that as free
-    // would be the same mistake as reading unknown as zero, one level up.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -804,12 +638,6 @@ test "asking about a session that never ran makes no log and does not report suc
         std.Io.Dir.cwd().statFile(testing.io, path, .{}),
     );
 
-    // And the command says so rather than exiting 0: a command that did
-    // nothing must not report success. See `src/main.zig`'s own top comment.
-    //
-    // **Each refusal names what was asked for**, and each is captured rather
-    // than let through to the test binary's own standard error: see
-    // `tty.Capture`, and `test/proto/lock.zig`.
     var said: tty.Capture = undefined;
     said.start(testing.io, testing.allocator);
     defer said.stop(testing.io);
@@ -818,10 +646,6 @@ test "asking about a session that never ran makes no log and does not report suc
     try testing.expect(std.mem.indexOf(u8, said.err(), never) != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), dir) != null);
 
-    // **A path that is not a session identifier is refused as that**, and the
-    // words it is refused with must not be the words for a session that is
-    // simply not there: one is a mistake to correct and the other is a fact
-    // about this project.
     said.clear();
     try testing.expect((try showSession(arena, testing.io, dir, "../../etc/passwd")) != Exit.finished.code());
     try testing.expect(std.mem.indexOf(u8, said.err(), "not a session identifier") != null);
@@ -829,13 +653,10 @@ test "asking about a session that never ran makes no log and does not report suc
     said.clear();
     try testing.expect((try showSession(arena, testing.io, dir, "")) != Exit.finished.code());
     try testing.expect(said.err().len != 0);
-    // Every one of them is a diagnostic, so none reached the rows a pipe reads.
     try testing.expectEqualStrings("", said.out());
 }
 
 test "a project that never ran a session lists nothing rather than failing" {
-    // An ordinary state, not a fault: the session directory is only made when
-    // a session runs.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -851,16 +672,10 @@ test "a project that never ran a session lists nothing rather than failing" {
     const sessions = try list(arena, testing.io, missing);
     try testing.expectEqual(@as(usize, 0), sessions.len);
     try testing.expectEqual(Exit.finished.code(), try listSessions(arena, testing.io, missing));
-    // **It names the directory it found nothing in.** A person who ran Chock in
-    // the wrong project reads the same words as a person whose project is
-    // genuinely new, unless the path is on the line.
     try testing.expect(std.mem.indexOf(u8, said.err(), missing) != null);
 }
 
 test "only a session log is read, and a file that is not one is left alone" {
-    // A session directory also holds a workspace and a sandbox root, and it
-    // can hold a file no build of Chock wrote. None of those is a session,
-    // and folding one would put a made up row in the report.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -893,11 +708,8 @@ test "only a session log is read, and a file that is not one is left alone" {
     try testing.expectApproxEqAbs(@as(f64, 0.10), totalOf(sessions).amount, 1e-12);
 }
 
+// Not hypothetical: ai& sends X-Cost and X-Cost-Currency apart, so a bare printed number would read as dollars to anyone who assumes dollars.
 test "a cost the provider gave no currency for is not printed as a bare number" {
-    // Measured, not hypothetical. ai& sends `X-Cost` and `X-Cost-Currency`
-    // apart, and this project's own session logs hold `usage` events reading
-    // {"known":{"value":0.00021565,"currency":""}}. A report that printed
-    // "0.0002" alone reads as dollars to anybody who assumes dollars.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -918,16 +730,11 @@ test "a cost the provider gave no currency for is not printed as a bare number" 
 
     const text = try costText(arena, spent.spend);
     try testing.expectEqualStrings("0.0002, in a currency the provider did not name", text);
-    // The number is still there, so nothing is hidden, and it is not left
-    // standing on its own where a reader supplies the unit.
     try testing.expect(std.mem.indexOf(u8, text, "0.0002") != null);
     try testing.expect(!std.mem.endsWith(u8, text, "0.0002"));
 }
 
 test "every verdict has its own words, so no two states read alike" {
-    // Six states and six sentences. Two that read the same would put a user
-    // back where the three state cost started: unable to tell a measured zero
-    // from an absence.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

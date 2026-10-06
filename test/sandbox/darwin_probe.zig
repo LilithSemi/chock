@@ -1,13 +1,6 @@
-//! The program `test/sandbox/darwin_escape.zig` drives. Every operation really
-//! tries the thing its name says, in a real sandbox on a real Mac, and reports
-//! what the kernel answered. Nothing here reads a profile.
-//!
-//! Exit codes:
-//!
-//! * 0: the operation succeeded.
-//! * 1: the kernel refused it.
-//! * 2: the operation could not be done at all, so it says nothing.
-//! * 20 and above: a fault outside the sandbox, in this program's own setup.
+//! The program `test/sandbox/darwin_escape.zig` drives. Every operation tries
+//! the thing its name says, in a real sandbox on a real Mac, and reports the
+//! kernel's answer as an exit status.
 
 const std = @import("std");
 const sandbox = @import("chock-sandbox");
@@ -29,8 +22,7 @@ const outer_fault: u8 = 20;
 const spawn_refused: u8 = 21;
 const inner_missing: u8 = 22;
 const not_cancelled: u8 = 23;
-/// Inside a `nix build` the builder already holds a Seatbelt profile, so
-/// `sandbox_init` refuses and every operation here answers this.
+/// Inside a `nix build` the builder already holds a Seatbelt profile, so `sandbox_init` refuses with this.
 const profile_refused: u8 = 24;
 const not_expressible: u8 = 25;
 const profile_unbuildable: u8 = 26;
@@ -68,8 +60,7 @@ fn join(arena: std.mem.Allocator, root: []const u8, rest: []const u8) []const u8
     return std.fs.path.join(arena, &.{ root, rest }) catch @panic("out of memory");
 }
 
-/// A name a sandbox denies answers `BOOTSTRAP_NOT_PRIVILEGED` (1100), not
-/// `BOOTSTRAP_UNKNOWN_SERVICE` (1102), so a refusal is never a missing name.
+/// A name a sandbox denies answers `BOOTSTRAP_NOT_PRIVILEGED`, not `BOOTSTRAP_UNKNOWN_SERVICE`.
 fn machLookup(name: []const u8) u8 {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     var port: mach_port_t = 0;
@@ -77,8 +68,7 @@ fn machLookup(name: []const u8) u8 {
     return if (kr == 0) succeeded else refused;
 }
 
-/// `Sandbox.Config` carries no field for `Options.mach_services`, so nothing
-/// public can widen the list. The profile text is typed out by hand.
+/// `Sandbox.Config` carries no field to widen the Mach service list, so the profile text is typed out by hand.
 fn widenedMachLookup(granted: []const u8, target: []const u8) u8 {
     var buffer: [1024]u8 = undefined;
     const profile = std.fmt.bufPrintZ(
@@ -97,8 +87,7 @@ fn sleepStep() void {
     _ = std.c.nanosleep(&step, null);
 }
 
-/// argv[0] is relative, because build.zig hands the test a path under
-/// `.zig-cache`, and a relative path in a sandbox rule matches nothing.
+/// argv[0] is relative, since build.zig hands the test a path under `.zig-cache`.
 fn resolve(arena: std.mem.Allocator, path: []const u8) []const u8 {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const fd = openRead(path);
@@ -241,8 +230,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
 
     if (std.mem.eql(u8, op, "in-inherited-fd")) {
-        // Descriptor 3 is a file the outer call opened outside the sandbox. If the
-        // driver closed it, this is EBADF.
+        // Descriptor 3 is a file the outer call opened outside the sandbox.
         return if (readsBack(3)) succeeded else refused;
     }
 
@@ -271,8 +259,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         );
         if (fd < 0) return no_answer;
         defer _ = std.c.close(fd);
-        // A write past `RLIMIT_FSIZE` raises SIGXFSZ as well as answering EFBIG, and
-        // the signal must not end this process before it reports.
+        // A write past `RLIMIT_FSIZE` raises SIGXFSZ, which must not end this process before it reports.
         var ignore: std.c.Sigaction = undefined;
         @memset(std.mem.asBytes(&ignore), 0);
         ignore.handler = .{ .handler = std.c.SIG.IGN };

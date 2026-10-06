@@ -1,6 +1,5 @@
-//! Which providers and which models a session may use, as rows on the table
-//! that already exists. Read as a ceiling, so a row nobody wrote answers
-//! `allow` and a project that never heard of these names is unchanged.
+//! Which providers and which models a session may use, as rows on the
+//! policy table, read as a ceiling.
 
 const std = @import("std");
 const table = @import("table.zig");
@@ -9,8 +8,6 @@ pub const namespace = "provider";
 
 pub const max_instance_bytes = 128;
 
-/// Longer than a model id is today, and bounded because it arrives from
-/// `--model` and from a configuration file.
 pub const max_model_bytes = 128;
 
 pub const max_row_bytes = namespace.len + 1 + max_instance_bytes + 1 + max_model_bytes;
@@ -18,14 +15,9 @@ pub const max_row_bytes = namespace.len + 1 + max_instance_bytes + 1 + max_model
 pub const Error = error{
     NameIsEmpty,
     NameTooLong,
-    /// A byte that would make the row read as a pattern rather than as a name:
-    /// `*`, or a NUL.
     NameMalformed,
 };
 
-/// One buffer and two slices of it, because the instance row is a prefix of the
-/// model row. No allocation, so a caller that picks a model before a session
-/// exists needs no allocator.
 pub const Rows = struct {
     buffer: [max_row_bytes]u8,
     instance_len: usize,
@@ -40,15 +32,8 @@ pub const Rows = struct {
     }
 };
 
-/// A model id holds a dot often enough that it is the ordinary case. An
-/// instance name may hold one too, and then a row can be read two ways, as that
-/// instance or as a model at a shorter one. That can only narrow, because every
-/// row is one more term of a minimum.
-/// Two things these names cannot say. "Any instance, this model" is not
-/// expressible, because a pattern is a prefix and a `.*` with no wildcard in
-/// the middle. And the instance name is the user's own, so it is no barrier
-/// against a user who edits their own configuration: it binds the project, the
-/// agent and every subagent, and the credential is still what the hub checks.
+/// Reading both rows can only narrow: "any instance, this model" is not
+/// expressible, since a pattern is a prefix with no wildcard in the middle.
 pub fn rowsFor(instance_name: []const u8, model_id: []const u8) Error!Rows {
     try checkName(instance_name);
     try checkName(model_id);
@@ -82,14 +67,10 @@ fn copyInto(out: []u8, text: []const u8) usize {
 pub const Ask = struct {
     chain: []const []const u8,
     agent_kind: []const u8,
-    /// The alias, and not the model id in `rows`: the alias says who is asking
-    /// and the id says what is being asked for, and a rule can name either.
+    /// The alias, not the model id in `rows`. A rule can name either.
     model_alias: []const u8,
 };
 
-/// No tool asks this question, because a session picks its provider before the
-/// first turn. A name rather than an empty string, because `table.Key` allows
-/// no empty part.
 pub const tool_name = "session";
 
 pub fn ceiling(
@@ -113,8 +94,6 @@ pub fn ceiling(
     return on_instance.intersect(on_model);
 }
 
-/// Only `allow` permits. A verb rather than a comparison each caller writes, so
-/// a sixth `Decision` cannot be added without this one place naming it.
 pub fn refusalNeeded(decision: table.Decision) bool {
     return switch (decision) {
         .allow => false,

@@ -34,13 +34,11 @@ pub const Workspace = struct {
     kind: event.WorkspaceKind,
     attempt: []const u8,
     path: []const u8,
-    /// Empty for the overlay kind. Never treat that empty string as a commit.
+    /// Empty for overlay; never read that as a commit.
     base_commit: []const u8,
 };
 
-/// A cap is enforced against this and only against this: ai&'s analytics API is
-/// rate limited and cached for 120 seconds, so a cap checked against it is not
-/// a cap.
+/// Enforce caps against this only: ai&'s analytics API is rate limited and cached for 120 seconds.
 pub const Spend = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
@@ -53,8 +51,7 @@ pub const Spend = struct {
     unpriced_turns: u64 = 0,
     /// Apart from `unpriced_turns`: free and unknown are different facts.
     free_turns: u64 = 0,
-    /// Two currencies add up to a number in no currency at all, so the total
-    /// stops being enforceable rather than quietly becoming wrong.
+    /// Mixed currencies sum to nothing real, so this stops being enforceable instead of silently wrong.
     mixed_currency: bool = false,
 
     pub fn enforceable(self: Spend) bool {
@@ -81,13 +78,12 @@ pub const Spend = struct {
         }
     }
 
-    /// Saturating, so numbers that do not add up give a wrong answer, no panic.
+    /// Saturating: a mismatch gives a wrong number, never a panic.
     pub fn pricedTurns(self: Spend) u64 {
         return self.turns -| self.free_turns -| self.unpriced_turns;
     }
 
-    /// `currency` is borrowed from `other`: a caller that keeps the result must
-    /// keep that string alive too.
+    /// `currency` is borrowed from `other`; keep it alive if you keep the result.
     pub fn merge(self: *Spend, other: Spend) void {
         self.turns += other.turns;
         self.input_tokens += other.input_tokens;
@@ -108,9 +104,7 @@ pub const Spend = struct {
     }
 };
 
-/// Nothing is ever removed from this list. A step is merged in by identifier,
-/// so an agent that stops naming a step does not make it disappear: the only
-/// way off the list is `PlanStatus.abandoned`.
+/// Never removed; merged by identifier, so only `PlanStatus.abandoned` takes a step off.
 pub const Plan = struct {
     pub const Step = struct {
         id: []const u8,
@@ -189,15 +183,11 @@ pub const Plan = struct {
     }
 };
 
-/// Nothing is ever removed from this list, and no event can remove one. The
-/// ceiling for an act is the narrowest promise that covers it, so a list that
-/// only grows can only narrow.
+/// Append only: the ceiling is the narrowest promise covering an act, so growth only narrows.
 pub const SelfPolicy = struct {
     restrictions: std.ArrayList(event.SelfRestriction) = .empty,
 
-    /// An authorised update replaces by exact name, every other one appends. An
-    /// agent cannot write that flag: `chock_core.Loop` sets it only after a
-    /// broker outside the agent's reach permitted the widening.
+    /// Authorised replaces by name, others append; only `chock_core.Loop` sets that flag, after an outside broker permits it.
     pub fn apply(
         self: *SelfPolicy,
         allocator: std.mem.Allocator,
@@ -227,16 +217,12 @@ pub const SelfPolicy = struct {
     }
 };
 
-/// A memory of an answer, never a permission of its own. The type cannot
-/// enforce that a grant never outlives a narrowing, and it cannot detect one:
-/// `apply` folds `approval.response` events only.
+/// A memory of an answer, not a permission; can't detect a narrowing outliving a grant, since `apply` folds only `approval.response`.
 pub const SessionGrants = struct {
     granted: std.StringHashMapUnmanaged(void) = .empty,
 
-    /// The match is exact equality, never an `else`: a decision this fold does
-    /// not recognise must not fall through into a grant. `request_id` zero is
-    /// refused too, because a response the table answered on its own carries
-    /// zero, and so does the record of a grant that served an act.
+    /// Exact match, never an `else`: an unrecognised decision must not fall
+    /// into a grant. Zero `request_id` is refused too, since self-answers carry zero too.
     pub fn apply(
         self: *SessionGrants,
         allocator: std.mem.Allocator,
@@ -249,18 +235,14 @@ pub const SessionGrants = struct {
         try self.granted.put(allocator, owned, {});
     }
 
-    /// `fresh_decision_is_ask` must be true only when the table's answer for
-    /// this same action was exactly `ask`. The caller proves it with a flag
-    /// because `chock_proto` cannot import `chock_policy`.
+    /// True only when the table's fresh answer was exactly `ask`; a flag, since `chock_proto` can't import `chock_policy`.
     pub fn get(self: SessionGrants, action: []const u8, fresh_decision_is_ask: bool) ?bool {
         if (!fresh_decision_is_ask) return null;
         if (self.granted.contains(action)) return true;
         return null;
     }
 
-    /// Only a ceiling stricter than `ask` invalidates: a grant given while the
-    /// table said `ask` still answers a fresh `ask`. An `unknown` ceiling is
-    /// read the narrowest way there is, so it invalidates.
+    /// Only stricter-than-`ask` invalidates; a grant under `ask` still answers a fresh `ask`. `unknown` reads narrowest, so it invalidates.
     pub fn invalidate(
         self: *SessionGrants,
         allocator: std.mem.Allocator,
@@ -308,9 +290,7 @@ pub const Session = struct {
 
     children: std.ArrayList(Child) = .empty,
 
-    /// A process that takes a session over reads the log and nothing else. A
-    /// new owner that read `HEAD` again would compare the work against a
-    /// commit the session made itself.
+    /// A process that takes a session over reads the log and nothing else.
     workspace: ?Workspace = null,
 
     plan: Plan = .{},
@@ -349,8 +329,7 @@ pub const Session = struct {
                 try self.children.append(allocator, try childFrom(allocator, spawn));
             },
             .workspace_open => |opened| {
-                // The last one wins. Keeping the first would send the next
-                // owner to a path an earlier attempt removed.
+                // The last one wins; the first could point at a path an earlier attempt removed.
                 self.workspace = .{
                     .kind = try dupeWorkspaceKind(allocator, opened.kind),
                     .attempt = try allocator.dupe(u8, opened.attempt),
@@ -390,8 +369,7 @@ pub const Session = struct {
         }
     }
 
-    /// A summary entry is always added, even when the range holds no context
-    /// entry, so a reader can see that the compaction ran.
+    /// Always adds a summary, even for an empty range.
     fn applyCompaction(
         self: *Session,
         allocator: std.mem.Allocator,
@@ -444,8 +422,7 @@ fn ownedUsage(allocator: std.mem.Allocator, usage: event.Usage) std.mem.Allocato
     return owned;
 }
 
-/// This holds no `context` field and must never grow one: a caller that writes
-/// `.context` then gets a compile error rather than a stale value.
+/// No `context` field, and must never grow one: writing `.context` should fail to compile, not go stale.
 pub const PolicyFold = struct {
     arena: std.heap.ArenaAllocator,
 
@@ -479,9 +456,7 @@ pub const PolicyFold = struct {
     }
 };
 
-/// `from_id`, because the ids of `context` must stay in ascending order. With
-/// `through_id` the summary carried an id larger than the entries a tail kept,
-/// so the next compaction folded nothing and the context went on growing.
+/// `from_id`: context ids must stay ascending; `through_id` sits past the kept tail, so the next compaction would fold nothing.
 fn summaryEntry(allocator: std.mem.Allocator, compaction: event.Compaction) std.mem.Allocator.Error!ContextEntry {
     return .{
         .id = compaction.from_id,
@@ -1124,8 +1099,7 @@ test "a grant for the rest of the session survives a resume, because it is folde
 }
 
 test "the overlay is read only where a question was actually asked" {
-    // `request_id` is zero when the table decided on its own, so no question
-    // was written and nobody could have answered one.
+    // `request_id` is zero when the table decided on its own, with no question to answer.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1270,8 +1244,7 @@ test "a ceiling of ask or wider never clears a grant" {
 }
 
 test "get returns the grant only where the fresh decision is exactly ask" {
-    // `Broker.request` routes both `.ask` and `.agent_then_human` through
-    // `askTheHuman`, so a caller must prove which one it had.
+    // `Broker.request` routes both `.ask` and `.agent_then_human` through `askTheHuman`.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();

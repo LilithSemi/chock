@@ -8,12 +8,10 @@ const chock_workspace = @import("chock-workspace");
 const Workspace = chock_workspace.Workspace;
 const testing = std.testing;
 
-// The sandbox work runs through `escape_probe`, because `Sandbox.spawn` forks
-// and the zig test runner is not a single threaded caller.
+// Sandbox work runs through `escape_probe`, because `Sandbox.spawn` forks and the zig test runner is not a single threaded caller.
 const support = @import("support.zig");
 
-/// A listener on `127.0.0.1` that keeps the first bytes anybody sent it. It
-/// answers at once so a git that did have a route gives up instead of hanging.
+/// A listener on `127.0.0.1` that keeps the first bytes anybody sent it, and answers at once.
 const Recorder = struct {
     io: std.Io,
     gpa: std.mem.Allocator,

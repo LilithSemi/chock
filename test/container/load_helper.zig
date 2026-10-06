@@ -8,8 +8,7 @@ const chock_container = @import("chock-container");
 const Image = chock_container.Image;
 const Runtime = chock_container.Runtime;
 
-// Every answer is an exit status. Nothing here writes to standard error, which
-// is the rule `test/proto/lock.zig` holds for the whole build.
+// Every answer is an exit status. Nothing here writes to standard error.
 pub const from_cache = 0;
 pub const extracted = 1;
 pub const refused = 2;
@@ -76,8 +75,7 @@ const check_every_ms: u64 = 25;
 
 /// True when the mount set names a tree that is really on the disk.
 fn whole(io: std.Io, image: *const Image) bool {
-    // A base image has `/etc`, `/usr` and more. A shorter set means the tree was
-    // read while another process rebuilt it.
+    // A shorter mount set means the tree was read while another process rebuilt it.
     if (image.mounts.len < 4) return false;
 
     for (image.mounts) |mount| {

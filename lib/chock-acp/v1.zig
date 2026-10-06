@@ -1,30 +1,6 @@
 //! ACP version 1: the methods, who answers each one, and the values its enums
-//! take.
-//!
-//! ## Version 1 and not version 2
-//!
-//! The schema ships both. Version 1 is released, at 1.9.1 when this was written,
-//! and version 2 is `2.0.0-alpha.5` with its own fields still being renamed
-//! between alphas. So this speaks 1, and `initialize` negotiates: a client
-//! offering a higher version is answered with this one, which the protocol says
-//! is how an agent declines a version it does not have.
-//!
-//! Version 2 drops `fs/*` and `terminal/*` from the client side, which is the
-//! direction Chock already wants. Nothing here depends on their absence, so
-//! adding 2 later is a second table beside this one.
-//!
-//! ## Chock never calls the client's file or terminal methods
-//!
-//! In version 1 a client may offer to read and write files and to run terminals
-//! for the agent. Both are optional and the protocol says an agent must not call
-//! one a client did not declare. Chock declares it needs neither and never calls
-//! them: a tool call runs in Chock's own sandbox, which is the thing Chock is
-//! for, and handing the work to the editor would put it outside every layer.
-//!
-//! What that costs is real and worth naming: an editor's unsaved buffer is not
-//! visible to Chock, and the editor is not told which files changed as they
-//! change. Chock works in its own workspace and hands the work back at the end,
-//! which is the model it already has.
+//! take. Chock speaks version 1, since version 2 is still alpha, and never
+//! calls the client's file or terminal methods, running a tool call in its own sandbox instead.
 
 const std = @import("std");
 
@@ -34,13 +10,10 @@ pub const StopReason = common.StopReason;
 pub const ToolKind = common.ToolKind;
 pub const PermissionKind = common.PermissionKind;
 
-/// The version this speaks. `initialize` carries an integer, bumped only for a
-/// breaking change; everything else is negotiated by capability.
+/// Bumped only for a breaking change; everything else negotiates by capability.
 pub const protocol_version: u16 = 1;
 
-/// A method this agent answers, or a method it calls on the client.
 pub const Method = enum {
-    // Answered here, by the agent.
     initialize,
     authenticate,
     logout,
@@ -54,7 +27,6 @@ pub const Method = enum {
     session_delete,
     session_resume,
     session_close,
-    // Called on the client.
     session_update,
     session_request_permission,
     fs_read_text_file,
@@ -66,12 +38,9 @@ pub const Method = enum {
     terminal_kill,
     elicitation_create,
     elicitation_complete,
-    // Either side.
     cancel_request,
 
-    /// Which side answers this method. Read before dispatching one: a client
-    /// that sent a client method is confused, and answering it would be worse
-    /// than refusing it.
+    /// A client sending a client method is confused; answering would be worse than refusing.
     pub const Side = enum { agent, client, protocol };
 
     pub fn side(self: Method) Side {
@@ -106,8 +75,7 @@ pub const Method = enum {
         };
     }
 
-    /// The name on the wire. The enum spells a slash as an underscore, the way
-    /// the schema's own method table does.
+    /// Spells a slash as underscore, like the schema's table.
     pub fn wireName(self: Method) []const u8 {
         return switch (self) {
             .initialize => "initialize",
@@ -146,8 +114,6 @@ pub const Method = enum {
         return null;
     }
 
-    /// Whether this method is a notification, which takes no reply. Answering
-    /// one, or failing to answer a request, is the fault a peer notices first.
     pub fn isNotification(self: Method) bool {
         return switch (self) {
             .session_cancel, .session_update, .elicitation_complete, .cancel_request => true,
@@ -156,8 +122,7 @@ pub const Method = enum {
     }
 };
 
-/// The `sessionUpdate` member of a `session/update` notification, which is what
-/// says which variant the rest of the object is.
+/// Says which variant a `session/update`'s `sessionUpdate` object is.
 pub const UpdateKind = enum {
     user_message_chunk,
     agent_message_chunk,
@@ -176,7 +141,7 @@ pub const UpdateKind = enum {
     }
 };
 
-/// Where a tool call has got to. Version 2 adds `cancelled` to this.
+/// Version 2 adds `cancelled` to this.
 pub const ToolCallStatus = enum {
     pending,
     in_progress,
@@ -191,8 +156,7 @@ pub const ToolCallStatus = enum {
 const testing = std.testing;
 
 test "every method has a wire name and reads back as itself" {
-    // The guard that stops a method being added to the enum and forgotten in
-    // the name table, which is the same one `chock_proto.event` keeps.
+    // Catches a method added but forgotten in the name table.
     inline for (@typeInfo(Method).@"enum".fields) |field| {
         const one: Method = @enumFromInt(field.value);
         const name = one.wireName();
@@ -203,8 +167,7 @@ test "every method has a wire name and reads back as itself" {
 }
 
 test "the methods this agent answers are the ones the schema puts on the agent" {
-    // Copied from the schema's own `x-side` tags, so a method that moved sides
-    // between versions is caught here rather than at a client.
+    // Copied from the schema's own `x-side` tags.
     const agent_side = [_][]const u8{
         "initialize",     "authenticate",     "logout",
         "session/new",    "session/load",     "session/prompt",
@@ -235,8 +198,7 @@ test "a notification takes no reply, and a request does" {
     try testing.expect(Method.session_update.isNotification());
     try testing.expect(Method.cancel_request.isNotification());
 
-    // `session/prompt` is the one that must not be answered early: its reply
-    // carries the stop reason for the whole turn.
+    // `session/prompt`'s reply carries the stop reason for the whole turn.
     try testing.expect(!Method.session_prompt.isNotification());
     try testing.expect(!Method.initialize.isNotification());
     try testing.expect(!Method.session_request_permission.isNotification());
@@ -254,10 +216,9 @@ test "version 1's own enums spell themselves the way its schema does" {
         }
     }
 
-    // Version 1 has four statuses. Version 2 adds `cancelled`, and reading one
-    // version's set as the other's would report a status a client cannot draw.
+    // Reading v2's set as v1's would misread a status.
     try testing.expectEqual(@as(usize, 4), @typeInfo(ToolCallStatus).@"enum".fields.len);
-    // `tool_call` is version 1's, and version 2 has no such variant.
+    // `tool_call` is v1 only; v2 has no such variant.
     try testing.expect(std.mem.indexOf(u8, UpdateKind.tool_call.wireName(), "tool_call") != null);
     try testing.expectEqual(@as(usize, 11), @typeInfo(UpdateKind).@"enum".fields.len);
 }

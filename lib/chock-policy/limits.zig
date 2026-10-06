@@ -1,33 +1,24 @@
-//! The sandbox's resource limits, read from three files that spell the same
-//! block: the operator's `config.zon` is the machine's default, `chock.zon`
-//! overrides it, and the org policy bundle is a ceiling over both.
+//! The sandbox's resource limits: the operator's `config.zon` is the
+//! machine's default, `chock.zon` overrides it, and the org bundle ceils both.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 pub const file_name = "chock.zon";
 
-/// Copied from `lib/chock-auth/config.zig`, because that library imports no
-/// other chock library and this one cannot import it back.
 pub const operator_file_name = "config.zon";
 
 pub const max_file_bytes = 1 << 20;
 
-/// Copied from `lib/chock-sandbox/linux/rlimits.zig`. Never used alone:
-/// `builtinProcesses` is the bottom of the fold and this is its floor.
+/// Never used alone: `builtinProcesses` is the bottom of the fold and this
+/// is its floor.
 pub const default_processes: u64 = 256;
 
 pub const default_memory_bytes: u64 = 2 << 30;
 
-/// On the 128 cpu machine this file exists for, `cargo` ran about 128 parallel
-/// `rustc`, each wanting several threads. 8 is a round number above that,
-/// chosen so an 8 cpu machine stays under the floor of 256 and a 128 cpu
-/// machine reaches 1024 with no project configuring anything.
 pub const processes_per_cpu: u64 = 8;
 
-/// An eighth, so a 16 GiB machine reaches exactly `default_memory_bytes` and is
-/// unchanged, while the 197 GiB machine this file exists for reaches about
-/// 24.6 GiB and still leaves most of the machine for everything else.
+/// An eighth, so a 16 GiB machine reaches exactly `default_memory_bytes`.
 pub const memory_share_divisor: u64 = 8;
 
 pub fn builtinProcesses(machine: Machine) Setting {
@@ -42,8 +33,6 @@ pub const Setting = union(enum) {
     percent: u7,
     absolute: u64,
 
-    /// `basis` and `100` both fit inside `u128`, so the multiply cannot
-    /// overflow whatever `basis` a real machine reports.
     pub fn resolve(self: Setting, basis: u64) u64 {
         return switch (self) {
             .absolute => |value| value,
@@ -58,9 +47,8 @@ pub const SettingError = error{
     Overflow,
 };
 
-/// The units `parseAbsolute` knows, longest suffix first. Order matters:
-/// `KiB` and `GiB` both end in `iB` and every one ends in `B`, so the bare byte
-/// suffix has to be tried last or `"4GiB"` reads as the digits `"4Gi"`.
+/// Longest suffix first: the bare byte suffix must be tried last or
+/// `"4GiB"` reads as the digits `"4Gi"`.
 const units = [_]struct { suffix: []const u8, multiplier: u64 }{
     .{ .suffix = "TiB", .multiplier = 1 << 40 },
     .{ .suffix = "GiB", .multiplier = 1 << 30 },
@@ -70,10 +58,7 @@ const units = [_]struct { suffix: []const u8, multiplier: u64 }{
 };
 
 fn parseAbsolute(text: []const u8) SettingError!u64 {
-    // Checked up front and not left to `std.fmt.parseInt`: that reader accepts
-    // a leading '-' on an unsigned type and answers `error.Overflow` for any
-    // negative value that is not exactly zero, so "-5" would read as a number
-    // too large to hold instead of a shape this field cannot take.
+    // `std.fmt.parseInt` on an unsigned type answers `error.Overflow` here.
     if (std.mem.startsWith(u8, text, "-")) return error.Malformed;
 
     for (units) |unit| {
@@ -104,8 +89,6 @@ pub fn parseSetting(text: []const u8) SettingError!Setting {
     return .{ .absolute = try parseAbsolute(text) };
 }
 
-/// Every member is optional, so "this file named nothing" is told apart from
-/// "this file named today's default".
 pub const Limits = struct {
     processes: ?Setting = null,
     memory: ?Setting = null,
@@ -128,26 +111,13 @@ pub fn foldLayers(project: Limits, operator: Limits, ceiling: ?Ceiling, machine:
     return underCeiling(resolved, ceiling, machine);
 }
 
-/// The most an organisation lets any project of this installation ask for.
-///
-/// Text, and not `Setting`. `org.zig` reads the whole bundle through one
-/// `std.zon.parse.fromSliceAlloc` call, which needs one static schema per
-/// field, and `std.zon.parse` cannot be told "a bare integer or a quoted
-/// string". `.processes = "300"` says what `.processes = 300` says in a
-/// project's own file, one keystroke longer.
+/// Text, not `Setting`: `std.zon.parse` cannot be told "a bare integer or a
+/// quoted string".
 pub const Ceiling = struct {
     processes: ?[]const u8 = null,
     memory: ?[]const u8 = null,
 };
 
-/// A minimum, and never a refusal. A program inside the sandbox cannot see the
-/// cap that kills it, so a session held to a lower number without being told
-/// would die of a `SIGKILL` that explains nothing. `src/doctor.zig`'s
-/// `measureOrgCeilings` is where a person reads the lowered number.
-///
-/// A ceiling this build cannot parse leaves the field unchanged rather than
-/// crashing: the safe reading of "this organisation's number is unreadable" is
-/// "this organisation set no ceiling".
 pub fn underCeiling(resolved: Resolved, ceiling: ?Ceiling, machine: Machine) Resolved {
     const bound = ceiling orelse return resolved;
     var held = resolved;
@@ -178,9 +148,8 @@ pub const Machine = struct {
 
     pub const ReadError = error{CannotReadMachine};
 
-    /// A caller reads these once, before it sizes a sandbox, and never from
-    /// inside one: `namespace.zig` hides `/proc/meminfo` from the program a
-    /// limit bounds precisely so it cannot be confused by the host's numbers.
+    /// Never read from inside the sandbox: `namespace.zig` hides
+    /// `/proc/meminfo` from the program a limit bounds.
     pub fn read() ReadError!Machine {
         const cpu_count = std.Thread.getCpuCount() catch return error.CannotReadMachine;
         const memory_bytes = try readMemoryBytes();
@@ -326,11 +295,7 @@ pub fn parseFrom(
     var ast_owned = true;
     defer if (ast_owned) ast.deinit(gpa);
 
-    // `parse_str_lits = true`, unlike `table.zig` and `subagents.zig`. Those
-    // hand every value node to `std.zon.parse.fromZoirNodeAlloc`, which reads a
-    // string's bytes off the `Ast`. This reader reads `Node.string_literal`
-    // directly off `zoir.string_bytes`, and that pool is left empty when the
-    // option is false: every string field then reads back as `""`.
+    // Left false, `zoir.string_bytes` is empty and a string field reads "".
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = true });
     var zoir_owned = true;
     defer if (zoir_owned) zoir.deinit(gpa);
@@ -344,10 +309,6 @@ pub fn parseFrom(
     }
 
     const node = try findLimitsNode(zoir, source_name, diag) orelse return .{};
-
-    // Every field below is read by hand off the raw syntax tree. A percentage
-    // string beside a bare integer is not one schema `fromZoirNodeAlloc` can
-    // express, so `ast` and `zoir` stay owned by this function to the end.
     return parseFields(gpa, zoir, node, source_name, diag);
 }
 
@@ -428,9 +389,6 @@ fn readSetting(
 
 const IntLiteralError = error{ NegativeSetting, SettingOverflow };
 
-/// `.small` is a plain `i32` and always fits once it is proven non-negative.
-/// `.big` needs `std.math.big.int.Const.toInt`, which already tells negative
-/// and too large apart.
 fn intLiteralToU64(lit: anytype) IntLiteralError!u64 {
     return switch (lit) {
         .small => |v| std.math.cast(u64, v) orelse error.NegativeSetting,
@@ -516,12 +474,8 @@ fn loadFrom(
     return parseFrom(gpa, source, source_name, diag);
 }
 
-// Every test below builds its own source in the test binary.
-
 const testing = std.testing;
 
-/// `std.testing.tmpDir` hands back a directory only a relative path reaches,
-/// and the loaders need a root independent of the test binary's cwd.
 fn absoluteDirPath(buffer: []u8, dir: std.Io.Dir) ![]u8 {
     const len = dir.realPath(testing.io, buffer) catch return error.RealPathFailed;
     return buffer[0..len];
@@ -562,9 +516,6 @@ test "an absolute value is read as a bare number or a number with a unit" {
     try testing.expectEqual(Setting{ .absolute = 4 << 20 }, try parseSetting("4MiB"));
     try testing.expectEqual(Setting{ .absolute = 4 << 30 }, try parseSetting("4GiB"));
     try testing.expectEqual(Setting{ .absolute = 4 << 40 }, try parseSetting("4TiB"));
-
-    // The unit suffixes overlap on their trailing bytes, so the longest match
-    // has to win or a value is read with the wrong multiplier.
     try testing.expectEqual(Setting{ .absolute = 4 << 10 }, try parseSetting("4KiB"));
 
     try testing.expectError(error.Malformed, parseSetting(""));
@@ -590,8 +541,6 @@ test "a limits block is read, and the rest of the file is left to other readers"
 test "a bare ZON integer is read directly, with no string in between" {
     const limits = try parse(testing.allocator, ".{ .limits = .{ .processes = 300 } }", null);
     try testing.expectEqual(Setting{ .absolute = 300 }, limits.processes.?);
-    // The field left unnamed is null, not a default value, so a later layer
-    // can still supply it.
     try testing.expectEqual(@as(?Setting, null), limits.memory);
 
     try testing.expectError(
@@ -744,8 +693,6 @@ test "the fold: the project wins over the operator, and the operator wins over t
 }
 
 test "the machine sized default reaches four times the old fixed number on a 128 cpu box" {
-    // The measurement this file exists to answer: 256 threads on a 128 cpu
-    // machine.
     const big_machine = Machine{ .cpu_count = 128, .memory_bytes = 197 << 30 };
     const resolved = foldLayers(.{}, .{}, null, big_machine);
     try testing.expectEqual(@as(u64, 1024), resolved.processes);

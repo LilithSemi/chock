@@ -1,62 +1,17 @@
-//! The index: one line per thing that exists, in the system prompt, and a
+//! The index: one line per thing that exists in the system prompt, and a
 //! tool that fetches the body of one when the model decides it applies.
-//!
-//! **This is one mechanism with three users**, and building it once is the
-//! whole point. The prompt is short and every line is justified; a
-//! knowledgebase of two hundred entries, or a shelf of guidance documents,
-//! cannot live in a prompt that follows that rule. So the prompt names what
-//! exists and nothing more:
-//!
-//! | Source | The index line | Fetched with |
-//! |---|---|---|
-//! | guidance shipped with Chock | one per piece | `read_guidance` |
-//! | the knowledgebase | one per entry | `read_memory` |
-//! | an `AGENTS.md` in a subdirectory | one per file | `read_file` |
-//!
-//! The prompt then grows by about one line per thing, never one paragraph,
-//! and a piece of guidance the model never reads costs its one line and
-//! nothing else.
-//!
-//! **A description is one line, always.** A description that carried a
-//! newline would turn one index entry into two lines of prompt, and a
-//! description nobody bounded would turn it into a paragraph. Both faults
-//! break the size property the whole design rests on, and both are quiet:
-//! the prompt simply gets bigger and nothing fails. `oneLine` is what stops
-//! them, and it runs over every description, whoever wrote it.
 
 const std = @import("std");
 
-/// One line of the index: what the thing is called, and what it is.
 pub const Entry = struct {
-    /// How the thing is fetched. Short and stable.
     name: []const u8,
-    /// What it is, in one line. Pass it through `oneLine` before it reaches
-    /// here if anything other than Chock itself wrote it.
     description: []const u8,
 };
 
-/// The longest description an index line carries. Past this, `oneLine` cuts
-/// and marks the cut. Chosen so a full index line stays inside one terminal
-/// width, which is also about as much as a model needs to decide whether to
-/// fetch the body.
 pub const max_description_bytes: usize = 160;
 
-/// What `oneLine` puts at the end of a description it had to cut, so a
-/// reader can tell a short description from a shortened one.
 pub const cut_marker = "...";
 
-/// `text` as exactly one line, no longer than `max_description_bytes`.
-///
-/// Every newline, carriage return, and tab becomes a space, runs of spaces
-/// collapse, and the ends are trimmed. A description that is still too long
-/// is cut and `cut_marker` is put on the end.
-///
-/// **Run this over anything Chock did not write itself.** A description in a
-/// knowledgebase entry comes from the agent, and one for an `AGENTS.md`
-/// comes from whoever wrote the repository. Neither is trusted to keep to
-/// one line, and neither has to be: this makes it one.
-///
-/// Caller owns the result and frees it with `allocator.free`.
 pub fn oneLine(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u8 {
     var flat: std.ArrayList(u8) = .empty;
     errdefer flat.deinit(allocator);
@@ -76,11 +31,6 @@ pub fn oneLine(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator
 
     if (flat.items.len <= max_description_bytes) return flat.toOwnedSlice(allocator);
 
-    // Cut on a UTF-8 boundary, so the description stays text. A tool result
-    // and a system prompt both travel as a JSON string, and half of a
-    // multi byte character is not one: `lib/chock-core/tools.zig`'s own
-    // `outputForModel` records what a provider does with bytes that are not
-    // valid UTF-8.
     var keep = max_description_bytes - cut_marker.len;
     while (keep != 0 and flat.items[keep] & 0xC0 == 0x80) keep -= 1;
 
@@ -89,15 +39,6 @@ pub fn oneLine(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator
     return flat.toOwnedSlice(allocator);
 }
 
-/// The first line of `text` that says something, for a file whose author
-/// never wrote a description of it. A Markdown heading loses its `#` and its
-/// spaces, so `# Build rules` reads as `Build rules`.
-///
-/// Answers an empty slice for a file with nothing in it. The caller decides
-/// what an empty description means; this does not invent one.
-///
-/// The result is a slice of `text` and is not allocated. Pass it through
-/// `oneLine` before it becomes an index entry.
 pub fn firstMeaningfulLine(text: []const u8) []const u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
@@ -109,11 +50,6 @@ pub fn firstMeaningfulLine(text: []const u8) []const u8 {
     return "";
 }
 
-/// Write `entries` as an index: one `- name: description` line each.
-///
-/// **This never writes a body**, and there is nowhere in this function for
-/// one to arrive. That is the property the size test in `prompt.zig` pins,
-/// and it is the one a later change would break in silence.
 pub fn renderInto(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(u8),
@@ -130,11 +66,6 @@ pub fn renderInto(
     }
 }
 
-/// The longest one index line can be: the two byte bullet, the name, the two
-/// byte separator, the description, and the newline. A caller that wants to
-/// bound the prompt against the entry count needs this number, and reading
-/// it from here rather than writing it out again is what keeps the two in
-/// step.
 pub fn maxLineBytes(max_name_bytes: usize) usize {
     return "- ".len + max_name_bytes + ": ".len + max_description_bytes + "\n".len;
 }

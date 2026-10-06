@@ -31,14 +31,12 @@ pub const LogError = error{
 pub const Log = struct {
     file: std.Io.File,
     session: []const u8,
-    /// What `open` found, never an instruction: another `Log` on the same path can
-    /// move the fragment or remove it, so `append` finds it again itself.
+    /// What `open` found, not an instruction: another `Log` can move or remove the fragment, so `append` re-checks.
     tail_was_torn: bool = false,
     torn_tail_at: u64 = 0,
     lock_generation: u64 = 0,
 
-    /// Opened through `std.posix.openatZ` because no option in `std.Io.Dir` asks for
-    /// `O_APPEND`, and `append` needs it to land every write at the true end of file.
+    /// Uses `std.posix.openatZ`: `std.Io.Dir` has no `O_APPEND`, needed to land writes at the true end.
     pub fn open(io: std.Io, path: [:0]const u8, session: []const u8) LogError!Log {
         const flags: std.posix.O = .{ .ACCMODE = .RDWR, .CREAT = true, .APPEND = true };
         const fd = std.posix.openatZ(std.posix.AT.FDCWD, path, flags, 0o644) catch |err| switch (err) {
@@ -63,16 +61,14 @@ pub const Log = struct {
         return log;
     }
 
-    /// Safe to call more than once, and the handle check is what makes it safe:
-    /// `std.Io` panics on a close of an invalid handle where `close(2)` gave `EBADF`.
+    /// Safe to call twice: the handle check guards it, since `std.Io` panics on closing an `EBADF` handle.
     pub fn close(self: *Log, io: std.Io) void {
         if (self.file.handle == -1) return;
         self.file.close(io);
         self.file.handle = -1;
     }
 
-    /// `tryLock` is `flock(2)`, which locks the open file description and not the
-    /// path: two `open` calls contend correctly, but a `dup` of one shares the lock.
+    /// `flock(2)` locks the file description, not the path: two `open`s contend, but a `dup` shares the lock.
     pub fn lock(self: *Log, io: std.Io) LogError!Locked {
         std.debug.assert(self.file.handle != -1);
         const acquired = self.file.tryLock(io, .exclusive) catch return error.Unexpected;
@@ -165,15 +161,14 @@ pub const Log = struct {
         return self.digestOfRange(io, 0, header_end - 1);
     }
 
-    /// A copied log must carry these bytes: a header composed again verifies only
-    /// while the two spellings agree.
+    /// A copy must carry these bytes: a recomposed header verifies only if the spellings agree.
     pub fn headerLine(self: *const Log, io: std.Io, buffer: *[max_header_bytes]u8) LogError![]const u8 {
         const filled = self.file.readPositionalAll(io, buffer, 0) catch return error.Unexpected;
         const newline = std.mem.indexOfScalar(u8, buffer[0..filled], '\n') orelse return error.BadHeader;
         return buffer[0..newline];
     }
 
-    /// Read on every call, never remembered: another `Log` on this path can append.
+    /// Read fresh each call; another `Log` on this path can append.
     fn lastLineDigest(self: *const Log, io: std.Io) LogError!chain.Digest {
         const size = self.file.length(io) catch return error.Unexpected;
         std.debug.assert(size > 0);
@@ -181,14 +176,13 @@ pub const Log = struct {
         return self.digestOfRange(io, try self.findLineStart(io, end), end);
     }
 
-    /// One write per call. A short result is reported, never completed with a second.
+    /// One write per call; a short result is reported, never finished with a second.
     fn writeExact(self: *Log, io: std.Io, line: []const u8) LogError!void {
         const written = self.file.writeStreaming(io, &.{}, &.{line}, 1) catch return error.WriteFailed;
         if (written != line.len) return error.ShortWrite;
     }
 
-    /// Inclusive of `offset`, so it is wrong for a client's `Last-Event-ID`, which
-    /// names an event the client already has. Use `resumeAfter` for that.
+    /// Inclusive, so wrong for `Last-Event-ID`, which names an event already held. Use `resumeAfter`.
     pub fn replayFrom(self: *const Log, allocator: std.mem.Allocator, io: std.Io, offset: u64) LogError!Replay {
         const header_end = try self.headerEnd(io);
         if (offset == 0) return .{ .file = self.file, .allocator = allocator, .pos = header_end };
@@ -227,8 +221,7 @@ pub const Log = struct {
     }
 };
 
-/// The file boundary stops naming `Locked`, not building one: Zig still builds a
-/// value of a type it cannot name, through `@TypeOf`. `generation` is what refuses it.
+/// Not `pub`, but Zig can still build an unnamed `Locked` via `@TypeOf`; `generation` refuses it.
 const Locked = struct {
     log: *Log,
     generation: u64,
@@ -248,8 +241,7 @@ const Locked = struct {
         if (self.generation != log.lock_generation) return error.NotLocked;
         if (!self.held) return error.NotLocked;
 
-        // Ask the file every time, both whether a tear exists and where it starts.
-        // Cutting to the offset `open` cached destroys committed events.
+        // Ask the file every time: cutting to the offset `open` cached could destroy committed events.
         if (try log.tailIsTorn(io)) |size| {
             const cut_at = try log.findTornFragmentStart(io, size);
             log.file.setLength(io, cut_at) catch return error.Unexpected;
@@ -268,8 +260,7 @@ const Locked = struct {
         const text = try event.toJson(allocator, envelope);
         defer allocator.free(text);
 
-        // The line and its newline reach the kernel as one write. A crash between
-        // two writes leaves a line a replay cannot tell from a partial write.
+        // The line and its newline reach the kernel as one write, so a crash leaves no half-written line.
         const line = try std.fmt.allocPrint(allocator, "{s}\n", .{text});
         defer allocator.free(line);
 
@@ -290,8 +281,7 @@ pub const Replay = struct {
     allocator: std.mem.Allocator,
     pos: u64,
     buffer: std.ArrayList(u8) = .empty,
-    /// Reflects the last call to `next` alone: read it right after each `next` that
-    /// gave null, because an owner can append past the tear between two calls.
+    /// Reflects only the last `next`; read it right after a null, since another owner can append past the tear.
     truncated: bool = false,
     truncated_at: u64 = 0,
 
@@ -304,8 +294,7 @@ pub const Replay = struct {
         return self.buffer.items;
     }
 
-    /// A tear is never an error, but a complete line that is not valid JSON is one.
-    /// A tear does not end the replay: `pos` stays put for the next call.
+    /// A tear is never an error; bad JSON in a whole line is. A tear leaves `pos` for the next call.
     pub fn next(self: *Replay, io: std.Io) (LogError || event.DecodeError)!?std.json.Parsed(event.Envelope) {
         self.buffer.clearRetainingCapacity();
         const line_start = self.pos;
@@ -344,8 +333,7 @@ pub const Replay = struct {
     }
 };
 
-/// `std.fmt.parseInt` alone accepts `+1` and `01` as 1, and JSON accepts neither,
-/// so a corrupt header would pass as version 1 without this check.
+/// `parseInt` alone accepts `+1`/`01` as 1; JSON doesn't, so a corrupt header would pass without this.
 fn parseVersionNumber(text: []const u8) ?u32 {
     if (text.len == 0) return null;
     for (text) |c| {
@@ -607,8 +595,7 @@ test "an append's offset still locates its line after the log is closed and reop
 }
 
 test "a write that lands short at the kernel is reported as ShortWrite, never retried or silently accepted" {
-    // A write above PIPE_BUF loses its atomicity, so a nonblocking pipe gives a
-    // short write on demand. The mechanism is portable, this reproduction is not.
+    // A write above PIPE_BUF loses its atomicity, so a nonblocking pipe gives a short write on demand.
     const chock_io_driver = chock_io.default();
     const raw_pipe = try chock_io_driver.pipeCloseOnExec();
     defer std.Io.File.close(.{ .handle = raw_pipe.read_fd, .flags = .{ .nonblocking = false } }, std.testing.io);
@@ -1108,8 +1095,7 @@ test "replay stops at a truncated last line and says that it did" {
 }
 
 test "replay refuses an offset past the end of the file instead of returning an empty stream" {
-    // A caught up caller and one with a wrong offset both see nothing from a naive
-    // replay. Only this error tells them apart.
+    // A caught up caller and one with a wrong offset both see nothing from a naive replay otherwise.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = try TestLog.init("replay-offset-out-of-range");
@@ -1131,8 +1117,7 @@ test "replay refuses an offset that does not land on the start of a line" {
     try std.testing.expectError(error.OffsetNotLineStart, tmp.log.replayFrom(allocator, io, offset + 1));
 }
 
-// The test that a second process cannot take a held lock lives in test/proto/lock.zig:
-// two `Log` values here cannot prove it, because two `open` calls already contend.
+// A second process failing to take a held lock is tested in test/proto/lock.zig; two opens here already contend.
 
 test "the lock is free again once the holder closes the log" {
     const io = std.testing.io;
@@ -1190,8 +1175,7 @@ test "a released lock cannot be used to append" {
 }
 
 test "regression: a handle whose generation does not match the log's own is refused, not merely one whose held flag is false" {
-    // `held` defaults to true on a struct literal, so it cannot catch a handle
-    // built outside `lock`. The `generation` comparison is what does.
+    // `held` defaults to true on a struct literal; only the `generation` comparison catches this.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = try TestLog.init("forged-generation");
@@ -1344,8 +1328,7 @@ test "a line longer than the read buffer hashes the same as the whole line at on
 
     const long = try allocator.alloc(u8, 20_000);
     defer allocator.free(long);
-    // Not one repeated byte: a chunk read twice, or out of order, hashes the same
-    // over a run of identical bytes and this test would pass a broken reader.
+    // Not one repeated byte, or a chunk read twice or out of order would hash the same and hide a broken reader.
     for (long, 0..) |*byte, i| byte.* = @intCast('a' + (i % 26));
 
     _ = try tmp.append(allocator, .{ .message = .{ .role = .user, .content = &.{.{ .text = long }} } }, 1);

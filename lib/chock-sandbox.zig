@@ -1,33 +1,5 @@
 //! A sandbox for a tool call, behind a driver interface: see `Sandbox.zig`'s own
-//! top comment for the shape and for why. On Linux,
-//! the driver `Sandbox.spawn` selects always applies a user namespace, a PID
-//! namespace, an IPC namespace, a mount namespace, Landlock, and seccomp, and
-//! a network namespace unless the caller asks for the host's own network. No
-//! layer there is sufficient alone. The PID and IPC namespaces have no
-//! configuration field and cannot be turned off: see `namespace.enter` for
-//! what each one refuses.
-//!
-//! On Darwin, the driver runs a real tool call. Seatbelt enforces the paths
-//! it may read and write, the network including `AF_UNIX`, and the signals
-//! and other interprocess communication it may send. Darwin's own resource
-//! limits bound its appetite. **There is no system call filter and no bind
-//! mount**, so two of the Linux layers have no equal there and the driver
-//! claims neither. `spawn` succeeds for a configuration Darwin can express,
-//! and refuses by name one it cannot. See `chock-sandbox/darwin/driver.zig`
-//! for which is which, and for the measurement behind every claim.
-//!
-//! `landlock`, `bpf`, `seccomp`, and `namespace` below are the Linux driver's
-//! own mechanism modules, re-exported here unchanged from before the driver
-//! split, because `chock-workspace` and `chock-core`
-//! both still reach `namespace.Mount` and `landlock.AccessFs` directly, not
-//! only through `Sandbox.Config`. They live under `chock-sandbox/linux/` now,
-//! the same as every other Linux-only file this module has; see
-//! `tools/lint_linux_only.zig`'s own top comment for the rule that puts them
-//! there. Exporting them here compiles cleanly for Darwin too, the same as it
-//! always has: none of the four collides with a std.c type the way the old,
-//! undivided Sandbox.zig once did, which is exactly the false negative
-//! `tools/lint_linux_only.zig` exists to catch on the files that do carry
-//! real Linux syscalls behind a portable looking name.
+//! top comment for the shape and for why.
 
 const builtin = @import("builtin");
 
@@ -35,64 +7,14 @@ pub const landlock = @import("chock-sandbox/linux/landlock.zig");
 pub const bpf = @import("chock-sandbox/linux/bpf.zig");
 pub const seccomp = @import("chock-sandbox/linux/seccomp.zig");
 pub const namespace = @import("chock-sandbox/linux/namespace.zig");
-/// The supervisor half of the seccomp user notification, re-exported beside
-/// `seccomp` above because a caller that names a `seccomp.TrapSet` reads the
-/// counts this module defines. See its own top comment for the handover.
 pub const notify = @import("chock-sandbox/linux/notify.zig");
-/// The exchange a `namespace.Network.filtered` process uses to reach a host.
-/// Re-exported here beside the four above, and for the same reason: the
-/// program that runs **inside** a filtered sandbox calls `net_broker.ask`, and
-/// the implementation of `Sandbox.NetBroker` that answers it lives in
-/// `chock-broker`, so both sides need to name this module without reaching a
-/// driver file directly.
 pub const net_broker = @import("chock-sandbox/linux/netbroker.zig");
-/// The cgroup v2 half of the resource limits, re-exported beside the four
-/// above and for the same reason: a caller outside this library needs to name
-/// it. `src/doctor.zig` asks this machine whether the memory and pids
-/// controllers are delegated **before** a session starts, and everything that
-/// walks the delegated parents is private to the file below, so
-/// `Cgroup.create` is the only way to learn the answer. Exporting it compiles
-/// cleanly for Darwin the same way `namespace` and `seccomp` already do.
 pub const cgroup = @import("chock-sandbox/linux/cgroup.zig");
-/// The nftables ruleset the network router installs in the sandbox's own
-/// network namespace, re-exported beside the modules above for the same
-/// reason: it is a mechanism a caller outside this library names directly.
-/// **The driver installs it for every `.filtered` call.** It is the kernel
-/// half of the router, and the resolver and the relay sit beside it.
 pub const nftables = @import("chock-sandbox/linux/nftables.zig");
-/// The network the router gives a sandbox inside its own network namespace:
-/// loopback, one dummy device, an address, and a default route through it.
-/// Re-exported beside `nftables` for the same reason. **The dummy device is a
-/// blackhole and that is the whole design**: read that file's top comment
-/// before changing anything about the device it makes.
-/// The driver builds it for every `.filtered` call.
 pub const netns = @import("chock-sandbox/linux/netns.zig");
-/// The userspace half of the network router: the TCP relay every outbound
-/// connection is redirected to, and the resolver beside it. Re-exported beside
-/// `nftables` and `netns` for the same reason. **The resolver is not a
-/// boundary**: it is what lets the boundary speak in names, and an address
-/// Chock never handed out is not in the allow set and dies at the kernel.
-/// The driver wires it into every `.filtered` call: see `Config.net_router`.
 pub const router = @import("chock-sandbox/linux/router.zig");
-/// The one channel the router has out of the sandbox. A caller that
-/// implements `Sandbox.NetRouter` never names this file, the same way a
-/// caller that implements `NetBroker` never names `net_broker`: the driver
-/// serves the wire and calls the seam. Re-exported so a test can drive the
-/// exchange without a sandbox.
 pub const net_router = @import("chock-sandbox/linux/routerlink.zig");
-/// The channel a device passthrough uses to cross the sandbox boundary: one
-/// descriptor and one destination path, host to sandbox. Re-exported beside
-/// `net_router` for the same reason: a caller outside this library implements
-/// `devicelink.DeviceSeam` and drives `devicelink.serveOne` without reaching a
-/// driver file directly. See its own top comment for the whole design.
 pub const devicelink = @import("chock-sandbox/linux/devicelink.zig");
-/// What a forked child puts right before it takes a boundary: the descriptors it
-/// keeps and the signal state it resets. Re-exported beside the modules above
-/// because `src/vmm.zig` forks a guest of its own and needs the same two calls
-/// the Linux driver's forked helpers make. See its own top comment.
-/// Two files behind one name, because the calls differ: macOS has no
-/// `close_range`, and a `sigset_t` is one word to the Linux kernel and sixteen
-/// to POSIX.
 pub const after_fork = switch (builtin.os.tag) {
     .macos => @import("chock-sandbox/darwin/afterfork.zig"),
     else => @import("chock-sandbox/linux/afterfork.zig"),
@@ -101,82 +23,26 @@ pub const Sandbox = @import("chock-sandbox/Sandbox.zig");
 pub const spawn = Sandbox.spawn;
 pub const Config = Sandbox.Config;
 
-/// See `Sandbox.Middle`. Re-exported beside `spawn`, which fills one in, and
-/// beside the two calls a caller needs to use it at all: every caller of
-/// `spawn` that ever cancels a call holds one of these.
 pub const Middle = Sandbox.Middle;
-/// See `Sandbox.signalMiddle`.
 pub const signalMiddle = Sandbox.signalMiddle;
-/// See `Sandbox.closeMiddle`.
 pub const closeMiddle = Sandbox.closeMiddle;
-/// See `Sandbox.SignalError`.
 pub const SignalError = Sandbox.SignalError;
-/// See `Sandbox.NetBroker`. Re-exported beside `Config`, which names it, so a
-/// caller that implements one never has to reach a file under `chock-sandbox/`
-/// by path.
 pub const NetBroker = Sandbox.NetBroker;
-/// See `Sandbox.NetRouter`, the other seam a `.filtered` call fills.
-/// Re-exported beside `NetBroker` for the same reason: `Config` names it, and
-/// `lib/chock-broker/network.zig` implements both.
 pub const NetRouter = Sandbox.NetRouter;
-/// See `Sandbox.DeviceSource`. Re-exported beside `NetBroker` and
-/// `NetRouter` for the same reason: `Config.device_source` names it, and a
-/// caller that implements one never has to reach a file under
-/// `chock-sandbox/` by path.
 pub const DeviceSource = Sandbox.DeviceSource;
-/// See `Sandbox.copyStrings`. Re-exported beside `Config.copy`, which uses it,
-/// because a caller that copies a config for a process that outlives one tool
-/// call has an argv to copy beside it and must not grow a second spelling of
-/// this loop.
 pub const copyStrings = Sandbox.copyStrings;
-/// See `Sandbox.runtime_prefix`. Re-exported here because both
-/// `chock-workspace` and `chock-core` place a path under it, and neither
-/// imports the other.
 pub const runtime_prefix = Sandbox.runtime_prefix;
-/// See `Sandbox.trust_store_inside`. Re-exported beside `runtime_prefix` for
-/// the same reason: `chock-core` stages a copy under it and the Linux
-/// driver names it as a symbolic link's own target, and neither imports the
-/// other.
 pub const trust_store_inside = Sandbox.trust_store_inside;
-/// See `Sandbox.expresses`. Re-exported beside `runtime_prefix`, because a
-/// caller that places a path under that prefix is exactly the caller that has
-/// to know whether this build can put it there.
 pub const expresses = Sandbox.expresses;
 
-/// What crosses between a host and a guest when the sandbox runs in a microVM:
-/// one request holding a `Config`'s geometry, one answer. Read its own top
-/// comment for what stays on the host and why none of it is a gap.
 pub const vm_wire = @import("chock-sandbox/vm/wire.zig");
-
-/// Where a host path is inside a guest. The share set is given and never derived:
-/// read its own top comment for why, and for the two things a wrong answer here
-/// breaks.
 pub const vm_shares = @import("chock-sandbox/vm/shares.zig");
-
-/// The other side of a guest's own boundary: confines the process that runs it
-/// to the shares it serves. Re-exported beside `vm_shares`, which gives it the
-/// set, for the same reason every module here is re-exported: a caller outside
-/// this library never reaches a file under `chock-sandbox/` by path.
 pub const vm_confine = @import("chock-sandbox/vm/confine.zig");
-
-/// The host half of the microVM driver: one `Sandbox.Driver` over a stream into a
-/// guest. It builds no boundary of its own, which is the whole design: read its
-/// own top comment.
 pub const vm_driver = @import("chock-sandbox/vm/driver.zig");
-/// See `Sandbox.resolvedPath`.
 pub const resolvedPath = Sandbox.resolvedPath;
-/// See `Sandbox.firstGap`. Re-exported because the two lists it compares are
-/// built outside this library: `chock-workspace` writes the workspace half
-/// and `chock-core` writes the toolchain half and the per call half.
 pub const firstGap = Sandbox.firstGap;
-/// See `Sandbox.LayerGap`.
 pub const LayerGap = Sandbox.LayerGap;
 
-/// Imported directly, not only through `Sandbox.zig`'s own comptime driver
-/// dispatch, so this driver's tests run on every host this project builds
-/// on, including the native Linux one `zig build test` normally runs: see
-/// `chock-sandbox/darwin/driver.zig`'s own top comment for why that file has
-/// nothing target-specific to make that unsafe.
 pub const darwin_driver_for_testing = @import("chock-sandbox/darwin/driver.zig");
 
 test {

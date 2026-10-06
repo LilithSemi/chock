@@ -1,7 +1,4 @@
-//! The build installs exactly one artifact, and it is `chock`. `build.zig`
-//! walks its own install step and gives the names as `install_names.installed`,
-//! because `zig build test` puts nothing in `zig-out/bin` and a stale directory
-//! there shows programs this build no longer makes.
+//! The build installs exactly one artifact, and it is `chock`.
 
 const std = @import("std");
 
