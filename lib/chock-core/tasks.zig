@@ -158,6 +158,19 @@ pub const Request = struct {
     config: sandbox.Config,
     argv: []const []const u8,
     timeout_ns: u64 = default_timeout_ns,
+    /// Which way of sandboxing this command gets. A background task meets the same
+    /// boundary a foreground call does, and this table holds no context, so the
+    /// driver travels with the request.
+    driver: sandbox.Sandbox.Driver = sandbox.Sandbox.native_driver,
+    /// Host files this task owns and removes when it ends.
+    ///
+    /// **A file a tool call stages lives as long as the call, and a background
+    /// task outlives its own.** A trust store is staged under `TMPDIR` and bound
+    /// in, the call's frame deleted it the moment `start` answered, and the
+    /// task's thread then built a sandbox on a source that had gone: every
+    /// first background command in a session with a network rule died with
+    /// `MountTreeFailed` before it ran a thing.
+    staged: []const []const u8 = &.{},
 };
 
 /// What a `Runner` answers with once the command has ended.
@@ -555,6 +568,12 @@ const Job = struct {
         const allocator = self.arena.allocator();
         const outcome = self.table.runner.run(allocator, self.io, &self.request);
 
+        // Whatever the command did, the files staged for it go now: see
+        // `Request.staged`.
+        for (self.request.staged) |path| {
+            std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
+        }
+
         const host_path = hostPathFor(allocator, self.table.dir, &self.id) catch {
             self.finish(outcome, 0);
             return;
@@ -622,6 +641,7 @@ fn copyRequest(allocator: std.mem.Allocator, request: Request) std.mem.Allocator
     var copy = request;
     copy.config = try request.config.copy(allocator);
     copy.argv = try sandbox.copyStrings(allocator, request.argv);
+    copy.staged = try sandbox.copyStrings(allocator, request.staged);
     return copy;
 }
 

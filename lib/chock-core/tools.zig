@@ -1515,6 +1515,11 @@ fn runCommand(
     var trust_staged: ?Staged = null;
     defer if (trust_staged) |*staged| staged.deinit(allocator, io);
 
+    // What a background task takes over, so nothing here deletes a file its
+    // own thread has not bound yet. See `tasks.Request.staged`.
+    var handed: std.ArrayList([]const u8) = .empty;
+    defer handed.deinit(allocator);
+
     if (context.scratch_dir) |session_dir| {
         emptied = try boundScratchpad(allocator, io, session_dir);
 
@@ -1569,6 +1574,7 @@ fn runCommand(
 
                 if (stageContent(allocator, io, env, bytes)) |staged| {
                     trust_staged = staged;
+                    if (in_background) try handed.append(allocator, staged.host_path);
                     try extra_mounts.append(allocator, .{ .bind = .{
                         .source = staged.host_path,
                         .target = trust_store_inside,
@@ -1688,6 +1694,7 @@ fn runCommand(
         else
             context.idle,
         .approval_wait_ns = if (in_background) null else context.approval_wait_ns,
+        .staged = handed.items,
     }) catch |err| switch (err) {
         error.TooManyTasks => return toolErrorResult(
             allocator,
@@ -1751,6 +1758,14 @@ fn runCommand(
         else => |e| return e,
     };
 
+    // The task owns them now, and `Table.start` already copied every path.
+    if (ran == .started and handed.items.len != 0) {
+        if (trust_staged) |*staged| {
+            staged.release(allocator);
+            trust_staged = null;
+        }
+    }
+
     var result = switch (ran) {
         .captured => |captured| try buildToolResult(allocator, call, captured),
         .started => |id| try startedResult(allocator, call, &id, context.tasks.?.dir),
@@ -1780,6 +1795,21 @@ fn runCommand(
     return result;
 }
 
+/// What a guest said when it refused, for the four errors that carry a sentence.
+///
+/// The driver keeps the reason and the error name alone does not: `GuestRefused`
+/// told a reader nothing while the sentence behind it sat unread.
+fn guestReason(driver: sandbox.Sandbox.Driver, err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.GuestRefused,
+        error.GuestCannotPlacePath,
+        error.GuestCannotExpress,
+        error.GuestGone,
+        => driver.whyLast(),
+        else => null,
+    };
+}
+
 pub fn backgroundRunner() tasks.Runner {
     return .{ .ptr = @constCast(&background_runner_marker), .vtable = &background_runner_vtable };
 }
@@ -1798,6 +1828,9 @@ fn backgroundRun(
     const captured = spawnCapturing(
         allocator,
         io,
+        // A background task is sandboxed the same way a foreground call is. The
+        // table holds no context, so it carries the driver with the request.
+        request.driver,
         request.config,
         request.argv,
         request.timeout_ns,
@@ -1806,7 +1839,18 @@ fn backgroundRun(
         null,
     ) catch |err| return .{
         .status = .did_not_run,
-        .output = std.fmt.allocPrint(allocator, "the command did not start: {s}\n", .{@errorName(err)}) catch "",
+        .output = if (guestReason(request.driver, err)) |said|
+            std.fmt.allocPrint(
+                allocator,
+                "the command did not start: {s}: {s}\n",
+                .{ @errorName(err), said },
+            ) catch ""
+        else
+            std.fmt.allocPrint(
+                allocator,
+                "the command did not start: {s}\n",
+                .{@errorName(err)},
+            ) catch "",
     };
 
     // A background task meets the same limits a foreground call does, and nobody
@@ -3153,6 +3197,13 @@ const Staged = struct {
         allocator.free(self.host_path);
         self.* = undefined;
     }
+
+    /// Free the name and leave the file. **Only after something else took the
+    /// path**, or the file stays for as long as the directory holding it.
+    fn release(self: *Staged, allocator: std.mem.Allocator) void {
+        allocator.free(self.host_path);
+        self.* = undefined;
+    }
 };
 
 const StageError = error{StagingFailed} || std.mem.Allocator.Error;
@@ -3394,6 +3445,9 @@ const SandboxCall = struct {
     background: ?*tasks.Table = null,
     idle: ?idle_mod.Idle = null,
     approval_wait_ns: ?*const std.atomic.Value(u64) = null,
+    /// Host files a background task takes over. Ignored for a foreground call,
+    /// whose own frame outlives the program. See `tasks.Request.staged`.
+    staged: []const []const u8 = &.{},
 };
 
 const Ran = union(enum) {
@@ -3502,6 +3556,8 @@ fn runInSandboxWith(
             .config = prepared.config,
             .argv = prepared.argv,
             .timeout_ns = call.timeout_ns,
+            .driver = driverNow(),
+            .staged = call.staged,
         });
         return .{ .started = id };
     }
@@ -3509,6 +3565,7 @@ fn runInSandboxWith(
     const captured = try spawnCapturing(
         allocator,
         io,
+        driverNow(),
         prepared.config,
         prepared.argv,
         call.timeout_ns,
@@ -3716,6 +3773,7 @@ const Captured = struct {
 /// brings back the deadlock, because nothing reads the pipe while the program runs.
 const SpawnThread = struct {
     allocator: std.mem.Allocator,
+    driver: sandbox.Sandbox.Driver,
     config: sandbox.Config,
     argv: []const []const u8,
     /// Written by `Sandbox.spawn` right after its own first fork. Read `pid` with an
@@ -3727,7 +3785,13 @@ const SpawnThread = struct {
     spawn_err: ?sandbox.Sandbox.SpawnError = null,
 
     fn run(self: *SpawnThread) void {
-        self.term = sandbox.spawn(self.allocator, self.config, self.argv, null, &self.middle) catch |err| {
+        self.term = self.driver.spawn(
+            self.allocator,
+            self.config,
+            self.argv,
+            null,
+            &self.middle,
+        ) catch |err| {
             self.spawn_err = err;
             self.done.store(true, .release);
             return;
@@ -3735,6 +3799,29 @@ const SpawnThread = struct {
         self.done.store(true, .release);
     }
 };
+
+/// Which way of sandboxing every tool call of this process gets.
+///
+/// **Process level and not per call**, for two reasons. The operator chooses it in
+/// their own `config.zon` and it is fixed before the first turn, so there is one
+/// answer for the life of the process. And threading it would put a parameter
+/// through every built-in tool, most of which hold no `Context` at all, for a value
+/// none of them would ever vary.
+///
+/// **Nothing an agent says reaches this.** It is set once by `src/run.zig` from a
+/// file the sandbox puts beyond the agent's reach, and there is no tool that writes
+/// it.
+var chosen_driver: sandbox.Sandbox.Driver = sandbox.Sandbox.native_driver;
+
+/// Say which driver this process sandboxes with. Called once, before the first
+/// tool call.
+pub fn useDriver(one: sandbox.Sandbox.Driver) void {
+    chosen_driver = one;
+}
+
+pub fn driverNow() sandbox.Sandbox.Driver {
+    return chosen_driver;
+}
 
 /// The cancellation handle of every call this process runs now. A free slot holds
 /// -1. A handle and never a pid: a pid that was reaped can name another process.
@@ -3767,13 +3854,16 @@ pub fn cancelRunningTool() void {
     for (&running_tool_handles) |*slot| {
         const handle = slot.load(.monotonic);
         if (handle < 0) continue;
-        sandbox.signalMiddle(handle, std.posix.SIG.KILL) catch {};
+        // Through the driver this process sandboxes with: a guest's call is not
+        // signalled by a syscall of this kernel's.
+        chosen_driver.signalMiddle(handle, std.posix.SIG.KILL) catch {};
     }
 }
 
 fn spawnCapturing(
     allocator: std.mem.Allocator,
     io: std.Io,
+    driver: sandbox.Sandbox.Driver,
     config: sandbox.Config,
     argv: []const []const u8,
     timeout_ns: u64,
@@ -3781,12 +3871,24 @@ fn spawnCapturing(
     filler: ?idle_mod.Idle,
     approval_wait_ns: ?*const std.atomic.Value(u64),
 ) sandbox.Sandbox.SpawnError!Captured {
-    return spawnCapturingIo(allocator, io, config, argv, timeout_ns, keep_bytes, filler, approval_wait_ns, chock_io.default());
+    return spawnCapturingIo(
+        allocator,
+        io,
+        driver,
+        config,
+        argv,
+        timeout_ns,
+        keep_bytes,
+        filler,
+        approval_wait_ns,
+        chock_io.default(),
+    );
 }
 
 fn spawnCapturingIo(
     allocator: std.mem.Allocator,
     io: std.Io,
+    driver: sandbox.Sandbox.Driver,
     config: sandbox.Config,
     argv: []const []const u8,
     timeout_ns: u64,
@@ -3819,6 +3921,7 @@ fn spawnCapturingIo(
 
     var spawn_thread = SpawnThread{
         .allocator = thread_arena_state.allocator(),
+        .driver = driver,
         .config = thread_config,
         .argv = argv,
     };
@@ -3844,7 +3947,7 @@ fn spawnCapturingIo(
         return error.Unexpected;
     }
 
-    defer sandbox.closeMiddle(&spawn_thread.middle);
+    defer driver.closeMiddle(&spawn_thread.middle);
 
     const cancel_slot = takeRunningSlot(spawn_thread.middle.fd);
     defer releaseRunningSlot(cancel_slot);
@@ -3962,7 +4065,7 @@ fn drainCapture(
                 timed_out = true;
                 // Through the handle and never the pid.
                 if (@atomicLoad(std.posix.pid_t, &spawn_thread.middle.pid, .acquire) != 0) {
-                    sandbox.signalMiddle(spawn_thread.middle.fd, std.posix.SIG.TERM) catch {};
+                    spawn_thread.driver.signalMiddle(spawn_thread.middle.fd, std.posix.SIG.TERM) catch {};
                     signal_sent = true;
                 }
                 continue;
@@ -5122,6 +5225,7 @@ test "spawnCapturing reports a pipe creation failure without ever reaching the s
     const result = spawnCapturingIo(
         allocator,
         std.testing.io,
+        sandbox.Sandbox.native_driver,
         empty_config,
         &.{"true"},
         default_timeout_ns,

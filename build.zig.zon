@@ -5,24 +5,28 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .vulcan = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan.git#2cb8ca63f37e2abe7c710e1691f3349bd86ab5be",
-            .hash = "vulcan-0.0.0-d6EfZEUBnwACn46df0z0srU6bg59280658kqUnGkuMGK",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan.git#e78c023a8487e087f53c6d4060d992f31997c904",
+            .hash = "vulcan-0.0.0-d6EfZDVmqQCFNcA8-IWk4jzCrlA7HUqTuwxDKWMxBERn",
         },
         .phantom = .{
-            .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#7694e28f3c8d24e8a44b8ec755792375d26e3891",
-            .hash = "phantom-0.1.0-HsUDTP_bGgCTDs95R8grcWK53sN7H27QbByzHTPN138k",
+            .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#d8ce52b46b5c1009b35e40b9ea45b01d43bfa7a2",
+            .hash = "phantom-0.1.0-HsUDTLr3HgBfdZHlOXJE3xewGbxC6bJ3_bRYR_YrJnXp",
         },
         .udev = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/udev.zig.git#67e0061ab53028c93134c9fe8e44a5a89a17137f",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/udev.zig#67e0061ab53028c93134c9fe8e44a5a89a17137f",
             .hash = "udev-0.1.0-ZWb7H_1aBwCNMTs30b9SL6tTkvpmDLzz_RfKP1UPC1FZ",
         },
         .fix = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/fix.git?ref=integration#b6d3cf17237f2f77bd7e0532c207f83152ecd1a8",
-            .hash = "fix-0.3.0-2pqVLF7MVwBtbO4Rg7qCN7gycwmV5Q1NH48rK5jCByhM",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/fix?ref=integration#1c1b7f3a7027e0eb5e5fdfc55b94737d2b7050cb",
+            .hash = "fix-0.3.0-2pqVLGLMVwCRmq8PCXCUZOxs-tBGn9rUTKn7IAj4Kg9E",
         },
         .dbus = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/dbus.zig#2d8f179d202f002eb490d4d0636c066003d9fbb4",
             .hash = "dbus-0.1.0-8F4MwHAvBACyrhHqEeT4UwRn9cHvu5N3mwS7e_hqDyGF",
+        },
+        .mirage = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/mirage#529d61e0790fb908a9dddd8d70a722c5eec68506",
+            .hash = "mirage-0.16.0-ORLT6FDOEQBszWkCukNRagv63o_urldXHFcj6jNP0HSw",
         },
     },
     .paths = .{

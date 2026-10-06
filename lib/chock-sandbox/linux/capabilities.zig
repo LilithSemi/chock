@@ -152,6 +152,57 @@ pub fn keepOnly(capability: u32, diag: ?*?Diagnostic) Error!void {
     return dropAllBut(capability, diag);
 }
 
+/// Become `uid` and `gid`, keeping the capabilities this process already holds.
+///
+/// **Called before `dropAll` or `keepOnly`, never after.** Changing user needs
+/// `CAP_SETUID`, and both of those take it away: the order the other way round
+/// fails with `EPERM` and leaves a helper running as the call's own user, which
+/// is exactly what `Config.hide_helpers` exists to prevent.
+///
+/// The kernel clears the permitted set when a process leaves user zero, so
+/// `PR_SET_KEEPCAPS` holds it across the change, and the effective set, which the
+/// kernel clears too, is raised again from it. Whoever calls this drops what it
+/// does not want immediately afterwards.
+pub fn becomeUser(uid: linux.uid_t, gid: linux.gid_t, diag: ?*?Diagnostic) Error!void {
+    const keep_rc = linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 1, 0, 0, 0);
+    if (linux.errno(keep_rc) != .SUCCESS) {
+        note(diag, .set_securebits, linux.errno(keep_rc));
+        return error.Rejected;
+    }
+
+    // The group first: after the user changes there is no `CAP_SETGID` left.
+    if (linux.errno(linux.setgid(gid)) != .SUCCESS) {
+        note(diag, .capset, linux.errno(linux.setgid(gid)));
+        return error.Rejected;
+    }
+    if (linux.errno(linux.setuid(uid)) != .SUCCESS) {
+        note(diag, .capset, linux.errno(linux.setuid(uid)));
+        return error.Rejected;
+    }
+
+    // Permitted survived; effective did not, and every call below this needs it.
+    var header = linux.cap_user_header_t{ .version = capability_version_3, .pid = 0 };
+    var data = [_]linux.cap_user_data_t{
+        .{ .effective = 0, .permitted = 0, .inheritable = 0 },
+        .{ .effective = 0, .permitted = 0, .inheritable = 0 },
+    };
+    if (linux.errno(linux.capget(&header, &data[0])) != .SUCCESS) {
+        note(diag, .capset, linux.errno(linux.capget(&header, &data[0])));
+        return error.Rejected;
+    }
+    for (&data) |*word| word.effective = word.permitted;
+    if (linux.errno(linux.capset(&header, &data[0])) != .SUCCESS) {
+        note(diag, .capset, linux.errno(linux.capset(&header, &data[0])));
+        return error.Rejected;
+    }
+
+    const off_rc = linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 0, 0, 0, 0);
+    if (linux.errno(off_rc) != .SUCCESS) {
+        note(diag, .set_securebits, linux.errno(off_rc));
+        return error.Rejected;
+    }
+}
+
 fn dropAllBut(keep: ?u32, diag: ?*?Diagnostic) Error!void {
     var cap: u32 = 0;
     while (cap <= linux.CAP.LAST_CAP) : (cap += 1) {

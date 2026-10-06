@@ -7,6 +7,7 @@ const subagent = @import("subagents.zig");
 const limits_mod = @import("limits.zig");
 const nix_mod = @import("nix.zig");
 const search_mod = @import("search.zig");
+const sandbox_mod = @import("sandbox.zig");
 
 pub const file_name = "org-policy.zon";
 
@@ -66,6 +67,13 @@ pub const Bundle = struct {
     /// What the search engine may be. An organisation can pin a kind or a
     /// base url, and can forbid the `scrape` kind outright.
     search: ?search_mod.Ceiling = null,
+    /// Which way of sandboxing a session may use. An organisation that requires
+    /// a guest names `microvm` alone, and a session on a machine that cannot boot
+    /// one then does not start, which is what requiring it means.
+    ///
+    /// **A bundle that says nothing permits every driver.** Absent is not empty:
+    /// an empty list would forbid the driver every session uses today.
+    sandbox: ?sandbox_mod.Ceiling = null,
     /// Files every project of this installation must keep out of the sandbox,
     /// on top of its own `deny_read` block.
     ///
@@ -964,4 +972,28 @@ test "a bundle carries a search ceiling, and it reaches the fold that enforces i
     const none = try parse(gpa, ".{}", null);
     defer destroy(gpa, none);
     try testing.expectEqual(@as(?search_mod.Ceiling, null), none.search);
+}
+
+test "a bundle carries a sandbox ceiling, and it reaches the check that enforces it" {
+    const gpa = std.testing.allocator;
+
+    // `Bundle.sandbox` is filled by the struct parser, so this reads a real
+    // bundle rather than building the value by hand.
+    const parsed = try parse(gpa,
+        \\.{ .sandbox = .{ .drivers = .{.microvm} } }
+    , null);
+    defer destroy(gpa, parsed);
+
+    const ceiling = parsed.sandbox.?;
+    try sandbox_mod.underCeiling(ceiling, .microvm);
+    try std.testing.expectError(
+        sandbox_mod.CeilingError.DriverNotPermitted,
+        sandbox_mod.underCeiling(ceiling, .native),
+    );
+
+    // And a bundle that says nothing about it permits what a session uses today.
+    const quiet = try parse(gpa, ".{}", null);
+    defer destroy(gpa, quiet);
+    try std.testing.expectEqual(@as(?sandbox_mod.Ceiling, null), quiet.sandbox);
+    try sandbox_mod.underCeiling(.{}, .native);
 }

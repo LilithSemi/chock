@@ -4781,6 +4781,64 @@ test "a background command finishes past the bound that stops a foreground one" 
     try std.testing.expectEqual(@as(usize, 0), written.len);
 }
 
+test "a routed background command keeps its trust store until its own thread builds the sandbox" {
+    // The call that starts a task stages the bundle under `TMPDIR` and binds
+    // it, and that frame deleted the file the moment `start` answered. The
+    // task's own thread then found no source, so the first background command
+    // of any session with a network rule died before it ran anything.
+    const allocator = std.testing.allocator;
+    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+    if (!hostHasTrustStore()) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+    var pad = try Scratchpad.init(allocator, tmp);
+    defer pad.deinit();
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    const arguments = try std.fmt.allocPrint(
+        allocator,
+        "{{\"argv\":[\"grep\",\"-c\",\"BEGIN CERTIFICATE\",\"{s}\"],\"background\":true}}",
+        .{chock_core.tools.trust_store_inside},
+    );
+    defer allocator.free(arguments);
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+    var started = try runToolCallWith(
+        allocator,
+        &workspace,
+        root_tmp,
+        "run_command",
+        arguments,
+        .{ .routed = true, .scratch_dir = pad.dir },
+    );
+    defer started.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u8, null), started.fault);
+    try std.testing.expect(!started.is_error);
+
+    const record = try std.fs.path.join(allocator, &.{ pad.tasks, "task-01.out" });
+    defer allocator.free(record);
+    const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, record, allocator, .limited(4096));
+    defer allocator.free(written);
+
+    // A sandbox that did not build says so in the file, and `grep -c` on a
+    // real bundle answers a count above zero.
+    try std.testing.expect(std.mem.indexOf(u8, written, "did not start") == null);
+    const counted = std.fmt.parseInt(
+        usize,
+        std.mem.trim(u8, written, " \r\n"),
+        10,
+    ) catch 0;
+    try std.testing.expect(counted > 0);
+}
+
 test "a background call with no session refuses instead of quietly running in the foreground" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

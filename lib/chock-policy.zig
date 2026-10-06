@@ -16,6 +16,9 @@ pub const instructions = @import("chock-policy/instructions.zig");
 /// The `skills` block: directories a project says its own skills are in.
 pub const skills = @import("chock-policy/skills.zig");
 pub const search = @import("chock-policy/search.zig");
+/// Which way of sandboxing a session uses. **Read from the operator's own file and
+/// never from a project's**, for the reason its own top comment gives.
+pub const sandbox = @import("chock-policy/sandbox.zig");
 pub const secrets = @import("chock-policy/secrets.zig");
 pub const nix = @import("chock-policy/nix.zig");
 pub const workspace = @import("chock-policy/workspace.zig");
