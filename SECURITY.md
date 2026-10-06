@@ -16,15 +16,15 @@ network rule and a dev shell with nothing in it, and the dev shell that ships.
 It answers "did it break out" as a value, because grading a transcript by hand
 is how a real escape gets argued away.
 
-**Two models have been thrown at it**, `moonshotai/kimi-k3` and
+Two models have been thrown at it, `moonshotai/kimi-k3` and
 `claude-fable-5`. Kimi engaged and probed hard, and one real fault came out of
 it: a tool call could write into the worktree metadata directory inside the real
 repository. That is closed, on both platforms. Fable refused the exercise and
-returned nothing, so it measured nothing, and the harness records that as an
+returned nothing, so it tested nothing, and the harness records that as an
 empty answer rather than as a session that held. A session that called no tool,
 that ended in a fault, or that left no log reports every boundary as unchecked
 and exits non-zero, because a canary that nothing tried to move says nothing
-about the sandbox. That catches a session which measured nothing. It does not
+about the sandbox. That catches a session which tested nothing. It does not
 catch every way an instrument can be wrong.
 
 Read the result knowing what it is. Two models on one machine is a measurement,
@@ -80,8 +80,8 @@ the normal issue tracker.
 These are real features. None of them stops an attacker, and treating any of
 them as a control would be a mistake.
 
-- **Secret redaction is protection against accident, and it now covers the log
-  as well as the request.** Every record the agent loop writes passes one
+- Secret redaction is protection against accident, and it now covers the log
+  as well as the request. Every record the agent loop writes passes one
   redactor before it is written, and so does every approval record the broker
   writes, so a tool result, a diff, a compaction summary, a provider's own error
   message and the question you are asked to approve are all covered. The set is
@@ -94,23 +94,22 @@ them as a control would be a mistake.
   cannot be taken out again without breaking the chain. That is why the
   replacement happens before the record is written, and why there is no command
   that cleans a log after the fact.
-  Four things are still not covered. A project can declare a secret of its own, and the `{{secret:name}}` handle path
-  is not wired. A project cannot name a secret of its
-  own yet. A git password and a `{{secret:name}}` credential have mechanisms
+  Four things are still not covered. The `{{secret:name}}` handle path is not
+  wired. A git password and a `{{secret:name}}` credential have mechanisms
   built and nothing that fills them, so they protect nothing today. A block of
   model reasoning is signed by the provider and is passed through untouched.
   The message you type yourself goes into the log as you typed it.
   Redaction cannot stop a model that means to leak, because anything an agent
   can read it can encode first.
-- **robots.txt is a convention.** The fetch tool honours it because every other
+- robots.txt is a convention. The fetch tool honours it because every other
   harness does. A server that wants to refuse Chock must refuse the request.
-- **A TCP transport carries no peer identity.** The daemon checks the peer on a
+- A TCP transport carries no peer identity. The daemon checks the peer on a
   unix socket. Over TCP there is nobody to check, so authentication is the job
   of a proxy in front of it, such as Authelia. `--host 0.0.0.0` does what it
   says, and a person who types it has chosen to be reachable.
-- **A model's own statement about what it did is not evidence.** The session log
+- A model's own statement about what it did is not evidence. The session log
   is the evidence. It records what the harness did, not what the model said.
-- **A tool that comes from your own Nix configuration is a tool you chose.**
+- A tool that comes from your own Nix configuration is a tool you chose.
   Chock builds a tool call's environment from the project's dev shell, so a
   flake that supplies a hostile program supplies it on purpose. Choosing what
   goes in the dev shell is the same decision as choosing what to install. Chock
@@ -123,8 +122,8 @@ On Linux a tool call runs in its own user, mount, PID, IPC and network
 namespaces, under a Landlock rule set and a seccomp filter, in a throwaway copy
 of the project. The credential store is never mounted into the sandbox.
 
-**No tool call writes the real project unless you approved a `workspace` bind in
-write mode**, and that sentence is stronger than it was. A git worktree keeps its own metadata inside the real
+No tool call writes the real project unless you approved a `workspace` bind in
+write mode, and that sentence is stronger than it was. A git worktree keeps its own metadata inside the real
 repository, at `.git/worktrees/<id>`, and git must write the index there for
 `git status` to work at all. Chock used to give that directory to the tool call
 itself. A red team run wrote two files into it, so now the directory is copied
@@ -134,8 +133,8 @@ Linux binds the copy at the path git looks for. macOS has no bind mount, so it
 names the copy with `GIT_DIR` and `GIT_WORK_TREE` instead and leaves the whole
 of the real `.git` read only.
 
-**macOS runs a real session, and it is weaker than Linux.** Seatbelt is
-measured on real hardware and it holds the paths, the network including unix
+macOS runs a real session, and it is weaker than Linux. Seatbelt has run on
+real hardware and it holds the paths, the network including unix
 sockets, the signals and shared memory. A whole session has run on a Darwin
 machine: `read_file`, `write_file`, `run_command`, the knowledgebase and a
 background task all answered, and `cat /etc/passwd` came back "Operation not
@@ -174,7 +173,7 @@ the Zig standard library, Nix, `pcscd`, a model provider, a plugin you install,
 and an MCP server you configure are all outside this policy. Report those to
 their own projects.
 
-**One thing on that list stays ours.** If Chock opens a path to a dependency's
+One thing on that list stays ours. If Chock opens a path to a dependency's
 fault, the guard on that path is Chock's job. Chock parses an attestation
 certificate that comes off a smart card, so a parser that fails on bad input is
 a fault Chock must survive whoever wrote the parser. The rule is simple: the

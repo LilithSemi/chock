@@ -67,23 +67,23 @@ dropped in silence.
 
 ## What a skill cannot do
 
-**A skill is an instruction file, and an instruction file grants nothing.** The
+A skill is an instruction file, and an instruction file grants nothing. The
 rule is the same one [instructions.md](instructions.md) states: the policy, the
 budget and the tool list come from `chock.zon`, which the sandbox puts beyond
 the agent's reach.
 
 So:
 
-- **`allowed-tools` is never a grant.** The field exists in the format and is
+- `allowed-tools` is never a grant. The field exists in the format and is
   marked experimental. Chock keeps the text and acts on none of it. Read as a
   narrowing, meaning the skill saying it needs no more than these, it is free
   and costs nothing; read as a permission it would let a downloaded directory
   widen what an agent may do.
-- **A skill reaches the prompt as one line until the agent asks for it.** The
+- A skill reaches the prompt as one line until the agent asks for it. The
   ask is a `read_skill` call, which is a line in the session log, so "the agent
   read a stranger's instructions" is a fact somebody can find afterwards.
-- **A skill is never fetched.** Only directories on disk. There is no URL here.
-- **A skill's `scripts/` are programs like any other.** A `SKILL.md` that says
+- A skill is never fetched. Only directories on disk. There is no URL here.
+- A skill's `scripts/` are programs like any other. A `SKILL.md` that says
   to run `scripts/extract.py` produces an ordinary gated `run_command`, under
   `exec.path.*` or `exec.workspace.*` like anything else. A project that has
   not permitted it gets a refusal, and the skill saying to run it changes
@@ -115,11 +115,11 @@ namespace. A project that trusts its own skills writes one rule:
 
 ## What is not supported
 
-- **Agent Plugins.** Chock has plugins and they are a different thing: a
+- Agent Plugins. Chock has plugins and they are a different thing: a
   WebAssembly module with its metadata in a custom section. See
   [../extend/plugins.md](../extend/plugins.md).
-- **Agent Stacks.** It is draft 0.1.0 and pins two untagged specifications by
+- Agent Stacks. It is draft 0.1.0 and pins two untagged specifications by
   commit.
-- **`compatibility` as a check.** It is prose, up to 500 characters. Chock reads
+- `compatibility` as a check. It is prose, up to 500 characters. Chock reads
   it and shows it, and a harness that guessed at its meaning would refuse a
   skill that would have worked.

@@ -134,7 +134,7 @@ with its access bits, the scratch areas, the limits, the network mode and the
 devices. The environment is left out, because it decides what a program does
 and not what it may reach, and it carries paths that move between machines.
 
-It is written on every run and not only the first. `chock run --continue` can
+It is written on every run, including resumes. `chock run --continue` can
 be given different flags from the run before it, and a resumed session is
 where someone would try to alter the sandbox: the run that resumes builds its
 sandbox again from that run's files and flags. Two `session.config` events in
@@ -160,7 +160,7 @@ chain over the event would not match a re-import of the swap.
 
 Every run writes a `sandbox.open` event before its first turn, naming the run
 and whether the sandbox's write and execute rule was on for it. It is written on
-every run and not only on the run that gave the rule up, so an absent line means
+every run, whether or not that run is the one that gave the rule up, so an absent line means
 an older Chock and never a session nobody recorded.
 [sandbox.md](security/sandbox.md) has the row a project writes to give it up,
 and `chock doctor` reports the same fact before a session starts.

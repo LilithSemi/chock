@@ -47,7 +47,7 @@ must not read the same to an agent.
 
 Chock calls `GET {base_url}/search?q=...&format=json`.
 
-**SearXNG answers 403 to that until you turn JSON on.** The format is off by
+SearXNG answers 403 to that until you turn JSON on. The format is off by
 default. Add it to `settings.yml`:
 
 ```yaml
@@ -122,7 +122,7 @@ Kagi is configured the same way, with its own base URL:
 }
 ```
 
-**Kagi's own documentation disagrees with itself about the credential header.**
+Kagi's own documentation disagrees with itself about the credential header.
 Its API specification says `Authorization: Bearer`, and two of its help pages
 say the literal word `Bot`. This build sends `Bearer`, which the specification
 and the quick-start page both show. If Kagi answers 401 on a key you know is
@@ -152,21 +152,21 @@ one that a keyword search would miss.
 
 Three things Chock asks Exa for, and three it refuses to.
 
-Chock asks for **highlights**, which are extracts of the page in the page's own
+Chock asks for `highlights`, which are extracts of the page in the page's own
 words. That is Exa's equivalent of the snippet Brave and Kagi return, and a
 result with no extract would be a bare link.
 
-Chock never asks for **`text`**, which is the whole page. A search is approved
+Chock never asks for `text`, which is the whole page. A search is approved
 under `web.search`; reading a page is approved under `net.fetch`, for the one
 host the agent named. Full page text arriving inside a search result would put a
 stranger's page in front of the model under an approval that was given for
 something else. [actions.md](actions.md) has both actions.
 
-Chock never asks for **`summary`**, which is written by a model at Exa. It would
+Chock never asks for `summary`, which is written by a model at Exa. It would
 be text with no source to attribute it to, and everything the model reads from a
 search has to be something a person can go and check.
 
-Chock never asks for the **deep search modes**. Exa's `type` accepts `deep` and
+Chock never asks for the deep search modes. Exa's `type` accepts `deep` and
 `deep-reasoning`, each of which is Exa running an agent of its own: unbounded
 work outside this session's budget, its policy table and its log. The mode is a
 constant in the request builder, so there is no way to name one.
@@ -191,12 +191,12 @@ reading it as no results found.
 No key, so no `credential`. Chock posts the query to DuckDuckGo's own
 no-JavaScript results page and reads the result blocks out of the HTML.
 
-**It will never be the default, and not on principle.** A results page changes
+It will never be the default, and not on principle. A results page changes
 shape without notice, so a scraper works until it quietly does not. Of the four
 harnesses read while this was designed, the one that scrapes needed a headless
 browser with stealth patches to keep it working.
 
-**What makes it usable anyway is that it tells you which way it failed.** Three
+What makes it usable anyway is that it tells you which way it failed. Three
 answers come back, and they do not look alike:
 
 | What happened | What the agent is told |
@@ -245,8 +245,8 @@ never gives back page text: reading a page stays `fetch_url`'s job, which is
 what keeps reachability a decision made outside the sandbox.
 
 Results are marked as text a stranger wrote, and they go through the same
-cleaning a fetched page does. **A ranked list is more attacker shaped than an
-ordinary page**, because whoever ranks decides what the agent reads first. That
+cleaning a fetched page does. A ranked list is more attacker shaped than an
+ordinary page, because whoever ranks decides what the agent reads first. That
 you chose the engine says something about where the bytes come from and nothing
 about who wrote them.
 

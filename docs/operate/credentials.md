@@ -27,7 +27,7 @@ Name the store in `~/.config/chock/config.zon`:
 | `file` | a file in `~/.local/share/chock`, mode `0600` in a directory `0700` | Linux |
 | `secretspec` | [SecretSpec](https://secretspec.dev), asked over its own protocol | every platform |
 
-**Nothing is guessed, and nothing falls back.** A keystore can look reachable
+Nothing is guessed, and nothing falls back. A keystore can look reachable
 and still be unusable: on a machine with no desktop session the bus is there,
 the service starts when asked, and opening a session works, and then the
 collection is locked and the prompt that would unlock it cannot be drawn. So a
@@ -51,13 +51,13 @@ Chock runs `secretspec serve` and asks it, so `secretspec` has to be on your
 `PATH`. Reading a credential runs it in its own read only mode, so a session
 that only needs a key cannot change one.
 
-**A secret it does not have is not an error.** Chock reads that as "nobody has
+A secret it does not have is not an error. Chock reads that as "nobody has
 stored this yet", the same as every other store, so `chock login` is what fills
 it. What a login cannot fix is a secret your `secretspec.toml` does not declare,
 or a SecretSpec configured read only. Both refuse, and Chock repeats what
 SecretSpec said about it rather than inventing a reason of its own.
 
-**A machine you only reach over ssh usually wants `file`.** It has no desktop
+A machine you only reach over ssh usually wants `file`. It has no desktop
 session to unlock a collection with. The file is mode `0600` in a directory
 `0700`, so it is readable by your account and no other, which is the same
 guarantee the secret service gives against other accounts. What the keystore
