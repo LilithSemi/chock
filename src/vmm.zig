@@ -24,6 +24,31 @@ const ram_base: u64 = switch (builtin.cpu.arch) {
     else => @compileError("a guest is only placed for x86_64 and aarch64"),
 };
 
+/// The 32-bit window the x86 platform lays its devices in, from the virtio base
+/// up to 4 GiB. Guest RAM must leave it clear: a memory slot over it makes the
+/// kernel claim the range as System RAM, and a device can no longer take its own
+/// region. The RAM that would land here moves above 4 GiB instead. aarch64 starts
+/// its RAM above the devices, so it needs no hole.
+const mmio_hole_base: u64 = 0xd000_0000;
+const high_ram_base: u64 = 0x1_0000_0000;
+
+const RamSlot = struct { gpa: u64, len: u64 };
+
+/// Guest RAM slots that keep clear of a device window from `hole_base` to
+/// `high_base`. RAM that would cross `hole_base` is split: the part below stays,
+/// the rest is placed at `high_base`. A target with no window passes a `hole_base`
+/// above every address, so one slot comes back. Returns the count written, 1 or 2.
+fn ramSlots(base: u64, size: u64, hole_base: u64, high_base: u64, out: *[2]RamSlot) usize {
+    if (base < hole_base and base + size > hole_base) {
+        const low = hole_base - base;
+        out[0] = .{ .gpa = base, .len = low };
+        out[1] = .{ .gpa = high_base, .len = size - low };
+        return 2;
+    }
+    out[0] = .{ .gpa = base, .len = size };
+    return 1;
+}
+
 const uart_base = arch.platform.serial.addr;
 
 const serial_on_port = arch.platform.serial_is_port;
@@ -494,9 +519,19 @@ fn host(
 
     const ram_size = options.memory_mb * 1024 * 1024;
 
+    const hole_base, const high_base = switch (builtin.cpu.arch) {
+        .x86_64 => .{ mmio_hole_base, high_ram_base },
+        else => .{ std.math.maxInt(u64), @as(u64, 0) },
+    };
+    var slots: [2]RamSlot = undefined;
+    const slot_count = ramSlots(ram_base, ram_size, hole_base, high_base, &slots);
+
     var pages: ?[]align(std.heap.page_size_min) u8 = null;
     defer if (pages) |held| std.posix.munmap(held);
-    const region = if (own_memory) got: {
+    var regions: [2]GuestMemory.Region = undefined;
+    if (own_memory) {
+        // One host block, mapped at the base. A macOS guest keeps its RAM below the
+        // devices, so it never crosses the window and comes back as one slot.
         const room = std.posix.mmap(
             null,
             ram_size,
@@ -509,18 +544,20 @@ fn host(
             return 1;
         };
         pages = room;
-        machine.map(room, ram_base) catch {
+        machine.map(room, slots[0].gpa) catch {
             fault.* = .{ .said = "this hypervisor would not take the guest's memory" };
             return 1;
         };
-        break :got GuestMemory.Region{
-            .gpa = ram_base,
-            .len = ram_size,
-            .backing = .{ .shared = room },
-        };
-    } else try machine.vm.addMemory(ram_base, ram_size, .shared);
-    var regions = [_]GuestMemory.Region{region};
-    var memory: GuestMemory = .{ .regions = regions[0..1] };
+        regions[0] = .{ .gpa = slots[0].gpa, .len = slots[0].len, .backing = .{ .shared = room } };
+    } else {
+        for (slots[0..slot_count], 0..) |one, index| {
+            regions[index] = machine.vm.addMemory(one.gpa, one.len, .shared) catch {
+                fault.* = .{ .said = "this hypervisor would not take the guest's memory" };
+                return 1;
+            };
+        }
+    }
+    var memory: GuestMemory = .{ .regions = regions[0..slot_count] };
 
     const hv = machine.backend();
 
@@ -592,7 +629,9 @@ fn host(
     if (comptime sev_possible) {
         if (sev != .off) {
             var measured: [256]u8 = undefined;
-            _ = machine.sevSeal(region, &measured) catch {
+            // The kernel, initrd, and page tables all sit in the low slot, so sealing
+            // it covers the launch image. The relocated high slot starts empty.
+            _ = machine.sevSeal(regions[0], &measured) catch {
                 fault.* = .{ .said = "the guest's memory encryption would not seal" };
                 return 1;
             };
@@ -1223,6 +1262,39 @@ const attach_wait_ms: u64 = 30 * std.time.ms_per_s;
 const attach_look_ms: u64 = 100;
 
 const testing = std.testing;
+
+test "guest ram that crosses the device window splits, leaving it clear" {
+    var slots: [2]RamSlot = undefined;
+    const count = ramSlots(0, 16 * 1024 * 1024 * 1024, 0xd000_0000, 0x1_0000_0000, &slots);
+
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(u64, 0), slots[0].gpa);
+    try testing.expectEqual(@as(u64, 0xd000_0000), slots[0].len);
+    try testing.expectEqual(@as(u64, 0x1_0000_0000), slots[1].gpa);
+    // The total is kept: the part above the window moves, none is lost.
+    try testing.expectEqual(16 * 1024 * 1024 * 1024, slots[0].len + slots[1].len);
+    for (slots[0..count]) |one| {
+        const stop = one.gpa + one.len;
+        try testing.expect(stop <= 0xd000_0000 or one.gpa >= 0x1_0000_0000);
+    }
+}
+
+test "guest ram below the device window stays one slot" {
+    var slots: [2]RamSlot = undefined;
+    const count = ramSlots(0, 512 * 1024 * 1024, 0xd000_0000, 0x1_0000_0000, &slots);
+
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqual(@as(u64, 0), slots[0].gpa);
+    try testing.expectEqual(@as(u64, 512 * 1024 * 1024), slots[0].len);
+}
+
+test "a target with no device window keeps one slot above its devices" {
+    var slots: [2]RamSlot = undefined;
+    const count = ramSlots(0x4000_0000, 16 * 1024 * 1024 * 1024, std.math.maxInt(u64), 0, &slots);
+
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqual(@as(u64, 0x4000_0000), slots[0].gpa);
+}
 
 const Greeting = struct {
     path: []const u8,

@@ -363,6 +363,9 @@ pub const vmm_calls = blk: {
         .exit,
     };
     if (@hasField(linux.SYS, "poll")) list = list ++ &[_]linux.SYS{.poll};
+    // Where the target has the older call, Mirage forgets its bound socket path
+    // with unlink, not unlinkat.
+    if (@hasField(linux.SYS, "unlink")) list = list ++ &[_]linux.SYS{.unlink};
     break :blk list;
 };
 
@@ -1450,6 +1453,16 @@ test "the VMM allow list holds the hypervisor and the channels it was handed" {
     }
 
     try std.testing.expectEqualStrings("", missing.items);
+}
+
+test "the VMM allow list holds unlink where the target has it, so a session server can forget its socket" {
+    if (comptime @hasField(linux.SYS, "unlink")) {
+        var found = false;
+        for (vmm_calls) |permitted| {
+            if (permitted == .unlink) found = true;
+        }
+        try std.testing.expect(found);
+    }
 }
 
 test "the VMM allow list holds the streaming pair a console that is not a file needs" {

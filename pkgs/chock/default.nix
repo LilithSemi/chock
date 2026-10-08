@@ -18,7 +18,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   zigDeps = zig.fetchDeps {
     inherit (finalAttrs) src pname version;
-    hash = "sha256-UY7sXCsQGNwHPQJhce6Y1ikd/rlLZ+9e3XkEhaV7olo=";
+    hash = "sha256-SMH157bVjVgmGhaJ1Net44c3NoWNxaYRAEBH+VP3DA0=";
   };
 
   # **The hypervisor entitlement, which a Mac runs no microVM guest without.**

@@ -133,19 +133,18 @@ gets all come from the target the build is for.
 
 ### Which platforms run a guest, and what each one has done
 
-Three targets compile `src/vmm.zig`. Two have booted a guest.
+Three targets compile `src/vmm.zig`, and all three have booted a guest.
 
 - `aarch64-linux` boots a guest, against KVM, with the devices stated in a
   device tree. This is the development machine, every number on this page
   with no platform named was taken here, and it is the one platform where
   `chock daemon` has booted a guest for a real session.
-- `x86_64-linux` compiles the VMM and has never booted a guest. The build
-  targets KVM, which on x86 means its ACPI tables, its 16550 behind an I/O
-  port, and the virtio-mmio-over-ACPI path. Nothing in this repository has run
-  one: the development machine is aarch64, emulating a userspace proves
-  nothing about a hypervisor, and a GitHub hosted runner exposes no
-  `/dev/kvm`. So the x86 machine setup is held only by the compiler and the
-  drift guards.
+- `x86_64-linux` boots a guest, against KVM, with its ACPI tables, its 16550
+  behind an I/O port, and the virtio-mmio-over-ACPI path. Guest RAM is laid
+  out around the 32-bit MMIO window, so the kernel leaves each device its own
+  region rather than claiming the window as system memory. A GitHub hosted
+  runner exposes no `/dev/kvm` and boots no guest, so in CI the x86 machine
+  setup is held by the compiler and the drift guards.
 - `aarch64-darwin` boots a guest, given an ad hoc signature, against
   Hypervisor.framework. The binary must carry `com.apple.security.hypervisor`
   or the call that makes a machine answers `HV_DENIED` and says nothing more.
@@ -171,9 +170,10 @@ it is reported only when it is on: `chock run` and `chock daemon` print one
 line naming the feature when a guest comes up encrypted, and nothing
 otherwise, so a line never reads as a promise on a machine that has none.
 
-Two limits stand out. This is `x86_64` only, and nothing here has run: no
-machine in this project has booted an x86 guest, and no AMD machine with
-`/dev/sev` has been available. And SEV-ES is not selected, on purpose: it
+Two limits stand out. This is `x86_64` only, and no guest has come up
+encrypted: an x86 guest boots, but every run so far has run in the clear,
+because no reachable `/dev/sev` has opened. And SEV-ES is not selected, on
+purpose: it
 also encrypts register state and needs the guest to handle `#VC` exceptions
 the guest kernel here is unverified for, so taking it automatically could
 swap a guest that boots for one that does not, so choosing it is left to
