@@ -590,6 +590,7 @@ test "a program that knows nothing about chock resolves a permitted host and rea
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-reach", scratch.path());
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -599,6 +600,7 @@ test "a name the policy refuses is refused by the resolver and never looked up" 
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-refused-name", scratch.path());
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -607,6 +609,7 @@ test "an address that was never handed out is refused by the kernel" {
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-hardcoded", scratch.path());
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -615,6 +618,7 @@ test "a program that hardcodes the cloud metadata address reaches nothing" {
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-metadata", scratch.path());
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -623,6 +627,7 @@ test "glibc inside a routed sandbox is answered by the router and by nobody else
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-glibc", scratch.path());
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -631,6 +636,7 @@ test "a routed sandbox starts on a host whose resolv.conf is a symbolic link" {
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-glibc-linked", scratch.path());
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -639,6 +645,7 @@ test "a routed sandbox starts on a host that ships no nsswitch.conf" {
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-glibc-absent", scratch.path());
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -647,6 +654,7 @@ test "a routed sandbox that owns /etc still reads the host's own certificates" {
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-trust-store", scratch.path());
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -655,6 +663,7 @@ test "a routed program cannot take away the ruleset that bounds it" {
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-flush", scratch.path());
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -663,6 +672,7 @@ test "a program that carries its own resolver gets nowhere" {
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-routed-own-resolver", scratch.path());
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 

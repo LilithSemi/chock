@@ -183,8 +183,26 @@ const Listener = struct {
         return linux.errno(ready) == .SUCCESS and ready > 0;
     }
 
+    /// How long to wait for a connection that is expected to arrive.
+    ///
+    /// A zero timeout samples the instant the child exited, and the child's
+    /// connection goes through the router, so it can land a moment behind it.
+    /// That reads as nothing arriving at all, which is the same answer a real
+    /// escape would give.
+    const wait_for_peer_ms: i32 = 2000;
+
+    fn waitPending(self: Listener, limit_ms: i32) bool {
+        var fds = [1]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
+        const ready = linux.poll(&fds, 1, limit_ms);
+        return linux.errno(ready) == .SUCCESS and ready > 0;
+    }
+
     fn readFirst(self: Listener, buffer: []u8) ?[]u8 {
-        if (!self.hasPending()) return null;
+        // Waits, where `hasPending` samples. Every caller of this one is
+        // asserting that something DID arrive; the callers that assert nothing
+        // arrived keep the sample, because waiting to prove an absence only
+        // makes the test slower.
+        if (!self.waitPending(wait_for_peer_ms)) return null;
         const rc = linux.accept4(self.fd, null, null, linux.SOCK.CLOEXEC);
         if (linux.errno(rc) != .SUCCESS) return null;
         const peer: i32 = @intCast(rc);
@@ -1781,6 +1799,12 @@ fn ringRefusal(rc: usize) u8 {
 pub fn main(init: std.process.Init.Minimal) !u8 {
     return runOperation(init) catch |err| {
         if (err == error.NamespaceFailed) return sandbox.namespace.nothing_measured_exit_status;
+        // This host will not give a sandbox its own filtered network, so a routed
+        // test measures nothing here. Silent: the driver has already named the
+        // missing module on the child's own stderr, and a print on this side
+        // would make the test runner show an error beside a test it then marks
+        // as passed.
+        if (err == error.NetRouterUnavailable) return sandbox.namespace.nothing_measured_exit_status;
         return err;
     };
 }

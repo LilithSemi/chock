@@ -9,6 +9,41 @@ const tty = @import("tty.zig");
 
 const control = chock_proto.control;
 
+/// The browser interface, built by `build/web_bundle.zig` and carried here.
+///
+/// A tar of the page, each member compressed on its own. Nothing is
+/// decompressed on this side: a member goes to the browser as it is, with
+/// `Content-Encoding: gzip`, and the browser does the work.
+const web_bundle = @embedFile("web-bundle");
+
+/// One file of the page, as the browser asks for it.
+pub const Member = struct {
+    name: []const u8,
+    /// Still compressed. See `web_bundle`.
+    bytes: []const u8,
+};
+
+/// The member a request names, or null. The name has no leading slash, so "/"
+/// is asked for as "index.html".
+pub fn memberNamed(wanted: []const u8) ?Member {
+    var reading: std.Io.Reader = .fixed(web_bundle);
+    var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var it: std.tar.Iterator = .init(&reading, .{
+        .file_name_buffer = &name_buffer,
+        .link_name_buffer = &link_buffer,
+    });
+    while (it.next() catch return null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.eql(u8, entry.name, wanted)) continue;
+        const at = reading.seek;
+        const size: usize = @intCast(entry.size);
+        if (at + size > web_bundle.len) return null;
+        return .{ .name = entry.name, .bytes = web_bundle[at..][0..size] };
+    }
+    return null;
+}
+
 pub const default_port: u16 = control.default_port + 1;
 
 pub const socket_name = "serve.sock";
@@ -16,6 +51,11 @@ pub const socket_name = "serve.sock";
 const max_connections: usize = 32;
 
 const max_head_bytes: usize = 16 * 1024;
+
+/// The longest name a file of the page may have. `routeOf` refuses anything
+/// longer, so the dispatch below can decode into a buffer this size and the two
+/// never disagree about what fits.
+const max_asset_name: usize = 512;
 
 const usage_text =
     \\Usage: chock serve [options]
@@ -291,17 +331,55 @@ fn runConnection(conn: Connection) void {
 pub const Route = enum {
     page,
     sessions,
+    projects,
+    prompt,
     events,
+    /// The same events as `events`, read once and answered whole. A browser
+    /// reads this: a page built on phantom's web backend gets one response per
+    /// request and cannot hold a stream open.
+    lines,
     answer,
+    asset,
 };
 
 pub fn routeOf(target: []const u8) ?Route {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     if (std.mem.eql(u8, path, "/")) return .page;
     if (std.mem.eql(u8, path, "/api/sessions")) return .sessions;
+    if (std.mem.eql(u8, path, "/api/projects")) return .projects;
     if (std.mem.eql(u8, path, "/api/events")) return .events;
+    if (std.mem.eql(u8, path, "/api/lines")) return .lines;
     if (std.mem.eql(u8, path, "/api/answer")) return .answer;
+    if (std.mem.eql(u8, path, "/api/prompt")) return .prompt;
+    // Everything else is a file of the page, or nothing. The name is matched
+    // against the bundle rather than against a directory, so a request can
+    // never reach outside what was built.
+    // A browser escapes a name before it asks for it, so `fonts/Mesmerize Rg.otf`
+    // arrives as `fonts/Mesmerize%20Rg.otf` and matches no member until it is
+    // decoded.
+    // The page's own routes. A browser asks for these on a reload or a link,
+    // and the page sorts out what to draw from the address itself.
+    if (std.mem.startsWith(u8, path, app_route) and isSessionName(path[app_route.len..])) return .page;
+
+    if (path.len > 1 and path.len - 1 <= max_asset_name) {
+        var room: [max_asset_name]u8 = undefined;
+        const raw = path[1..];
+        @memcpy(room[0..raw.len], raw);
+        if (memberNamed(std.Uri.percentDecodeInPlace(room[0..raw.len])) != null) return .asset;
+    }
     return null;
+}
+
+/// Where the page puts a session it has open.
+const app_route = "/s/";
+
+/// Whether what follows `/s/` could name a session. Not a check that the session
+/// exists: the page asks the daemon that, and a name of the wrong shape is a
+/// request for something this never serves.
+fn isSessionName(said: []const u8) bool {
+    if (said.len == 0 or said.len > 64) return false;
+    for (said) |one| if (!std.ascii.isAlphanumeric(one)) return false;
+    return true;
 }
 
 fn handle(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
@@ -310,23 +388,68 @@ fn handle(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Req
         return;
     };
 
-    const wanted: std.http.Method = if (route == .answer) .POST else .GET;
+    // A route that changes what a session does is a POST, so nothing that
+    // prefetches a link can drive it.
+    const wanted: std.http.Method = switch (route) {
+        .answer, .prompt => .POST,
+        .page, .asset, .sessions, .projects, .events, .lines => .GET,
+    };
     if (request.head.method != wanted and !(wanted == .GET and request.head.method == .HEAD)) {
         try sendWhole(request, "that route does not take that method\n", .{ .status = .method_not_allowed });
         return;
     }
 
     switch (route) {
-        .page => try sendWhole(request, page_html, .{ .extra_headers = &.{
-            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
-        } }),
+        .page => try sendMember(request, "index.html"),
+        .asset => {
+            const target = request.head.target;
+            const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+            var room: [max_asset_name]u8 = undefined;
+            const raw = path[1..];
+            @memcpy(room[0..raw.len], raw);
+            try sendMember(request, std.Uri.percentDecodeInPlace(room[0..raw.len]));
+        },
         .sessions => try serveSessions(serve, arena, request),
+        .projects => try serveProjects(serve, arena, request),
         .events => try serveEvents(serve, arena, request),
+        .lines => try serveLines(serve, arena, request),
         .answer => try serveAnswer(serve, arena, request),
+        .prompt => try servePrompt(serve, arena, request),
     }
 }
 
+/// Which project a request is about: the one it names, or the one this was
+/// started for. A browser lists across projects, so it says which.
+///
+/// Copied into `arena`, and every caller reads it before touching the body or
+/// the response. `std.http.Server` invalidates every string in the head the
+/// moment a reader or a streaming response is made, so a target read after
+/// either one is freed memory.
+fn projectOf(serve: *Serve, arena: std.mem.Allocator, target: []const u8) []const u8 {
+    const said = queryValue(target, "project") orelse return serve.project;
+    return arena.dupe(u8, said) catch serve.project;
+}
+
 fn serveSessions(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
+    // `all=1` asks past the project this was started for. A browser is not
+    // inside one project, and the rows then say which one each belongs to.
+    const everything = queryValue(request.head.target, "all") != null;
+    const project = if (everything) "" else serve.project;
+    try sendRecords(serve, arena, request, .{ .list = .{ .project = project } });
+}
+
+fn serveProjects(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
+    try sendRecords(serve, arena, request, .{ .projects = {} });
+}
+
+/// Ask the daemon something that answers in records, and send them as one JSON
+/// array. The records are the daemon's own bytes, joined and not re-encoded.
+fn sendRecords(
+    serve: *Serve,
+    arena: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    asked: control.Request,
+) !void {
     const stream = serve.daemon.connect(serve.io) catch |err| {
         try respondUnreachable(arena, request, serve.daemon, err);
         return;
@@ -365,7 +488,80 @@ fn serveSessions(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Ser
     control.exchange(
         &stream_reader.interface,
         &stream_writer.interface,
-        .{ .list = .{ .project = serve.project } },
+        asked,
+        &said,
+        &gather,
+        Gather.take,
+    ) catch |err| {
+        if (!said.ok()) {
+            try respondHandshake(arena, request, serve.daemon, said);
+            return;
+        }
+        try respondDaemonFault(arena, request, @errorName(err));
+        return;
+    };
+
+    if (gather.failed) |text| {
+        try respondDaemonRefusal(arena, request, text);
+        return;
+    }
+
+    const json = try std.fmt.allocPrint(arena, "[{s}]", .{body.items});
+    try sendWhole(request, json, .{ .extra_headers = &json_headers });
+}
+
+/// One session's events after a point, answered whole and then closed.
+///
+/// `serveEvents` holds a stream open, which a browser on phantom's web backend
+/// cannot read: there, one request is one whole response. The daemon already
+/// answers a bounded read, so this asks for that rather than asking the page to
+/// do something it cannot.
+fn serveLines(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
+    const session = queryValue(request.head.target, "session") orelse {
+        try sendWhole(request, "a session is required\n", .{ .status = .bad_request });
+        return;
+    };
+    const after = parseAfter(queryValue(request.head.target, "after"));
+
+    const stream = serve.daemon.connect(serve.io) catch |err| {
+        try respondUnreachable(arena, request, serve.daemon, err);
+        return;
+    };
+    defer stream.close(serve.io);
+
+    var read_buffer: [256 * 1024]u8 = undefined;
+    var stream_reader = stream.reader(serve.io, &read_buffer);
+    var write_buffer: [4 * 1024]u8 = undefined;
+    var stream_writer = stream.writer(serve.io, &write_buffer);
+
+    var body: std.ArrayList(u8) = .empty;
+    const Gather = struct {
+        gpa: std.mem.Allocator,
+        body: *std.ArrayList(u8),
+        failed: ?[]const u8 = null,
+
+        fn take(self: *@This(), reply: control.Reply) anyerror!bool {
+            switch (reply) {
+                .record => |one| {
+                    if (self.body.items.len != 0) try self.body.append(self.gpa, ',');
+                    try self.body.appendSlice(self.gpa, one.payload);
+                },
+                .failed => |text| {
+                    self.failed = text;
+                    return false;
+                },
+                .ok => {},
+            }
+            return true;
+        }
+    };
+    var gather = Gather{ .gpa = arena, .body = &body };
+    var said: control.Handshake = .{ .unreadable = "" };
+
+    control.exchange(
+        &stream_reader.interface,
+        &stream_writer.interface,
+        .{ .read = .{ .session = session, .after = after } },
         &said,
         &gather,
         Gather.take,
@@ -393,6 +589,7 @@ fn serveEvents(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Serve
         return;
     };
     const after = lastEventId(request) orelse parseAfter(queryValue(request.head.target, "after"));
+    const project = projectOf(serve, arena, request.head.target);
 
     const stream = serve.daemon.connect(serve.io) catch |err| {
         try respondUnreachable(arena, request, serve.daemon, err);
@@ -441,7 +638,11 @@ fn serveEvents(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Serve
     control.exchange(
         &stream_reader.interface,
         &stream_writer.interface,
-        .{ .watch = .{ .project = serve.project, .session = session, .after = after } },
+        .{ .watch = .{
+            .project = project,
+            .session = session,
+            .after = after,
+        } },
         &said,
         &pump,
         Pump.take,
@@ -466,7 +667,7 @@ pub fn writeFrame(writer: *std.Io.Writer, record: control.Reply.Record) std.Io.W
 }
 
 fn serveAnswer(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
-    const asked = answerFrom(request.head.target, serve.project) catch |err| {
+    const asked = answerFrom(request.head.target, projectOf(serve, arena, request.head.target)) catch |err| {
         const text = switch (err) {
             error.NoSession => "that needs a session\n",
             error.NoRequest => "that needs the identifier of the approval it answers\n",
@@ -476,6 +677,17 @@ fn serveAnswer(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Serve
         return;
     };
 
+    try askDaemon(serve, arena, request, asked, "{\"answered\":true}");
+}
+
+/// Put one request to the daemon and answer `good` when it says yes.
+fn askDaemon(
+    serve: *Serve,
+    arena: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    asked: control.Request,
+    good: []const u8,
+) !void {
     const stream = serve.daemon.connect(serve.io) catch |err| {
         try respondUnreachable(arena, request, serve.daemon, err);
         return;
@@ -526,7 +738,45 @@ fn serveAnswer(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Serve
         try respondDaemonRefusal(arena, request, answered.said orelse "the daemon said nothing");
         return;
     }
-    try sendWhole(request, "{\"answered\":true}", .{ .extra_headers = &json_headers });
+    try sendWhole(request, good, .{ .extra_headers = &json_headers });
+}
+
+/// The most one message may be. A prompt past this is not a person typing.
+const max_message_bytes: usize = 128 * 1024;
+
+/// Send a message to a session that already exists.
+///
+/// The message is the request body and not a query value: a prompt is as long
+/// as a person wants, and a URL is not.
+fn servePrompt(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
+    const session = queryValue(request.head.target, "session") orelse {
+        try sendWhole(request, "that needs a session\n", .{ .status = .bad_request });
+        return;
+    };
+    // Both read before the body. Making a reader invalidates every string in
+    // the head, so a target read after this point is freed memory.
+    const project = projectOf(serve, arena, request.head.target);
+    const asked = arena.dupe(u8, session) catch return;
+
+    var body_buffer: [8 * 1024]u8 = undefined;
+    const body = request.readerExpectContinue(&body_buffer) catch {
+        try sendWhole(request, "the message could not be read\n", .{ .status = .bad_request });
+        return;
+    };
+    const message = body.allocRemaining(arena, .limited(max_message_bytes)) catch {
+        try sendWhole(request, "the message could not be read\n", .{ .status = .bad_request });
+        return;
+    };
+    if (message.len == 0) {
+        try sendWhole(request, "that needs a message\n", .{ .status = .bad_request });
+        return;
+    }
+
+    try askDaemon(serve, arena, request, .{ .prompt = .{
+        .project = project,
+        .session = asked,
+        .message = message,
+    } }, "{\"sent\":true}");
 }
 
 const json_headers = [_]std.http.Header{
@@ -534,6 +784,29 @@ const json_headers = [_]std.http.Header{
 };
 
 // std.http.Server.respond asserts the request declared a body length, and a POST with neither header is legal and crashed this.
+/// Send one file of the page, still compressed, and let the browser expand it.
+fn sendMember(request: *std.http.Server.Request, name: []const u8) !void {
+    const one = memberNamed(name) orelse {
+        try sendWhole(request, "not found\n", .{ .status = .not_found });
+        return;
+    };
+    try sendWhole(request, one.bytes, .{ .extra_headers = &.{
+        .{ .name = "content-type", .value = contentTypeOf(name) },
+        .{ .name = "content-encoding", .value = "gzip" },
+    } });
+}
+
+/// What a browser should read a member as. A name the page does not use answers
+/// a stream of bytes rather than a guess.
+fn contentTypeOf(name: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, name, ".html")) return "text/html; charset=utf-8";
+    if (std.mem.endsWith(u8, name, ".js")) return "text/javascript; charset=utf-8";
+    if (std.mem.endsWith(u8, name, ".wasm")) return "application/wasm";
+    if (std.mem.endsWith(u8, name, ".otf")) return "font/otf";
+    if (std.mem.endsWith(u8, name, ".json")) return "application/json";
+    return "application/octet-stream";
+}
+
 fn sendWhole(
     request: *std.http.Server.Request,
     content: []const u8,
@@ -727,171 +1000,6 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
     return options;
 }
 
-const page_html =
-    \\<!doctype html>
-    \\<html lang="en">
-    \\<head>
-    \\<meta charset="utf-8">
-    \\<meta name="viewport" content="width=device-width, initial-scale=1">
-    \\<title>chock</title>
-    \\<style>
-    \\:root { color-scheme: light dark; --line: #8884; --dim: #8889; }
-    \\* { box-sizing: border-box; }
-    \\body { margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-    \\  height: 100vh; display: grid; grid-template-rows: auto 1fr auto;
-    \\  grid-template-columns: 22rem 1fr; grid-template-areas: "top top" "side main" "ask ask"; }
-    \\header { grid-area: top; padding: .5rem .75rem; border-bottom: 1px solid var(--line);
-    \\  display: flex; gap: 1rem; align-items: baseline; }
-    \\header b { font-weight: 600; }
-    \\header span { color: var(--dim); }
-    \\#side { grid-area: side; border-right: 1px solid var(--line); overflow-y: auto; }
-    \\#main { grid-area: main; overflow-y: auto; padding: .5rem .75rem; }
-    \\#ask { grid-area: ask; border-top: 1px solid var(--line); padding: .75rem; display: none; }
-    \\#ask.open { display: block; }
-    \\.row { padding: .5rem .75rem; border-bottom: 1px solid var(--line); cursor: pointer; }
-    \\.row:hover { background: #8881; }
-    \\.row.on { background: #8882; }
-    \\.row .id { font-weight: 600; }
-    \\.row .meta { color: var(--dim); font-size: 12px; }
-    \\.dot { display: inline-block; width: .5rem; height: .5rem; border-radius: 50%; }
-    \\.live { background: #2a2; } .idle { background: #888; } .unknown { background: #c82; }
-    \\.ev { padding: .25rem 0; border-bottom: 1px solid var(--line); white-space: pre-wrap;
-    \\  word-break: break-word; }
-    \\.ev .kind { color: var(--dim); margin-right: .5rem; }
-    \\.warn { color: #c82; }
-    \\button { font: inherit; padding: .35rem .9rem; margin-right: .5rem; cursor: pointer; }
-    \\pre { margin: .25rem 0; white-space: pre-wrap; }
-    \\</style>
-    \\</head>
-    \\<body>
-    \\<header><b>chock</b><span id="where"></span><span id="note"></span></header>
-    \\<div id="side"></div>
-    \\<div id="main"></div>
-    \\<div id="ask"><div id="asktext"></div>
-    \\  <p><button id="yes">Allow</button><button id="no">Refuse</button></p></div>
-    \\<script>
-    \\"use strict";
-    \\let current = null, source = null, open = null;
-    \\const $ = (id) => document.getElementById(id);
-    \\const say = (t) => { $("note").textContent = t; };
-    \\
-    \\async function sessions() {
-    \\  try {
-    \\    const answer = await fetch("/api/sessions");
-    \\    if (!answer.ok) { say(await answer.text()); return; }
-    \\    say("");
-    \\    draw(await answer.json());
-    \\  } catch (e) { say(String(e)); }
-    \\}
-    \\
-    \\function draw(rows) {
-    \\  const side = $("side");
-    \\  side.replaceChildren();
-    \\  if (rows.length === 0) {
-    \\    const empty = document.createElement("div");
-    \\    empty.className = "row"; empty.textContent = "no sessions yet";
-    \\    side.append(empty); return;
-    \\  }
-    \\  for (const row of rows.slice().reverse()) {
-    \\    const el = document.createElement("div");
-    \\    el.className = "row" + (row.id === current ? " on" : "");
-    \\    const dot = document.createElement("span");
-    \\    dot.className = "dot " + (row.live || "unknown");
-    \\    const id = document.createElement("div");
-    \\    id.className = "id"; id.append(dot, " " + row.id);
-    \\    const meta = document.createElement("div");
-    \\    meta.className = "meta";
-    \\    const bits = [new Date(row.started_ms).toLocaleString()];
-    \\    if (row.model) bits.push(row.model);
-    \\    if (row.end) bits.push(row.end);
-    \\    if (row.turns) bits.push(row.turns + " turns");
-    \\    if (row.chain !== "intact") bits.push("chain " + row.chain);
-    \\    meta.textContent = bits.join(" \u00b7 ");
-    \\    el.append(id, meta);
-    \\    el.onclick = () => watch(row.id);
-    \\    side.append(el);
-    \\  }
-    \\}
-    \\
-    \\function watch(id) {
-    \\  if (source) { source.close(); source = null; }
-    \\  current = id; open = null; $("ask").className = "";
-    \\  $("main").replaceChildren();
-    \\  sessions();
-    \\  source = new EventSource("/api/events?session=" + encodeURIComponent(id) + "&after=0");
-    \\  source.onmessage = (m) => show(JSON.parse(m.data));
-    \\  source.addEventListener("refused", (m) => say(m.data));
-    \\  source.onerror = () => say("the event stream stopped");
-    \\}
-    \\
-    \\function show(envelope) {
-    \\  if (!envelope.event) return;
-    \\  const kind = Object.keys(envelope.event)[0];
-    \\  const body = envelope.event[kind];
-    \\  if (kind === "approval.request") { ask(envelope.id, body); }
-    \\  if (kind === "approval.response" && open !== null) { $("ask").className = ""; open = null; }
-    \\  const el = document.createElement("div");
-    \\  el.className = "ev";
-    \\  const tag = document.createElement("span");
-    \\  tag.className = "kind"; tag.textContent = kind;
-    \\  const text = document.createElement("span");
-    \\  text.textContent = summarise(kind, body);
-    \\  el.append(tag, text);
-    \\  const main = $("main");
-    \\  const at_end = main.scrollTop + main.clientHeight >= main.scrollHeight - 40;
-    \\  main.append(el);
-    \\  if (at_end) main.scrollTop = main.scrollHeight;
-    \\}
-    \\
-    \\function summarise(kind, body) {
-    \\  if (!body) return "";
-    \\  if (kind === "message") {
-    \\    const parts = (body.content || []).map((p) => p.text || p.thinking || "").filter(Boolean);
-    \\    return body.role + ": " + parts.join("\n");
-    \\  }
-    \\  if (kind === "tool.call") return body.name + " " + (body.arguments || "");
-    \\  if (kind === "tool.result") return (body.ok === false ? "failed: " : "") + (body.output || "");
-    \\  if (kind === "session.end") return body.reason + (body.detail ? ": " + body.detail : "");
-    \\  if (kind === "approval.response") return body.decision + " by " + (body.responder || "somebody");
-    \\  return JSON.stringify(body);
-    \\}
-    \\
-    \\function ask(id, body) {
-    \\  open = id;
-    \\  const box = $("asktext");
-    \\  box.replaceChildren();
-    \\  const head = document.createElement("b");
-    \\  head.textContent = body.action + ": " + (body.summary || "");
-    \\  const why = document.createElement("div");
-    \\  why.className = "meta"; why.textContent = body.reason || "";
-    \\  const detail = document.createElement("pre");
-    \\  detail.textContent = body.detail || "";
-    \\  box.append(head, why, detail);
-    \\  $("ask").className = "open";
-    \\}
-    \\
-    \\async function answer(word) {
-    \\  if (open === null || current === null) return;
-    \\  const url = "/api/answer?session=" + encodeURIComponent(current) +
-    \\    "&request=" + open + "&decision=" + word;
-    \\  try {
-    \\    const done = await fetch(url, { method: "POST" });
-    \\    if (!done.ok) { say(await done.text()); return; }
-    \\    say(""); $("ask").className = ""; open = null;
-    \\  } catch (e) { say(String(e)); }
-    \\}
-    \\
-    \\$("yes").onclick = () => answer("yes");
-    \\$("no").onclick = () => answer("no");
-    \\$("where").textContent = location.host;
-    \\sessions();
-    \\setInterval(sessions, 3000);
-    \\</script>
-    \\</body>
-    \\</html>
-    \\
-;
-
 const testing = std.testing;
 
 test "serve reaches a daemon and never a session on disk" {
@@ -1052,24 +1160,54 @@ test "a browser cannot name a project, so it cannot ask about a directory it was
 
 test "every route is one the dispatch has a case for, and a query does not make a new one" {
     try testing.expectEqual(Route.page, routeOf("/").?);
+    // The page's own route, so a reload or a link lands back in the session.
+    try testing.expectEqual(Route.page, routeOf("/s/01M2GPTA3SSYQ9X0KGRRNVY0MT").?);
+    try testing.expectEqual(Route.page, routeOf("/s/01M2GPTA3SSYQ9X0KGRRNVY0MT?x=1").?);
     try testing.expectEqual(Route.sessions, routeOf("/api/sessions").?);
+    try testing.expectEqual(Route.projects, routeOf("/api/projects").?);
     try testing.expectEqual(Route.events, routeOf("/api/events").?);
     try testing.expectEqual(Route.answer, routeOf("/api/answer").?);
+    try testing.expectEqual(Route.prompt, routeOf("/api/prompt?session=01JQ").?);
 
     try testing.expectEqual(Route.events, routeOf("/api/events?session=01&after=0").?);
     try testing.expectEqual(Route.sessions, routeOf("/api/sessions?").?);
+
+    // A file of the page answers by its own name, because the name is matched
+    // against the bundle.
+    try testing.expectEqual(Route.asset, routeOf("/index.html").?);
+    try testing.expectEqual(Route.asset, routeOf("/boot.js").?);
+    try testing.expectEqual(Route.asset, routeOf("/chock-web.wasm").?);
 
     for ([_][]const u8{
         "/api",
         "/api/",
         "/api/sessions/1",
-        "/index.html",
+        // Nothing after `/s/`, and a name of a shape no session has.
+        "/s/",
+        "/s/not a session",
+        "/s/../etc/passwd",
+        // A name no member has, which is every path outside the page. Nothing
+        // here reads a directory, so a traversal names nothing rather than
+        // being cleaned up and then read.
         "/../etc/passwd",
+        "/etc/passwd",
+        "/fonts/",
         "",
     }) |target| try testing.expect(routeOf(target) == null);
 
+    try testing.expectEqual(Route.lines, routeOf("/api/lines?session=01JQ&after=0").?);
+
     var reached = std.EnumSet(Route).initEmpty();
-    for ([_][]const u8{ "/", "/api/sessions", "/api/events", "/api/answer" }) |target| {
+    for ([_][]const u8{
+        "/",
+        "/api/sessions",
+        "/api/projects",
+        "/api/events",
+        "/api/lines",
+        "/api/answer",
+        "/api/prompt",
+        "/boot.js",
+    }) |target| {
         reached.insert(routeOf(target).?);
     }
     try testing.expectEqual(std.enums.values(Route).len, reached.count());
@@ -1203,12 +1341,43 @@ test "a request whose body cannot be discarded gets an answer and not a panic" {
     try testing.expect(mayKeepAlive(.HEAD, .none, null));
 }
 
+/// A member, expanded. Only a test does this: the server never decompresses.
+fn expandedForTest(gpa: std.mem.Allocator, name: []const u8) ![]u8 {
+    const one = memberNamed(name) orelse return error.MemberMissing;
+    var reading: std.Io.Reader = .fixed(one.bytes);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var expand: std.compress.flate.Decompress = .init(&reading, .gzip, &window);
+    return expand.reader.allocRemaining(gpa, .limited(32 * 1024 * 1024));
+}
+
 test "the page fetches nothing from anywhere else" {
-    for ([_][]const u8{ "http://", "https://", "//cdn", "<script src", "<link " }) |outside| {
-        try testing.expect(std.mem.indexOf(u8, page_html, outside) == null);
+    const gpa = testing.allocator;
+    // The page and the script it loads. A dependency on a CDN would be a tool
+    // call reaching the network through the interface rather than through the
+    // broker, so it is refused here rather than reviewed by eye.
+    for ([_][]const u8{ "index.html", "boot.js" }) |name| {
+        const said = try expandedForTest(gpa, name);
+        defer gpa.free(said);
+        for ([_][]const u8{ "http://", "https://", "//cdn" }) |outside| {
+            try testing.expect(std.mem.indexOf(u8, said, outside) == null);
+        }
     }
-    try testing.expect(std.mem.indexOf(u8, page_html, "<!doctype html>") != null);
-    try testing.expect(std.mem.indexOf(u8, page_html, "/api/sessions") != null);
-    try testing.expect(std.mem.indexOf(u8, page_html, "/api/events") != null);
-    try testing.expect(std.mem.indexOf(u8, page_html, "/api/answer") != null);
+
+    const page = try expandedForTest(gpa, "index.html");
+    defer gpa.free(page);
+    try testing.expect(std.mem.indexOf(u8, page, "<!doctype html>") != null or
+        std.mem.indexOf(u8, page, "<!DOCTYPE html>") != null);
+}
+
+test "every file of the browser interface is in the bundle, still compressed" {
+    // The page a browser loads first, and the two the page then asks for by
+    // name. A rename on phantom's side fails here rather than at run time.
+    for ([_][]const u8{ "index.html", "boot.js", "chock-web.wasm" }) |wanted| {
+        const one = memberNamed(wanted) orelse return error.MemberMissing;
+        try testing.expect(one.bytes.len != 0);
+        // A gzip stream, so it goes to the browser untouched.
+        try testing.expectEqual(@as(u8, 0x1f), one.bytes[0]);
+        try testing.expectEqual(@as(u8, 0x8b), one.bytes[1]);
+    }
+    try testing.expectEqual(@as(?Member, null), memberNamed("nothing.here"));
 }

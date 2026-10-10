@@ -465,6 +465,7 @@ fn serve(daemon: *Daemon, arena: std.mem.Allocator, stream: *std.Io.net.Stream) 
         .cancel => |one| handleCancel(daemon, writer, one),
         .read => |one| handleRead(daemon, arena, writer, one),
         .list => |one| handleList(daemon, arena, writer, one),
+        .projects => handleProjects(daemon, arena, writer),
         .watch => |one| handleWatch(daemon, arena, writer, stream.socket.handle, one),
         .answer => |one| handleAnswer(daemon, arena, writer, one),
     }
@@ -810,6 +811,10 @@ fn startGuest(
 
     const guest_machine = chock_policy.sandbox.Machine.now();
 
+    const console = guestConsolePath(daemon, id) orelse return null;
+    var console_owned = true;
+    defer if (console_owned) daemon.gpa.free(console);
+
     const work = GuestWork{
         .daemon = daemon,
         .running = running,
@@ -823,6 +828,7 @@ fn startGuest(
             .control = vmm.fork_sets_control,
         },
         .shares = room,
+        .console = console,
     };
 
     running.thread = std.Thread.spawn(.{}, runGuest, .{work}) catch |err| {
@@ -830,6 +836,7 @@ fn startGuest(
         return null;
     };
     room_owned = false;
+    console_owned = false;
 
     if (!waitForGuest(daemon.io, running)) {
         tty.print(
@@ -849,7 +856,7 @@ fn startGuest(
     }
     socket_owned = false;
     running_owned = false;
-    tty.detail("chock daemon: session {s} has a guest at {s}\n", .{ id, socket });
+    tty.detail("chock daemon: session {s} has a guest at {s}, console at {s}\n", .{ id, socket, console });
     return socket;
 }
 
@@ -858,13 +865,31 @@ const GuestWork = struct {
     running: *Running,
     options: vmm.Options,
     shares: *std.heap.ArenaAllocator,
+    /// Where the guest's console is written. Owned by the thread that runs the
+    /// guest, and freed with it.
+    console: [:0]u8,
 };
 
 fn runGuest(work: GuestWork) void {
     const daemon = work.daemon;
     const running = work.running;
 
-    const console = std.Io.File.stdout();
+    defer daemon.gpa.free(work.console);
+
+    // A file and not this daemon's own output. A guest writes its kernel log and
+    // its init script to this, and a daemon that answers many sessions would
+    // otherwise have all of them spliced through its own messages.
+    var console = std.Io.Dir.cwd().createFile(daemon.io, work.console, .{}) catch {
+        tty.print(
+            .err,
+            "chock daemon: a guest's console could not be opened at {s}\n",
+            .{work.console},
+        );
+        releaseShares(daemon, work.shares);
+        running.ended.store(true, .release);
+        return;
+    };
+    defer console.close(daemon.io);
 
     var child = vmm.forkHost(daemon.io, work.options, console.handle) catch |err| {
         tty.print(.err, "chock daemon: a guest's own process could not be started: {t}\n", .{err});
@@ -945,6 +970,7 @@ fn guestShares(
 
     const paths = session_paths.pathsFor(arena, daemon.env, root, id) catch return null;
     session_paths.create(daemon.io, paths) catch return null;
+    session_paths.markProject(daemon.io, paths, root);
     grant(arena, &out, daemon.io, paths.work, true) catch return null;
 
     const backing = run_cmd.projectGrantDir(arena, daemon.io, root) catch return null;
@@ -1076,6 +1102,20 @@ fn waitForGuest(io: std.Io, running: *Running) bool {
 }
 
 const guest_name_bytes: usize = 12;
+
+/// Where a guest's console is written, beside its socket and named the same.
+fn guestConsolePath(
+    daemon: *Daemon,
+    id: *const [session_paths.id_length]u8,
+) ?[:0]u8 {
+    const tail = id[id.len - guest_name_bytes ..];
+    return std.fmt.allocPrintSentinel(
+        daemon.gpa,
+        "{s}/g-{s}.console",
+        .{ daemon.socket_dir, tail },
+        0,
+    ) catch null;
+}
 
 fn guestSocketPath(
     daemon: *Daemon,
@@ -1248,10 +1288,20 @@ fn handleList(
     writer: *std.Io.Writer,
     one: control.Request.List,
 ) void {
+    // Empty asks for every project, which is what a picker covering more than
+    // one needs. A named project still has to be a real path.
     if (one.project.len == 0) {
-        fail(writer, "list needs a project directory, and it cannot be empty");
+        const found = session_paths.listProjects(arena, daemon.io, daemon.env) catch {
+            fail(writer, "the projects could not be read");
+            return;
+        };
+        for (found) |project| {
+            if (!listInto(daemon, arena, writer, project.dir, project.name, project.root)) return;
+        }
+        writer.flush() catch return;
         return;
     }
+
     if (!std.fs.path.isAbsolute(one.project)) {
         fail(writer, "the project directory has to be an absolute path");
         return;
@@ -1262,18 +1312,56 @@ fn handleList(
         return;
     };
 
+    if (!listInto(daemon, arena, writer, dir, "", one.project)) return;
+    writer.flush() catch return;
+}
+
+/// Write out every session in one directory. False when something refused and
+/// the caller has already been told.
+fn listInto(
+    daemon: *Daemon,
+    arena: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    dir: []const u8,
+    project: []const u8,
+    root: []const u8,
+) bool {
     const found = sessions_cmd.list(arena, daemon.io, dir) catch {
         fail(writer, "out of memory");
-        return;
+        return false;
     };
 
     for (found) |session| {
-        const row = rowOf(session);
+        var row = rowOf(session);
+        row.project = project;
+        row.project_root = root;
         const text = row.toJson(arena) catch {
             fail(writer, "a session could not be written out");
-            return;
+            return false;
         };
         say(writer, .{ .record = .{ .id = session.started_ms, .payload = text } });
+    }
+    return true;
+}
+
+/// Every project this daemon can see, one record each.
+fn handleProjects(daemon: *Daemon, arena: std.mem.Allocator, writer: *std.Io.Writer) void {
+    const found = session_paths.listProjects(arena, daemon.io, daemon.env) catch {
+        fail(writer, "the projects could not be read");
+        return;
+    };
+
+    for (found, 0..) |one, index| {
+        const row: control.ProjectRow = .{
+            .root = one.root,
+            .name = one.name,
+            .sessions = one.sessions,
+        };
+        const text = row.toJson(arena) catch {
+            fail(writer, "a project could not be written out");
+            return;
+        };
+        say(writer, .{ .record = .{ .id = index, .payload = text } });
     }
     writer.flush() catch return;
 }
@@ -1285,6 +1373,7 @@ pub fn rowOf(session: sessions_cmd.Session) control.SessionRow {
         .model = session.model,
         .model_count = session.model_count,
         .model_alias = session.model_alias,
+        .title = session.title,
         .live = @tagName(session.live),
         .end = if (session.end) |reason| reason.wireName() else null,
         .turns = session.spend.turns,

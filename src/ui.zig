@@ -16,6 +16,58 @@ const clock_mod = @import("clock.zig");
 const chock_broker = @import("chock-broker");
 const chock_policy = @import("chock-policy");
 const sandbox = @import("chock-sandbox");
+const chock_ui = @import("chock-ui");
+
+const ui_text = chock_ui.text;
+const ui_layout = chock_ui.layout;
+const ui_model = chock_ui.model;
+
+pub const Split = ui_layout.Split;
+pub const split = ui_layout.split;
+pub const Measure = ui_layout.Measure;
+pub const Room = ui_layout.Room;
+pub const spread = ui_layout.spread;
+pub const narrow_columns = ui_layout.narrow_columns;
+const grid_measure = ui_layout.grid_measure;
+const countIn = ui_layout.countIn;
+const drawnAt = ui_layout.drawnAt;
+const visibleLine = ui_layout.visibleLine;
+
+pub const durationText = ui_text.durationText;
+pub const sizeText = ui_text.sizeText;
+pub const clockText = ui_text.clockText;
+pub const argumentText = ui_text.argumentText;
+pub const askArgumentText = ui_text.askArgumentText;
+pub const summaryText = ui_text.summaryText;
+
+pub const Attach = ui_model.Attach;
+pub const Facts = ui_model.Facts;
+pub const Layer = ui_model.Layer;
+pub const statusWord = ui_model.statusWord;
+pub const sizeMoved = ui_model.sizeMoved;
+pub const isStatus = ui_model.isStatus;
+pub const PlanLine = ui_model.PlanLine;
+pub const planRows = ui_model.planRows;
+pub const HeaderPiece = ui_model.HeaderPiece;
+pub const layerText = ui_model.layerText;
+pub const headerPieces = ui_model.headerPieces;
+pub const Voice = ui_model.Voice;
+pub const Pane = ui_model.Pane;
+pub const Fold = ui_model.Fold;
+pub const markerText = ui_model.markerText;
+pub const Command = ui_model.Command;
+pub const commandOf = ui_model.commandOf;
+pub const Resumable = ui_model.Resumable;
+pub const Approval = ui_model.Approval;
+pub const Answered = ui_model.Answered;
+pub const Look = ui_model.Look;
+pub const Question = ui_model.Question;
+pub const Text = ui_model.Text;
+pub const questionKeys = ui_model.questionKeys;
+pub const sidebar_columns = ui_model.sidebar_columns;
+pub const sidebar_needs_columns = ui_model.sidebar_needs_columns;
+const columnsOf = ui_model.columnsOf;
+const yesNo = ui_model.yesNo;
 
 pub const Plan = enum {
     window,
@@ -228,319 +280,6 @@ fn pipedMessage(arena: std.mem.Allocator, io: std.Io) !?[]const u8 {
 
 const max_message_bytes = 4096;
 
-pub const Split = struct {
-    header: u16,
-    transcript: u16,
-    approval: u16,
-    input: u16,
-};
-
-const band_rows: u16 = 1;
-
-pub fn split(rows: u16, wanted: u16) Split {
-    if (rows == 0) return .{ .header = 0, .transcript = 0, .approval = 0, .input = 0 };
-    if (rows == 1) return .{ .header = 0, .transcript = 0, .approval = 0, .input = band_rows };
-    const room = rows - 2 * band_rows;
-    const asked = @min(wanted, room);
-    return .{
-        .header = band_rows,
-        .transcript = room - asked,
-        .approval = asked,
-        .input = band_rows,
-    };
-}
-
-const Rows = struct {
-    into: std.ArrayList(phantom.Widget) = .empty,
-    left: u16,
-
-    fn add(self: *Rows, arena: std.mem.Allocator, one: phantom.Widget) void {
-        if (self.left == 0) return;
-        self.left -= 1;
-        self.into.append(arena, one) catch {};
-    }
-
-    fn items(self: Rows) []const phantom.Widget {
-        return self.into.items;
-    }
-};
-
-const Drawn = struct {
-    point: u21,
-    length: usize,
-    whole: bool,
-};
-
-fn drawnAt(raw: []const u8, at: usize) Drawn {
-    const size = std.unicode.utf8ByteSequenceLength(raw[at]) catch return .{
-        .point = '?',
-        .length = 1,
-        .whole = false,
-    };
-    if (at + size > raw.len) return .{ .point = '?', .length = 1, .whole = false };
-    const point = std.unicode.utf8Decode(raw[at..][0..size]) catch return .{
-        .point = '?',
-        .length = 1,
-        .whole = false,
-    };
-    if (point < 0x20 or point == 0x7f) return .{ .point = ' ', .length = size, .whole = false };
-    return .{ .point = point, .length = size, .whole = true };
-}
-
-fn safeText(
-    arena: std.mem.Allocator,
-    raw: []const u8,
-) std.mem.Allocator.Error![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var index: usize = 0;
-    while (index < raw.len) {
-        const one = drawnAt(raw, index);
-        if (one.whole) {
-            try out.appendSlice(arena, raw[index..][0..one.length]);
-        } else {
-            try out.append(arena, @intCast(one.point));
-        }
-        index += one.length;
-    }
-    return out.items;
-}
-
-fn visibleLine(
-    arena: std.mem.Allocator,
-    raw: []const u8,
-    room: Room,
-) std.mem.Allocator.Error![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var index: usize = 0;
-    var used: f32 = 0;
-
-    while (index < raw.len) {
-        const one = drawnAt(raw, index);
-        const advance = room.measure.advanceOf(one.point);
-        if (used + advance > room.width) break;
-        if (one.whole) {
-            try out.appendSlice(arena, raw[index..][0..one.length]);
-        } else {
-            try out.append(arena, @intCast(one.point));
-        }
-        index += one.length;
-        used += advance;
-    }
-
-    return out.items;
-}
-
-const Mark = struct {
-    id: phantom.icon.Id,
-    label: ?[]const u8,
-};
-
-fn markFor(point: u21) ?Mark {
-    return switch (point) {
-        '\u{2713}' => .{ .id = .check, .label = "ok" },
-        '\u{2717}' => .{ .id = .cross, .label = "not ok" },
-        '\u{2502}' => .{ .id = .rule_vertical, .label = null },
-        '\u{2500}' => .{ .id = .rule_horizontal, .label = null },
-        '\u{25b8}' => .{ .id = .chevron_right, .label = null },
-        '\u{25be}' => .{ .id = .chevron_down, .label = null },
-        '\u{22ef}' => .{ .id = .ellipsis, .label = "running" },
-        else => null,
-    };
-}
-
-pub const readable_columns: u16 = 80;
-
-fn wrapText(
-    arena: std.mem.Allocator,
-    raw: []const u8,
-    room: Room,
-) std.mem.Allocator.Error![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    if (!(room.width > 0)) {
-        try out.append(arena, "");
-        return out.items;
-    }
-
-    const safe = try safeText(arena, raw);
-    const broken = phantom.text.layout.layoutParagraph(
-        arena,
-        room.measure.font,
-        safe,
-        room.measure.size,
-        room.measure.logicalMetrics(),
-        room.width,
-    ) catch {
-        try out.append(arena, safe);
-        return out.items;
-    };
-
-    for (broken.lines) |line| {
-        var words: std.ArrayList(u8) = .empty;
-        for (line.glyphs) |one| {
-            var bytes: [4]u8 = undefined;
-            const length = std.unicode.utf8Encode(one.cp, &bytes) catch continue;
-            try words.appendSlice(arena, bytes[0..length]);
-        }
-        try out.append(arena, words.items);
-    }
-    if (out.items.len == 0) try out.append(arena, "");
-    return out.items;
-}
-
-const first_printable: u21 = ' ';
-const last_printable: u21 = '~';
-const printable_count = last_printable - first_printable + 1;
-
-pub const Measure = struct {
-    metrics: phantom.text.mono.TextMetrics,
-    dpr: f32,
-    font: *phantom.text.Font,
-    size: f32,
-    known: ?Known = null,
-
-    const Known = struct {
-        line: f32,
-        typical: f32,
-        ascii: [printable_count]f32,
-    };
-
-    pub fn of(ctx: *phantom.BuildContext) Measure {
-        const theme = phantom.theme.defaultTheme(ctx.owner);
-        const view = ctx.owner.activeView();
-        return (Measure{
-            .metrics = ctx.owner.text_metrics,
-            .dpr = if (view) |one| one.metrics.dpr else 1,
-            .font = theme.body_font,
-            .size = theme.text_size,
-        }).measured();
-    }
-
-    pub fn measured(self: Measure) Measure {
-        var made = self;
-        made.known = null;
-        var found: Known = undefined;
-        var total: f32 = 0;
-        for (&found.ascii, 0..) |*one, at| {
-            one.* = made.advanceOf(first_printable + @as(u21, @intCast(at)));
-            total += one.*;
-        }
-        const mean = total / printable_count;
-        found.line = made.height();
-        found.typical = if (mean > 0) mean else made.size;
-        made.known = found;
-        return made;
-    }
-
-    fn ratio(self: Measure) f32 {
-        return if (self.dpr > 0) self.dpr else 1;
-    }
-
-    pub fn height(self: Measure) f32 {
-        if (self.known) |one| return one.line;
-        return switch (self.metrics) {
-            .mono => |cell| cell.line / self.ratio(),
-            .proportional => blk: {
-                const per_em: f32 = @floatFromInt(self.font.unitsPerEm());
-                if (per_em <= 0) break :blk self.size;
-                const up: f32 = @floatFromInt(self.font.ascent());
-                const down: f32 = @floatFromInt(self.font.descent());
-                break :blk (up - down) * self.size / per_em;
-            },
-        };
-    }
-
-    pub fn logicalMetrics(self: Measure) phantom.text.mono.TextMetrics {
-        return switch (self.metrics) {
-            .mono => |cell| .{ .mono = .{
-                .advance = cell.advance / self.ratio(),
-                .line = cell.line / self.ratio(),
-                .ascent = cell.ascent / self.ratio(),
-            } },
-            .proportional => .proportional,
-        };
-    }
-
-    pub fn advanceOf(self: Measure, point: u21) f32 {
-        if (point >= first_printable and point <= last_printable) {
-            if (self.known) |one| return one.ascii[point - first_printable];
-        }
-        return switch (self.metrics) {
-            .mono => |cell| blk: {
-                const columns: f32 = @floatFromInt(phantom.text.mono.wcwidth(point));
-                break :blk cell.advance * columns / self.ratio();
-            },
-            .proportional => self.font.advance(point, self.size),
-        };
-    }
-
-    pub fn widthOf(self: Measure, text: []const u8) f32 {
-        var index: usize = 0;
-        var used: f32 = 0;
-        while (index < text.len) {
-            const one = drawnAt(text, index);
-            used += self.advanceOf(one.point);
-            index += one.length;
-        }
-        return used;
-    }
-
-    pub fn step(self: Measure) f32 {
-        if (self.known) |one| return one.typical;
-        var total: f32 = 0;
-        var point: u21 = first_printable;
-        while (point <= last_printable) : (point += 1) total += self.advanceOf(point);
-        const mean = total / printable_count;
-        return if (mean > 0) mean else self.size;
-    }
-
-    pub fn rowsIn(self: Measure, logical_height: f32) u16 {
-        return countIn(logical_height, self.height());
-    }
-};
-
-const grid_measure: Measure = .{
-    .metrics = .{ .mono = .{ .advance = 1, .line = 1, .ascent = 0.8 } },
-    .dpr = 1,
-    .font = undefined,
-    .size = 1,
-};
-
-pub const Room = struct {
-    measure: Measure,
-    width: f32,
-
-    pub fn grid(columns: f32) Room {
-        return .{ .measure = grid_measure, .width = columns };
-    }
-
-    pub fn less(self: Room, text: []const u8) Room {
-        const taken = self.measure.widthOf(text);
-        return .{
-            .measure = self.measure,
-            .width = if (self.width > taken) self.width - taken else 0,
-        };
-    }
-
-    pub fn upTo(self: Room, width: f32) Room {
-        return .{ .measure = self.measure, .width = @min(self.width, width) };
-    }
-
-    pub fn holds(self: Room, text: []const u8) bool {
-        return self.measure.widthOf(text) <= self.width;
-    }
-
-    pub fn isNarrow(self: Room) bool {
-        return self.width < @as(f32, narrow_columns) * self.measure.step();
-    }
-};
-
-fn countIn(room: f32, step: f32) u16 {
-    if (!(room > 0) or !(step > 0)) return 0;
-    const whole = @floor(room / step);
-    if (whole >= @as(f32, std.math.maxInt(u16))) return std.math.maxInt(u16);
-    return @intFromFloat(whole);
-}
-
 // The buffer is zero length, so a frame reaches tty's own buffer at once and nothing is left behind when Loop.run forks.
 const Frames = struct {
     writer: std.Io.Writer = .{ .vtable = &vtable, .buffer = &.{} },
@@ -638,755 +377,9 @@ const Diagnostics = struct {
     }
 };
 
-pub const Attach = union(enum) {
-    terminal: Terminal,
-    window: Window,
-
-    pub const Terminal = struct {
-        in: std.Io.File,
-        out: std.Io.File,
-        size: ?phantom.tui.term.Size = null,
-    };
-
-    pub const Window = struct {
-        width: u32 = 960,
-        height: u32 = 640,
-    };
-};
-
-pub const Facts = struct {
-    project: []const u8 = "",
-    workspace: []const u8 = "",
-    model: []const u8 = "",
-    provider: []const u8 = "",
-    layers: []const Layer = &.{},
-};
-
-pub const Layer = struct {
-    name: []const u8,
-    note: []const u8 = "",
-    state: State,
-
-    pub const State = enum {
-        on,
-        off,
-        unsupported,
-        unavailable,
-
-        pub fn glyph(self: State) []const u8 {
-            return switch (self) {
-                .on => "\u{2713}",
-                .off, .unsupported, .unavailable => "\u{2717}",
-            };
-        }
-
-        pub fn word(self: State) []const u8 {
-            return switch (self) {
-                .on => "",
-                .off => "OFF",
-                .unsupported => "NONE",
-                .unavailable => "BLOCKED",
-            };
-        }
-    };
-};
-
-pub const narrow_columns: u16 = 60;
-
-pub const sidebar_columns: u16 = 26;
-
-pub const sidebar_needs_columns: u16 = 80;
-
-pub fn statusWord(status: chock_proto.event.PlanStatus) []const u8 {
-    return switch (status) {
-        .pending => "next",
-        .in_progress => "now",
-        .done => "done",
-        .abandoned => "stopped",
-        .unknown => "unknown",
-    };
-}
-
-pub fn sizeMoved(
-    now: phantom.tui.term.Size,
-    viewport: phantom.PhysicalSize,
-    dpr: f32,
-) bool {
-    const box = now.viewport();
-    return box.width != viewport.width or
-        box.height != viewport.height or
-        now.dpr() != dpr;
-}
-
-pub fn isStatus(
-    status: chock_proto.event.PlanStatus,
-    wanted: std.meta.Tag(chock_proto.event.PlanStatus),
-) bool {
-    return std.meta.activeTag(status) == wanted;
-}
-
-pub const PlanLine = struct {
-    text: []const u8,
-    tone: Tone,
-
-    pub const Tone = enum {
-        title,
-        now,
-        step,
-        aside,
-    };
-};
-
-pub fn planRows(
-    arena: std.mem.Allocator,
-    plan: chock_proto.state.Plan,
-    rows: u16,
-) std.mem.Allocator.Error![]const PlanLine {
-    var out: std.ArrayList(PlanLine) = .empty;
-    if (rows == 0) return out.items;
-
-    const counts = plan.counts();
-    try out.append(arena, .{
-        .tone = .title,
-        .text = if (counts.total() == 0)
-            try std.fmt.allocPrint(arena, " plan   nothing yet", .{})
-        else
-            try std.fmt.allocPrint(arena, " plan   {d}/{d} done", .{
-                counts.done,
-                counts.total(),
-            }),
-    });
-
-    const total: u16 = @intCast(@min(plan.steps.items.len, std.math.maxInt(u16)));
-    var room = rows -| 1;
-    if (room == 0) return out.items;
-
-    const hides = total > room;
-    if (hides and room > 1) room -= 1;
-
-    var first: u16 = 0;
-    while (first < total and isStatus(plan.steps.items[first].status, .done)) first += 1;
-    first = @min(first, total -| room);
-
-    var at: u16 = first;
-    while (at < total and at < first + room) : (at += 1) {
-        const step = plan.steps.items[at];
-        try out.append(arena, .{
-            .tone = if (isStatus(step.status, .in_progress)) .now else .step,
-            .text = try std.fmt.allocPrint(arena, " {s: <7} {s}", .{
-                statusWord(step.status),
-                step.subject,
-            }),
-        });
-    }
-
-    if (!hides or out.items.len >= rows) return out.items;
-    const below = total -| at;
-    try out.append(arena, .{
-        .tone = .aside,
-        .text = try std.fmt.allocPrint(arena, " {d} above, {d} below", .{ first, below }),
-    });
-    return out.items;
-}
-
-pub const HeaderPiece = struct {
-    text: []const u8,
-    tone: Tone,
-
-    pub const Tone = enum {
-        name,
-        context,
-        on,
-        off,
-    };
-};
-
-fn columnsOf(text: []const u8) f32 {
-    return grid_measure.widthOf(text);
-}
-
-pub fn layerText(
-    arena: std.mem.Allocator,
-    one: Layer,
-    narrow: bool,
-) std.mem.Allocator.Error![]const u8 {
-    if (narrow and one.state == .on) return one.state.glyph();
-
-    var text: std.ArrayList(u8) = .empty;
-    try text.appendSlice(arena, one.state.glyph());
-    try text.append(arena, ' ');
-    try text.appendSlice(arena, one.name);
-    if (one.note.len != 0 and !narrow) {
-        try text.append(arena, ' ');
-        try text.appendSlice(arena, one.note);
-    }
-    const said = one.state.word();
-    if (said.len != 0) {
-        try text.append(arena, ' ');
-        try text.appendSlice(arena, said);
-    }
-    return text.items;
-}
-
-pub fn headerPieces(
-    arena: std.mem.Allocator,
-    facts: Facts,
-    room: Room,
-    into: *std.ArrayList(HeaderPiece),
-) std.mem.Allocator.Error!void {
-    const narrow = room.isNarrow();
-
-    var layers: std.ArrayList(HeaderPiece) = .empty;
-    var taken: f32 = 0;
-    for (facts.layers) |one| {
-        const said = try layerText(arena, one, narrow);
-        const whole = try std.fmt.allocPrint(arena, "  {s}", .{said});
-        taken += room.measure.widthOf(whole);
-        try layers.append(arena, .{
-            .text = whole,
-            .tone = switch (one.state) {
-                .on => .on,
-                .off, .unsupported, .unavailable => .off,
-            },
-        });
-    }
-
-    var left = if (room.width > taken) room.width - taken else 0;
-    const name = " chock";
-    const named = room.measure.widthOf(name);
-    if (named <= left) {
-        left -= named;
-        try into.append(arena, .{ .text = name, .tone = .name });
-    }
-    for ([_][]const u8{ facts.project, facts.workspace, facts.model, facts.provider }) |fact| {
-        if (fact.len == 0) continue;
-        const whole = try std.fmt.allocPrint(arena, "  {s}", .{fact});
-        const width = room.measure.widthOf(whole);
-        if (width > left) break;
-        left -= width;
-        try into.append(arena, .{ .text = whole, .tone = .context });
-    }
-
-    for (layers.items) |one| try into.append(arena, one);
-}
-
-pub const Voice = enum {
-    chock,
-    agent,
-
-    pub fn prefix(self: Voice) []const u8 {
-        return switch (self) {
-            .chock => "\u{2502} ",
-            .agent => "  ",
-        };
-    }
-};
-
-pub const Pane = struct {
-    at: u16 = 0,
-
-    kind: Kind,
-
-    pub const Kind = enum { keys };
-
-    pub fn move(self: *Pane, by: i8, room: u16, total: u16) void {
-        const last = total -| room;
-        const now: i32 = self.at;
-        const wanted = now + by;
-        if (wanted < 0) {
-            self.at = 0;
-            return;
-        }
-        self.at = @min(@as(u16, @intCast(@min(wanted, std.math.maxInt(u16)))), last);
-    }
-
-    pub fn hold(self: *Pane, room: u16, total: u16) void {
-        self.at = @min(self.at, total -| room);
-    }
-};
-
-pub const Fold = struct {
-    kind: Kind,
-    body: []const u8,
-    dropped: usize = 0,
-    open: bool = false,
-
-    pub const Kind = enum { result, reasoning, compaction, subagent };
-};
-
-pub fn markerText(open: bool, focused: bool) []const u8 {
-    if (open) return if (focused) "\u{25be} hide  Space" else "\u{25be} hide";
-    return if (focused) "\u{25b8} show  Space" else "\u{25b8} show";
-}
-
-pub fn spread(
-    arena: std.mem.Allocator,
-    left: []const u8,
-    right: []const u8,
-    room: Room,
-) std.mem.Allocator.Error![]const u8 {
-    if (right.len == 0) return visibleLine(arena, left, room);
-    const pinned = room.measure.widthOf(right);
-    if (pinned >= room.width) return visibleLine(arena, right, room);
-
-    const gap = room.measure.advanceOf(' ');
-    const cut = try visibleLine(arena, left, room.upTo(room.width - pinned - gap));
-    var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena, cut);
-    const starts = room.width - pinned;
-    var filled = room.measure.widthOf(cut);
-    while (filled + gap <= starts) : (filled += gap) try out.append(arena, ' ');
-    try out.appendSlice(arena, right);
-    return out.items;
-}
-
-pub fn durationText(arena: std.mem.Allocator, ms: i64) std.mem.Allocator.Error![]const u8 {
-    const took: u64 = if (ms <= 0) 0 else @intCast(ms);
-    if (took < 60 * 1000) {
-        return std.fmt.allocPrint(arena, "{d}.{d}s", .{ took / 1000, (took % 1000) / 100 });
-    }
-    const seconds = took / 1000;
-    return std.fmt.allocPrint(arena, "{d}m{d:0>2}s", .{ seconds / 60, seconds % 60 });
-}
-
-pub fn sizeText(arena: std.mem.Allocator, bytes: usize) std.mem.Allocator.Error![]const u8 {
-    if (bytes < 1024) return std.fmt.allocPrint(arena, "{d} B", .{bytes});
-    if (bytes < 1024 * 1024) {
-        return std.fmt.allocPrint(arena, "{d}.{d} KB", .{ bytes / 1024, (bytes % 1024) * 10 / 1024 });
-    }
-    const mb = bytes / (1024 * 1024);
-    const rest = bytes % (1024 * 1024);
-    return std.fmt.allocPrint(arena, "{d}.{d} MB", .{ mb, rest * 10 / (1024 * 1024) });
-}
-
-const last_second: u64 = 253402300799;
-
-pub fn clockText(
-    arena: std.mem.Allocator,
-    epoch_ms: i64,
-    offset_minutes: i32,
-) std.mem.Allocator.Error![]const u8 {
-    const shifted = @divFloor(epoch_ms, 1000) + @as(i64, offset_minutes) * 60;
-    const seconds: u64 = if (shifted < 0) 0 else @min(@as(u64, @intCast(shifted)), last_second);
-    const day = (std.time.epoch.EpochSeconds{ .secs = seconds }).getDaySeconds();
-    return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}", .{
-        day.getHoursIntoDay(),
-        day.getMinutesIntoHour(),
-    });
-}
-
-const argument_keys = [_][]const u8{
-    "pattern",
-    "path",
-    "name",
-    "program",
-    "agent_kind",
-    "action",
-};
-
-pub fn argumentText(
-    arena: std.mem.Allocator,
-    arguments: []const u8,
-) std.mem.Allocator.Error![]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, arena, arguments, .{}) catch {
-        return arguments;
-    };
-    const object = switch (parsed.value) {
-        .object => |one| one,
-        else => return arguments,
-    };
-
-    if (object.get("argv")) |argv| {
-        if (argv == .array) {
-            var out: std.ArrayList(u8) = .empty;
-            for (argv.array.items) |item| {
-                if (item != .string) continue;
-                if (out.items.len != 0) try out.append(arena, ' ');
-                try out.appendSlice(arena, item.string);
-            }
-            if (out.items.len != 0) return out.items;
-        }
-    }
-
-    var out: std.ArrayList(u8) = .empty;
-    for (argument_keys) |key| {
-        const value = object.get(key) orelse continue;
-        if (value != .string or value.string.len == 0) continue;
-        if (out.items.len != 0) try out.append(arena, ' ');
-        try out.appendSlice(arena, value.string);
-    }
-    if (out.items.len != 0) return out.items;
-
-    var only: ?[]const u8 = null;
-    var members = object.iterator();
-    while (members.next()) |member| {
-        if (member.value_ptr.* != .string) continue;
-        if (only != null) return arguments;
-        only = member.value_ptr.string;
-    }
-    return only orelse arguments;
-}
-
-pub fn askArgumentText(
-    arena: std.mem.Allocator,
-    arguments: []const u8,
-) std.mem.Allocator.Error![]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, arena, arguments, .{}) catch {
-        return argumentText(arena, arguments);
-    };
-    const object = switch (parsed.value) {
-        .object => |one| one,
-        else => return argumentText(arena, arguments),
-    };
-    const question = object.get("question") orelse return argumentText(arena, arguments);
-    if (question != .string or question.string.len == 0) return argumentText(arena, arguments);
-
-    const first = question.string[0 .. std.mem.indexOfScalar(u8, question.string, '\n') orelse
-        question.string.len];
-
-    const options = object.get("options") orelse return first;
-    if (options != .array or options.array.items.len == 0) return first;
-    return std.fmt.allocPrint(arena, "{s}  ({d} to choose from)", .{
-        first,
-        options.array.items.len,
-    });
-}
-
-pub fn summaryText(
-    arena: std.mem.Allocator,
-    output: []const u8,
-    is_error: bool,
-    truncated: bool,
-) std.mem.Allocator.Error![]const u8 {
-    var rest = output;
-    var lead: []const u8 = "";
-
-    const status_prefix = "exit status: ";
-    if (std.mem.startsWith(u8, rest, status_prefix)) {
-        const at = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-        const code = rest[status_prefix.len..at];
-        if (!std.mem.eql(u8, code, "0")) {
-            lead = try std.fmt.allocPrint(arena, "exit {s}", .{code});
-        }
-        rest = if (at == rest.len) rest[at..] else rest[at + 1 ..];
-    }
-
-    const failed = is_error or lead.len != 0;
-    var said = if (failed) firstLine(rest) else lastLine(rest);
-    const note = firstLine(rest);
-    if (std.mem.startsWith(u8, note, "[chock: ") and std.mem.endsWith(u8, note, "]")) {
-        said = note["[chock: ".len .. note.len - 1];
-    }
-
-    var out: std.ArrayList(u8) = .empty;
-    if (lead.len != 0) try out.appendSlice(arena, lead);
-    if (said.len != 0) {
-        if (out.items.len != 0) try out.appendSlice(arena, " \u{b7} ");
-        try out.appendSlice(arena, said);
-    }
-    if (truncated) {
-        if (out.items.len != 0) try out.appendSlice(arena, " \u{b7} ");
-        try out.appendSlice(arena, "output truncated");
-    }
-    if (out.items.len == 0) return "no output";
-    return out.items;
-}
-
-fn firstLine(text: []const u8) []const u8 {
-    var rest = text;
-    while (rest.len != 0) {
-        const at = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-        const line = std.mem.trim(u8, rest[0..at], " \t\r");
-        if (line.len != 0) return line;
-        if (at == rest.len) break;
-        rest = rest[at + 1 ..];
-    }
-    return "";
-}
-
-fn lastLine(text: []const u8) []const u8 {
-    var rest = text;
-    var found: []const u8 = "";
-    while (rest.len != 0) {
-        const at = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-        const line = std.mem.trim(u8, rest[0..at], " \t\r");
-        if (line.len != 0) found = line;
-        if (at == rest.len) break;
-        rest = rest[at + 1 ..];
-    }
-    return found;
-}
-
-pub const Command = enum {
-    help,
-    plan,
-    usage,
-    @"resume",
-
-    pub fn typed(self: Command) []const u8 {
-        return switch (self) {
-            .help => "/help",
-            .plan => "/plan",
-            .usage => "/usage",
-            .@"resume" => "/resume",
-        };
-    }
-
-    pub fn does(self: Command) []const u8 {
-        return switch (self) {
-            .help => "every key, and every command",
-            .plan => "the plan, kept at the side of the screen",
-            .usage => "the tokens and the cost so far",
-            .@"resume" => "end this session and take up another",
-        };
-    }
-
-    pub const all = [_]Command{ .help, .plan, .usage, .@"resume" };
-};
-
-pub fn commandOf(line: []const u8) ?Command {
-    const trimmed = std.mem.trim(u8, line, " \t\r\n");
-    if (trimmed.len == 0 or trimmed[0] != '/') return null;
-    for (Command.all) |one| {
-        if (std.mem.eql(u8, trimmed, one.typed())) return one;
-    }
-    return null;
-}
-
-fn yesNo(answer: bool) []const u8 {
-    return if (answer) "yes" else "no";
-}
-
-pub const Resumable = struct {
-    id: []const u8,
-    words: []const u8,
-    refusal: []const u8 = "",
-};
-
-pub const Approval = struct {
-    request_id: u64,
-    action: []const u8,
-    summary: []const u8,
-    reason: []const u8,
-    chain: []const u8,
-    depth: usize,
-    detail: []const u8,
-    review: []const u8 = "",
-    left_ms: i64 = 0,
-    view: View = .question,
-
-    pub const View = enum {
-        question,
-        diff,
-        why,
-    };
-};
-
-pub const Answered = enum { approved, refused };
-
-pub const Look = union(enum) {
-    waiting,
-    answered: Answered,
-    canceled,
-};
-
-pub const Question = struct {
-    agent_kind: []const u8 = "",
-    text: []const u8,
-    options: []const []const u8 = &.{},
-    left_ms: i64 = 0,
-    echo: Echo = .on,
-
-    pub const Echo = enum {
-        on,
-        masked,
-    };
-};
-
-pub const Text = union(enum) {
-    waiting,
-    canceled,
-    answered: []const u8,
-    declined,
-};
-
-pub const question_keys = " [1-9] choose  [Enter] send, or send nothing.  Answering allows nothing.";
-
-pub const question_keys_open = " [Enter] send, or send nothing.  Answering allows nothing.";
-
-pub const question_keys_narrow = " [1-9] choose  [Enter] send.  Allows nothing.";
-pub const question_keys_open_narrow = " [Enter] send.  Allows nothing.";
-
-pub fn questionKeys(room: Room, has_options: bool) []const u8 {
-    if (room.isNarrow()) return if (has_options) question_keys_narrow else question_keys_open_narrow;
-    return if (has_options) question_keys else question_keys_open;
-}
-
-pub fn countLines(text: []const u8) usize {
-    return 1 + std.mem.count(u8, text, "\n");
-}
-
-pub fn backOne(text: []const u8) usize {
-    if (text.len == 0) return 0;
-    var at = text.len - 1;
-    while (at != 0 and text[at] & 0b1100_0000 == 0b1000_0000) at -= 1;
-    return at;
-}
-
-fn dupeOptions(arena: std.mem.Allocator, options: []const []const u8) []const []const u8 {
-    var kept: std.ArrayList([]const u8) = .empty;
-    for (options) |option| {
-        const one = arena.dupe(u8, option) catch continue;
-        kept.append(arena, one) catch return kept.items;
-    }
-    return kept.items;
-}
-
-pub const answer_prompt = " > ";
-
-pub const question_unanswerable = " nobody can answer here. The agent is told so when the time runs out.";
-
-pub const approval_keys = " [y] approve  [n] refuse  [d] diff  [w] why";
-
-pub const approval_keys_narrow = " [y] yes  [n] no  [d] diff  [w] why";
-
-pub fn approvalKeys(room: Room) []const u8 {
-    return if (room.isNarrow()) approval_keys_narrow else approval_keys;
-}
-
-pub fn elsewhereText(
-    arena: std.mem.Allocator,
-    session: []const u8,
-    room: Room,
-) []const u8 {
-    const short = " answer it with: chock approve";
-    if (session.len == 0) return short;
-    const whole = std.fmt.allocPrint(arena, "{s} {s}", .{ short, session }) catch return short;
-    return if (room.holds(whole)) whole else short;
-}
-
-pub const settle_looks: u8 = 3;
-
-pub fn countdownText(arena: std.mem.Allocator, left_ms: i64) std.mem.Allocator.Error![]const u8 {
-    if (left_ms <= 0) return "0:00";
-    const seconds: u64 = @intCast(@divFloor(left_ms + 999, 1000));
-    return std.fmt.allocPrint(arena, "{d}:{d:0>2}", .{ seconds / 60, seconds % 60 });
-}
-
-pub fn ctrlCPresses(bytes: []const u8) usize {
-    return std.mem.count(u8, bytes, &.{0x03});
-}
-
-pub fn quietOf(was: std.posix.termios) std.posix.termios {
-    var quiet = was;
-    quiet.lflag.ECHO = false;
-    quiet.lflag.ECHONL = false;
-    return quiet;
-}
-
 fn putTermios(handle: std.posix.fd_t, settings: std.posix.termios) void {
     std.posix.tcsetattr(handle, .FLUSH, settings) catch {};
 }
-
-pub const Ask = union(enum) {
-    done,
-    message: []const u8,
-    take_up: []const u8,
-};
-
-pub const Answer = union(enum) {
-    nothing,
-    command: Command,
-    message: []const u8,
-};
-
-fn keepText(gpa: std.mem.Allocator, into: *std.ArrayList(u8), text: []const u8) void {
-    var at: usize = 0;
-    while (at < text.len) {
-        // A whole escape sequence goes, and never its first byte alone: keeping the rest turns a colour code into a literal [0m.
-        if (text[at] == 0x1b) {
-            at += escapeLength(text[at..]);
-            continue;
-        }
-        const length = std.unicode.utf8ByteSequenceLength(text[at]) catch {
-            at += 1;
-            continue;
-        };
-        if (at + length > text.len) return;
-        const scalar = text[at..][0..length];
-        _ = std.unicode.utf8Decode(scalar) catch {
-            at += 1;
-            continue;
-        };
-        at += length;
-        if (length == 1) {
-            const byte = scalar[0];
-            if (byte < 0x20 and byte != '\n' and byte != '\t') continue;
-            if (byte == 0x7f) continue;
-        }
-        into.appendSlice(gpa, scalar) catch return;
-    }
-}
-
-fn escapeLength(text: []const u8) usize {
-    if (text.len < 2) return text.len;
-    switch (text[1]) {
-        '[' => {
-            var at: usize = 2;
-            while (at < text.len) : (at += 1) {
-                if (text[at] >= 0x40 and text[at] <= 0x7e) return at + 1;
-            }
-            return text.len;
-        },
-        ']' => {
-            var at: usize = 2;
-            while (at < text.len) : (at += 1) {
-                if (text[at] == 0x07) return at + 1;
-                if (text[at] == 0x1b and at + 1 < text.len and text[at + 1] == '\\') return at + 2;
-            }
-            return text.len;
-        },
-        else => return 2,
-    }
-}
-
-pub fn answerFor(line: []const u8) Answer {
-    const trimmed = std.mem.trim(u8, line, " \t\r\n");
-    if (trimmed.len == 0) return .nothing;
-    if (commandOf(trimmed)) |command| return .{ .command = command };
-    return .{ .message = trimmed };
-}
-
-pub fn completions(line: []const u8, into: []Command) []const Command {
-    const trimmed = std.mem.trim(u8, line, " \t\r\n");
-    if (trimmed.len == 0 or trimmed[0] != '/') return into[0..0];
-    if (std.mem.indexOfScalar(u8, trimmed, ' ') != null) return into[0..0];
-
-    var found: usize = 0;
-    for (Command.all) |one| {
-        if (found == into.len) break;
-        if (!std.mem.startsWith(u8, one.typed(), trimmed)) continue;
-        into[found] = one;
-        found += 1;
-    }
-    return into[0..found];
-}
-const Line = struct {
-    voice: Voice,
-    text: []const u8,
-    pinned: []const u8 = "",
-    fold: ?Fold = null,
-    gap: bool = false,
-};
-
-const Shown = struct {
-    voice: Voice,
-    text: []const u8,
-    pinned: []const u8 = "",
-    fold_at: ?usize = null,
-    open: bool = false,
-    gap: bool = false,
-};
 
 const Surface = union(enum) {
     terminal: *phantom.tui.Session,
@@ -1447,103 +440,115 @@ const Surface = union(enum) {
     }
 };
 
-pub const Ui = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    inner: ?chock_core.Loop.Observer = null,
-    transcript: std.ArrayList(u8) = .empty,
+/// What a terminal gives the interface. The other side of `chock_ui.Host`, and
+/// the only place in this file that reaches `tty` or `interrupt` on behalf of a
+/// screen.
+/// What stops a session being taken up, in words, or empty when nothing does.
+pub fn refusalFor(ready: sessions_cmd.Readiness, has_work: bool) []const u8 {
+    switch (ready) {
+        .ready => {},
+        .running => return "another process is running it",
+        .no_such_session => return "its log is gone",
+        .nothing_to_carry_on => return "it holds no conversation",
+        .unknown => return "its log could not be read",
+    }
 
-    phase: Phase = .message,
-    typed: std.ArrayList(u8) = .empty,
-    submitted: bool = false,
-    primed: ?[]const u8 = null,
+    if (has_work) {
+        return "it still holds work. `chock workspace` lists it and clears it";
+    }
+    return "";
+}
 
-    scroll_back: usize = 0,
-    completion_selected: usize = 0,
+fn terminalOptions(frames: *Frames, attach: chock_ui.model.Attach.Terminal) phantom.tui.Options {
+    return .{
+        .in = attach.in,
+        .out = attach.out,
+        .writer = &frames.writer,
+        .size = attach.size,
+        .raw_mode = false,
+        .install_signal_handlers = false,
+        .install_panic_hook = false,
+        .stderr = .leave,
+        .own_screen = true,
+        .color = if (tty.stdoutPainter().on) null else .none,
+    };
+}
 
-    picker: ?[]const Resumable = null,
-    picked: usize = 0,
-    sessions_dir: []const u8 = "",
-    current_session: []const u8 = "",
-    taken: ?[]const u8 = null,
+pub fn windowOptions(attach: chock_ui.model.Attach.Window) phantom.window.Options {
+    return .{
+        .title = "chock",
+        .width = attach.width,
+        .height = attach.height,
+        .poll_ms = 0,
+    };
+}
 
-    tasks: ?*chock_core.tasks.Table = null,
-    tasks_shown_early: usize = 0,
+/// The surface behind a native interface. Valid only for one made by `startUi`,
+/// which is every interface this file builds, and is how a test reaches the grid
+/// a frame was drawn into.
+fn surfaceOf(screen: *Ui) *Surface {
+    const self: *TerminalHost = @ptrCast(@alignCast(screen.host.ptr));
+    return &self.surface;
+}
 
-    tokens_in: u64 = 0,
-    tokens_out: u64 = 0,
-    spent: f64 = 0,
-    spent_currency: []const u8 = "",
+/// The terminal settings with the two echo bits off, and nothing else touched.
+fn quietOf(was: std.posix.termios) std.posix.termios {
+    var quiet = was;
+    quiet.lflag.ECHO = false;
+    quiet.lflag.ECHONL = false;
+    return quiet;
+}
 
-    transcript_focused: bool = false,
+fn ctrlCPresses(bytes: []const u8) usize {
+    return std.mem.count(u8, bytes, &.{0x03});
+}
 
-    approval: ?Approval = null,
-    approval_focused: bool = false,
-    approval_settle: u8 = 0,
-    approval_answer: ?Answered = null,
-    approval_arena: std.heap.ArenaAllocator,
-
-    question: ?Question = null,
-    question_focused: bool = false,
-    question_settle: u8 = 0,
-    question_typed: [chock_core.ask.max_answer_bytes]u8 = undefined,
-    question_filled: usize = 0,
-    question_said: ?enum { answered, declined } = null,
-    question_arena: std.heap.ArenaAllocator,
+const TerminalHost = struct {
+    ui: *Ui,
+    /// The keyboard, while the interface holds it. Null until a terminal is
+    /// attached, which is every other host.
+    keys: ?Keys = null,
     raise: *const fn (std.posix.SIG) std.posix.RaiseError!void = std.posix.raise,
-
     apply_termios: *const fn (
         std.posix.fd_t,
         std.posix.TCSA,
         std.posix.termios,
     ) std.posix.TermiosSetError!void = std.posix.tcsetattr,
 
-    lines: std.ArrayList(Line) = .empty,
-    pending: std.ArrayList(u8) = .empty,
-    pending_voice: Voice = .chock,
-
-    cursor: ?usize = null,
-
-    pane: ?Pane = null,
-
-    sidebar_open: bool = false,
-
-    fixed_size: bool = false,
-
-    running_call: ?Running = null,
-    running_row: ?usize = null,
-
-    reasoning: std.ArrayList(u8) = .empty,
-    turn_open: bool = false,
-
-    clock: chock_core.notices.Clock = .{ .nowMs = noClock },
-
-    surface: Surface,
+    /// The thing frames are drawn on. Native only: a browser draws its own.
+    surface: Surface = undefined,
+    /// The writer phantom draws a terminal frame through.
     frames: Frames = .{},
+    /// What the session wrote to standard error while the interface held it.
     diagnostics: Diagnostics = .{},
 
-    replaying: bool = false,
-
-    rows: u16 = 0,
-    width: f32 = 0,
-    measure: Measure = grid_measure,
-
-    arena: std.heap.ArenaAllocator,
-    plan: chock_proto.state.Plan = .{},
-
-    facts: Facts = .{},
-
-    seen_scrolls: u32 = 0,
-    running: bool = true,
-    said_stopping: bool = false,
-    stopped: bool = false,
-    keys: ?Keys = null,
-    screen: ?*Screen.State = null,
-
-    const status_bytes = 256;
-
-    pub const Phase = enum { message, session };
-
+    fn flushOut(_: *anyopaque) void {
+        tty.flushOut();
+    }
+    fn writeOut(_: *anyopaque, bytes: []const u8) void {
+        _ = tty.writeOut(bytes);
+    }
+    fn scrollCount(_: *anyopaque) usize {
+        return tty.scrollCount();
+    }
+    fn verbose(_: *anyopaque) bool {
+        return tty.verbose();
+    }
+    fn colorOn(_: *anyopaque) bool {
+        return tty.stdoutPainter().on;
+    }
+    fn requestStop(_: *anyopaque) void {
+        interrupt.requestStop();
+    }
+    fn stopRequested(_: *anyopaque) bool {
+        return interrupt.requested();
+    }
+    /// A press is a real signal, so the session's own handler runs. Falling back
+    /// to `requestStop` keeps the stop happening on a machine that refused it.
+    fn interruptTimes(ptr: *anyopaque, times: usize) void {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
+        for (0..times) |_| self.raise(.INT) catch interrupt.requestStop();
+    }
     const Keys = struct {
         device: phantom.tui.term.Term,
         session: *phantom.tui.Session,
@@ -1552,2452 +557,291 @@ pub const Ui = struct {
         held: ?std.posix.termios = null,
     };
 
-    const Running = struct {
-        tool: []const u8,
-        argument: []const u8,
-        at_ms: i64,
-    };
+    /// The most one read takes. A person types a key at a time and an escape
+    /// sequence is a few bytes, so this is a paste and not a stream.
+    const read_bytes = 64;
 
-    fn noClock(ctx: ?*anyopaque) i64 {
-        _ = ctx;
-        return 0;
-    }
-
-    fn realNowMs(ctx: ?*anyopaque) i64 {
-        const self: *const Ui = @ptrCast(@alignCast(ctx.?));
-        return std.Io.Timestamp.now(self.io, .real).toMilliseconds();
-    }
-
-    pub fn start(
-        gpa: std.mem.Allocator,
-        io: std.Io,
-        environ: *const std.process.Environ.Map,
-        attach: Attach,
-    ) !*Ui {
-        const self = try gpa.create(Ui);
-        errdefer gpa.destroy(self);
-
-        self.* = .{
-            .gpa = gpa,
-            .io = io,
-            .surface = undefined,
-            .rows = 0,
-            .width = 0,
-            .measure = grid_measure,
-            .arena = std.heap.ArenaAllocator.init(gpa),
-            .approval_arena = std.heap.ArenaAllocator.init(gpa),
-            .question_arena = std.heap.ArenaAllocator.init(gpa),
-            .seen_scrolls = tty.scrollCount(),
-        };
-        errdefer self.arena.deinit();
-        errdefer self.approval_arena.deinit();
-        errdefer self.question_arena.deinit();
-
-        const at = std.Io.Timestamp.now(io, .real).toMilliseconds();
-        self.clock = .{
-            .ctx = self,
-            .nowMs = realNowMs,
-            .utc_offset_minutes = clock_mod.localOffsetMinutes(gpa, io, at),
-        };
-
-        switch (attach) {
-            .terminal => |terminal| {
-                var device = phantom.tui.term.Term.initFiles(io, terminal.in, terminal.out);
-                const size = terminal.size orelse try device.size();
-                self.fixed_size = terminal.size != null;
-
-                var was: ?std.posix.termios = null;
-                var held: ?std.posix.termios = null;
-                if (terminal.in.isTty(io) catch false) device.enterRaw() catch {};
-                if (device.saved) |original| {
-                    device.saved = null;
-                    if (std.posix.tcgetattr(terminal.in.handle)) |now| {
-                        was = original;
-                        held = now;
-                    } else |_| {
-                        putTermios(terminal.in.handle, original);
-                    }
-                }
-                const raw = was != null;
-                errdefer if (was) |original| putTermios(terminal.in.handle, original);
-
-                const session = try gpa.create(phantom.tui.Session);
-                errdefer gpa.destroy(session);
-                var options = terminalOptions(self, terminal);
-                options.size = size;
-                options.query_capabilities = raw;
-                try session.init(
-                    gpa,
-                    io,
-                    environ,
-                    phantom.Root.of(Ui, rootOf, self),
-                    options,
-                );
-                self.surface = .{ .terminal = session };
-                self.keys = .{
-                    .device = device,
-                    .session = session,
-                    .raw = raw,
-                    .was = was,
-                    .held = held,
-                };
-                self.sayProbe(session.caps, session.mode, raw);
-
-                interrupt.armTerminalRestore();
-                if (was) |original| interrupt.armTerminalSettings(terminal.in.handle, original);
-            },
-            .window => |window| {
-                const session = try gpa.create(phantom.window.Session);
-                errdefer gpa.destroy(session);
-                try session.init(
-                    gpa,
-                    io,
-                    environ,
-                    phantom.Root.of(Ui, rootOf, self),
-                    windowOptions(window),
-                );
-                self.surface = .{ .window = session };
-            },
-        }
-
-        self.diagnostics.ui = self;
-        self.diagnostics.was = tty.useErrStream(io, &self.diagnostics.writer);
-
-        return self;
-    }
-
-    pub fn terminalOptions(self: *Ui, attach: Attach.Terminal) phantom.tui.Options {
-        return .{
-            .in = attach.in,
-            .out = attach.out,
-            .writer = &self.frames.writer,
-            .size = attach.size,
-            .raw_mode = false,
-            .install_signal_handlers = false,
-            .install_panic_hook = false,
-            .stderr = .leave,
-            .own_screen = true,
-            .color = if (tty.stdoutPainter().on) null else .none,
+    fn whenOf(when: chock_ui.host.When) std.posix.TCSA {
+        return switch (when) {
+            .now => .NOW,
+            .flush => .FLUSH,
         };
     }
 
-    pub fn windowOptions(attach: Attach.Window) phantom.window.Options {
-        return .{
-            .title = "chock",
-            .width = attach.width,
-            .height = attach.height,
-            .poll_ms = 0,
-        };
-    }
-
-    pub fn askForMessage(self: *Ui, arena: std.mem.Allocator) !Ask {
-        defer self.endInput();
-
-        if (self.primed) |message| {
-            self.primed = null;
-            self.saidByUser(message);
-            return .{ .message = try arena.dupe(u8, message) };
-        }
-
-        while (true) {
-            self.beginInput();
-
-            while (!self.submitted) {
-                if (!self.paintWaiting(look_ms)) return .done;
-
-                if (!self.surface.hasFocus()) self.surface.focusLast();
-
-                if (self.keys) |*keys| {
-                    var buffer: [read_bytes]u8 = undefined;
-                    const read = keys.device.in.readStreaming(self.io, &.{&buffer}) catch |err| switch (err) {
-                        error.EndOfStream => 0,
-                        else => |e| return e,
-                    };
-                    if (read > 0) keys.session.feed(buffer[0..read]);
-                }
-
-                self.pollFinishedTasks();
-            }
-
-            if (self.taken) |id| {
-                self.taken = null;
-                return .{ .take_up = try arena.dupe(u8, id) };
-            }
-
-            switch (answerFor(self.typed.items)) {
-                .nothing => return .done,
-                .message => |words| {
-                    self.saidByUser(words);
-                    return .{ .message = try arena.dupe(u8, words) };
-                },
-                .command => |command| {
-                    self.runCommand(command);
-                    self.phase = .session;
-                    _ = self.paint();
-                    continue;
-                },
-            }
-        }
-    }
-
-    fn pollFinishedTasks(self: *Ui) void {
-        const table = self.tasks orelse return;
-        const finished = table.peek(self.gpa) catch return;
-        defer chock_core.tasks.freeCompletions(self.gpa, finished);
-
-        if (finished.len <= self.tasks_shown_early) return;
-        for (finished[self.tasks_shown_early..]) |one| {
-            self.sayFmt(.chock, "the background task {s} finished, {s} {d}", .{
-                one.id,
-                one.status.wireName(),
-                one.code,
-            });
-        }
-        self.tasks_shown_early = finished.len;
-        self.draw();
-    }
-
-    const said_by_user = "you";
-
-    fn saidByUser(self: *Ui, text: []const u8) void {
-        self.startBlock();
-
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const at = clockText(arena, self.clock.now(), self.clock.utc_offset_minutes) catch "";
-        self.sayPinned(.chock, said_by_user, at);
-
-        self.say(.chock, text);
-        self.endLine();
-        self.draw();
-    }
-
-    fn runCommand(self: *Ui, command: Command) void {
-        switch (command) {
-            .help => self.openHelp(),
-            .plan => self.togglePlan(),
-            .usage => self.sayUsage(),
-            .@"resume" => self.openPicker(),
-        }
-    }
-
-    fn openHelp(self: *Ui) void {
-        self.pane = .{ .kind = .keys };
-    }
-
-    fn helpRows(
-        arena: std.mem.Allocator,
-    ) std.mem.Allocator.Error![]const []const u8 {
-        var rows: std.ArrayList([]const u8) = .empty;
-        try rows.append(arena, "keys");
-        for ([_][2][]const u8{
-            .{ "Enter", "send what you typed" },
-            .{ "Ctrl-C", "once stops the turn, twice leaves" },
-            .{ "Tab", "move the focus between the transcript and the input" },
-            .{ "up down", "scroll the transcript, and step between the rows that open" },
-            .{ "Space", "open or close the focused row, with the transcript focused" },
-            .{ "g", "go to the newest row, with the transcript focused" },
-            .{ "p", "open the plan beside the transcript, or close it" },
-            .{ "?", "this" },
-        }) |pair| {
-            try rows.append(arena, try std.fmt.allocPrint(arena, "  {s: <8} {s}", .{
-                pair[0],
-                pair[1],
-            }));
-        }
-
-        try rows.append(arena, "");
-        try rows.append(arena, "in this pane");
-        for ([_][2][]const u8{
-            .{ "up down", "read the rest of it" },
-            .{ "Esc", "close it" },
-            .{ "?", "close it" },
-        }) |pair| {
-            try rows.append(arena, try std.fmt.allocPrint(arena, "  {s: <8} {s}", .{
-                pair[0],
-                pair[1],
-            }));
-        }
-
-        try rows.append(arena, "");
-        try rows.append(arena, "commands");
-        for (Command.all) |one| {
-            try rows.append(arena, try std.fmt.allocPrint(arena, "  {s: <8} {s}", .{
-                one.typed(),
-                one.does(),
-            }));
-        }
-        try rows.append(arena, "");
-        try rows.append(arena, "a line whose first word is not one of those is a message");
-        return rows.items;
-    }
-
-    fn sayPlan(self: *Ui) void {
-        if (self.plan.isEmpty()) {
-            self.sayFmt(.chock, "the agent has written no plan", .{});
-            return;
-        }
-        const counts = self.plan.counts();
-        self.sayFmt(.chock, "plan: {d} done, {d} left", .{ counts.done, counts.left() });
-        for (self.plan.steps.items) |step| {
-            self.sayFmt(.chock, "  {s: <12} {s}", .{ step.status.wireName(), step.subject });
-        }
-    }
-
-    fn togglePlan(self: *Ui) void {
-        if (self.sidebar_open) {
-            self.sidebar_open = false;
-            return;
-        }
-        if (!self.fitsSidebar()) {
-            self.sayFmt(
-                .chock,
-                "there is no room beside the transcript. A wider display keeps the plan there.",
-                .{},
-            );
-            self.sayPlan();
-            return;
-        }
-        self.sidebar_open = true;
-    }
-
-    fn foldPlan(self: *Ui, update: chock_proto.event.PlanUpdate) void {
-        var gave_up: [max_said_steps]usize = undefined;
-        var count: usize = 0;
-        for (update.steps, 0..) |step, at| {
-            if (!isStatus(step.status, .abandoned)) continue;
-            if (self.plan.find(step.id)) |had| {
-                if (isStatus(had.status, .abandoned)) continue;
-            }
-            if (count == gave_up.len) break;
-            gave_up[count] = at;
-            count += 1;
-        }
-
-        self.plan.apply(self.arena.allocator(), update) catch {};
-
-        if (!self.sidebar_open) {
-            for (update.steps) |step| {
-                self.sayFmt(.chock, "plan step {s} is now {s}", .{
-                    step.id,
-                    step.status.wireName(),
-                });
-            }
-            return;
-        }
-
-        for (gave_up[0..count]) |at| {
-            self.sayFmt(.chock, "plan step {s} was given up: {s}", .{
-                update.steps[at].id,
-                update.steps[at].subject,
-            });
-        }
-
-        const counts = self.plan.counts();
-        const now = self.stepInProgress();
-        if (now) |one| {
-            self.sayFmt(.chock, "plan: {d} of {d} done, now on \"{s}\"", .{
-                counts.done,
-                counts.total(),
-                one.subject,
-            });
-        } else {
-            self.sayFmt(.chock, "plan: {d} of {d} done", .{ counts.done, counts.total() });
-        }
-    }
-
-    const max_said_steps = 64;
-
-    fn stepInProgress(self: *const Ui) ?chock_proto.state.Plan.Step {
-        for (self.plan.steps.items) |step| {
-            if (isStatus(step.status, .in_progress)) return step;
-        }
-        return null;
-    }
-
-    fn sayProbe(self: *Ui, caps: anytype, mode: phantom.tui.Mode, asked: bool) void {
-        if (!tty.verbose()) return;
-
-        if (!asked) {
-            self.sayFmt(.chock, "the terminal was not asked what it can do: it took no raw mode", .{});
-            return;
-        }
-
-        self.sayFmt(.chock, "the terminal drawing mode is {s}", .{@tagName(mode)});
-        self.sayFmt(
-            .chock,
-            "  it answered: graphics {s}, keyboard {s}, truecolor {s}",
-            .{ yesNo(caps.kitty_graphics), yesNo(caps.kitty_keyboard), yesNo(caps.truecolor) },
-        );
-        self.sayFmt(
-            .chock,
-            "  and: sync {s}, inband resize {s}, pixel mouse {s}",
-            .{ yesNo(caps.sync_output), yesNo(caps.inband_resize), yesNo(caps.sgr_pixel_mouse) },
-        );
-
-        const anything = caps.kitty_keyboard or caps.sync_output or
-            caps.inband_resize or caps.sgr_pixel_mouse;
-        if (!anything) {
-            self.sayFmt(
-                .chock,
-                "  nothing came back at all, so the reply did not arrive rather than not matching",
-                .{},
-            );
-        } else if (!caps.kitty_graphics) {
-            self.sayFmt(
-                .chock,
-                "  a reply did arrive and its graphics answer did not match, which is phantom's matcher",
-                .{},
-            );
-        }
-    }
-
-    pub fn resumable(self: *Ui, sessions_dir: []const u8, current: []const u8) void {
-        self.sessions_dir = sessions_dir;
-        self.current_session = current;
-    }
-
-    fn openPicker(self: *Ui) void {
-        const arena = self.arena.allocator();
-        if (self.sessions_dir.len == 0) {
-            self.sayFmt(.chock, "this session has no directory to look in", .{});
-            return;
-        }
-
-        const found = sessions_cmd.list(arena, self.io, self.sessions_dir) catch {
-            self.sayFmt(.chock, "the sessions of this project could not be read", .{});
-            return;
-        };
-
-        var offered: std.ArrayList(Resumable) = .empty;
-        for (found) |one| {
-            if (std.mem.eql(u8, one.id, self.current_session)) continue;
-
-            const log_path = sessions_cmd.logPathIn(arena, self.sessions_dir, one.id) catch continue;
-            const ready = sessions_cmd.readinessOf(arena, self.io, log_path, one.id);
-            const refusal = refusalFor(ready, one.has_work);
-
-            const ended = if (one.end) |reason| reason.wireName() else "no end recorded";
-            const words = std.fmt.allocPrint(arena, "{s}  {s}", .{ one.id, ended }) catch one.id;
-            offered.append(arena, .{
-                .id = one.id,
-                .words = words,
-                .refusal = refusal,
-            }) catch {};
-        }
-
-        if (offered.items.len == 0) {
-            self.sayFmt(.chock, "this project has no other session to take up", .{});
-            return;
-        }
-        self.picker = offered.items;
-        self.picked = 0;
-    }
-
-    pub fn refusalFor(ready: sessions_cmd.Readiness, has_work: bool) []const u8 {
-        switch (ready) {
-            .ready => {},
-            .running => return "another process is running it",
-            .no_such_session => return "its log is gone",
-            .nothing_to_carry_on => return "it holds no conversation",
-            .unknown => return "its log could not be read",
-        }
-
-        if (has_work) {
-            return "it still holds work. `chock workspace` lists it and clears it";
-        }
-        return "";
-    }
-
-    fn takePicked(self: *Ui) void {
-        const offered = self.picker orelse return;
-        if (offered.len == 0) return;
-        const chosen = offered[@min(self.picked, offered.len - 1)];
-
-        if (chosen.refusal.len != 0) {
-            self.sayFmt(.chock, "{s} cannot be taken up: {s}", .{ chosen.id, chosen.refusal });
-            return;
-        }
-
-        self.taken = chosen.id;
-        self.picker = null;
-        self.submitted = true;
-    }
-
-    fn sayUsage(self: *Ui) void {
-        self.sayFmt(.chock, "usage: {d} tokens in, {d} tokens out", .{
-            self.tokens_in,
-            self.tokens_out,
-        });
-        if (self.spent_currency.len == 0) {
-            self.sayFmt(.chock, "  the cost is not known for this provider", .{});
-            return;
-        }
-        self.sayFmt(.chock, "  {d:.4} {s}", .{ self.spent, self.spent_currency });
-    }
-
-    fn beginInput(self: *Ui) void {
-        self.takeKeys(.FLUSH);
-        self.typed.clearRetainingCapacity();
-        self.submitted = false;
-        self.phase = .message;
-    }
-
-    fn takeKeys(self: *Ui, when: std.posix.TCSA) void {
+    fn takeKeys(ptr: *anyopaque, when: chock_ui.host.When) void {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
         const keys = if (self.keys) |*one| one else return;
         if (keys.raw) return;
         const held = keys.held orelse return;
-        self.apply_termios(keys.device.in.handle, when, held) catch return;
+        self.apply_termios(keys.device.in.handle, whenOf(when), held) catch return;
         keys.raw = true;
     }
 
-    pub fn answersKeys(self: *const Ui) bool {
-        const keys = self.keys orelse return false;
-        return keys.raw;
-    }
-
-    fn giveKeys(self: *Ui, when: std.posix.TCSA) void {
+    fn giveKeys(ptr: *anyopaque, when: chock_ui.host.When) void {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
         const keys = if (self.keys) |*one| one else return;
         if (!keys.raw) return;
         keys.raw = false;
         const was = keys.was orelse return;
-        self.apply_termios(keys.device.in.handle, when, quietOf(was)) catch {};
+        self.apply_termios(keys.device.in.handle, whenOf(when), quietOf(was)) catch {};
     }
 
-    fn dropKeys(self: *Ui) void {
+    fn answersKeys(ptr: *anyopaque) bool {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
+        const keys = self.keys orelse return false;
+        return keys.raw;
+    }
+
+    fn dropKeys(ptr: *anyopaque) void {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
         const keys = if (self.keys) |*one| one else return;
         keys.raw = false;
         const was = keys.was orelse return;
         keys.was = null;
         keys.held = null;
         self.apply_termios(keys.device.in.handle, .FLUSH, was) catch {};
-        interrupt.disarmTerminalSettings();
     }
 
-    pub fn endInput(self: *Ui) void {
-        self.giveKeys(.FLUSH);
-        self.phase = .session;
+    /// Read what has arrived, hand everything but the interrupt to the tree,
+    /// and answer how many interrupts there were.
+    fn pumpKeys(ptr: *anyopaque) usize {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
+        const keys = if (self.keys) |*one| one else return 0;
+
+        var buffer: [read_bytes]u8 = undefined;
+        const read = keys.device.in.readStreaming(self.ui.io, &.{&buffer}) catch 0;
+        const said = buffer[0..read];
+
+        const presses = ctrlCPresses(said);
+        if (presses != 0) return presses;
+        if (read > 0) keys.session.feed(said);
+        return 0;
     }
 
-    const read_bytes = 64;
-
-    pub fn showApproval(self: *Ui, one: Approval) void {
-        _ = self.approval_arena.reset(.free_all);
-        const arena = self.approval_arena.allocator();
-
-        var copy = one;
-        copy.view = .question;
-        for ([_]*[]const u8{
-            &copy.action,
-            &copy.summary,
-            &copy.reason,
-            &copy.chain,
-            &copy.detail,
-            &copy.review,
-        }) |field| {
-            field.* = arena.dupe(u8, field.*) catch "";
-        }
-
-        self.approval = copy;
-        self.approval_answer = null;
-        self.approval_settle = settle_looks;
-        self.takeKeys(.FLUSH);
-        _ = self.paint();
-        self.surface.focusLast();
-    }
-
-    pub fn clearApproval(self: *Ui) void {
-        if (self.approval == null) return;
-        self.approval = null;
-        self.approval_answer = null;
-        self.approval_settle = 0;
-        self.approval_focused = false;
-        _ = self.approval_arena.reset(.free_all);
-        self.giveKeys(.FLUSH);
-        _ = self.paint();
-    }
-
-    pub fn approvalLeft(self: *Ui, left_ms: i64) void {
-        if (self.approval) |*one| one.left_ms = left_ms;
-    }
-
-    pub fn awaitAnswer(self: *Ui, budget_ms: u64) Look {
-        if (self.approval == null) return .waiting;
-
-        if (!self.approval_focused) self.surface.focusLast();
-
-        if (!self.paintWaiting(lookWait(budget_ms))) {
-            self.running = false;
-            interrupt.requestStop();
-            return .canceled;
-        }
-
-        if (self.approval_answer) |said| {
-            self.approval_answer = null;
-            return .{ .answered = said };
-        }
-
-        if (self.answersKeys()) {
-            const keys = &self.keys.?;
-            var buffer: [read_bytes]u8 = undefined;
-            const read = keys.device.in.readStreaming(self.io, &.{&buffer}) catch |err| switch (err) {
-                error.EndOfStream => 0,
-                else => 0,
-            };
-            const said = buffer[0..read];
-            const presses = ctrlCPresses(said);
-            if (presses != 0) {
-                // The device goes back before the signal is raised.
-                self.giveKeys(.FLUSH);
-                for (0..presses) |_| self.raise(.INT) catch interrupt.requestStop();
-                return .canceled;
-            }
-            if (read > 0) keys.session.feed(said);
-        }
-
-        if (self.approval_settle > 0) self.approval_settle -= 1;
-
-        if (self.approval_answer) |said| {
-            self.approval_answer = null;
-            return .{ .answered = said };
-        }
-        return .waiting;
-    }
-
-    pub fn pumpStep(self: *Ui) void {
-        if (self.replaying) return;
-        if (!self.running) return;
-        if (self.approval != null or self.question != null) return;
-        if (self.phase != .session) return;
-
-        self.noteStopping();
-
-        self.takeKeys(.NOW);
-        defer self.giveKeys(.NOW);
-
-        if (self.answersKeys() and self.typedSomething()) {
-            const keys = &self.keys.?;
-            var buffer: [read_bytes]u8 = undefined;
-            const read = keys.device.in.readStreaming(self.io, &.{&buffer}) catch |err| switch (err) {
-                error.EndOfStream => 0,
-                else => 0,
-            };
-            const said = buffer[0..read];
-            const presses = ctrlCPresses(said);
-            if (presses != 0) {
-                self.giveKeys(.NOW);
-                for (0..presses) |_| self.raise(.INT) catch interrupt.requestStop();
-                return;
-            }
-            if (read > 0) keys.session.feed(said);
-        }
-
-        if (self.paint()) return;
-
-        self.running = false;
-        interrupt.requestStop();
-    }
-
-    fn typedSomething(self: *Ui) bool {
+    fn keysWaiting(ptr: *anyopaque) bool {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
         const keys = if (self.keys) |*one| one else return false;
         var fds = [_]std.posix.pollfd{.{
             .fd = keys.device.in.handle,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
+        // True where it cannot tell: the read that follows finds nothing.
         const ready = std.posix.poll(&fds, 0) catch return true;
         return ready != 0;
     }
 
-    pub fn showQuestion(self: *Ui, one: Question) void {
-        _ = self.question_arena.reset(.free_all);
-        const arena = self.question_arena.allocator();
+    fn step(ptr: *anyopaque, wait_ms: u32) bool {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
+        return self.surface.stepWaiting(wait_ms) catch false;
+    }
 
-        var copy = one;
-        copy.agent_kind = arena.dupe(u8, one.agent_kind) catch "";
-        copy.text = arena.dupe(u8, one.text) catch "";
-        copy.options = dupeOptions(arena, one.options);
+    fn followSize(ptr: *anyopaque) void {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
+        const one = self.surface.terminalSession() orelse return;
+        const now = one.term.size() catch return;
+        if (!chock_ui.model.sizeMoved(now, one.viewport, one.dpr)) return;
+        one.resize(now) catch {};
+    }
 
-        self.question = copy;
-        self.question_filled = 0;
-        self.question_said = null;
-        self.question_settle = settle_looks;
-        self.takeKeys(.FLUSH);
-        _ = self.paint();
+    fn invalidate(ptr: *anyopaque) void {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
+        self.surface.invalidate();
+    }
+
+    fn focusLast(ptr: *anyopaque) void {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
         self.surface.focusLast();
     }
 
-    pub fn clearQuestion(self: *Ui) void {
-        if (self.question == null) return;
-        std.crypto.secureZero(u8, self.question_typed[0..self.question_filled]);
-        self.question = null;
-        self.question_said = null;
-        self.question_filled = 0;
-        self.question_settle = 0;
-        self.question_focused = false;
-        _ = self.question_arena.reset(.free_all);
-        self.giveKeys(.FLUSH);
-        _ = self.paint();
+    fn hasFocus(ptr: *anyopaque) bool {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
+        return self.surface.hasFocus();
     }
 
-    pub fn questionLeft(self: *Ui, left_ms: i64) void {
-        if (self.question) |*one| one.left_ms = left_ms;
-    }
-
-    pub fn awaitText(self: *Ui, budget_ms: u64) Text {
-        if (self.question == null) return .waiting;
-
-        if (!self.question_focused) self.surface.focusLast();
-
-        if (!self.paintWaiting(lookWait(budget_ms))) {
-            self.running = false;
-            interrupt.requestStop();
-            return .canceled;
-        }
-
-        if (self.takeSaid()) |said| return said;
-
-        if (self.answersKeys()) {
-            const keys = &self.keys.?;
-            var buffer: [read_bytes]u8 = undefined;
-            const read = keys.device.in.readStreaming(self.io, &.{&buffer}) catch |err| switch (err) {
-                error.EndOfStream => 0,
-                else => 0,
-            };
-            const said = buffer[0..read];
-            const presses = ctrlCPresses(said);
-            if (presses != 0) {
-                self.giveKeys(.FLUSH);
-                for (0..presses) |_| self.raise(.INT) catch interrupt.requestStop();
-                return .canceled;
-            }
-            if (read > 0) keys.session.feed(said);
-        }
-
-        if (self.question_settle > 0) self.question_settle -= 1;
-
-        if (self.takeSaid()) |said| return said;
-        return .waiting;
-    }
-
-    fn takeSaid(self: *Ui) ?Text {
-        const said = self.question_said orelse return null;
-        self.question_said = null;
-        return switch (said) {
-            .declined => .declined,
-            .answered => .{ .answered = self.question_typed[0..self.question_filled] },
-        };
-    }
-
-    pub fn questionRows(self: *const Ui) u16 {
-        const one = self.question orelse return 0;
-        var wanted: usize = 3 + countLines(one.text) + one.options.len;
-        if (one.options.len != 0) wanted += 1; // the blank row before the list
-        const half: u16 = @max(question_rows_min, self.rows / 2);
-        const asked: u16 = @intCast(@min(wanted, std.math.maxInt(u16)));
-        return @min(@max(question_rows_min, asked), half);
-    }
-
-    const question_rows_min: u16 = 4;
-
-    pub fn panelRows(self: *const Ui) u16 {
-        if (self.approval != null) return self.approvalRows();
-        return self.questionRows();
-    }
-
-    pub fn approvalRows(self: *const Ui) u16 {
-        const one = self.approval orelse return 0;
-        return switch (one.view) {
-            .question => question_rows,
-            .diff, .why => @max(question_rows, self.rows / 2),
-        };
-    }
-
-    const question_rows: u16 = 6;
-
-    pub fn wrap(self: *Ui, inner: chock_core.Loop.Observer) void {
-        self.inner = inner;
-    }
-
-    pub fn describe(self: *Ui, facts: Facts) void {
-        self.facts = facts;
-    }
-
-    pub fn prime(self: *Ui, message: []const u8) void {
-        self.primed = message;
-    }
-
-    pub fn note(self: *Ui, comptime fmt: []const u8, args: anytype) void {
-        self.sayFmt(.chock, fmt, args);
-    }
-
-    pub fn stop(self: *Ui) void {
-        if (self.stopped) return;
-        self.stopped = true;
-        self.endInput();
-        self.dropKeys();
-
+    /// Put the terminal back the way it was found, before the transcript is
+    /// written out past the interface.
+    fn finish(ptr: *anyopaque) void {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
         self.surface.deinit();
-        tty.flushOut();
         interrupt.disarmTerminalRestore();
-
-        self.diagnostics.finish(self.io);
-
-        _ = tty.writeOut(self.transcript.items);
-        tty.flushOut();
+        interrupt.disarmTerminalSettings();
+        self.diagnostics.finish(self.ui.io);
     }
 
-    pub fn deinit(self: *Ui) void {
-        const gpa = self.gpa;
-        self.stop();
+    /// The other sessions of this project, read off the disk.
+    fn resumables(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        current: []const u8,
+    ) ?[]const chock_ui.model.Resumable {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
+        const ui_self = self.ui;
+        if (ui_self.sessions_dir.len == 0) return &.{};
+
+        const found = sessions_cmd.list(arena, ui_self.io, ui_self.sessions_dir) catch return null;
+
+        var offered: std.ArrayList(chock_ui.model.Resumable) = .empty;
+        for (found) |one| {
+            if (std.mem.eql(u8, one.id, current)) continue;
+            const log_path = sessions_cmd.logPathIn(arena, ui_self.sessions_dir, one.id) catch continue;
+            const ready = sessions_cmd.readinessOf(arena, ui_self.io, log_path, one.id);
+            const ended = if (one.end) |reason| reason.wireName() else "no end recorded";
+            const words = chock_ui.model.resumableWords(arena, one.id, one.title, ended) catch one.id;
+            offered.append(arena, .{
+                .id = one.id,
+                .words = words,
+                .refusal = refusalFor(ready, one.has_work),
+            }) catch {};
+        }
+        return offered.items;
+    }
+
+    fn release(ptr: *anyopaque) void {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
+        const gpa = self.ui.gpa;
+        self.diagnostics.held.deinit(gpa);
+        // The session was allocated here, so it is freed here. `finish` has
+        // already taken it down; this is only the memory.
         switch (self.surface) {
             .terminal => |one| gpa.destroy(one),
             .window => |one| gpa.destroy(one),
         }
-        self.arena.deinit();
-        self.approval_arena.deinit();
-        self.question_arena.deinit();
-        self.transcript.deinit(gpa);
-        self.diagnostics.held.deinit(gpa);
-        self.typed.deinit(gpa);
-        self.pending.deinit(gpa);
-        self.reasoning.deinit(gpa);
-        self.dropRunning();
-        for (self.lines.items) |line| self.freeLine(line);
-        self.lines.deinit(gpa);
         gpa.destroy(self);
     }
 
-    pub fn observer(self: *Ui) chock_core.Loop.Observer {
-        return .{ .ptr = self, .vtable = &vtable };
+    fn nowMs(ptr: *anyopaque) i64 {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
+        return self.ui.clock.now();
+    }
+    fn utcOffsetMinutes(ptr: *anyopaque) i32 {
+        const self: *TerminalHost = @ptrCast(@alignCast(ptr));
+        return self.ui.clock.utc_offset_minutes;
     }
 
-    const vtable = chock_core.Loop.Observer.VTable{
-        .onEvent = onEventFn,
-        .onPiece = onPieceFn,
-        .onNotice = onNoticeFn,
+    const vtable: chock_ui.Host.VTable = .{
+        .flushOut = flushOut,
+        .writeOut = writeOut,
+        .scrollCount = scrollCount,
+        .verbose = verbose,
+        .colorOn = colorOn,
+        .requestStop = requestStop,
+        .stopRequested = stopRequested,
+        .interrupt = interruptTimes,
+        .nowMs = nowMs,
+        .utcOffsetMinutes = utcOffsetMinutes,
+        .invalidate = invalidate,
+        .focusLast = focusLast,
+        .hasFocus = hasFocus,
+        .takeKeys = takeKeys,
+        .giveKeys = giveKeys,
+        .answersKeys = answersKeys,
+        .dropKeys = dropKeys,
+        .pumpKeys = pumpKeys,
+        .keysWaiting = keysWaiting,
+        .step = step,
+        .followSize = followSize,
+        .finish = finish,
+        .release = release,
+        .resumables = resumables,
     };
 
-    fn onEventFn(ptr: *anyopaque, id: u64, ev: chock_proto.event.Event) void {
-        const self: *Ui = @ptrCast(@alignCast(ptr));
-        if (self.inner) |one| one.onEvent(id, ev);
-        self.foldEvent(id, ev);
-    }
-
-    fn foldEvent(self: *Ui, id: u64, ev: chock_proto.event.Event) void {
-        _ = id;
-        switch (ev) {
-            .plan_update => |update| self.foldPlan(update),
-            .message => |m| switch (m.role) {
-                .assistant => {
-                    self.foldReasoning();
-                    self.endLine();
-                    self.turn_open = false;
-                },
-                .system => for (m.content) |part| {
-                    if (part == .text) self.say(.chock, part.text);
-                },
-                else => {},
-            },
-            .tool_call => |call| self.beginCall(call),
-            .tool_result => |result| self.finishCall(result),
-            .compaction => |folded| {
-                var buffer: [128]u8 = undefined;
-                const said = std.fmt.bufPrint(
-                    &buffer,
-                    "\u{2500}\u{2500} events {d} to {d} folded. The log keeps them.",
-                    .{ folded.from_id, folded.through_id },
-                ) catch "\u{2500}\u{2500} the context was folded. The log keeps it.";
-                self.sayFolded(.chock, said, .compaction, folded.summary);
-            },
-            .session_spawn => |spawn| {
-                var buffer: [256]u8 = undefined;
-                const said = std.fmt.bufPrint(&buffer, "started a subagent, {s}", .{
-                    spawn.child_agent_kind,
-                }) catch "started a subagent";
-                self.sayFolded(.chock, said, .subagent, spawn.reason);
-            },
-            .agent_complete => |done| {
-                var buffer: [256]u8 = undefined;
-                const said = std.fmt.bufPrint(&buffer, "the subagent {s} came back, {s}", .{
-                    done.child_agent_kind,
-                    done.outcome.wireName(),
-                }) catch "a subagent came back";
-                self.sayFolded(.chock, said, .subagent, done.result);
-            },
-            .task_complete => |done| if (self.tasks_shown_early > 0) {
-                self.tasks_shown_early -= 1;
-            } else self.sayFmt(.chock, "the background task {s} finished, {s} {d}", .{
-                done.task_id,
-                done.status.wireName(),
-                done.code,
-            }),
-            .policy_self => |update| for (update.restrictions) |one| {
-                self.sayFmt(.chock, "the agent promised {s} at most {s}", .{
-                    one.action,
-                    one.ceiling.wireName(),
-                });
-            },
-            .workspace_integrate => |landed| if (landed.branch.len != 0) self.sayFmt(
-                .chock,
-                "your branch {s} moved to {s}, because this project asks for {s}",
-                .{ landed.branch, landed.branch_to, landed.mode },
-            ) else self.sayFmt(
-                .chock,
-                "no branch of yours moved, and the reason recorded is {s}. The work is at {s}",
-                .{ landed.parked, landed.ref },
-            ),
-            .sandbox_open => |opened| switch (opened.write_execute) {
-                .strict => {},
-                .relaxed, .unknown => self.sayFmt(
-                    .chock,
-                    "the write and execute rule is off for this session, because the policy " ++
-                        "answers {s} for sandbox.jit",
-                    .{opened.decision},
-                ),
-            },
-            .session_end => |ended| if (ended.detail.len == 0)
-                self.sayFmt(.chock, "session ended, {s}", .{ended.reason.wireName()})
-            else
-                self.sayFmt(.chock, "session ended, {s}: {s}", .{
-                    ended.reason.wireName(),
-                    ended.detail[0..@min(ended.detail.len, shown_detail_bytes)],
-                }),
-            .usage => |spent| {
-                self.tokens_in += spent.input_tokens +
-                    spent.cache_creation_input_tokens +
-                    spent.cache_read_input_tokens;
-                self.tokens_out += spent.output_tokens;
-                switch (spent.cost) {
-                    .known => |amount| {
-                        self.spent += amount.value;
-                        self.spent_currency = amount.currency;
-                    },
-                    .free, .unknown, .unrecognized => {},
-                }
-            },
-            else => {},
-        }
-        self.draw();
-    }
-
-    pub fn replay(self: *Ui, id: u64, ev: chock_proto.event.Event) void {
-        self.replaying = true;
-        defer self.replaying = false;
-        switch (ev) {
-            .message => |m| switch (m.role) {
-                .assistant => {
-                    self.openTurn();
-                    for (m.content) |part| {
-                        if (part == .text) self.say(.agent, part.text);
-                    }
-                    self.endLine();
-                    self.turn_open = false;
-                },
-                .user => for (m.content) |part| {
-                    if (part == .text) self.saidByUser(part.text);
-                },
-                else => self.foldEvent(id, ev),
-            },
-            else => self.foldEvent(id, ev),
-        }
-    }
-
-    fn onPieceFn(ptr: *anyopaque, piece: chock_core.Loop.Piece) void {
-        const self: *Ui = @ptrCast(@alignCast(ptr));
-        if (self.inner) |one| one.onPiece(piece);
-        switch (piece) {
-            .text => |text| {
-                self.openTurn();
-                self.foldReasoning();
-                self.say(.agent, text);
-            },
-            .reasoning => |text| {
-                self.openTurn();
-                self.reasoning.appendSlice(self.gpa, text) catch {};
-            },
-        }
-        self.draw();
-    }
-
-    fn openTurn(self: *Ui) void {
-        if (self.turn_open) return;
-        self.turn_open = true;
-        self.startBlock();
-        if (self.facts.model.len == 0) return;
-
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const at = clockText(arena, self.clock.now(), self.clock.utc_offset_minutes) catch return;
-        const who = if (self.facts.provider.len == 0)
-            self.facts.model
-        else
-            std.fmt.allocPrint(arena, "{s} \u{b7} {s}", .{
-                self.facts.model,
-                self.facts.provider,
-            }) catch self.facts.model;
-        self.sayPinned(.agent, who, at);
-    }
-
-    fn foldReasoning(self: *Ui) void {
-        if (self.reasoning.items.len == 0) return;
-        var buffer: [64]u8 = undefined;
-        var fixed = std.heap.FixedBufferAllocator.init(&buffer);
-        const size = sizeText(fixed.allocator(), self.reasoning.items.len) catch "some";
-
-        var said: [96]u8 = undefined;
-        const text = std.fmt.bufPrint(&said, "{s} of reasoning", .{size}) catch "reasoning";
-        self.sayFolded(.agent, text, .reasoning, self.reasoning.items);
-        self.reasoning.clearRetainingCapacity();
-    }
-
-    fn beginCall(self: *Ui, call: chock_proto.event.ToolCall) void {
-        self.dropRunning();
-        self.startBlock();
-
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const argument = if (std.mem.eql(u8, call.tool, chock_core.Loop.ask_tool_name))
-            askArgumentText(arena, call.arguments) catch call.arguments
-        else
-            argumentText(arena, call.arguments) catch call.arguments;
-        const tool = self.gpa.dupe(u8, call.tool) catch return;
-        const kept = self.gpa.dupe(u8, argument) catch {
-            self.gpa.free(tool);
-            return;
-        };
-        self.running_call = .{ .tool = tool, .argument = kept, .at_ms = self.clock.now() };
-
-        self.sayPinned(.agent, callText(arena, "\u{22ef}", tool, kept) catch "", "");
-        self.running_row = if (self.lines.items.len == 0) null else self.lines.items.len - 1;
-    }
-
-    fn callText(
-        arena: std.mem.Allocator,
-        glyph: []const u8,
-        tool: []const u8,
-        argument: []const u8,
-    ) std.mem.Allocator.Error![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}  {s}", .{ glyph, tool, argument });
-    }
-
-    fn finishCall(self: *Ui, result: chock_proto.event.ToolResult) void {
-        self.endLine();
-
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const glyph = if (result.is_error) "\u{2717}" else "\u{2713}";
-        if (self.running_call) |call| {
-            const took = durationText(arena, self.clock.now() - call.at_ms) catch "";
-            const said = callText(arena, glyph, call.tool, call.argument) catch "";
-            self.rewriteRunningRow(said, took);
-        }
-        self.dropRunning();
-
-        if (result.note.len != 0) {
-            self.say(.chock, result.note);
-            self.endLine();
-        }
-
-        const summary = summaryText(
-            arena,
-            result.output,
-            result.is_error,
-            result.truncated,
-        ) catch "no output";
-        self.sayFolded(.agent, summary, .result, result.output);
-    }
-
-    fn rewriteRunningRow(self: *Ui, text: []const u8, right: []const u8) void {
-        const at = self.running_row orelse return;
-        if (at >= self.lines.items.len) return;
-        const kept = self.gpa.dupe(u8, text) catch return;
-        const held = self.gpa.dupe(u8, right) catch {
-            self.gpa.free(kept);
-            return;
-        };
-        self.gpa.free(self.lines.items[at].text);
-        self.gpa.free(self.lines.items[at].pinned);
-        self.lines.items[at].text = kept;
-        self.lines.items[at].pinned = held;
-    }
-
-    fn dropRunning(self: *Ui) void {
-        if (self.running_call) |call| {
-            self.gpa.free(call.tool);
-            self.gpa.free(call.argument);
-        }
-        self.running_call = null;
-        self.running_row = null;
-    }
-
-    fn onNoticeFn(ptr: *anyopaque, text: []const u8) void {
-        const self: *Ui = @ptrCast(@alignCast(ptr));
-        if (self.inner) |one| one.onNotice(text);
-        self.startBlock();
-        self.say(.chock, text);
-        self.endLine();
-        self.draw();
-    }
-
-    const shown_line_bytes = 400;
-
-    const shown_detail_bytes = 240;
-
-    const kept_lines = 512;
-
-    fn say(self: *Ui, voice: Voice, text: []const u8) void {
-        if (voice != self.pending_voice) self.endLine();
-        self.pending_voice = voice;
-
-        var rest = text;
-        while (std.mem.indexOfScalar(u8, rest, '\n')) |at| {
-            self.pending.appendSlice(self.gpa, rest[0..at]) catch {};
-            self.endRow();
-            self.pending_voice = voice;
-            rest = rest[at + 1 ..];
-        }
-        self.pending.appendSlice(self.gpa, rest) catch {};
-    }
-
-    fn sayFmt(self: *Ui, voice: Voice, comptime fmt: []const u8, args: anytype) void {
-        var buffer: [shown_line_bytes + 128]u8 = undefined;
-        const said = std.fmt.bufPrint(&buffer, fmt, args) catch said: {
-            @memset(buffer[buffer.len - 3 ..], '.');
-            break :said buffer[0..];
-        };
-        self.say(voice, said);
-        self.endLine();
-    }
-
-    const kept_body_bytes = 16 * 1024;
-
-    const open_body_rows = 200;
-
-    fn screenRoom(self: *const Ui) Room {
-        return .{ .measure = self.measure, .width = self.width };
-    }
-
-    fn transcriptRoom(self: *const Ui) Room {
-        return self.transcriptBandRoom().upTo(@as(f32, readable_columns) * self.measure.step());
-    }
-
-    fn sidebarWidth(self: *const Ui) f32 {
-        if (!self.sidebar_open) return 0;
-        if (!self.fitsSidebar()) return 0;
-        return @as(f32, sidebar_columns) * self.measure.step();
-    }
-
-    fn fitsSidebar(self: *const Ui) bool {
-        return self.width >= @as(f32, sidebar_needs_columns) * self.measure.step();
-    }
-
-    fn transcriptBandRoom(self: *const Ui) Room {
-        const room = self.screenRoom();
-        const side = self.sidebarWidth();
-        return .{
-            .measure = room.measure,
-            .width = if (room.width > side) room.width - side else 0,
-        };
-    }
-
-    fn sidebarRoom(self: *const Ui) Room {
-        return .{ .measure = self.measure, .width = self.sidebarWidth() };
-    }
-
-    fn roomFor(self: *const Ui, voice: Voice) Room {
-        return self.transcriptRoom().less(voice.prefix());
-    }
-
-    fn agentRoom(self: *const Ui) Room {
-        return self.roomFor(.agent);
-    }
-
-    fn endLine(self: *Ui) void {
-        if (self.pending.items.len == 0) return;
-        self.endRow();
-    }
-
-    fn endRow(self: *Ui) void {
-        const kept = self.gpa.dupe(u8, self.pending.items) catch {
-            self.pending.clearRetainingCapacity();
-            return;
-        };
-        self.pending.clearRetainingCapacity();
-        self.addLine(.{ .voice = self.pending_voice, .text = kept });
-    }
-
-    fn startBlock(self: *Ui) void {
-        self.endLine();
-        if (self.lines.items.len == 0) return;
-        if (self.lines.items[self.lines.items.len - 1].gap) return;
-        self.addLine(.{ .voice = .chock, .text = "", .gap = true });
-    }
-
-    fn sayFolded(
-        self: *Ui,
-        voice: Voice,
-        text: []const u8,
-        kind: Fold.Kind,
-        body: []const u8,
-    ) void {
-        self.endLine();
-        if (body.len == 0) {
-            self.say(voice, text);
-            self.endLine();
-            return;
-        }
-        const kept = self.gpa.dupe(u8, text) catch return;
-        const held = self.gpa.dupe(u8, body[0..@min(body.len, kept_body_bytes)]) catch {
-            self.gpa.free(kept);
-            return;
-        };
-        self.addLine(.{
-            .voice = voice,
-            .text = kept,
-            .fold = .{ .kind = kind, .body = held, .dropped = body.len - held.len },
-        });
-    }
-
-    fn addLine(self: *Ui, line: Line) void {
-        if (self.lines.items.len >= kept_lines) {
-            self.freeLine(self.lines.orderedRemove(0));
-            if (self.running_row) |at| self.running_row = if (at == 0) null else at - 1;
-            if (self.cursor) |at| self.cursor = if (at == 0) null else at - 1;
-        }
-        self.lines.append(self.gpa, line) catch self.freeLine(line);
-    }
-
-    fn freeLine(self: *Ui, line: Line) void {
-        self.gpa.free(line.text);
-        self.gpa.free(line.pinned);
-        if (line.fold) |one| self.gpa.free(one.body);
-    }
-
-    fn sayPinned(self: *Ui, voice: Voice, text: []const u8, right: []const u8) void {
-        self.endLine();
-        const kept = self.gpa.dupe(u8, text) catch return;
-        const held = self.gpa.dupe(u8, right) catch {
-            self.gpa.free(kept);
-            return;
-        };
-        self.addLine(.{ .voice = voice, .text = kept, .pinned = held });
-    }
-
-    pub const stopping_text = "stopping at the next safe point, and writing the session end. " ++
-        "Press Ctrl-C again to stop now.";
-
-    fn noteStopping(self: *Ui) void {
-        if (self.said_stopping) return;
-        if (!interrupt.requested()) return;
-        self.said_stopping = true;
-        self.startBlock();
-        self.say(.chock, stopping_text);
-        self.endLine();
-    }
-
-    fn draw(self: *Ui) void {
-        if (self.replaying) return;
-        if (!self.running) return;
-        self.noteStopping();
-        if (self.paint()) return;
-
-        self.running = false;
-        interrupt.requestStop();
-    }
-
-    fn followSize(self: *Ui) void {
-        if (self.fixed_size) return;
-        const one = self.surface.terminalSession() orelse return;
-        const now = one.term.size() catch return;
-        if (!sizeMoved(now, one.viewport, one.dpr)) return;
-        one.resize(now) catch {};
-    }
-
-    fn paint(self: *Ui) bool {
-        return self.paintWaiting(0);
-    }
-
-    const look_ms: u32 = @intCast(chock_core.idle.slice_ms);
-
-    fn lookWait(budget_ms: u64) u32 {
-        return @intCast(@min(budget_ms, @as(u64, look_ms)));
-    }
-
-    fn paintWaiting(self: *Ui, wait_ms: u32) bool {
-        const scrolls = tty.scrollCount();
-        if (scrolls != self.seen_scrolls) {
-            self.seen_scrolls = scrolls;
-            self.surface.invalidate();
-        }
-
-        self.followSize();
-
-        if (self.screen) |one| phantom.markNeedsBuild(one);
-        const carry_on = self.surface.stepWaiting(wait_ms) catch false;
-        tty.flushOut();
-        return carry_on;
-    }
-
-    fn view(self: *Ui, ctx: *phantom.BuildContext) phantom.Widget {
-        const colors = phantom.ColorScheme.tokyoNight();
-        const measure = self.resize(ctx);
-        const parts = split(self.rows, self.panelRows());
-
-        var regions: std.ArrayList(phantom.Widget) = .empty;
-        regions.append(ctx.arena, band(
-            ctx,
-            measure,
-            parts.header,
-            colors.bg_dark,
-            self.headerRows(ctx, colors),
-        )) catch {};
-        regions.append(ctx.arena, self.middleRegions(
-            ctx,
-            measure,
-            parts.transcript,
-            colors,
-        )) catch {};
-        if (parts.approval != 0) {
-            const approving = self.approval != null;
-            regions.append(ctx.arena, ctx.new(phantom.Focus{
-                .child = band(
-                    ctx,
-                    measure,
-                    parts.approval,
-                    colors.bg_medium,
-                    if (approving)
-                        self.approvalRegion(ctx, parts.approval, colors)
-                    else
-                        self.questionRegion(ctx, parts.approval, colors),
-                ),
-                .on_key = if (approving) onApprovalKey else onQuestionKey,
-                .on_focus_change = if (approving) onApprovalFocus else onQuestionFocus,
-                .ctx = self,
-            }).widget()) catch {};
-        }
-        regions.append(ctx.arena, band(
-            ctx,
-            measure,
-            parts.input,
-            colors.bg_dark,
-            self.inputRows(ctx, colors),
-        )) catch {};
-
-        const screen = ctx.new(phantom.Column(.{ .children = regions.items })).widget();
-        return ctx.new(phantom.KeyboardListener{
-            .child = screen,
-            .on_key = onSessionKey,
-            .ctx = self,
-        }).widget();
-    }
-
-    fn resize(self: *Ui, ctx: *phantom.BuildContext) Measure {
-        const measure = Measure.of(ctx);
-        self.measure = measure;
-        const view_now = ctx.owner.activeView() orelse return measure;
-        self.rows = measure.rowsIn(view_now.metrics.size.height);
-        self.width = view_now.metrics.size.width;
-        return measure;
-    }
-
-    fn band(
-        ctx: *phantom.BuildContext,
-        measure: Measure,
-        rows: u16,
-        color: phantom.Color,
-        contents: []const phantom.Widget,
-    ) phantom.Widget {
-        const inside = ctx.new(phantom.Column(.{ .children = contents })).widget();
-        const painted = ctx.new(phantom.DecoratedBox{ .color = color, .child = inside }).widget();
-        return ctx.new(phantom.SizedBox{
-            .height = bandHeight(measure, rows),
-            .child = painted,
-        }).widget();
-    }
-
-    fn bandHeight(measure: Measure, rows: u16) f32 {
-        return @as(f32, @floatFromInt(rows)) * measure.height();
-    }
-
-    fn middleRegions(
-        self: *Ui,
-        ctx: *phantom.BuildContext,
-        measure: Measure,
-        rows: u16,
-        colors: phantom.ColorScheme,
-    ) phantom.Widget {
-        const focused = ctx.new(phantom.Focus{
-            .child = self.transcriptBand(ctx, measure, rows, colors),
-            .on_key = onTranscriptKey,
-            .on_focus_change = onTranscriptFocus,
-            .ctx = self,
-        }).widget();
-
-        const side = self.sidebarWidth();
-        const beside = if (side > 0) band(
-            ctx,
-            measure,
-            rows,
-            colors.bg_dark,
-            self.sidebarRows(ctx, rows, colors),
-        ) else plainRow(ctx, "", colors.fg);
-
-        const both = ctx.newSlice(phantom.Widget, &.{
-            ctx.new(phantom.Expanded(.{ .child = focused })).widget(),
-            ctx.new(phantom.SizedBox{ .width = side, .child = beside }).widget(),
-        });
-        return ctx.new(phantom.SizedBox{
-            .height = bandHeight(measure, rows),
-            .child = ctx.new(phantom.Row(.{ .children = both })).widget(),
-        }).widget();
-    }
-
-    fn sidebarRows(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        rows: u16,
-        colors: phantom.ColorScheme,
-    ) []const phantom.Widget {
-        var lines = Rows{ .left = rows };
-        const said = planRows(ctx.arena, self.plan, rows) catch return &.{};
-        for (said) |one| {
-            lines.add(ctx.arena, row(
-                ctx,
-                self.measure,
-                visibleLine(ctx.arena, one.text, self.sidebarRoom()) catch "",
-                switch (one.tone) {
-                    .title => colors.blue_light,
-                    .now => colors.green,
-                    .step => colors.fg,
-                    .aside => colors.fg_muted,
-                },
-            ));
-        }
-        return lines.items();
-    }
-
-    fn transcriptBand(
-        self: *Ui,
-        ctx: *phantom.BuildContext,
-        measure: Measure,
-        rows: u16,
-        colors: phantom.ColorScheme,
-    ) phantom.Widget {
-        const under = band(
-            ctx,
-            measure,
-            rows,
-            colors.bg,
-            self.transcriptRows(ctx, measure, rows, colors),
-        );
-        const over = self.paneOver(ctx, rows, colors) orelse return under;
-        return ctx.new(phantom.Stack{
-            .children = ctx.newSlice(phantom.Widget, &.{ under, over }),
-        }).widget();
-    }
-
-    fn paneOver(
-        self: *Ui,
-        ctx: *phantom.BuildContext,
-        rows: u16,
-        colors: phantom.ColorScheme,
-    ) ?phantom.Widget {
-        if (self.pane == null) return null;
-        const contents = self.paneRows(ctx, rows, colors);
-        const inside = ctx.new(phantom.Column(.{ .children = contents })).widget();
-        const painted = ctx.new(phantom.DecoratedBox{
-            .color = colors.bg_medium,
-            .child = inside,
-        }).widget();
-        return ctx.new(phantom.Positioned{
-            .top = 0,
-            .right = 0,
-            .bottom = 0,
-            .left = 0,
-            .child = painted,
-        }).widget();
-    }
-
-    fn paneRows(
-        self: *Ui,
-        ctx: *phantom.BuildContext,
-        rows: u16,
-        colors: phantom.ColorScheme,
-    ) []const phantom.Widget {
-        if (self.pane == null) return &.{};
-        const pane = &self.pane.?;
-        const all = switch (pane.kind) {
-            .keys => helpRows(ctx.arena) catch return &.{},
-        };
-        const total: u16 = @intCast(@min(all.len, std.math.maxInt(u16)));
-
-        var lines = Rows{ .left = rows };
-        const room = rows -| 2;
-        pane.hold(room, total);
-
-        lines.add(ctx.arena, self.bandRow(ctx, switch (pane.kind) {
-            .keys => " keys",
-        }, colors.blue_light));
-
-        var index: u16 = pane.at;
-        while (index < total and index < pane.at + room) : (index += 1) {
-            lines.add(ctx.arena, self.bandRow(
-                ctx,
-                std.fmt.allocPrint(ctx.arena, " {s}", .{all[index]}) catch "",
-                colors.fg,
-            ));
-        }
-
-        const left = total -| (pane.at + room);
-        lines.add(ctx.arena, self.bandRow(ctx, if (left == 0)
-            " Esc closes this"
-        else
-            std.fmt.allocPrint(ctx.arena, " {d} rows below. Esc closes this.", .{
-                left,
-            }) catch " Esc closes this", colors.fg_muted));
-        return lines.items();
-    }
-
-    fn headerRows(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        colors: phantom.ColorScheme,
-    ) []const phantom.Widget {
-        var said: std.ArrayList(HeaderPiece) = .empty;
-        headerPieces(ctx.arena, self.facts, self.screenRoom(), &said) catch {};
-
-        var pieces: std.ArrayList(phantom.Widget) = .empty;
-        for (said.items) |one| {
-            pieces.append(ctx.arena, row(ctx, self.measure, one.text, switch (one.tone) {
-                .name => colors.fg,
-                .context => colors.fg_muted,
-                .on => colors.green,
-                .off => colors.red,
-            })) catch {};
-        }
-
-        const line = ctx.new(phantom.Row(.{ .children = pieces.items })).widget();
-        return ctx.newSlice(phantom.Widget, &.{line});
-    }
-
-    fn transcriptRows(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        measure: Measure,
-        rows: u16,
-        colors: phantom.ColorScheme,
-    ) []const phantom.Widget {
-        var lines = Rows{ .left = rows };
-        var room = rows;
-
-        var slots: [Command.all.len]Command = undefined;
-        const all_listed = self.openCompletions(&slots);
-        const all_offered = self.picker orelse &[_]Resumable{};
-        const taken: u16 = @intCast(@min(all_listed.len + all_offered.len, room));
-        const listed = all_listed[0..@min(all_listed.len, taken)];
-        const seats = taken - listed.len;
-        const first = if (self.picked < seats) 0 else self.picked - seats + 1;
-        const offered = all_offered[@min(first, all_offered.len)..][0..seats];
-        room -= taken;
-
-        if (self.showsRule() and room != 0) {
-            lines.add(ctx.arena, self.ruleRow(ctx, colors));
-            room -= 1;
-        }
-
-        const open: u16 = if (self.pending.items.len != 0 and self.scroll_back == 0) 1 else 0;
-        const shown = self.visibleRows(ctx.arena, room -| open);
-
-        var blank: u16 = room -| (@as(u16, @intCast(shown.len)) + open);
-        while (blank > 0) : (blank -= 1) {
-            lines.add(ctx.arena, plainRow(ctx, "", colors.fg));
-        }
-        for (shown) |line| {
-            lines.add(ctx.arena, self.voicedRow(ctx, measure, line, colors));
-        }
-        if (open != 0) {
-            lines.add(ctx.arena, self.voicedRow(ctx, measure, .{
-                .voice = self.pending_voice,
-                .text = self.pending.items,
-            }, colors));
-        }
-        for (self.completionRows(ctx, listed, colors)) |one| {
-            lines.add(ctx.arena, one);
-        }
-        for (offered, 0..) |one, index| {
-            lines.add(ctx.arena, self.pickerRow(ctx, one, first + index, colors));
-        }
-        return lines.items();
-    }
-
-    fn approvalRegion(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        rows: u16,
-        colors: phantom.ColorScheme,
-    ) []const phantom.Widget {
-        const one = self.approval orelse return &.{};
-        var lines = Rows{ .left = rows };
-
-        if (rows == 0) return &.{};
-        var room = rows - 1;
-
-        if (room != 0) {
-            room -= 1;
-            const left = countdownText(ctx.arena, one.left_ms) catch "";
-            lines.add(ctx.arena, self.regionRow(ctx, std.fmt.allocPrint(
-                ctx.arena,
-                " APPROVAL  {s}   {s}",
-                .{ one.action, left },
-            ) catch " APPROVAL", colors.blue_light));
-        }
-        switch (one.view) {
-            .question => {
-                const middle = [_][]const u8{
-                    std.fmt.allocPrint(ctx.arena, " {s}  depth {d}", .{
-                        one.chain,
-                        one.depth,
-                    }) catch " ",
-                    std.fmt.allocPrint(ctx.arena, "   \"{s}\"", .{one.reason}) catch " ",
-                    std.fmt.allocPrint(ctx.arena, "   {s}", .{one.summary}) catch " ",
-                    if (one.review.len != 0)
-                        std.fmt.allocPrint(ctx.arena, "   review: {s}", .{one.review}) catch " "
-                    else
-                        std.fmt.allocPrint(ctx.arena, "   {d} bytes of effect. [d] shows them.", .{
-                            one.detail.len,
-                        }) catch " ",
-                };
-                const tones = [middle.len]phantom.Color{
-                    colors.fg_muted,
-                    colors.fg,
-                    colors.fg,
-                    colors.fg_muted,
-                };
-                for (middle, tones) |text, tone| {
-                    if (room == 0) break;
-                    room -= 1;
-                    lines.add(ctx.arena, self.regionRow(ctx, text, tone));
-                }
-            },
-            .diff => {
-                var rest = one.detail;
-                while (room > 0) : (room -= 1) {
-                    const at = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-                    lines.add(ctx.arena, self.regionRow(ctx, std.fmt.allocPrint(
-                        ctx.arena,
-                        "   {s}",
-                        .{rest[0..at]},
-                    ) catch " ", colors.fg));
-                    if (at == rest.len) break;
-                    rest = rest[at + 1 ..];
-                }
-            },
-            .why => {
-                const middle = [_][]const u8{
-                    std.fmt.allocPrint(ctx.arena, " {s}  depth {d}", .{
-                        one.chain,
-                        one.depth,
-                    }) catch " ",
-                    std.fmt.allocPrint(ctx.arena, "   \"{s}\"", .{one.reason}) catch " ",
-                };
-                for (middle) |text| {
-                    if (room == 0) break;
-                    room -= 1;
-                    lines.add(ctx.arena, self.regionRow(ctx, text, colors.fg));
-                }
-            },
-        }
-
-        while (lines.left > 1) {
-            lines.add(ctx.arena, plainRow(ctx, "", colors.fg));
-        }
-        lines.add(ctx.arena, self.regionRow(
-            ctx,
-            if (self.answersKeys())
-                approvalKeys(self.screenRoom())
-            else
-                elsewhereText(ctx.arena, self.current_session, self.screenRoom()),
-            colors.blue_light,
-        ));
-        return lines.items();
-    }
-
-    fn questionRegion(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        rows: u16,
-        colors: phantom.ColorScheme,
-    ) []const phantom.Widget {
-        const one = self.question orelse return &.{};
-        var lines = Rows{ .left = rows };
-
-        if (rows == 0) return &.{};
-        if (rows < 3) return &.{};
-        var room = rows - 3;
-
-        const left = countdownText(ctx.arena, one.left_ms) catch "";
-        lines.add(ctx.arena, self.regionRow(ctx, std.fmt.allocPrint(
-            ctx.arena,
-            " QUESTION from {s}   {s}",
-            .{ if (one.agent_kind.len == 0) "the agent" else one.agent_kind, left },
-        ) catch " QUESTION", colors.blue_light));
-
-        var body = std.mem.splitScalar(u8, one.text, '\n');
-        while (body.next()) |line| {
-            if (room == 0) break;
-            room -= 1;
-            lines.add(ctx.arena, self.regionRow(ctx, std.fmt.allocPrint(
-                ctx.arena,
-                chock_core.ask.question_marker ++ "{s}",
-                .{line},
-            ) catch chock_core.ask.question_marker, colors.fg));
-        }
-
-        if (one.options.len != 0 and room != 0) {
-            room -= 1;
-            lines.add(ctx.arena, plainRow(ctx, "", colors.fg));
-            for (one.options, 1..) |option, number| {
-                if (room == 0) break;
-                room -= 1;
-                lines.add(ctx.arena, self.regionRow(ctx, std.fmt.allocPrint(
-                    ctx.arena,
-                    chock_core.ask.question_marker ++ "{d}) {s}",
-                    .{ number, option },
-                ) catch chock_core.ask.question_marker, colors.fg_muted));
-            }
-        }
-
-        while (lines.left > 2) {
-            lines.add(ctx.arena, plainRow(ctx, "", colors.fg));
-        }
-
-        const shown: []const u8 = switch (one.echo) {
-            .on => self.question_typed[0..self.question_filled],
-            .masked => marks: {
-                const cells = ctx.arena.alloc(u8, self.question_filled) catch break :marks "";
-                @memset(cells, '*');
-                break :marks cells;
-            },
-        };
-        lines.add(ctx.arena, self.regionRow(ctx, std.fmt.allocPrint(
-            ctx.arena,
-            answer_prompt ++ "{s}\u{2588}",
-            .{shown},
-        ) catch answer_prompt, colors.fg));
-
-        lines.add(ctx.arena, self.regionRow(
-            ctx,
-            if (self.answersKeys())
-                questionKeys(self.screenRoom(), one.options.len != 0)
-            else
-                question_unanswerable,
-            colors.blue_light,
-        ));
-        return lines.items();
-    }
-
-    fn regionRow(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        text: []const u8,
-        color: phantom.Color,
-    ) phantom.Widget {
-        return row(
-            ctx,
-            self.measure,
-            visibleLine(ctx.arena, text, self.screenRoom()) catch "",
-            color,
-        );
-    }
-
-    fn bandRow(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        text: []const u8,
-        color: phantom.Color,
-    ) phantom.Widget {
-        return row(
-            ctx,
-            self.measure,
-            visibleLine(ctx.arena, text, self.transcriptBandRoom()) catch "",
-            color,
-        );
-    }
-
-    fn pickerRow(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        one: Resumable,
-        index: usize,
-        colors: phantom.ColorScheme,
-    ) phantom.Widget {
-        const chosen = index == self.picked;
-        const words = if (one.refusal.len == 0)
-            std.fmt.allocPrint(ctx.arena, "{s} {s}", .{
-                if (chosen) "\u{25b8}" else " ",
-                one.words,
-            }) catch one.words
-        else
-            std.fmt.allocPrint(ctx.arena, "{s} {s}  {s}", .{
-                if (chosen) "\u{25b8}" else " ",
-                one.words,
-                one.refusal,
-            }) catch one.words;
-
-        return self.bandRow(ctx, words, if (one.refusal.len != 0)
-            colors.red
-        else if (chosen)
-            colors.blue_light
-        else
-            colors.fg_muted);
-    }
-
-    fn ruleRow(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        colors: phantom.ColorScheme,
-    ) phantom.Widget {
-        const words = std.fmt.allocPrint(
-            ctx.arena,
-            "\u{2500}\u{2500} {d} rows above. The log keeps them. \u{2500}\u{2500}",
-            .{self.scroll_back},
-        ) catch "\u{2500}\u{2500}";
-        return self.bandRow(ctx, words, if (self.transcript_focused)
-            colors.blue_light
-        else
-            colors.fg_dim);
-    }
-
-    fn inputRows(
-        self: *Ui,
-        ctx: *phantom.BuildContext,
-        colors: phantom.ColorScheme,
-    ) []const phantom.Widget {
-        var pieces: std.ArrayList(phantom.Widget) = .empty;
-        pieces.append(ctx.arena, plainRow(
-            ctx,
-            " > ",
-            if (self.transcript_focused) colors.fg_dim else colors.blue_light,
-        )) catch {};
-
-        if (self.phase == .message) {
-            const field = ctx.new(phantom.TextField{
-                .color = colors.fg,
-                .caret_color = colors.blue_light,
-                .on_change = onTyped,
-                .ctx = self,
-            });
-            pieces.append(ctx.arena, ctx.new(phantom.KeyboardListener{
-                .child = field.widget(),
-                .on_key = onMessageKey,
-                .ctx = self,
-            }).widget()) catch {};
-        }
-
-        const line = ctx.new(phantom.Row(.{ .children = pieces.items })).widget();
-        return ctx.newSlice(phantom.Widget, &.{line});
-    }
-
-    fn openCompletions(self: *const Ui, into: []Command) []const Command {
-        if (self.phase != .message) return into[0..0];
-        return completions(self.typed.items, into);
-    }
-
-    fn completionRows(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        shown: []const Command,
-        colors: phantom.ColorScheme,
-    ) []const phantom.Widget {
-        var rows: std.ArrayList(phantom.Widget) = .empty;
-        for (shown, 0..) |one, index| {
-            const chosen = index == self.completion_selected;
-            const words = std.fmt.allocPrint(ctx.arena, "{s} {s: <8}  {s}", .{
-                if (chosen) "\u{25b8}" else " ",
-                one.typed(),
-                one.does(),
-            }) catch one.typed();
-            rows.append(ctx.arena, self.bandRow(
-                ctx,
-                words,
-                if (chosen) colors.blue_light else colors.fg_muted,
-            )) catch {};
-        }
-        return rows.items;
-    }
-
-    fn onTyped(context: *anyopaque, text: []const u8) void {
-        const self: *Ui = @ptrCast(@alignCast(context));
-        self.completion_selected = 0;
-        self.typed.clearRetainingCapacity();
-        keepText(self.gpa, &self.typed, text);
-    }
-
-    fn onMessageKey(context: *anyopaque, event: phantom.input.KeyEvent) bool {
-        if (event.action == .release) return false;
-        if (event.keysym != .enter) return false;
-        const self: *Ui = @ptrCast(@alignCast(context));
-
-        if (self.picker != null) {
-            self.takePicked();
-            return true;
-        }
-
-        var slots: [Command.all.len]Command = undefined;
-        const listed = self.openCompletions(&slots);
-        if (listed.len != 0) {
-            const chosen = listed[@min(self.completion_selected, listed.len - 1)];
-            self.typed.clearRetainingCapacity();
-            self.typed.appendSlice(self.gpa, chosen.typed()) catch {};
-        }
-
-        self.submitted = true;
-        return true;
-    }
-
-    fn showRows(self: *const Ui, arena: std.mem.Allocator) []const Shown {
-        var out: std.ArrayList(Shown) = .empty;
-        for (self.lines.items, 0..) |line, at| {
-            const fold = line.fold;
-            if (line.gap) {
-                out.append(arena, .{ .voice = line.voice, .text = "", .gap = true }) catch
-                    return out.items;
-                continue;
-            }
-            const head = wrapText(arena, line.text, self.roomFor(line.voice)) catch
-                return out.items;
-            for (head, 0..) |words, part| {
-                out.append(arena, .{
-                    .voice = line.voice,
-                    .text = words,
-                    .pinned = if (part == 0) line.pinned else "",
-                    .fold_at = if (fold != null and part == 0) at else null,
-                    .open = if (fold) |one| one.open else false,
-                }) catch return out.items;
-            }
-            const one = fold orelse continue;
-            if (!one.open) continue;
-
-            var rest = one.body;
-            var drawn: usize = 0;
-            while (rest.len != 0 and drawn < open_body_rows) {
-                const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-                const body = wrapText(arena, rest[0..end], self.roomFor(.agent)) catch
-                    return out.items;
-                for (body) |words| {
-                    out.append(arena, .{ .voice = .agent, .text = words }) catch
-                        return out.items;
-                }
-                drawn += 1;
-                if (end == rest.len) {
-                    rest = rest[end..];
-                    break;
-                }
-                rest = rest[end + 1 ..];
-            }
-            if (rest.len + one.dropped != 0) {
-                const more = std.fmt.allocPrint(
-                    arena,
-                    "\u{2026} {d} bytes more, in the log",
-                    .{rest.len + one.dropped},
-                ) catch "\u{2026} more, in the log";
-                out.append(arena, .{ .voice = .agent, .text = more }) catch return out.items;
-            }
-        }
-        return out.items;
-    }
-
-    fn shownCount(self: *const Ui) usize {
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        return self.showRows(arena_state.allocator()).len;
-    }
-
-    fn visibleRows(self: *const Ui, arena: std.mem.Allocator, count: u16) []const Shown {
-        const all = self.showRows(arena);
-        const back = @min(self.scroll_back, all.len -| count);
-        const end = all.len - back;
-        const from = end - @min(end, count);
-        return all[from..end];
-    }
-
-    fn maxScrollBack(self: *const Ui) usize {
-        const parts = split(self.rows, self.panelRows());
-        const room = parts.transcript -| 1;
-        return self.shownCount() -| room;
-    }
-
-    fn showsRule(self: *const Ui) bool {
-        return self.transcript_focused or self.scroll_back != 0;
-    }
-
-    fn scrollBy(self: *Ui, rows: i32) void {
-        const most = self.maxScrollBack();
-        const now: i64 = @intCast(self.scroll_back);
-        const moved = std.math.clamp(now + rows, 0, @as(i64, @intCast(most)));
-        self.scroll_back = @intCast(moved);
-    }
-
-    const Step = enum { older, newer };
-
-    fn stepCursor(self: *Ui, step: Step) void {
-        if (self.foldCount() == 0) {
-            self.scrollBy(if (step == .older) 1 else -1);
-            return;
-        }
-
-        const at = self.cursor orelse {
-            self.cursor = self.nextFold(self.lines.items.len, .older);
-            self.showCursor();
-            return;
-        };
-        self.cursor = self.nextFold(at, step) orelse at;
-        self.showCursor();
-    }
-
-    fn foldCount(self: *const Ui) usize {
-        var found: usize = 0;
-        for (self.lines.items) |line| {
-            if (line.fold != null) found += 1;
-        }
-        return found;
-    }
-
-    fn nextFold(self: *const Ui, from: usize, step: Step) ?usize {
-        if (step == .older) {
-            var at = @min(from, self.lines.items.len);
-            while (at > 0) {
-                at -= 1;
-                if (self.lines.items[at].fold != null) return at;
-            }
-            return null;
-        }
-        var at = from + 1;
-        while (at < self.lines.items.len) : (at += 1) {
-            if (self.lines.items[at].fold != null) return at;
-        }
-        return null;
-    }
-
-    fn showCursor(self: *Ui) void {
-        const at = self.cursor orelse return;
-        const parts = split(self.rows, self.panelRows());
-        const room: usize = parts.transcript -| 1;
-        if (room == 0) return;
-
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        const all = self.showRows(arena_state.allocator());
-        var first: ?usize = null;
-        for (all, 0..) |one, index| {
-            if (one.fold_at != null and one.fold_at.? == at) {
-                first = index;
-                break;
-            }
-        }
-        const below = all.len - (first orelse return);
-        self.scroll_back = @min(below -| room, self.maxScrollBack());
-    }
-
-    fn toggleFocused(self: *Ui) void {
-        const at = self.cursor orelse return;
-        if (at >= self.lines.items.len) return;
-        if (self.lines.items[at].fold == null) return;
-        self.lines.items[at].fold.?.open = !self.lines.items[at].fold.?.open;
-        self.showCursor();
-    }
-
-    fn onTranscriptKey(context: *anyopaque, event: phantom.input.KeyEvent) bool {
-        if (event.action == .release) return false;
-        const self: *Ui = @ptrCast(@alignCast(context));
-        if (self.pane != null and self.onPaneKey(event)) return true;
-        switch (event.keysym) {
-            .up => {
-                self.stepCursor(.older);
-                return true;
-            },
-            .down => {
-                self.stepCursor(.newer);
-                return true;
-            },
-            else => {
-                const typed = event.text orelse return false;
-                if (std.mem.eql(u8, typed, " ")) {
-                    self.toggleFocused();
-                    return true;
-                }
-                if (std.mem.eql(u8, typed, "g")) {
-                    self.scroll_back = 0;
-                    self.cursor = null;
-                    return true;
-                }
-                if (std.mem.eql(u8, typed, "p")) {
-                    self.togglePlan();
-                    return true;
-                }
-                if (std.mem.eql(u8, typed, "?")) {
-                    self.openHelp();
-                    return true;
-                }
-                return false;
-            },
-        }
-    }
-
-    fn onPaneKey(self: *Ui, event: phantom.input.KeyEvent) bool {
-        if (self.pane == null) return false;
-        const pane = &self.pane.?;
-        const room = split(self.rows, self.panelRows()).transcript -| 2;
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        const all = switch (pane.kind) {
-            .keys => helpRows(arena_state.allocator()) catch return false,
-        };
-        const total: u16 = @intCast(@min(all.len, std.math.maxInt(u16)));
-
-        switch (event.keysym) {
-            .up => {
-                pane.move(-1, room, total);
-                return true;
-            },
-            .down => {
-                pane.move(1, room, total);
-                return true;
-            },
-            .escape => {
-                self.pane = null;
-                return true;
-            },
-            else => {
-                const typed = event.text orelse return false;
-                if (std.mem.eql(u8, typed, "?")) {
-                    self.pane = null;
-                    return true;
-                }
-                return false;
-            },
-        }
-    }
-
-    fn onTranscriptFocus(context: *anyopaque, focused: bool) void {
-        const self: *Ui = @ptrCast(@alignCast(context));
-        self.transcript_focused = focused;
-    }
-
-    fn onApprovalKey(context: *anyopaque, event: phantom.input.KeyEvent) bool {
-        if (event.action == .release) return false;
-        const self: *Ui = @ptrCast(@alignCast(context));
-        if (self.approval == null) return false;
-
-        const typed = event.text orelse return false;
-        if (std.mem.eql(u8, typed, "d")) {
-            self.approval.?.view = if (self.approval.?.view == .diff) .question else .diff;
-            return true;
-        }
-        if (std.mem.eql(u8, typed, "w")) {
-            self.approval.?.view = if (self.approval.?.view == .why) .question else .why;
-            return true;
-        }
-        if (self.approval_settle != 0) return false;
-        if (std.mem.eql(u8, typed, "y")) {
-            self.approval_answer = .approved;
-            return true;
-        }
-        if (std.mem.eql(u8, typed, "n")) {
-            self.approval_answer = .refused;
-            return true;
-        }
-        return false;
-    }
-
-    fn onApprovalFocus(context: *anyopaque, focused: bool) void {
-        const self: *Ui = @ptrCast(@alignCast(context));
-        self.approval_focused = focused;
-    }
-
-    fn onQuestionKey(context: *anyopaque, event: phantom.input.KeyEvent) bool {
-        if (event.action == .release) return false;
-        const self: *Ui = @ptrCast(@alignCast(context));
-        const one = self.question orelse return false;
-
-        switch (event.keysym) {
-            .enter => {
-                if (self.question_settle != 0) return false;
-                self.question_said = if (self.question_filled == 0) .declined else .answered;
-                return true;
-            },
-            .backspace => {
-                self.question_filled = backOne(self.question_typed[0..self.question_filled]);
-                return true;
-            },
-            else => {},
-        }
-
-        const typed = event.text orelse return false;
-        if (typed.len == 0) return false;
-
-        if (one.echo == .on and self.question_filled == 0 and one.options.len != 0 and typed.len == 1) {
-            if (typed[0] >= '1' and typed[0] <= '9') {
-                if (self.question_settle != 0) return false;
-                const index: usize = typed[0] - '1';
-                if (index < one.options.len) {
-                    const chose = one.options[index];
-                    if (chose.len <= self.question_typed.len) {
-                        @memcpy(self.question_typed[0..chose.len], chose);
-                        self.question_filled = chose.len;
-                        self.question_said = .answered;
-                        return true;
-                    }
-                }
-            }
-        }
-
-        for (typed) |byte| {
-            if (byte < 0x20 or byte == 0x7f) return false;
-        }
-        if (self.question_filled + typed.len > self.question_typed.len) return false;
-        @memcpy(self.question_typed[self.question_filled..][0..typed.len], typed);
-        self.question_filled += typed.len;
-        return true;
-    }
-
-    fn onQuestionFocus(context: *anyopaque, focused: bool) void {
-        const self: *Ui = @ptrCast(@alignCast(context));
-        self.question_focused = focused;
-    }
-
-    fn onSessionKey(context: *anyopaque, event: phantom.input.KeyEvent) bool {
-        if (event.action == .release) return false;
-        const self: *Ui = @ptrCast(@alignCast(context));
-
-        var slots: [Command.all.len]Command = undefined;
-        const listed = self.openCompletions(&slots);
-        const offered = self.picker orelse &[_]Resumable{};
-
-        switch (event.keysym) {
-            .up => {
-                if (offered.len != 0) {
-                    self.picked -|= 1;
-                } else if (listed.len != 0) {
-                    self.completion_selected -|= 1;
-                } else self.scrollBy(1);
-                return true;
-            },
-            .down => {
-                if (offered.len != 0) {
-                    self.picked = @min(self.picked + 1, offered.len - 1);
-                } else if (listed.len != 0) {
-                    self.completion_selected = @min(self.completion_selected + 1, listed.len - 1);
-                } else self.scrollBy(-1);
-                return true;
-            },
-            else => return false,
-        }
-    }
-
-    fn voicedRow(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        measure: Measure,
-        line: Shown,
-        colors: phantom.ColorScheme,
-    ) phantom.Widget {
-        if (line.gap) return plainRow(ctx, "", colors.fg);
-
-        const focused = line.fold_at != null and
-            self.transcript_focused and
-            self.cursor != null and
-            self.cursor.? == line.fold_at.?;
-        const marker = if (line.fold_at == null) "" else markerText(line.open, focused);
-        const right = if (marker.len != 0) marker else line.pinned;
-        const words = spread(ctx.arena, line.text, right, self.roomFor(line.voice)) catch "";
-        const cut = std.mem.trimEnd(u8, words, " ");
-        const pinned = right.len != 0 and std.mem.endsWith(u8, cut, right);
-        const left = if (!pinned)
-            cut
-        else
-            std.mem.trimEnd(u8, cut[0 .. cut.len - right.len], " ");
-
-        const tone = switch (line.voice) {
-            .chock => colors.blue_light,
-            .agent => colors.fg,
-        };
-        const said = self.voicedText(ctx, measure, line.voice, left, tone);
-        if (!pinned) return said;
-        return pinnedRow(
-            ctx,
-            measure,
-            self.transcriptRoom().width,
-            said,
-            row(ctx, measure, right, tone),
-        );
-    }
-
-    fn voicedText(
-        self: *const Ui,
-        ctx: *phantom.BuildContext,
-        measure: Measure,
-        voice: Voice,
-        words: []const u8,
-        tone: phantom.Color,
-    ) phantom.Widget {
-        _ = self;
-        return switch (voice) {
-            .chock => row(ctx, measure, std.fmt.allocPrint(ctx.arena, "{s}{s}", .{
-                Voice.chock.prefix(),
-                words,
-            }) catch Voice.chock.prefix(), tone),
-            .agent => ctx.new(phantom.Padding{
-                .insets = .{
-                    .left = measure.widthOf(Voice.agent.prefix()),
-                },
-                .child = row(ctx, measure, words, tone),
-            }).widget(),
-        };
-    }
-
-    fn pinnedRow(
-        ctx: *phantom.BuildContext,
-        measure: Measure,
-        across: f32,
-        left: phantom.Widget,
-        right: phantom.Widget,
-    ) phantom.Widget {
-        const both = ctx.newSlice(phantom.Widget, &.{
-            ctx.new(phantom.Align{ .alignment = .top_left, .child = left }).widget(),
-            ctx.new(phantom.Align{ .alignment = .top_right, .child = right }).widget(),
-        });
-        return ctx.new(phantom.SizedBox{
-            .width = across,
-            .height = measure.height(),
-            .child = ctx.new(phantom.Stack{ .children = both }).widget(),
-        }).widget();
-    }
-
-    fn row(
-        ctx: *phantom.BuildContext,
-        measure: Measure,
-        text: []const u8,
-        color: phantom.Color,
-    ) phantom.Widget {
-        if (marked(ctx, measure, text, color)) |made| return made;
-        return plainRow(ctx, text, color);
-    }
-
-    fn plainRow(
-        ctx: *phantom.BuildContext,
-        text: []const u8,
-        color: phantom.Color,
-    ) phantom.Widget {
-        return ctx.new(phantom.Text{
-            .text = text,
-            .color = color,
-        }).widget();
-    }
-
-    fn marked(
-        ctx: *phantom.BuildContext,
-        measure: Measure,
-        text: []const u8,
-        color: phantom.Color,
-    ) ?phantom.Widget {
-        var pieces: std.ArrayList(phantom.Widget) = .empty;
-        var index: usize = 0;
-        var kept: usize = 0;
-        while (index < text.len) {
-            const one = drawnAt(text, index);
-            const mark = if (one.whole) markFor(one.point) else null;
-            const width = if (mark == null) 0 else measure.advanceOf(one.point);
-            if (mark == null or !(width > 0)) {
-                index += one.length;
-                continue;
-            }
-            if (index > kept) pieces.append(ctx.arena, plainRow(
-                ctx,
-                text[kept..index],
-                color,
-            )) catch return null;
-            pieces.append(
-                ctx.arena,
-                markBox(ctx, measure, mark.?, width, color),
-            ) catch return null;
-            index += one.length;
-            kept = index;
-        }
-        if (pieces.items.len == 0) return null;
-        if (kept < text.len) pieces.append(ctx.arena, plainRow(
-            ctx,
-            text[kept..],
-            color,
-        )) catch return null;
-        return ctx.new(phantom.SizedBox{
-            .width = measure.widthOf(text),
-            .height = measure.height(),
-            .child = ctx.new(phantom.Row(.{ .children = pieces.items })).widget(),
-        }).widget();
-    }
-
-    fn markBox(
-        ctx: *phantom.BuildContext,
-        measure: Measure,
-        mark: Mark,
-        across: f32,
-        color: phantom.Color,
-    ) phantom.Widget {
-        const icon = ctx.new(phantom.Icon{
-            .id = mark.id,
-            .size = across,
-            .fit = if (isRule(mark.id)) .fill else .square,
-            .color = color,
-            .label = mark.label,
-        }).widget();
-        return ctx.new(phantom.SizedBox{
-            .width = across,
-            .height = measure.height(),
-            .child = if (isRule(mark.id)) icon else ctx.new(phantom.Align{
-                .alignment = .center,
-                .child = icon,
-            }).widget(),
-        }).widget();
-    }
-
-    fn isRule(id: phantom.icon.Id) bool {
-        const cell = phantom.icon.cellMarkFor(id) orelse return false;
-        return cell.tile;
-    }
-
-    fn rootOf(ctx: *phantom.BuildContext, self: *Ui) phantom.Widget {
-        return phantom.StatefulWidget(Screen, ctx.new(Screen{ .ui = self }));
+    fn host(self: *TerminalHost) chock_ui.Host {
+        return .{ .ptr = self, .vtable = &vtable, .name = "terminal" };
     }
 };
 
-const Screen = struct {
-    ui: *Ui,
+pub const Ui = @import("chock-ui").Ui;
 
-    pub const State = struct {
-        base: phantom.StateBase = .{},
-        ui: ?*Ui = null,
+/// Make the interface and attach it to a terminal or a window.
+///
+/// Native only: it reaches a real terminal, and it is what installs the host
+/// the tree then draws through.
+pub fn startUi(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    attach: chock_ui.model.Attach,
+) !*Ui {
+    const terminal_host = try gpa.create(TerminalHost);
+    errdefer gpa.destroy(terminal_host);
 
-        pub fn initState(self: *State, config: *const Screen) !void {
-            self.ui = config.ui;
-            config.ui.screen = self;
-        }
+    const self = try Ui.init(gpa, io, terminal_host.host());
+    errdefer gpa.destroy(self);
+    errdefer self.arena.deinit();
+    errdefer self.approval_arena.deinit();
+    errdefer self.question_arena.deinit();
 
-        pub fn build(self: *State, ctx: *phantom.BuildContext) anyerror!phantom.Widget {
-            const ui = self.ui orelse return ctx.new(phantom.Text{ .text = "" }).widget();
-            return ui.view(ctx);
-        }
-    };
-};
+    terminal_host.* = .{ .ui = self };
+
+    const at = std.Io.Timestamp.now(io, .real).toMilliseconds();
+    self.setClock(self, Ui.realNowMs, clock_mod.localOffsetMinutes(gpa, io, at));
+
+    switch (attach) {
+        .terminal => |terminal| {
+            var device = phantom.tui.term.Term.initFiles(io, terminal.in, terminal.out);
+            const size = terminal.size orelse try device.size();
+            self.fixed_size = terminal.size != null;
+
+            var was: ?std.posix.termios = null;
+            var held: ?std.posix.termios = null;
+            if (terminal.in.isTty(io) catch false) device.enterRaw() catch {};
+            if (device.saved) |original| {
+                device.saved = null;
+                if (std.posix.tcgetattr(terminal.in.handle)) |now| {
+                    was = original;
+                    held = now;
+                } else |_| {
+                    putTermios(terminal.in.handle, original);
+                }
+            }
+            const raw = was != null;
+            errdefer if (was) |original| putTermios(terminal.in.handle, original);
+
+            const session = try gpa.create(phantom.tui.Session);
+            errdefer gpa.destroy(session);
+            var options = terminalOptions(&terminal_host.frames, terminal);
+            options.size = size;
+            options.query_capabilities = raw;
+            try session.init(
+                gpa,
+                io,
+                environ,
+                phantom.Root.of(Ui, Ui.rootOf, self),
+                options,
+            );
+            terminal_host.surface = .{ .terminal = session };
+            terminal_host.keys = .{
+                .device = device,
+                .session = session,
+                .raw = raw,
+                .was = was,
+                .held = held,
+            };
+            self.sayProbe(session.caps, session.mode, raw);
+
+            interrupt.armTerminalRestore();
+            if (was) |original| interrupt.armTerminalSettings(terminal.in.handle, original);
+        },
+        .window => |window| {
+            const session = try gpa.create(phantom.window.Session);
+            errdefer gpa.destroy(session);
+            try session.init(
+                gpa,
+                io,
+                environ,
+                phantom.Root.of(Ui, Ui.rootOf, self),
+                windowOptions(window),
+            );
+            terminal_host.surface = .{ .window = session };
+        },
+    }
+
+    terminal_host.diagnostics.ui = self;
+    terminal_host.diagnostics.was = tty.useErrStream(io, &terminal_host.diagnostics.writer);
+
+    return self;
+}
 
 const testing = std.testing;
 
@@ -4173,7 +1017,7 @@ fn holdsSgr(bytes: []const u8) bool {
 }
 
 test "a window waits for nothing during a turn, and for a tenth of a second at the field" {
-    try testing.expectEqual(@as(?u32, 0), Ui.windowOptions(.{}).poll_ms);
+    try testing.expectEqual(@as(?u32, 0), windowOptions(.{}).poll_ms);
     try testing.expectEqual(@as(u32, @intCast(chock_core.idle.slice_ms)), Ui.look_ms);
 }
 
@@ -4497,15 +1341,6 @@ test "the advances a frame works out once are the advances it would have asked f
     );
 }
 
-test "a viewport with no room and a measurement with no size are counted as nothing" {
-    try testing.expectEqual(@as(u16, 0), countIn(0, 16));
-    try testing.expectEqual(@as(u16, 0), countIn(400, 0));
-    try testing.expectEqual(@as(u16, 0), countIn(-400, 16));
-    try testing.expectEqual(@as(u16, 25), countIn(400, 16));
-    try testing.expectEqual(@as(u16, 24), countIn(399, 16));
-    try testing.expectEqual(std.math.maxInt(u16), countIn(1e9, 1));
-}
-
 const every_layer_on = [_]Layer{
     .{ .name = "net", .note = "off", .state = .on },
     .{ .name = "fs", .note = "worktree", .state = .on },
@@ -4646,7 +1481,7 @@ test "a layer that is on is drawn in one colour and a layer that is not in anoth
 
     var plain: std.ArrayList(u8) = .empty;
     defer plain.deinit(gpa);
-    try h.screen.surface.terminal.grid.writePlain(gpa, &plain);
+    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
     const first = std.mem.sliceTo(plain.items, '\n');
     try testing.expect(std.mem.indexOf(u8, first, "landlock OFF") != null);
 
@@ -4655,7 +1490,7 @@ test "a layer that is on is drawn in one colour and a layer that is not in anoth
     const off = phantom.backend.cell_grid.Rgb.fromColor(colors.red);
     try testing.expect(!std.meta.eql(on, off));
 
-    const grid = &h.screen.surface.terminal.grid;
+    const grid = &surfaceOf(h.screen).terminal.grid;
     const off_at = columnsOf(first[0..std.mem.indexOf(u8, first, "\u{2717}").?]);
     try testing.expectEqual(off, grid.cellAt(@intFromFloat(off_at), 0).?.fg);
     const on_at = columnsOf(first[0..std.mem.indexOf(u8, first, "\u{2713}").?]);
@@ -4799,7 +1634,7 @@ const Headless = struct {
         errdefer tty.useStreams(io, null, null);
 
         tty.useStreams(io, &self.tap.writer, &self.diagnostics_tap.writer);
-        self.screen = try Ui.start(
+        self.screen = try startUi(
             gpa,
             io,
             &self.env,
@@ -4811,6 +1646,12 @@ const Headless = struct {
         self.recorder = .{ .gpa = gpa, .bytes = &self.screen.transcript };
         self.screen.wrap(self.recorder.observer());
         return self;
+    }
+
+    /// The host behind the interface, so a test can reach the terminal the
+    /// interface itself no longer holds.
+    fn terminal(self: *Headless) *TerminalHost {
+        return @ptrCast(@alignCast(self.screen.host.ptr));
     }
 
     fn transcript(self: *Headless) *std.ArrayList(u8) {
@@ -4861,7 +1702,7 @@ test "a whole run drives a real session with no terminal, and every frame goes t
 
     var plain: std.ArrayList(u8) = .empty;
     defer plain.deinit(gpa);
-    try h.screen.surface.terminal.grid.writePlain(gpa, &plain);
+    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
     try testing.expect(std.mem.indexOf(u8, plain.items, "the parser is where it fails") != null);
     try testing.expect(std.mem.indexOf(u8, plain.items, "plan step s2 is now in_progress") != null);
     try testing.expect(std.mem.indexOf(u8, plain.items, "waiting out a rate limit") != null);
@@ -4874,9 +1715,9 @@ test "the message is typed into the display, and Enter is what says it is the me
     h.screen.phase = .message;
 
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
+    surfaceOf(h.screen).focusLast();
 
-    h.screen.surface.terminal.feed("fix the parser");
+    surfaceOf(h.screen).terminal.feed("fix the parser");
     try testing.expect(h.screen.paint());
     try testing.expectEqualStrings("fix the parser", h.screen.typed.items);
     try testing.expect(!h.screen.submitted);
@@ -4884,7 +1725,7 @@ test "the message is typed into the display, and Enter is what says it is the me
     try testing.expect(h.screen.paint());
     try testing.expect(std.mem.indexOf(u8, h.sink.bytes.items, "fix the parser") != null);
 
-    h.screen.surface.terminal.feed("\r");
+    surfaceOf(h.screen).terminal.feed("\r");
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.submitted);
 }
@@ -4979,8 +1820,8 @@ test "a second turn gets a field of its own, and carries nothing of the first on
 
     h.screen.beginInput();
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
-    h.screen.surface.terminal.feed("first\r");
+    surfaceOf(h.screen).focusLast();
+    surfaceOf(h.screen).terminal.feed("first\r");
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.submitted);
     try testing.expectEqualStrings("first", h.screen.typed.items);
@@ -4995,13 +1836,13 @@ test "a second turn gets a field of its own, and carries nothing of the first on
     try testing.expect(!h.screen.submitted);
 
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
-    h.screen.surface.terminal.feed("second");
+    surfaceOf(h.screen).focusLast();
+    surfaceOf(h.screen).terminal.feed("second");
     try testing.expect(h.screen.paint());
     try testing.expectEqualStrings("second", h.screen.typed.items);
     try testing.expect(!h.screen.submitted);
 
-    h.screen.surface.terminal.feed("\r");
+    surfaceOf(h.screen).terminal.feed("\r");
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.submitted);
 
@@ -5016,17 +1857,17 @@ test "an empty line ends the conversation, and Ctrl-C at the field ends it too" 
 
     h.screen.beginInput();
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
-    h.screen.surface.terminal.feed("   \r");
+    surfaceOf(h.screen).focusLast();
+    surfaceOf(h.screen).terminal.feed("   \r");
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.submitted);
     try testing.expect(std.mem.trim(u8, h.screen.typed.items, " \t\r\n").len == 0);
 
     h.screen.beginInput();
-    h.screen.surface.terminal.feed("  \t \r");
-    try testing.expectEqual(Ask.done, try h.screen.askForMessage(gpa));
+    surfaceOf(h.screen).terminal.feed("  \t \r");
+    try testing.expectEqual(chock_ui.ui.Ask.done, try h.screen.askForMessage(gpa));
 
-    try testing.expect(!h.screen.keys.?.raw);
+    try testing.expect(!h.terminal().keys.?.raw);
 }
 
 test "the transcript is written back to the real screen, byte for byte, after the display goes" {
@@ -5123,7 +1964,7 @@ test "a diagnostic reaches the real terminal before the display takes it and aft
     tty.print(.warn, "chock: before the display\n", .{});
     try testing.expectEqualStrings("chock: before the display\n", real.bytes.items);
 
-    const screen = try Ui.start(gpa, io, &env, .{ .terminal = .{
+    const screen = try startUi(gpa, io, &env, .{ .terminal = .{
         .in = device,
         .out = device,
         .size = Headless.size,
@@ -5220,7 +2061,7 @@ test "with no question open the screen is three regions, with the transcript bet
 
     var plain: std.ArrayList(u8) = .empty;
     defer plain.deinit(gpa);
-    try h.screen.surface.terminal.grid.writePlain(gpa, &plain);
+    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
 
     try testing.expectEqualStrings(
         \\ chock  chock  worktree  glm4.7  local
@@ -5244,7 +2085,7 @@ test "each region is a surface of its own, and the bands are not the transcript'
     const colors = phantom.ColorScheme.tokyoNight();
     const recess = phantom.backend.cell_grid.Rgb.fromColor(colors.bg_dark);
     const base = phantom.backend.cell_grid.Rgb.fromColor(colors.bg);
-    const grid = &h.screen.surface.terminal.grid;
+    const grid = &surfaceOf(h.screen).terminal.grid;
     const parts = split(h.screen.rows, h.screen.approvalRows());
 
     try testing.expectEqual(recess, grid.cellAt(0, 0).?.bg);
@@ -5269,7 +2110,7 @@ test "an agent that writes Chock's own words still writes them under no rail, in
 
     var plain: std.ArrayList(u8) = .empty;
     defer plain.deinit(gpa);
-    try h.screen.surface.terminal.grid.writePlain(gpa, &plain);
+    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
 
     var rows = std.mem.splitScalar(u8, plain.items, '\n');
     var saw_chock = false;
@@ -5324,7 +2165,7 @@ test "the transcript stops growing at a readable measure, and the other regions 
 
     const cell = h.screen.measure.step();
     try testing.expectEqual(@as(f32, wide) * cell, h.screen.screenRoom().width);
-    try testing.expectEqual(@as(f32, readable_columns) * cell, h.screen.transcriptRoom().width);
+    try testing.expectEqual(@as(f32, chock_ui.ui.readable_columns) * cell, h.screen.transcriptRoom().width);
     try testing.expect(h.screen.agentRoom().width < @as(f32, wide) * cell);
 
     h.screen.observer().onPiece(.{ .text = "word " ** 120 });
@@ -5334,7 +2175,7 @@ test "the transcript stops growing at a readable measure, and the other regions 
     var rows = std.mem.splitScalar(u8, try screenText(h), '\n');
     while (rows.next()) |one| {
         if (!std.mem.startsWith(u8, one, Voice.agent.prefix())) continue;
-        try testing.expect(columnsOf(one) <= readable_columns);
+        try testing.expect(columnsOf(one) <= chock_ui.ui.readable_columns);
     }
 }
 
@@ -5400,29 +2241,29 @@ test "a wrapped row breaks at a space, and a word with none is broken at the mea
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const broken = try wrapText(arena, "the quick brown fox", gridRoom(&font, 10));
+    const broken = try chock_ui.ui.wrapText(arena, "the quick brown fox", gridRoom(&font, 10));
     try testing.expectEqual(@as(usize, 2), broken.len);
     try testing.expectEqualStrings("the quick", broken[0]);
     try testing.expectEqualStrings("brown fox", broken[1]);
 
-    const solid = try wrapText(arena, "x" ** 25, gridRoom(&font, 10));
+    const solid = try chock_ui.ui.wrapText(arena, "x" ** 25, gridRoom(&font, 10));
     try testing.expectEqual(@as(usize, 3), solid.len);
     try testing.expectEqualStrings("x" ** 10, solid[0]);
     try testing.expectEqualStrings("x" ** 5, solid[2]);
 
-    const short = try wrapText(arena, "fits", gridRoom(&font, 10));
+    const short = try chock_ui.ui.wrapText(arena, "fits", gridRoom(&font, 10));
     try testing.expectEqual(@as(usize, 1), short.len);
     try testing.expectEqualStrings("fits", short[0]);
 
-    const nothing = try wrapText(arena, "", gridRoom(&font, 10));
+    const nothing = try chock_ui.ui.wrapText(arena, "", gridRoom(&font, 10));
     try testing.expectEqual(@as(usize, 1), nothing.len);
     try testing.expectEqualStrings("", nothing[0]);
 
-    const wide = try wrapText(arena, "あいうえお", gridRoom(&font, 4));
+    const wide = try chock_ui.ui.wrapText(arena, "あいうえお", gridRoom(&font, 4));
     try testing.expectEqualStrings("あい", wide[0]);
     for (wide) |one| try testing.expect(std.unicode.utf8ValidateSlice(one));
 
-    const narrow = try wrapText(arena, "あA", gridRoom(&font, 1));
+    const narrow = try chock_ui.ui.wrapText(arena, "あA", gridRoom(&font, 1));
     try testing.expectEqual(@as(usize, 2), narrow.len);
     try testing.expectEqualStrings("あ", narrow[0]);
     try testing.expectEqualStrings("A", narrow[1]);
@@ -5436,12 +2277,12 @@ test "a control byte and a byte that is not UTF-8 are made safe before a row is 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const bad = try wrapText(arena, "good\xffbad words here", gridRoom(&font, 8));
+    const bad = try chock_ui.ui.wrapText(arena, "good\xffbad words here", gridRoom(&font, 8));
     for (bad) |one| try testing.expect(std.unicode.utf8ValidateSlice(one));
     try testing.expectEqualStrings("good?bad", bad[0]);
     try testing.expect(bad.len > 1);
 
-    const escaped = try wrapText(arena, "red\x1b[31m now", gridRoom(&font, 40));
+    const escaped = try chock_ui.ui.wrapText(arena, "red\x1b[31m now", gridRoom(&font, 40));
     try testing.expectEqual(@as(usize, 1), escaped.len);
     try testing.expect(std.mem.indexOfScalar(u8, escaped[0], 0x1b) == null);
     try testing.expectEqualStrings("red [31m now", escaped[0]);
@@ -5514,7 +2355,7 @@ test "one update of four steps is four rows with no sidebar and one row with one
     try testing.expectEqual(@as(usize, 4), h.screen.lines.items.len);
 
     h.screen.togglePlan();
-    try testing.expect(h.screen.sidebar_open);
+    try testing.expectEqual(chock_ui.model.Sidebar.plan, h.screen.sidebar);
     const before = h.screen.lines.items.len;
     h.screen.observer().onEvent(2, .{ .plan_update = .{ .steps = &four_steps } });
     try testing.expectEqual(@as(usize, 1), h.screen.lines.items.len - before);
@@ -5561,7 +2402,7 @@ test "the plan opens beside the transcript at the design width and refuses under
         h.screen.observer().onEvent(1, .{ .plan_update = .{ .steps = &four_steps } });
         const before = h.screen.lines.items.len;
         h.screen.togglePlan();
-        try testing.expect(!h.screen.sidebar_open);
+        try testing.expectEqual(chock_ui.model.Sidebar.none, h.screen.sidebar);
         try testing.expectEqual(@as(f32, 0), h.screen.sidebarWidth());
         try testing.expectEqualStrings(
             "there is no room beside the transcript. A wider display keeps the plan there.",
@@ -5580,7 +2421,7 @@ test "the plan opens beside the transcript at the design width and refuses under
         try testing.expect(h.screen.fitsSidebar());
 
         h.screen.togglePlan();
-        try testing.expect(h.screen.sidebar_open);
+        try testing.expectEqual(chock_ui.model.Sidebar.plan, h.screen.sidebar);
         try testing.expectEqual(@as(f32, sidebar_columns * 8), h.screen.sidebarWidth());
         try testing.expectEqual(
             h.screen.width,
@@ -5681,7 +2522,7 @@ test "the display follows the window, and asks the device for nothing it was tol
 }
 
 fn resizeTo(h: *Headless, columns: u16, rows: u16) !void {
-    const one = h.screen.surface.terminalSession().?;
+    const one = surfaceOf(h.screen).terminalSession().?;
     try one.resize(.{
         .cols = columns,
         .rows = rows,
@@ -5715,7 +2556,7 @@ test "a clock pinned to the right hand end is pinned again when the window narro
 
     const wide = try clockedRows(h, "13:45");
     try testing.expectEqual(@as(usize, 2), wide.rows);
-    try testing.expectEqual(@as(usize, readable_columns), wide.ends_at);
+    try testing.expectEqual(@as(usize, chock_ui.ui.readable_columns), wide.ends_at);
 
     try resizeTo(h, 50, 16);
     const narrow = try clockedRows(h, "13:45");
@@ -5739,7 +2580,7 @@ test "in pixels the right hand value is a run of its own, pinned at the true edg
     const h = try openWide(gpa, 140, 16);
     defer h.close();
 
-    h.screen.surface.terminal.owner.text_metrics = .proportional;
+    surfaceOf(h.screen).terminal.owner.text_metrics = .proportional;
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.measure.height() > phantom.tui.term.logical_cell_h);
 
@@ -5764,7 +2605,7 @@ test "in pixels the right hand value is a run of its own, pinned at the true edg
 }
 
 fn drawnEdgeOf(h: *Headless, words: []const u8) ?f32 {
-    for (h.screen.surface.terminal.canvas.list.primitives.items) |one| {
+    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
         switch (one) {
             .text => |t| {
                 var spelled: [64]u8 = undefined;
@@ -5919,7 +2760,7 @@ test "a sidebar on a display drawn with a real face keeps every row inside its o
     const h = try openWide(gpa, 180, 20);
     defer h.close();
 
-    h.screen.surface.terminal.owner.text_metrics = .proportional;
+    surfaceOf(h.screen).terminal.owner.text_metrics = .proportional;
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.fitsSidebar());
 
@@ -5966,18 +2807,18 @@ test "p opens the plan and p closes it, and only while the transcript has the fo
     try focusTranscript(h);
 
     try pressKeys(h, "p");
-    try testing.expect(h.screen.sidebar_open);
+    try testing.expectEqual(chock_ui.model.Sidebar.plan, h.screen.sidebar);
     try testing.expect(std.mem.indexOf(u8, try screenText(h), "plan   0/4 done") != null);
 
     try pressKeys(h, "p");
-    try testing.expect(!h.screen.sidebar_open);
+    try testing.expectEqual(chock_ui.model.Sidebar.none, h.screen.sidebar);
     try testing.expect(std.mem.indexOf(u8, try screenText(h), "plan   0/4 done") == null);
 
     h.screen.beginInput();
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
+    surfaceOf(h.screen).focusLast();
     try pressKeys(h, "p");
-    try testing.expect(!h.screen.sidebar_open);
+    try testing.expectEqual(chock_ui.model.Sidebar.none, h.screen.sidebar);
     try testing.expectEqualStrings("p", h.screen.typed.items);
 }
 
@@ -5987,19 +2828,19 @@ test "Tab moves the focus between the two regions, and the field starts with it"
     defer h.close();
     h.screen.beginInput();
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
+    surfaceOf(h.screen).focusLast();
     try testing.expect(!h.screen.transcript_focused);
 
-    h.screen.surface.terminal.feed("gg");
+    surfaceOf(h.screen).terminal.feed("gg");
     try testing.expect(h.screen.paint());
     try testing.expectEqualStrings("gg", h.screen.typed.items);
 
-    h.screen.surface.terminal.feed("\t");
+    surfaceOf(h.screen).terminal.feed("\t");
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.transcript_focused);
 
     h.screen.scroll_back = 3;
-    h.screen.surface.terminal.feed("g");
+    surfaceOf(h.screen).terminal.feed("g");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(usize, 0), h.screen.scroll_back);
     try testing.expectEqualStrings("gg", h.screen.typed.items);
@@ -6014,25 +2855,25 @@ test "the arrows scroll the transcript from either region, and stop at both ends
     while (index < 20) : (index += 1) h.screen.say(.agent, "a row\n");
     h.screen.beginInput();
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
+    surfaceOf(h.screen).focusLast();
 
-    h.screen.surface.terminal.feed("\x1b[A");
+    surfaceOf(h.screen).terminal.feed("\x1b[A");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(usize, 1), h.screen.scroll_back);
     try testing.expectEqualStrings("", h.screen.typed.items);
 
-    h.screen.surface.terminal.feed("\x1b[B");
+    surfaceOf(h.screen).terminal.feed("\x1b[B");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(usize, 0), h.screen.scroll_back);
 
-    h.screen.surface.terminal.feed("\x1b[B\x1b[B");
+    surfaceOf(h.screen).terminal.feed("\x1b[B\x1b[B");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(usize, 0), h.screen.scroll_back);
 
     const most = h.screen.maxScrollBack();
     try testing.expect(most > 0);
     var press: usize = 0;
-    while (press < most + 8) : (press += 1) h.screen.surface.terminal.feed("\x1b[A");
+    while (press < most + 8) : (press += 1) surfaceOf(h.screen).terminal.feed("\x1b[A");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(most, h.screen.scroll_back);
 }
@@ -6048,20 +2889,20 @@ test "a scrolled transcript says how much is above, and says so before it is scr
 
     var plain: std.ArrayList(u8) = .empty;
     defer plain.deinit(gpa);
-    try h.screen.surface.terminal.grid.writePlain(gpa, &plain);
+    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
     try testing.expect(std.mem.indexOf(u8, plain.items, "rows above") == null);
 
     h.screen.scrollBy(4);
     try testing.expect(h.screen.paint());
     plain.clearRetainingCapacity();
-    try h.screen.surface.terminal.grid.writePlain(gpa, &plain);
+    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
     try testing.expect(std.mem.indexOf(u8, plain.items, "4 rows above") != null);
 
     h.screen.scroll_back = 0;
     h.screen.transcript_focused = true;
     try testing.expect(h.screen.paint());
     plain.clearRetainingCapacity();
-    try h.screen.surface.terminal.grid.writePlain(gpa, &plain);
+    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
     try testing.expect(std.mem.indexOf(u8, plain.items, "0 rows above") != null);
 }
 
@@ -6107,7 +2948,7 @@ fn callAndAnswer(h: *Headless, output: []const u8, is_error: bool, took_ms: i64)
 
 fn focusTranscript(h: *Headless) !void {
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
+    surfaceOf(h.screen).focusLast();
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.transcript_focused);
 }
@@ -6273,8 +3114,8 @@ test "a message the person typed is in the transcript, in Chock's voice at colum
     defer tmp.cleanup();
 
     const io = h.threaded.io();
-    h.screen.keys.?.device.in = try pressesToRead(&tmp, "fix the parser\r");
-    defer h.screen.keys.?.device.in.close(io);
+    h.terminal().keys.?.device.in = try pressesToRead(&tmp, "fix the parser\r");
+    defer h.terminal().keys.?.device.in.close(io);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -6330,7 +3171,7 @@ test "a message that arrived on standard input is in the transcript too" {
     }
     try testing.expect(found);
 
-    try testing.expect(!h.screen.keys.?.raw);
+    try testing.expect(!h.terminal().keys.?.raw);
     try testing.expectEqual(Ui.Phase.session, h.screen.phase);
 }
 
@@ -6454,9 +3295,9 @@ test "a device that is not a terminal is never asked for raw mode" {
     defer h.close();
 
     try testing.expect(!(h.device.isTty(h.threaded.io()) catch true));
-    try testing.expect(!h.screen.keys.?.raw);
-    try testing.expect(h.screen.keys.?.was == null);
-    try testing.expect(h.screen.keys.?.held == null);
+    try testing.expect(!h.terminal().keys.?.raw);
+    try testing.expect(h.terminal().keys.?.was == null);
+    try testing.expect(h.terminal().keys.?.held == null);
     try testing.expect(h.screen.paint());
 }
 
@@ -6514,15 +3355,15 @@ test "Space on the focused row opens the result and Space again closes it" {
 
     try testing.expect(std.mem.indexOf(u8, try screenText(h), "the first line of the log") == null);
 
-    h.screen.surface.terminal.feed("\x1b[B");
+    surfaceOf(h.screen).terminal.feed("\x1b[B");
     try testing.expect(h.screen.paint());
-    h.screen.surface.terminal.feed(" ");
+    surfaceOf(h.screen).terminal.feed(" ");
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.lines.items[1].fold.?.open);
     try testing.expect(h.screen.paint());
     try testing.expect(std.mem.indexOf(u8, try screenText(h), "the first line of the log") != null);
 
-    h.screen.surface.terminal.feed(" ");
+    surfaceOf(h.screen).terminal.feed(" ");
     try testing.expect(h.screen.paint());
     try testing.expect(!h.screen.lines.items[1].fold.?.open);
     try testing.expect(h.screen.paint());
@@ -6550,20 +3391,20 @@ test "the arrows step the focus between the rows that can be opened" {
     try focusTranscript(h);
 
     try testing.expect(h.screen.cursor == null);
-    h.screen.surface.terminal.feed("\x1b[A");
+    surfaceOf(h.screen).terminal.feed("\x1b[A");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(usize, 4), h.screen.cursor.?);
 
-    h.screen.surface.terminal.feed("\x1b[A");
+    surfaceOf(h.screen).terminal.feed("\x1b[A");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(usize, 1), h.screen.cursor.?);
 
-    h.screen.surface.terminal.feed(" ");
+    surfaceOf(h.screen).terminal.feed(" ");
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.lines.items[1].fold.?.open);
     try testing.expect(!h.screen.lines.items[4].fold.?.open);
 
-    h.screen.surface.terminal.feed("\x1b[A\x1b[A\x1b[A");
+    surfaceOf(h.screen).terminal.feed("\x1b[A\x1b[A\x1b[A");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(usize, 1), h.screen.cursor.?);
 }
@@ -6691,17 +3532,17 @@ test "a line whose first word is not a command exactly is a message, paths inclu
 test "the completion list opens on a prefix and closes the moment the line stops being one" {
     var slots: [Command.all.len]Command = undefined;
 
-    try testing.expectEqual(@as(usize, Command.all.len), completions("/", &slots).len);
-    try testing.expectEqual(@as(usize, 1), completions("/h", &slots).len);
-    try testing.expectEqual(Command.help, completions("/h", &slots)[0]);
-    try testing.expectEqual(@as(usize, 1), completions("/pl", &slots).len);
+    try testing.expectEqual(@as(usize, Command.all.len), chock_ui.ui.completions("/", &slots).len);
+    try testing.expectEqual(@as(usize, 1), chock_ui.ui.completions("/h", &slots).len);
+    try testing.expectEqual(Command.help, chock_ui.ui.completions("/h", &slots)[0]);
+    try testing.expectEqual(@as(usize, 1), chock_ui.ui.completions("/pl", &slots).len);
 
-    try testing.expectEqual(@as(usize, 0), completions("/ho", &slots).len);
-    try testing.expectEqual(@as(usize, 0), completions("/home/ross", &slots).len);
-    try testing.expectEqual(@as(usize, 0), completions("fix the parser", &slots).len);
-    try testing.expectEqual(@as(usize, 0), completions("", &slots).len);
+    try testing.expectEqual(@as(usize, 0), chock_ui.ui.completions("/ho", &slots).len);
+    try testing.expectEqual(@as(usize, 0), chock_ui.ui.completions("/home/ross", &slots).len);
+    try testing.expectEqual(@as(usize, 0), chock_ui.ui.completions("fix the parser", &slots).len);
+    try testing.expectEqual(@as(usize, 0), chock_ui.ui.completions("", &slots).len);
 
-    try testing.expectEqual(@as(usize, 0), completions("/plan now", &slots).len);
+    try testing.expectEqual(@as(usize, 0), chock_ui.ui.completions("/plan now", &slots).len);
 }
 
 test "a slash command is answered in the transcript and never becomes a message" {
@@ -6711,9 +3552,9 @@ test "a slash command is answered in the transcript and never becomes a message"
 
     h.screen.beginInput();
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
+    surfaceOf(h.screen).focusLast();
 
-    h.screen.surface.terminal.feed("/plan\r");
+    surfaceOf(h.screen).terminal.feed("/plan\r");
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.submitted);
     try testing.expectEqualStrings("/plan", h.screen.typed.items);
@@ -6738,14 +3579,14 @@ test "Enter on an open list runs what is chosen, not the letters that were typed
 
     h.screen.beginInput();
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
+    surfaceOf(h.screen).focusLast();
 
-    h.screen.surface.terminal.feed("/pl");
+    surfaceOf(h.screen).terminal.feed("/pl");
     try testing.expect(h.screen.paint());
     var slots: [Command.all.len]Command = undefined;
     try testing.expectEqual(@as(usize, 1), h.screen.openCompletions(&slots).len);
 
-    h.screen.surface.terminal.feed("\r");
+    surfaceOf(h.screen).terminal.feed("\r");
     try testing.expect(h.screen.paint());
     try testing.expectEqualStrings("/plan", h.screen.typed.items);
     try testing.expectEqual(Command.plan, commandOf(h.screen.typed.items).?);
@@ -6760,22 +3601,22 @@ test "the arrows move through the list while it is open, and scroll the transcri
     while (index < 20) : (index += 1) h.screen.say(.agent, "a row\n");
     h.screen.beginInput();
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
+    surfaceOf(h.screen).focusLast();
 
-    h.screen.surface.terminal.feed("/");
+    surfaceOf(h.screen).terminal.feed("/");
     try testing.expect(h.screen.paint());
-    h.screen.surface.terminal.feed("\x1b[B");
+    surfaceOf(h.screen).terminal.feed("\x1b[B");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(usize, 1), h.screen.completion_selected);
     try testing.expectEqual(@as(usize, 0), h.screen.scroll_back);
 
-    h.screen.surface.terminal.feed("z");
+    surfaceOf(h.screen).terminal.feed("z");
     try testing.expect(h.screen.paint());
     var slots: [Command.all.len]Command = undefined;
     try testing.expectEqual(@as(usize, 0), h.screen.openCompletions(&slots).len);
     try testing.expectEqualStrings("/z", h.screen.typed.items);
 
-    h.screen.surface.terminal.feed("\x1b[A");
+    surfaceOf(h.screen).terminal.feed("\x1b[A");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(usize, 1), h.screen.scroll_back);
 }
@@ -6787,14 +3628,14 @@ test "the question mark opens the same pane the command does, and only where it 
 
     h.screen.beginInput();
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
+    surfaceOf(h.screen).focusLast();
 
-    h.screen.surface.terminal.feed("?");
+    surfaceOf(h.screen).terminal.feed("?");
     try testing.expect(h.screen.paint());
     try testing.expectEqualStrings("?", h.screen.typed.items);
     try testing.expect(h.screen.pane == null);
 
-    h.screen.surface.terminal.feed("\t?");
+    surfaceOf(h.screen).terminal.feed("\t?");
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.transcript_focused);
     try testing.expect(h.screen.pane != null);
@@ -6802,7 +3643,7 @@ test "the question mark opens the same pane the command does, and only where it 
 
     try testing.expectEqual(@as(usize, 0), h.screen.lines.items.len);
 
-    h.screen.surface.terminal.feed("?");
+    surfaceOf(h.screen).terminal.feed("?");
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.pane == null);
 
@@ -6907,9 +3748,9 @@ test "the pane takes the arrows and the two keys that close it, and refuses the 
 }
 
 test "a command is never read as a message, and a message that looks like one still is" {
-    try testing.expectEqual(Command.plan, answerFor("/plan").command);
-    try testing.expectEqual(Command.help, answerFor("  /help  ").command);
-    try testing.expectEqual(Command.usage, answerFor("/usage").command);
+    try testing.expectEqual(Command.plan, chock_ui.ui.answerFor("/plan").command);
+    try testing.expectEqual(Command.help, chock_ui.ui.answerFor("  /help  ").command);
+    try testing.expectEqual(Command.usage, chock_ui.ui.answerFor("/usage").command);
 
     for ([_][]const u8{
         "/home/ross/chock/src/main.zig is broken",
@@ -6920,18 +3761,18 @@ test "a command is never read as a message, and a message that looks like one st
     }) |line| {
         try testing.expectEqualStrings(
             std.mem.trim(u8, line, " \t\r\n"),
-            answerFor(line).message,
+            chock_ui.ui.answerFor(line).message,
         );
     }
 
-    try testing.expectEqual(Answer.nothing, answerFor(""));
-    try testing.expectEqual(Answer.nothing, answerFor("   \t "));
+    try testing.expectEqual(chock_ui.ui.Answer.nothing, chock_ui.ui.answerFor(""));
+    try testing.expectEqual(chock_ui.ui.Answer.nothing, chock_ui.ui.answerFor("   \t "));
 }
 
 test "a session that cannot be taken up says so on its own row, and one that can says nothing" {
-    try testing.expectEqualStrings("", Ui.refusalFor(.ready, false));
+    try testing.expectEqualStrings("", refusalFor(.ready, false));
 
-    const kept = Ui.refusalFor(.ready, true);
+    const kept = refusalFor(.ready, true);
     try testing.expect(kept.len != 0);
     try testing.expect(std.mem.indexOf(u8, kept, "chock workspace") != null);
 
@@ -6941,8 +3782,8 @@ test "a session that cannot be taken up says so on its own row, and one that can
         .nothing_to_carry_on,
         .unknown,
     }) |ready| {
-        try testing.expect(Ui.refusalFor(ready, false).len != 0);
-        try testing.expect(Ui.refusalFor(ready, true).len != 0);
+        try testing.expect(refusalFor(ready, false).len != 0);
+        try testing.expect(refusalFor(ready, true).len != 0);
     }
 }
 
@@ -6984,7 +3825,7 @@ test "the picker takes the arrows before the completion list and before the tran
     while (index < 20) : (index += 1) h.screen.say(.agent, "a row\n");
     h.screen.beginInput();
     try testing.expect(h.screen.paint());
-    h.screen.surface.focusLast();
+    surfaceOf(h.screen).focusLast();
 
     const offered = [_]Resumable{
         .{ .id = "01ARZ3NDEKTSV4RRFFQ69G5FAV", .words = "one" },
@@ -6992,13 +3833,13 @@ test "the picker takes the arrows before the completion list and before the tran
     };
     h.screen.picker = &offered;
 
-    h.screen.surface.terminal.feed("\x1b[B");
+    surfaceOf(h.screen).terminal.feed("\x1b[B");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(usize, 1), h.screen.picked);
     try testing.expectEqual(@as(usize, 0), h.screen.scroll_back);
     try testing.expectEqual(@as(usize, 0), h.screen.completion_selected);
 
-    h.screen.surface.terminal.feed("\x1b[B\x1b[B");
+    surfaceOf(h.screen).terminal.feed("\x1b[B\x1b[B");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(usize, 1), h.screen.picked);
 }
@@ -7022,17 +3863,17 @@ fn askIn(h: *Headless, one: Approval) !void {
 }
 
 fn takesKeys(h: *Headless) void {
-    h.screen.keys.?.raw = true;
+    h.terminal().keys.?.raw = true;
 }
 
 fn pressKeys(h: *Headless, keys: []const u8) !void {
-    h.screen.surface.terminal.feed(keys);
+    surfaceOf(h.screen).terminal.feed(keys);
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.paint());
 }
 
 fn settleOut(h: *Headless) !void {
-    var left: u8 = settle_looks;
+    var left: u8 = chock_ui.ui.settle_looks;
     while (left > 0) : (left -= 1) {
         try testing.expectEqual(Look.waiting, h.screen.awaitAnswer(50));
     }
@@ -7070,7 +3911,7 @@ test "the region is a raised surface of its own, between the transcript and the 
     try testing.expect(!std.meta.eql(panel, recess));
 
     const parts = split(h.screen.rows, h.screen.approvalRows());
-    const grid = &h.screen.surface.terminal.grid;
+    const grid = &surfaceOf(h.screen).terminal.grid;
     var at: u16 = parts.header + parts.transcript;
     while (at < parts.header + parts.transcript + parts.approval) : (at += 1) {
         try testing.expectEqual(panel, grid.cellAt(0, at).?.bg);
@@ -7084,7 +3925,7 @@ test "y approves and n refuses, and only after the region has settled" {
     defer h.close();
     try askIn(h, a_question);
 
-    h.screen.surface.terminal.feed("y");
+    surfaceOf(h.screen).terminal.feed("y");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(?Answered, null), h.screen.approval_answer);
 
@@ -7109,7 +3950,7 @@ test "Enter and Esc answer nothing, and neither does a letter that is not one of
     try settleOut(h);
 
     for ([_][]const u8{ "\r", "\n", "\x1b", "q", "Y", "N", " ", "s", "S" }) |key| {
-        h.screen.surface.terminal.feed(key);
+        surfaceOf(h.screen).terminal.feed(key);
         try testing.expect(h.screen.paint());
         try testing.expectEqual(@as(?Answered, null), h.screen.approval_answer);
         try testing.expect(h.screen.approval != null);
@@ -7152,23 +3993,23 @@ test "the region writes its own keys, so nobody has to remember them under a dea
     try askIn(h, a_question);
 
     const shown = try screenText(h);
-    try testing.expect(std.mem.indexOf(u8, shown, approvalKeys(h.screen.screenRoom())) != null);
+    try testing.expect(std.mem.indexOf(u8, shown, chock_ui.ui.approvalKeys(h.screen.screenRoom())) != null);
 
-    for ([_][]const u8{ approval_keys, approval_keys_narrow }) |named| {
+    for ([_][]const u8{ chock_ui.ui.approval_keys, chock_ui.ui.approval_keys_narrow }) |named| {
         for ([_][]const u8{ "[y]", "[n]", "[d]", "[w]" }) |key| {
             try testing.expect(std.mem.indexOf(u8, named, key) != null);
         }
         try testing.expect(columnsOf(named) <= narrow_columns);
     }
-    try testing.expectEqualStrings(approval_keys, approvalKeys(Room.grid(80)));
-    try testing.expectEqualStrings(approval_keys_narrow, approvalKeys(Room.grid(50)));
+    try testing.expectEqualStrings(chock_ui.ui.approval_keys, chock_ui.ui.approvalKeys(Room.grid(80)));
+    try testing.expectEqualStrings(chock_ui.ui.approval_keys_narrow, chock_ui.ui.approvalKeys(Room.grid(50)));
 
     h.screen.approval.?.view = .diff;
     try testing.expect(h.screen.paint());
     try testing.expect(std.mem.indexOf(
         u8,
         try screenText(h),
-        approvalKeys(h.screen.screenRoom()),
+        chock_ui.ui.approvalKeys(h.screen.screenRoom()),
     ) != null);
 }
 
@@ -7180,7 +4021,7 @@ test "a display that cannot take a key says which command answers, and shows no 
 
     try testing.expect(h.screen.paint());
     h.screen.showApproval(a_question);
-    try testing.expect(!h.screen.answersKeys());
+    try testing.expect(!h.screen.host.answersKeys());
     try testing.expect(h.screen.paint());
 
     const shown = try screenText(h);
@@ -7193,10 +4034,10 @@ test "a display that cannot take a key says which command answers, and shows no 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-    const wide = elsewhereText(arena, id, Room.grid(80));
+    const wide = chock_ui.ui.elsewhereText(arena, id, Room.grid(80));
     try testing.expect(std.mem.endsWith(u8, wide, id));
     try testing.expect(columnsOf(wide) <= 80);
-    const narrow = elsewhereText(arena, id, Room.grid(40));
+    const narrow = chock_ui.ui.elsewhereText(arena, id, Room.grid(40));
     try testing.expect(std.mem.indexOf(u8, narrow, id) == null);
     try testing.expect(std.mem.endsWith(u8, narrow, "chock approve"));
     try testing.expect(columnsOf(narrow) <= 40);
@@ -7236,7 +4077,7 @@ test "the agent's own words stay between the rows Chock owns and cannot reach th
     const first = parts.header + parts.transcript;
     try testing.expect(std.mem.startsWith(u8, rows.items[first], " APPROVAL  policy.widen"));
     try testing.expectEqualStrings(
-        approvalKeys(h.screen.screenRoom()),
+        chock_ui.ui.approvalKeys(h.screen.screenRoom()),
         rows.items[first + parts.approval - 1],
     );
     try testing.expect(std.mem.indexOf(u8, shown, "   APPROVAL  git.push") != null);
@@ -7263,12 +4104,12 @@ test "the countdown is minutes and seconds, and it never reads as time that is l
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    try testing.expectEqualStrings("0:42", try countdownText(arena, 42 * std.time.ms_per_s));
-    try testing.expectEqualStrings("5:00", try countdownText(arena, 5 * std.time.ms_per_min));
-    try testing.expectEqualStrings("0:06", try countdownText(arena, 5_200));
-    try testing.expectEqualStrings("0:01", try countdownText(arena, 900));
-    try testing.expectEqualStrings("0:00", try countdownText(arena, 0));
-    try testing.expectEqualStrings("0:00", try countdownText(arena, -4000));
+    try testing.expectEqualStrings("0:42", try chock_ui.ui.countdownText(arena, 42 * std.time.ms_per_s));
+    try testing.expectEqualStrings("5:00", try chock_ui.ui.countdownText(arena, 5 * std.time.ms_per_min));
+    try testing.expectEqualStrings("0:06", try chock_ui.ui.countdownText(arena, 5_200));
+    try testing.expectEqualStrings("0:01", try chock_ui.ui.countdownText(arena, 900));
+    try testing.expectEqualStrings("0:00", try chock_ui.ui.countdownText(arena, 0));
+    try testing.expectEqualStrings("0:00", try chock_ui.ui.countdownText(arena, -4000));
 }
 
 const Settings = struct {
@@ -7306,10 +4147,10 @@ fn holdsTerminal(h: *Headless) void {
     held.lflag.ICANON = false;
     held.lflag.ISIG = false;
 
-    h.screen.apply_termios = Settings.apply;
-    h.screen.keys.?.was = was;
-    h.screen.keys.?.held = held;
-    h.screen.keys.?.raw = true;
+    h.terminal().apply_termios = Settings.apply;
+    h.terminal().keys.?.was = was;
+    h.terminal().keys.?.held = held;
+    h.terminal().keys.?.raw = true;
 }
 
 test "a turn runs with the echo off, and with the signal key given back" {
@@ -7325,13 +4166,13 @@ test "a turn runs with the echo off, and with the signal key given back" {
     try testing.expect(!Settings.now().lflag.ECHONL);
     try testing.expect(Settings.now().lflag.ISIG);
     try testing.expect(Settings.now().lflag.ICANON);
-    try testing.expect(!h.screen.keys.?.raw);
+    try testing.expect(!h.terminal().keys.?.raw);
 
-    h.screen.takeKeys(.FLUSH);
+    h.screen.host.takeKeys(.flush);
     try testing.expectEqual(@as(usize, 2), Settings.only.count);
     try testing.expect(!Settings.now().lflag.ECHO);
     try testing.expect(!Settings.now().lflag.ISIG);
-    try testing.expect(h.screen.keys.?.raw);
+    try testing.expect(h.terminal().keys.?.raw);
 }
 
 test "the terminal is given back exactly as it was found, and only when the display goes" {
@@ -7375,7 +4216,7 @@ test "only the two bits that echo are taken out of a terminal's own settings" {
 const Raises = struct {
     count: usize = 0,
     raw_at_raise: bool = false,
-    screen: ?*Ui = null,
+    terminal: ?*TerminalHost = null,
     signals: [4]std.posix.SIG = @splat(.KILL),
 
     var only: Raises = .{};
@@ -7383,7 +4224,7 @@ const Raises = struct {
     fn raise(sig: std.posix.SIG) std.posix.RaiseError!void {
         if (only.count < only.signals.len) only.signals[only.count] = sig;
         only.count += 1;
-        if (only.screen) |one| {
+        if (only.terminal) |one| {
             if (one.keys) |keys| {
                 if (keys.raw) only.raw_at_raise = true;
             }
@@ -7396,8 +4237,8 @@ test "a Ctrl-C at a question puts the device back first, and then raises the sig
     const h = try Headless.open(gpa);
     defer h.close();
 
-    Raises.only = .{ .screen = h.screen };
-    h.screen.raise = Raises.raise;
+    Raises.only = .{ .terminal = h.terminal() };
+    h.terminal().raise = Raises.raise;
     interrupt.forgetForTest();
     defer interrupt.forgetForTest();
 
@@ -7406,11 +4247,11 @@ test "a Ctrl-C at a question puts the device back first, and then raises the sig
 
     try askIn(h, a_question);
     const io = h.threaded.io();
-    h.screen.keys.?.device.in = try pressesToRead(&tmp, "\x03\x03");
-    defer h.screen.keys.?.device.in.close(io);
+    h.terminal().keys.?.device.in = try pressesToRead(&tmp, "\x03\x03");
+    defer h.terminal().keys.?.device.in.close(io);
 
     try testing.expectEqual(Look.canceled, h.screen.awaitAnswer(50));
-    try testing.expect(!h.screen.keys.?.raw);
+    try testing.expect(!h.terminal().keys.?.raw);
     try testing.expect(!Raises.only.raw_at_raise);
     try testing.expectEqual(@as(usize, 2), Raises.only.count);
     try testing.expectEqual(std.posix.SIG.INT, Raises.only.signals[0]);
@@ -7442,7 +4283,7 @@ test "a Ctrl-C in an open question is counted as a press and not as a letter" {
 
 fn screenText(h: *Headless) ![]const u8 {
     h.plain.clearRetainingCapacity();
-    try h.screen.surface.terminal.grid.writePlain(h.gpa, &h.plain);
+    try surfaceOf(h.screen).terminal.grid.writePlain(h.gpa, &h.plain);
     return h.plain.items;
 }
 
@@ -7564,7 +4405,7 @@ const Typist = struct {
     fn waitFn(ptr: *anyopaque, io: std.Io, budget_ms: u64) chock_broker.Broker.Waiter.Wake {
         const self: *Typist = @ptrCast(@alignCast(ptr));
         takesKeys(self.h);
-        if (self.looks == settle_looks + 1) self.h.screen.surface.terminal.feed(self.keys);
+        if (self.looks == chock_ui.ui.settle_looks + 1) surfaceOf(self.h.screen).terminal.feed(self.keys);
         self.looks += 1;
         return self.inner.wait(io, budget_ms);
     }
@@ -7592,7 +4433,7 @@ test "a real broker's question is shown in the region, answered with one key, an
 
     try testing.expectEqual(@as(?Approval, null), h.screen.approval);
     try testing.expectEqual(@as(u16, 0), h.screen.approvalRows());
-    try testing.expect(!h.screen.keys.?.raw);
+    try testing.expect(!h.terminal().keys.?.raw);
 }
 
 test "n in the region is a refusal in the log, and the act does not happen" {
@@ -7649,7 +4490,7 @@ test "the chain a person reads begins with them and ends with the agent that ask
 
 fn drawnPastRight(h: *Headless, limit: f32) f32 {
     var worst: f32 = 0;
-    for (h.screen.surface.terminal.canvas.list.primitives.items) |one| {
+    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
         switch (one) {
             .text => |t| {
                 if (t.origin.x >= limit) continue;
@@ -7677,7 +4518,7 @@ fn bandEdge(h: *Headless) f32 {
 fn drawnPastBands(h: *Headless) f32 {
     var bottom: f32 = 0;
     var worst: f32 = 0;
-    for (h.screen.surface.terminal.canvas.list.primitives.items) |one| {
+    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
         switch (one) {
             .rrect => |r| bottom = r.rect.y + r.rect.height,
             .text => |t| {
@@ -7754,7 +4595,7 @@ test "a pane and an approval on a screen with almost no rows draw inside their b
         try testing.expect(std.mem.indexOf(
             u8,
             try screenText(h),
-            elsewhereText(arena, h.screen.current_session, h.screen.screenRoom()),
+            chock_ui.ui.elsewhereText(arena, h.screen.current_session, h.screen.screenRoom()),
         ) != null);
 
         h.screen.approval.?.view = .diff;
@@ -7763,7 +4604,7 @@ test "a pane and an approval on a screen with almost no rows draw inside their b
         try testing.expect(std.mem.indexOf(
             u8,
             try screenText(h),
-            elsewhereText(arena, h.screen.current_session, h.screen.screenRoom()),
+            chock_ui.ui.elsewhereText(arena, h.screen.current_session, h.screen.screenRoom()),
         ) != null);
     }
 }
@@ -7820,7 +4661,7 @@ test "a marker is pinned at the measure the row was cut to and not at the edge o
     try testing.expect(across < h.screen.screenRoom().width);
 
     var found = false;
-    for (h.screen.surface.terminal.canvas.list.primitives.items) |one| {
+    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
         const said = switch (one) {
             .text => |t| t,
             else => continue,
@@ -7841,14 +4682,14 @@ test "a region takes the rows it was given and drops the rest" {
     const text = phantom.Text{ .text = "row" };
     const one = text.widget();
 
-    var two = Rows{ .left = 2 };
+    var two = chock_ui.ui.Rows{ .left = 2 };
     two.add(arena, one);
     two.add(arena, one);
     two.add(arena, one);
     try testing.expectEqual(@as(usize, 2), two.items().len);
     try testing.expectEqual(@as(u16, 0), two.left);
 
-    var none = Rows{ .left = 0 };
+    var none = chock_ui.ui.Rows{ .left = 0 };
     none.add(arena, one);
     try testing.expectEqual(@as(usize, 0), none.items().len);
 }
@@ -7899,7 +4740,7 @@ test "a display drawn with a real face keeps every row inside its band" {
     });
     defer h.close();
 
-    h.screen.surface.terminal.owner.text_metrics = .proportional;
+    surfaceOf(h.screen).terminal.owner.text_metrics = .proportional;
 
     var said: usize = 0;
     while (said < 40) : (said += 1) {
@@ -7923,7 +4764,7 @@ test "a display drawn with a real face keeps every row inside its band" {
 }
 
 fn drawnMark(h: *Headless, id: phantom.icon.Id) ?phantom.display_list.IconPrimitive {
-    for (h.screen.surface.terminal.canvas.list.primitives.items) |one| {
+    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
         switch (one) {
             .icon => |mark| if (mark.id == id) return mark,
             else => {},
@@ -7933,7 +4774,7 @@ fn drawnMark(h: *Headless, id: phantom.icon.Id) ?phantom.display_list.IconPrimit
 }
 
 fn drawsPoint(h: *Headless, point: u21) bool {
-    for (h.screen.surface.terminal.canvas.list.primitives.items) |one| {
+    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
         switch (one) {
             .text => |t| for (t.glyphs) |glyph| {
                 if (glyph.cp == point) return true;
@@ -7947,7 +4788,7 @@ fn drawsPoint(h: *Headless, point: u21) bool {
 fn openProportional(gpa: std.mem.Allocator, columns: u16, rows: u16) !*Headless {
     const h = try openWide(gpa, columns, rows);
     errdefer h.close();
-    h.screen.surface.terminal.owner.text_metrics = .proportional;
+    surfaceOf(h.screen).terminal.owner.text_metrics = .proportional;
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.measure.height() > phantom.tui.term.logical_cell_h);
     return h;
@@ -7971,12 +4812,12 @@ test "every codepoint Chock draws as a mark is one the theme's own face has no g
         '\u{25be}',
         '\u{22ef}',
     }) |point| {
-        try testing.expect(markFor(point) != null);
+        try testing.expect(chock_ui.ui.markFor(point) != null);
         try testing.expectEqual(missing, measure.advanceOf(point));
     }
 
     for ([_]u21{ '\u{b7}', '\u{2026}' }) |point| {
-        try testing.expect(markFor(point) == null);
+        try testing.expect(chock_ui.ui.markFor(point) == null);
         try testing.expect(measure.advanceOf(point) != missing);
     }
 }
@@ -7992,9 +4833,9 @@ fn everyMarkSession(h: *Headless) !void {
     callAndAnswer(h, "255/255 passed\n", false, 18_200);
 
     try focusTranscript(h);
-    h.screen.surface.terminal.feed("\x1b[B");
+    surfaceOf(h.screen).terminal.feed("\x1b[B");
     try testing.expect(h.screen.paint());
-    h.screen.surface.terminal.feed(" ");
+    surfaceOf(h.screen).terminal.feed(" ");
     try testing.expect(h.screen.paint());
 
     h.screen.observer().onEvent(3, .{ .tool_call = .{
@@ -8064,7 +4905,7 @@ test "in cells the two chevrons change spelling and nothing else does" {
     try testing.expect(std.mem.indexOf(u8, shown, "\u{22ef} read_file") != null);
 
     for ([_]u21{ '\u{2713}', '\u{2717}', '\u{2502}', '\u{2500}', '\u{22ef}' }) |point| {
-        const mark = markFor(point) orelse return error.NoMarkForPoint;
+        const mark = chock_ui.ui.markFor(point) orelse return error.NoMarkForPoint;
         try testing.expectEqual(point, phantom.icon.cellMarkFor(mark.id).?.cp);
 
         var spelled: [4]u8 = undefined;
@@ -8072,7 +4913,7 @@ test "in cells the two chevrons change spelling and nothing else does" {
         try testing.expect(std.mem.indexOf(u8, shown, spelled[0..len]) != null);
     }
     for ([_]u21{ '\u{25b8}', '\u{25be}' }) |point| {
-        const mark = markFor(point) orelse return error.NoMarkForPoint;
+        const mark = chock_ui.ui.markFor(point) orelse return error.NoMarkForPoint;
         try testing.expect(phantom.icon.cellMarkFor(mark.id).?.cp != point);
     }
 }
@@ -8102,7 +4943,7 @@ fn drawnMarks(
 ) !std.ArrayList(phantom.display_list.IconPrimitive) {
     var found: std.ArrayList(phantom.display_list.IconPrimitive) = .empty;
     errdefer found.deinit(gpa);
-    for (h.screen.surface.terminal.canvas.list.primitives.items) |one| {
+    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
         switch (one) {
             .icon => |mark| if (mark.id == id) try found.append(gpa, mark),
             else => {},
@@ -8146,7 +4987,7 @@ test "the rail is one continuous line down the rows and the marks beside it stay
 }
 
 fn wordsStartOf(h: *Headless, words: []const u8) ?f32 {
-    for (h.screen.surface.terminal.canvas.list.primitives.items) |one| {
+    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
         switch (one) {
             .text => |t| {
                 var spelled: [64]u8 = undefined;
@@ -8231,7 +5072,7 @@ test "a session that ended leaves Chock's own row newest, with nothing drawn und
         return error.NoEndingDrawn;
     try testing.expectApproxEqAbs(input_top - step, ended, 0.01);
 
-    for (h.screen.surface.terminal.canvas.list.primitives.items) |one| {
+    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
         const top = switch (one) {
             .text => |words| words.origin.y,
             .icon => |mark| mark.origin.y,
@@ -8242,7 +5083,7 @@ test "a session that ended leaves Chock's own row newest, with nothing drawn und
 }
 
 fn drawnTopOf(h: *Headless, words: []const u8) ?f32 {
-    for (h.screen.surface.terminal.canvas.list.primitives.items) |one| {
+    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
         switch (one) {
             .text => |said| if (std.mem.eql(u8, said.text, words)) return said.origin.y,
             else => {},
@@ -8261,7 +5102,7 @@ test "the display reads a key and repaints while the session is waiting for some
     try testing.expect(h.screen.paint());
     try testing.expectEqual(@as(u16, 0), h.screen.scroll_back);
 
-    h.screen.surface.terminal.feed("\x1b[A");
+    surfaceOf(h.screen).terminal.feed("\x1b[A");
     h.screen.pumpStep();
     h.screen.pumpStep();
 
@@ -8275,10 +5116,10 @@ test "the pump gives the signal key back between two looks, so Ctrl-C stays the 
     defer h.close();
 
     holdsTerminal(h);
-    try testing.expect(h.screen.keys.?.raw);
+    try testing.expect(h.terminal().keys.?.raw);
 
     h.screen.pumpStep();
-    try testing.expect(!h.screen.keys.?.raw);
+    try testing.expect(!h.terminal().keys.?.raw);
     try testing.expect(Settings.now().lflag.ISIG);
     try testing.expect(!Settings.now().lflag.ECHO);
 
@@ -8286,7 +5127,7 @@ test "the pump gives the signal key back between two looks, so Ctrl-C stays the 
     try testing.expectEqual(@as(usize, 3), Settings.only.count);
     try testing.expect(!Settings.only.written[1].lflag.ISIG);
     try testing.expect(Settings.only.written[2].lflag.ISIG);
-    try testing.expect(!h.screen.keys.?.raw);
+    try testing.expect(!h.terminal().keys.?.raw);
 }
 
 test "the pump takes no key while a question is open, because the question is already reading one" {
@@ -8314,8 +5155,8 @@ test "a Ctrl-C read by the pump puts the device back first, and then raises the 
     const h = try Headless.open(gpa);
     defer h.close();
 
-    Raises.only = .{ .screen = h.screen };
-    h.screen.raise = Raises.raise;
+    Raises.only = .{ .terminal = h.terminal() };
+    h.terminal().raise = Raises.raise;
     interrupt.forgetForTest();
     defer interrupt.forgetForTest();
 
@@ -8324,11 +5165,11 @@ test "a Ctrl-C read by the pump puts the device back first, and then raises the 
 
     holdsTerminal(h);
     const io = h.threaded.io();
-    h.screen.keys.?.device.in = try pressesToRead(&tmp, "\x03\x03");
-    defer h.screen.keys.?.device.in.close(io);
+    h.terminal().keys.?.device.in = try pressesToRead(&tmp, "\x03\x03");
+    defer h.terminal().keys.?.device.in.close(io);
 
     h.screen.pumpStep();
-    try testing.expect(!h.screen.keys.?.raw);
+    try testing.expect(!h.terminal().keys.?.raw);
     try testing.expect(!Raises.only.raw_at_raise);
     try testing.expectEqual(@as(usize, 2), Raises.only.count);
     try testing.expectEqual(std.posix.SIG.INT, Raises.only.signals[0]);
@@ -8557,10 +5398,10 @@ test "an ask_user row shows the question and not the JSON it arrived as" {
 }
 
 test "a backspace takes a whole character and never half of one" {
-    try testing.expectEqual(@as(usize, 0), backOne(""));
-    try testing.expectEqual(@as(usize, 2), backOne("abc"));
-    try testing.expectEqual(@as(usize, 0), backOne("\u{4e2d}"));
-    try testing.expectEqual(@as(usize, 1), backOne("a\u{4e2d}"));
+    try testing.expectEqual(@as(usize, 0), chock_ui.ui.backOne(""));
+    try testing.expectEqual(@as(usize, 2), chock_ui.ui.backOne("abc"));
+    try testing.expectEqual(@as(usize, 0), chock_ui.ui.backOne("\u{4e2d}"));
+    try testing.expectEqual(@as(usize, 1), chock_ui.ui.backOne("a\u{4e2d}"));
 }
 
 test "a question grows with what it holds and stops at half the screen" {
@@ -8612,16 +5453,16 @@ test "a paste keeps its text and loses everything that is not text" {
     defer kept.deinit(gpa);
 
     const measured = "\x00\x37\xe0\x82\x39\xff\x00\x00build v0.8.0";
-    keepText(gpa, &kept, measured);
+    chock_ui.ui.keepText(gpa, &kept, measured);
     try std.testing.expectEqualStrings("79build v0.8.0", kept.items);
     try std.testing.expect(std.unicode.utf8ValidateSlice(kept.items));
 
     kept.clearRetainingCapacity();
-    keepText(gpa, &kept, "first\nsecond\tthird");
+    chock_ui.ui.keepText(gpa, &kept, "first\nsecond\tthird");
     try std.testing.expectEqualStrings("first\nsecond\tthird", kept.items);
 
     kept.clearRetainingCapacity();
-    keepText(gpa, &kept, "héllo wörld");
+    chock_ui.ui.keepText(gpa, &kept, "héllo wörld");
     try std.testing.expectEqualStrings("héllo wörld", kept.items);
 }
 
@@ -8630,14 +5471,133 @@ test "a paste of coloured output keeps the words and none of the colour" {
     var kept: std.ArrayList(u8) = .empty;
     defer kept.deinit(gpa);
 
-    keepText(gpa, &kept, "\x1b[0;32m   Compiling\x1b[0m flakebom v0.8.0\n");
+    chock_ui.ui.keepText(gpa, &kept, "\x1b[0;32m   Compiling\x1b[0m flakebom v0.8.0\n");
     try std.testing.expectEqualStrings("   Compiling flakebom v0.8.0\n", kept.items);
 
     kept.clearRetainingCapacity();
-    keepText(gpa, &kept, "before\x1b]0;a title\x07after");
+    chock_ui.ui.keepText(gpa, &kept, "before\x1b]0;a title\x07after");
     try std.testing.expectEqualStrings("beforeafter", kept.items);
 
     kept.clearRetainingCapacity();
-    keepText(gpa, &kept, "before\x1b]8;;https://example.com\x1b\\after");
+    chock_ui.ui.keepText(gpa, &kept, "before\x1b]8;;https://example.com\x1b\\after");
     try std.testing.expectEqualStrings("beforeafter", kept.items);
+}
+
+test "an agent's markdown is drawn as words, with the markers off and the runs kept" {
+    const gpa = testing.allocator;
+    const h = try Headless.open(gpa);
+    defer h.close();
+
+    h.screen.say(.agent, "**What changed** in `Terminal.astro`\n");
+    try testing.expect(h.screen.paint());
+
+    const drawn = try screenText(h);
+    try testing.expect(std.mem.indexOf(u8, drawn, "What changed in Terminal.astro") != null);
+    // The markers themselves never reach a reader.
+    try testing.expect(std.mem.indexOf(u8, drawn, "**") == null);
+    try testing.expect(std.mem.indexOf(u8, drawn, "`") == null);
+
+    // The runs are kept beside the words, so a renderer can still tell them
+    // apart after the markers are gone.
+    const line = h.screen.lines.items[h.screen.lines.items.len - 1];
+    try testing.expectEqualStrings("What changed in Terminal.astro", line.text);
+    try testing.expectEqual(@as(usize, 3), line.spans.len);
+    try testing.expectEqualStrings("What changed", line.spans[0].text);
+    try testing.expect(line.spans[0].style.strong);
+    try testing.expectEqualStrings(" in ", line.spans[1].text);
+    try testing.expect(!line.spans[1].style.strong);
+    try testing.expectEqualStrings("Terminal.astro", line.spans[2].text);
+    try testing.expect(line.spans[2].style.code);
+
+    // Every span points into the line's own text, so the two are freed together.
+    for (line.spans) |one| {
+        const at = @intFromPtr(one.text.ptr) - @intFromPtr(line.text.ptr);
+        try testing.expect(at + one.text.len <= line.text.len);
+    }
+}
+
+test "a fenced block keeps its code verbatim, markers and all" {
+    const gpa = testing.allocator;
+    const h = try Headless.open(gpa);
+    defer h.close();
+
+    h.screen.say(.agent, "```zig\nconst a = b.*;\n```\n");
+    try testing.expect(h.screen.paint());
+
+    // Inside a fence nothing is read as emphasis, so the stars stay.
+    var found = false;
+    for (h.screen.lines.items) |one| {
+        if (std.mem.indexOf(u8, one.text, "const a = b.*;") != null) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "a styled run is drawn as a run, and a row with none keeps the plain path" {
+    const gpa = testing.allocator;
+    const h = try Headless.open(gpa);
+    defer h.close();
+
+    h.screen.say(.agent, "plain words only\n");
+    h.screen.say(.agent, "**bold** words\n");
+    try testing.expect(h.screen.paint());
+
+    var room = std.heap.ArenaAllocator.init(gpa);
+    defer room.deinit();
+    const rows = h.screen.showRows(room.allocator());
+
+    var saw_plain = false;
+    var saw_styled = false;
+    for (rows) |one| {
+        if (std.mem.eql(u8, one.text, "plain words only")) {
+            saw_plain = true;
+            // One run, carrying no style, so this draws the way it always did.
+            for (one.spans) |span| try testing.expect(!span.style.strong);
+        }
+        if (std.mem.eql(u8, one.text, "bold words")) {
+            saw_styled = true;
+            try testing.expectEqual(@as(usize, 2), one.spans.len);
+            try testing.expect(one.spans[0].style.strong);
+            try testing.expect(!one.spans[1].style.strong);
+        }
+    }
+    try testing.expect(saw_plain);
+    try testing.expect(saw_styled);
+}
+
+test "a long styled line wraps and every row keeps its runs" {
+    const gpa = testing.allocator;
+    const h = try Headless.open(gpa);
+    defer h.close();
+
+    // Wider than the 40 column headless screen, so it has to break.
+    h.screen.say(.agent, "**start of it** and then a good deal more text that cannot fit on one row\n");
+    try testing.expect(h.screen.paint());
+
+    var room = std.heap.ArenaAllocator.init(gpa);
+    defer room.deinit();
+    const rows = h.screen.showRows(room.allocator());
+
+    const Row = @TypeOf(rows[0]);
+    var first: ?Row = null;
+    var second: ?Row = null;
+    for (rows) |one| {
+        if (std.mem.startsWith(u8, one.text, "start of it")) first = one;
+        if (std.mem.startsWith(u8, one.text, "text that cannot fit")) second = one;
+    }
+
+    // The row the emphasis is on keeps it, split into the strong run and the
+    // rest of the row.
+    const head = first orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), head.spans.len);
+    try testing.expectEqualStrings("start of it", head.spans[0].text);
+    try testing.expect(head.spans[0].style.strong);
+    try testing.expect(!head.spans[1].style.strong);
+
+    // A row the emphasis does not reach carries one plain run.
+    const tail = second orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), tail.spans.len);
+    try testing.expect(!tail.spans[0].style.strong);
+
+    // No row keeps a marker, wrapped or not.
+    for (rows) |one| try testing.expect(std.mem.indexOf(u8, one.text, "**") == null);
 }

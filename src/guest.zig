@@ -73,19 +73,67 @@ pub fn main(
         return 2;
     };
 
-    const control = dialHost(port) catch |err| {
-        tty.print(
-            .err,
-            "chock guest: nothing answered on vsock port {d} ({t}). This runs inside a " ++
-                "microVM Chock started and nowhere else.\n",
-            .{ port, err },
-        );
-        return 1;
-    };
-    defer _ = linux.close(control);
-
     const read_buffer = try gpa.alloc(u8, wire.max_message_bytes + 1);
     defer gpa.free(read_buffer);
+
+    // One turn is one connection. `chock run` is started for each turn and opens
+    // its own channel, so this dials again and waits rather than ending: the
+    // guest belongs to the session, not to the turn.
+    var first = true;
+    while (true) {
+        const control = dialHost(port) catch |err| switch (err) {
+            error.NobodyThere => {
+                if (first) {
+                    tty.print(
+                        .err,
+                        "chock guest: nothing answered on vsock port {d}. This runs inside a " ++
+                            "microVM Chock started and nowhere else.\n",
+                        .{port},
+                    );
+                    return powerOff(1);
+                }
+                // Between turns nothing is listening, which is the ordinary
+                // case. The host ends this machine when the session is done.
+                sleepMs(between_turns_ms);
+                continue;
+            },
+            error.NoSocket => {
+                tty.print(.err, "chock guest: this build has no vsock ({t}).\n", .{err});
+                return powerOff(1);
+            },
+        };
+        first = false;
+        serveOne(gpa, io, control, read_buffer) catch |err| {
+            tty.print(.err, "chock guest: the turn ended badly: {t}\n", .{err});
+            _ = linux.close(control);
+            return powerOff(1);
+        };
+        _ = linux.close(control);
+    }
+}
+
+/// How long to wait before dialling again. Nothing listens between turns, so
+/// this is the cost of noticing the next one starting.
+const between_turns_ms: i32 = 50;
+
+/// Stop the machine rather than return.
+///
+/// This process is the guest's init. A kernel panics when its init exits, whole
+/// or not, so the machine is powered off here and the host reads the exit code
+/// off the process it started instead.
+fn powerOff(code: u8) u8 {
+    _ = linux.reboot(.MAGIC1, .MAGIC2, .POWER_OFF, null);
+    // Only reached where this is not init, which is every test.
+    return code;
+}
+
+/// Answer one turn on one connection.
+fn serveOne(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    control: std.posix.fd_t,
+    read_buffer: []u8,
+) !void {
     var write_buffer: [64 * 1024]u8 = undefined;
 
     const stream = std.Io.File{ .handle = control, .flags = .{ .nonblocking = false } };
@@ -104,7 +152,6 @@ pub fn main(
     };
 
     try serve(gpa, io, &reader.interface, &writer.interface, if (watcher == null) null else &watch);
-    return 0;
 }
 
 const Watch = struct {
