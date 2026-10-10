@@ -7,6 +7,7 @@
   zig,
   zls,
   git,
+  typescript,
   mcp-server-time,
   flakever,
 }:
@@ -18,7 +19,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   zigDeps = zig.fetchDeps {
     inherit (finalAttrs) src pname version;
-    hash = "sha256-SMH157bVjVgmGhaJ1Net44c3NoWNxaYRAEBH+VP3DA0=";
+    hash = "sha256-kw/Zh9bu3HOMcWvc9BfI4DDIWPAgoVH8B8fA5ULY19c=";
   };
 
   # **The hypervisor entitlement, which a Mac runs no microVM guest without.**
@@ -40,6 +41,7 @@ stdenv.mkDerivation (finalAttrs: {
   nativeBuildInputs = [
     zig
     git
+    typescript
   ]
   # `codesign` is not in a Darwin build environment. sigtool's own takes
   # `--entitlements`, and the signature it writes is one the kernel honours.
@@ -73,6 +75,7 @@ stdenv.mkDerivation (finalAttrs: {
       zig
       git
       zls
+      typescript
       mcp-server-time
     ];
   };

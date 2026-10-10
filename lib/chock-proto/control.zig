@@ -376,6 +376,7 @@ pub const Verb = enum {
     cancel,
     read,
     list,
+    projects,
     watch,
     answer,
 };
@@ -389,6 +390,9 @@ pub const Request = union(Verb) {
     cancel: Cancel,
     read: Read,
     list: List,
+    /// Every project this daemon can see. Carries nothing: the answer is the
+    /// whole set, and a caller that wanted one already knows its path.
+    projects: void,
     watch: Watch,
     answer: Answer_,
 
@@ -405,6 +409,7 @@ pub const Request = union(Verb) {
         message: []const u8,
     };
     pub const Read = struct { session: []const u8, after: u64 };
+    /// An empty `project` asks for every project this daemon can see.
     pub const List = struct { project: []const u8 };
     pub const Watch = struct { project: []const u8, session: []const u8, after: u64 };
     pub const Answer_ = struct {
@@ -453,6 +458,7 @@ pub const Request = union(Verb) {
                 } };
             },
             .list => .{ .list = .{ .project = try field(asked.rest, 0, 1) } },
+            .projects => .{ .projects = {} },
             .watch => .{ .watch = .{
                 .project = try field(asked.rest, 0, 3),
                 .session = try field(asked.rest, 1, 3),
@@ -484,6 +490,7 @@ pub const Request = union(Verb) {
             ),
             .read => |one| try writer.print("read {s} {d}\n", .{ one.session, one.after }),
             .list => |one| try writer.print("list {s}\n", .{one.project}),
+            .projects => try writer.writeAll("projects\n"),
             .watch => |one| try writer.print(
                 "watch {s}\t{s}\t{d}\n",
                 .{ one.project, one.session, one.after },
@@ -500,7 +507,13 @@ pub const Request = union(Verb) {
 
 pub fn verbOf(request: []const u8) ?struct { verb: Verb, rest: []const u8 } {
     inline for (std.enums.values(Verb)) |verb| {
-        const prefix = @tagName(verb) ++ " ";
+        const name = @tagName(verb);
+        // Only a verb that takes nothing arrives on its own. Every other one
+        // without its arguments is not a request.
+        if (@FieldType(Request, name) == void and std.mem.eql(u8, request, name)) {
+            return .{ .verb = verb, .rest = "" };
+        }
+        const prefix = name ++ " ";
         if (std.mem.startsWith(u8, request, prefix)) {
             return .{ .verb = verb, .rest = request[prefix.len..] };
         }
@@ -554,12 +567,35 @@ pub const Answer = enum {
 };
 
 /// Never alias a local struct, or a local field changes the wire; every field defaults, none a pass.
+/// One project, as a picker shows it.
+pub const ProjectRow = struct {
+    /// The directory the project is in, or empty where nothing recorded it.
+    root: []const u8 = "",
+    /// What to call it. Never empty.
+    name: []const u8,
+    sessions: usize = 0,
+
+    pub fn toJson(self: ProjectRow, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        return std.fmt.allocPrint(gpa, "{f}", .{std.json.fmt(self, .{})});
+    }
+};
+
 pub const SessionRow = struct {
     id: []const u8,
     started_ms: u64 = 0,
     model: []const u8 = "",
     model_count: usize = 0,
     model_alias: []const u8 = "",
+    /// What the agent named the session, or empty when it named nothing. A
+    /// person picks by this, because an id says nothing about the work.
+    title: []const u8 = "",
+    /// What to call the project this belongs to, for a listing that covers more
+    /// than one. Empty when the caller asked for one project and already knows.
+    project: []const u8 = "",
+    /// That project's directory, which is what names it to the daemon. Empty
+    /// where nothing recorded it, and such a session cannot be opened by a
+    /// caller that is not already inside its project.
+    project_root: []const u8 = "",
     /// A lock that could not be tested says `unknown`, never `idle`.
     live: []const u8 = "unknown",
     end: ?[]const u8 = null,
@@ -803,6 +839,7 @@ test "every verb round trips from a request to a line and back" {
         .{ .read = .{ .session = id, .after = 0 } },
         .{ .read = .{ .session = id, .after = 4096 } },
         .{ .list = .{ .project = "/home/ross/chock" } },
+        .{ .projects = {} },
         .{ .watch = .{ .project = "/home/ross/chock", .session = id, .after = 128 } },
         .{ .answer = .{ .project = "/home/ross/chock", .session = id, .request_id = 9, .decision = .yes } },
         .{ .answer = .{ .project = "/home/ross/chock", .session = id, .request_id = 9, .decision = .no } },
@@ -854,6 +891,8 @@ test "a verb has to be a whole word, and every verb is one a client is told abou
     try testing.expect(verbOf("answered /p") == null);
     try testing.expect(verbOf("") == null);
     try testing.expect(verbOf("list") == null);
+    // `projects` takes nothing, so it is a whole request on its own.
+    try testing.expectEqual(Verb.projects, verbOf("projects").?.verb);
     try testing.expectError(error.NoVerb, Request.parse("nonsense /p"));
 }
 

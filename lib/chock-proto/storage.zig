@@ -257,6 +257,10 @@ const json_lines_replay_vtable = Replay.VTable{
 };
 
 /// Mirrors `log.Log`'s wire shape, not its durability: no sync, no torn tail.
+/// The first line of a session log. A reader tells it apart from an event by
+/// this exact text, because it is the one line that carries no event.
+pub const header_line = "{\"chock_log\":1}";
+
 pub const Memory = struct {
     allocator: std.mem.Allocator,
     session: []const u8,
@@ -266,7 +270,7 @@ pub const Memory = struct {
     /// `std.ArrayList.deinit` leaves the list undefined; without this guard, a second `deinit` double-frees.
     deinited: bool = false,
 
-    const header = "{\"chock_log\":1}\n";
+    const header = header_line ++ "\n";
 
     pub fn init(allocator: std.mem.Allocator, session: []const u8) std.mem.Allocator.Error!Memory {
         var self: Memory = .{ .allocator = allocator, .session = session };

@@ -722,6 +722,7 @@ fn start(
     if (options.adopt) try refuseAdoptWithNothingToAdopt(gpa, io, paths.log, id);
 
     session_paths.create(io, paths) catch return error.Reported;
+    session_paths.markProject(io, paths, project_root);
 
     // The guest is forked here, before the credential is read, so its copied memory never holds the token.
     var own_guest: ?*OwnGuest = null;
@@ -10095,7 +10096,7 @@ fn runSession(
     const layer_witness = witnessLayers(gpa, sandbox.Sandbox.guarantees);
 
     if (options.display) |wanted| {
-        screen = ui.Ui.start(gpa, io, env, wanted.attach) catch |err| open_failed: {
+        screen = ui.startUi(gpa, io, env, wanted.attach) catch |err| open_failed: {
             tty.print(
                 .warn,
                 "chock: the display could not start ({s}), printing plainly instead.\n",
@@ -13189,7 +13190,7 @@ test "a display opens on the conversation the log already holds" {
     const device = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{});
     defer device.close(io);
 
-    const screen = try ui.Ui.start(gpa, io, &env, .{ .terminal = .{
+    const screen = try ui.startUi(gpa, io, &env, .{ .terminal = .{
         .in = device,
         .out = device,
         .size = .{ .cols = 80, .rows = 24, .xpixel = 640, .ypixel = 384 },
@@ -13320,7 +13321,7 @@ test "the line about a mode the policy took away is said again once the display 
     const printed = try callAt(
         "\n    if (bounded == null) tty.print(.warn, \"chock: \" ++ bounded_mode_fmt",
     );
-    const opened = try callAt("\n        screen = ui.Ui.start(gpa, io, env, wanted.attach) catch |err|");
+    const opened = try callAt("\n        screen = ui.startUi(gpa, io, env, wanted.attach) catch |err|");
     const said_again = try callAt(
         "\n        if (started.apply_mode.mode == null) one.note(",
     );

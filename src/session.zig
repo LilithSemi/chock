@@ -4,6 +4,7 @@
 const std = @import("std");
 const chock_auth = @import("chock-auth");
 const chock_core = @import("chock-core");
+const chock_proto = @import("chock-proto");
 const tty = @import("tty.zig");
 
 pub const id_length = 26;
@@ -237,10 +238,207 @@ pub const CreateError = error{
     SessionDirectoryUnwritable,
 };
 
+/// The file in a project's directory that says which directory it is for.
+///
+/// `projectKey` hashes the path, so the directory name cannot be read back
+/// into a path. Without this, nothing can list the projects a person has.
+pub const project_marker = "project";
+
 pub fn create(io: std.Io, self: Paths) CreateError!void {
     try makeDirAll(io, self.dir);
     try makeDirAll(io, self.work);
     try makeDirAll(io, self.root);
+}
+
+/// Write down which directory this session directory belongs to.
+///
+/// Separate from `create` because it needs the project root, and `Paths` has
+/// already turned that into a hashed directory name. A failure is dropped: the
+/// marker only makes a listing nicer, and a session runs without it.
+pub fn markProject(io: std.Io, self: Paths, project_root: []const u8) void {
+    const path = std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.dir, project_marker }) catch return;
+    defer self.gpa.free(path);
+
+    const file = std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true }) catch return;
+    defer file.close(io);
+    file.writeStreamingAll(io, project_root) catch {};
+}
+
+/// One project a person has worked in.
+pub const Project = struct {
+    /// The directory the sessions are in. Always known.
+    dir: []const u8,
+    /// The project this is for, as the marker says, or empty when a directory
+    /// predates the marker and nothing wrote one.
+    root: []const u8,
+    /// A name to show. The marker's basename, or the directory's own name with
+    /// the hash taken off.
+    name: []const u8,
+    sessions: usize,
+    /// The identifier of the newest session in it. Identifiers sort by the time
+    /// they were made, so this orders projects by when each was last worked in.
+    newest: [id_length]u8 = @splat('0'),
+};
+
+/// Every project under the state directory, newest name order left to the
+/// caller. A directory with no sessions in it is left out.
+pub fn listProjects(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+) Error![]Project {
+    const state = try chock_auth.paths.stateDir(gpa, env);
+    defer gpa.free(state);
+
+    const root = try std.fmt.allocPrint(gpa, "{s}/sessions", .{state});
+    defer gpa.free(root);
+
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
+
+    var out: std.ArrayList(Project) = .empty;
+    var walker = dir.iterate();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, entry.name });
+        const found = sessionsIn(io, path);
+        if (found.count == 0) {
+            gpa.free(path);
+            continue;
+        }
+        const said = markerIn(gpa, io, path) orelse recoverRoot(gpa, io, path, entry.name);
+        // `entry.name` points into the walker's own buffer, which the next step
+        // writes over, so a name kept past this iteration has to be copied.
+        const name = if (said) |one|
+            std.fs.path.basename(one)
+        else
+            try gpa.dupe(u8, nameOf(entry.name));
+        try out.append(gpa, .{
+            .dir = path,
+            .root = said orelse "",
+            .name = name,
+            .sessions = found.count,
+            .newest = found.newest,
+        });
+    }
+
+    // Newest first, so the project a person is working in is at the top.
+    std.mem.sort(Project, out.items, {}, newerFirst);
+    return out.toOwnedSlice(gpa);
+}
+
+fn newerFirst(_: void, left: Project, right: Project) bool {
+    return std.mem.order(u8, &left.newest, &right.newest) == .gt;
+}
+
+const Counted = struct {
+    count: usize = 0,
+    newest: [id_length]u8 = @splat('0'),
+};
+
+fn sessionsIn(io: std.Io, path: []const u8) Counted {
+    var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return .{};
+    defer dir.close(io);
+
+    var out: Counted = .{};
+    var walker = dir.iterate();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+        const stem = entry.name[0 .. entry.name.len - ".jsonl".len];
+        if (!isValidId(stem)) continue;
+        out.count += 1;
+        if (std.mem.order(u8, stem, &out.newest) == .gt) out.newest = stem[0..id_length].*;
+    }
+    return out;
+}
+
+fn markerIn(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?[]const u8 {
+    const file_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ path, project_marker }) catch return null;
+    defer gpa.free(file_path);
+
+    const said = std.Io.Dir.readFileAlloc(.cwd(), io, file_path, gpa, .limited(std.fs.max_path_bytes)) catch
+        return null;
+    const kept = std.mem.trim(u8, said, " \t\r\n");
+    if (kept.len == 0 or !std.fs.path.isAbsolute(kept)) {
+        gpa.free(said);
+        return null;
+    }
+    return kept;
+}
+
+/// Work out a project's directory from a worktree it left behind, for a
+/// directory made before anything wrote a marker.
+///
+/// A git worktree's `.git` is a file naming the repository it came from, so a
+/// kept workspace still points home. The answer is only taken when hashing it
+/// reproduces the directory's own name, so a wrong guess is never written down.
+fn recoverRoot(gpa: std.mem.Allocator, io: std.Io, path: []const u8, entry: []const u8) ?[]const u8 {
+    var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    var walker = dir.iterate();
+    while (walker.next(io) catch null) |one| {
+        if (one.kind != .directory) continue;
+        if (!std.mem.endsWith(u8, one.name, ".work")) continue;
+
+        const work = std.fmt.allocPrint(gpa, "{s}/{s}", .{ path, one.name }) catch return null;
+        defer gpa.free(work);
+
+        if (rootUnder(gpa, io, work, entry)) |found| {
+            // Write it down, so the next listing reads a marker.
+            const marker = std.fmt.allocPrint(gpa, "{s}/{s}", .{ path, project_marker }) catch return found;
+            defer gpa.free(marker);
+            if (std.Io.Dir.createFileAbsolute(io, marker, .{ .truncate = true })) |file| {
+                defer file.close(io);
+                file.writeStreamingAll(io, found) catch {};
+            } else |_| {}
+            return found;
+        }
+    }
+    return null;
+}
+
+/// The project behind any one attempt under a `.work` directory.
+fn rootUnder(gpa: std.mem.Allocator, io: std.Io, work: []const u8, entry: []const u8) ?[]const u8 {
+    var dir = std.Io.Dir.openDirAbsolute(io, work, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    var walker = dir.iterate();
+    while (walker.next(io) catch null) |one| {
+        if (one.kind != .directory) continue;
+        const link = std.fmt.allocPrint(gpa, "{s}/{s}/.git", .{ work, one.name }) catch continue;
+        defer gpa.free(link);
+
+        const said = std.Io.Dir.readFileAlloc(.cwd(), io, link, gpa, .limited(4096)) catch continue;
+        defer gpa.free(said);
+
+        const root = rootOfGitLink(said) orelse continue;
+        const key = projectKey(gpa, root) catch continue;
+        defer gpa.free(key);
+        if (!std.mem.eql(u8, key, entry)) continue;
+
+        return gpa.dupe(u8, root) catch null;
+    }
+    return null;
+}
+
+/// `gitdir: /home/ross/chock/.git/worktrees/<name>` names `/home/ross/chock`.
+fn rootOfGitLink(said: []const u8) ?[]const u8 {
+    const prefix = "gitdir:";
+    if (!std.mem.startsWith(u8, said, prefix)) return null;
+    const path = std.mem.trim(u8, said[prefix.len..], " \t\r\n");
+    const at = std.mem.lastIndexOf(u8, path, "/.git/") orelse return null;
+    if (at == 0) return null;
+    return path[0..at];
+}
+
+/// A directory name is `<basename>-<eight hex>`, so the name is what comes
+/// before the last dash.
+fn nameOf(entry: []const u8) []const u8 {
+    const cut = std.mem.lastIndexOfScalar(u8, entry, '-') orelse return entry;
+    if (entry.len - cut - 1 != 8) return entry;
+    return entry[0..cut];
 }
 
 fn makeDirAll(io: std.Io, path: []const u8) CreateError!void {
@@ -497,4 +695,123 @@ test "a scratchpad is in the temp directory, keyed by session, and never beside 
     const fallback = try scratchpadDir(gpa, &bare, first_id);
     defer gpa.free(fallback);
     try testing.expectEqualStrings("/tmp/chock/" ++ first_id, fallback);
+}
+
+test "a project is listed by the path its marker names, and by its directory when nothing wrote one" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var room: [std.fs.max_path_bytes]u8 = undefined;
+    const state = try chock_proto.log.absoluteDirPath(io, &room, tmp.dir);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", state);
+
+    const project = "/home/somebody/work/parser";
+    const id = "01JQ" ++ "A" ** 22;
+
+    var paths = try pathsFor(gpa, &env, project, id);
+    defer paths.deinit();
+    try create(io, paths);
+    markProject(io, paths, project);
+
+    // A directory holding no session is not a project anybody can open, so a
+    // log goes in beside the marker.
+    const log = try std.fmt.allocPrint(gpa, "{s}/{s}.jsonl", .{ paths.dir, id });
+    defer gpa.free(log);
+    const file = try std.Io.Dir.createFileAbsolute(io, log, .{ .truncate = true });
+    file.close(io);
+
+    const found = try listProjects(gpa, io, &env);
+    defer {
+        for (found) |one| {
+            gpa.free(one.dir);
+            if (one.root.len != 0) gpa.free(one.root);
+        }
+        gpa.free(found);
+    }
+
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqualStrings(project, found[0].root);
+    try testing.expectEqualStrings("parser", found[0].name);
+    try testing.expectEqual(@as(usize, 1), found[0].sessions);
+}
+
+test "a directory name carries the project's own name with the hash taken off" {
+    try testing.expectEqualStrings("chock", nameOf("chock-e6146e21"));
+    try testing.expectEqualStrings("chock-website", nameOf("chock-website-40e39acb"));
+    // Not eight hex after the last dash, so the whole name stands.
+    try testing.expectEqualStrings("no-hash-here", nameOf("no-hash-here"));
+}
+
+test "a worktree left behind names its project, and a name that does not hash back is refused" {
+    try testing.expectEqualStrings(
+        "/home/ross/chock",
+        rootOfGitLink("gitdir: /home/ross/chock/.git/worktrees/01M0TMATKBZE7HQPXTQZ3CWAR6\n").?,
+    );
+    // Nothing to cut at, so nothing is claimed.
+    try testing.expectEqual(@as(?[]const u8, null), rootOfGitLink("gitdir: /home/ross/chock\n"));
+    try testing.expectEqual(@as(?[]const u8, null), rootOfGitLink("ref: refs/heads/master\n"));
+    try testing.expectEqual(@as(?[]const u8, null), rootOfGitLink(""));
+}
+
+test "a recovered project is only taken when hashing it gives the directory back" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var room: [std.fs.max_path_bytes]u8 = undefined;
+    const state = try chock_proto.log.absoluteDirPath(io, &room, tmp.dir);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", state);
+
+    const project = "/home/somebody/work/parser";
+    const id = "01JQ" ++ "A" ** 22;
+
+    var paths = try pathsFor(gpa, &env, project, id);
+    defer paths.deinit();
+    try create(io, paths);
+
+    // A session, and a worktree still pointing at where it came from. No
+    // marker: this is a directory made before markers existed.
+    const log = try std.fmt.allocPrint(gpa, "{s}/{s}.jsonl", .{ paths.dir, id });
+    defer gpa.free(log);
+    (try std.Io.Dir.createFileAbsolute(io, log, .{ .truncate = true })).close(io);
+
+    const attempt = try std.fmt.allocPrint(gpa, "{s}/01JQB", .{paths.work});
+    defer gpa.free(attempt);
+    try std.Io.Dir.createDirAbsolute(io, attempt, .default_dir);
+
+    const link = try std.fmt.allocPrint(gpa, "{s}/.git", .{attempt});
+    defer gpa.free(link);
+    const file = try std.Io.Dir.createFileAbsolute(io, link, .{ .truncate = true });
+    try file.writeStreamingAll(io, "gitdir: " ++ project ++ "/.git/worktrees/01JQB\n");
+    file.close(io);
+
+    const found = try listProjects(gpa, io, &env);
+    defer {
+        for (found) |one| {
+            gpa.free(one.dir);
+            if (one.root.len != 0) gpa.free(one.root);
+        }
+        gpa.free(found);
+    }
+
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqualStrings(project, found[0].root);
+
+    // Written down, so the next listing reads it rather than walking again.
+    const marker = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ paths.dir, project_marker });
+    defer gpa.free(marker);
+    const said = try std.Io.Dir.readFileAlloc(.cwd(), io, marker, gpa, .limited(4096));
+    defer gpa.free(said);
+    try testing.expectEqualStrings(project, said);
 }

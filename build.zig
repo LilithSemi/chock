@@ -1,4 +1,6 @@
 const std = @import("std");
+const phantom_build = @import("phantom");
+const WebBundle = @import("build/web_bundle.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -1584,9 +1586,110 @@ pub fn build(b: *std.Build) void {
         } else &.{},
     });
 
+    // The widget tree and the words on it. Imports phantom and nothing of the
+    // host, so the same tree builds for the terminal, a window, and wasm in a
+    // browser. See `lib/chock-ui.zig`.
+    const chock_ui = b.addModule("chock-ui", .{
+        .root_source_file = b.path("lib/chock-ui.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "phantom", .module = phantom.module("phantom") },
+            .{ .name = "chock-proto", .module = chock_proto },
+            .{ .name = "chock-core", .module = chock_core },
+        },
+    });
+
+    // The widget tree's own tests. Without this the module compiles into the
+    // binary and every test in it is skipped, which is how a broken assertion
+    // sat green: a module is not a test root until something makes one.
+    const chock_ui_tests = b.addTest(.{ .root_module = chock_ui });
+    const run_chock_ui_tests = b.addRunArtifact(chock_ui_tests);
+    test_step.dependOn(&run_chock_ui_tests.step);
+
+    // The browser's own wiring, built for the host so its pure parts run here.
+    // The page itself is wasm and cannot run on this machine; these are the
+    // functions that decide what a line says, which need no browser.
+    const web_test_module = b.createModule(.{
+        .root_source_file = b.path("src/web/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "phantom", .module = phantom.module("phantom") },
+            .{ .name = "chock-ui", .module = chock_ui },
+            .{ .name = "chock-proto", .module = chock_proto },
+        },
+    });
+    const web_tests = b.addTest(.{ .root_module = web_test_module });
+    const run_web_tests = b.addRunArtifact(web_tests);
+    test_step.dependOn(&run_web_tests.step);
+
+    // The browser build. `addApp` makes its own wasm phantom and injects it into
+    // every module passed here, so these instances must not import phantom
+    // themselves: a second instance would give types that do not match. One
+    // module instance per target, because `addApp` writes into the import table.
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+
+    const chock_proto_wasm = b.createModule(.{
+        .root_source_file = b.path("lib/chock-proto.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+
+    // Only the handful of declarations the interface reaches are compiled, so
+    // this needs the module graph and not every one of chock-core's own
+    // dependencies.
+    const chock_core_wasm = b.createModule(.{
+        .root_source_file = b.path("lib/chock-core.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    chock_core_wasm.addImport("chock-proto", chock_proto_wasm);
+
+    const chock_ui_wasm = b.createModule(.{
+        .root_source_file = b.path("lib/chock-ui.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    // A nested import is the caller's own: `imports` below reaches the app root
+    // and no further.
+    chock_ui_wasm.addImport("chock-proto", chock_proto_wasm);
+    chock_ui_wasm.addImport("chock-core", chock_core_wasm);
+
+    // The page, as build outputs. `addWebDist` always builds for
+    // wasm32-freestanding and installs nothing, so the wasm is compiled once and
+    // the file list comes from phantom rather than from a guess here.
+    const web_dist = phantom_build.addWebDist(b, phantom, .{
+        .id = "ws.chock.web",
+        .exec_name = "chock-web",
+        .name = .{ .default = "Chock" },
+        .summary = .{ .default = "The Chock interface in a browser" },
+        .root = b.path("src/web/main.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        // A real path and not a fragment, so a session can be linked and a
+        // reload lands back in it. `/s` is listed so the page carries
+        // `<base href="/">`: without it a page served at `/s/<id>` looks for
+        // `./boot.js` one directory down and loads nothing.
+        .url_strategy = .path,
+        .prerender_routes = &.{"s"},
+        .imports = &.{
+            .{ .name = "chock-ui", .module = chock_ui_wasm },
+            .{ .name = "chock-proto", .module = chock_proto_wasm },
+        },
+    });
+
+    // One file the binary carries, so `chock serve` needs nothing on disk.
+    const web_members = b.allocator.alloc(WebBundle.Member, web_dist.files.len) catch @panic("OOM");
+    for (web_dist.files, web_members) |name, *member| {
+        member.* = .{ .name = name, .source = web_dist.dir.path(b, name) };
+    }
+    const web_bundle = WebBundle.create(b, web_members);
+
     const exe_imports = [_]std.Build.Module.Import{
         .{ .name = "chock-vmm", .module = vmm_module },
         .{ .name = "phantom", .module = phantom.module("phantom") },
+        .{ .name = "chock-ui", .module = chock_ui },
         // What `chock --version` prints. See the block above.
         .{ .name = "chock-version", .module = chock_version_module },
         .{ .name = "vulcan-wasm", .module = vulcan.module("vulcan-wasm") },
@@ -1622,6 +1725,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &exe_imports,
+    });
+
+    // The page rides in the binary. `chock serve` has no files on disk to find,
+    // and the page cannot run without the daemon behind it anyway, so it is
+    // built by an ordinary `zig build` rather than by a step somebody has to
+    // remember.
+    chock_exe_module.addAnonymousImport("web-bundle", .{
+        .root_source_file = web_bundle.path(),
     });
 
     const exe = b.addExecutable(.{
@@ -1787,6 +1898,9 @@ pub fn build(b: *std.Build) void {
         .imports = &exe_imports,
     });
     chock_exe_test_module.addImport("tree_child_path", tree_child_path);
+    chock_exe_test_module.addAnonymousImport("web-bundle", .{
+        .root_source_file = web_bundle.path(),
+    });
 
     const exe_tests = b.addTest(.{
         .root_module = chock_exe_test_module,
