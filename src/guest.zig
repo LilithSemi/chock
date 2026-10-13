@@ -421,7 +421,7 @@ const HostNet = struct {
     ) Sandbox.NetRouter.Resolution {
         const self: *HostNet = @ptrCast(@alignCast(ptr));
 
-        noteResolveAsked(host);
+        noteResolveAsked(self.io, host);
 
         if (self.watch) |one| one.reading.lockUncancelable(self.io);
         defer if (self.watch) |one| one.reading.unlock(self.io);
@@ -446,24 +446,23 @@ const HostNet = struct {
         };
         const got = wire.addressIn(text) orelse
             return noteResolve("the address the host gave", host, error.BadAddress);
-        noteResolveAsked("the host answered with an address for");
+        noteResolveAsked(self.io, "the host answered with an address for");
         return .{ .granted = got };
     }
 
-    fn noteResolveAsked(host: []const u8) void {
+    fn noteResolveAsked(io: std.Io, host: []const u8) void {
         var room: [256]u8 = undefined;
         const line = std.fmt.bufPrint(
             &room,
             "chock guest: [{d}ms] resolving {s}\n",
-            .{ nowMs(), host },
+            .{ nowMs(io), host },
         ) catch "chock guest: resolving a name\n";
         _ = linux.write(std.posix.STDERR_FILENO, line.ptr, line.len);
     }
 
-    fn nowMs() i64 {
-        var at: linux.timespec = undefined;
-        if (linux.clock_gettime(.MONOTONIC, &at) != 0) return 0;
-        return @as(i64, at.sec) * 1000 + @divTrunc(at.nsec, 1_000_000);
+    fn nowMs(io: std.Io) i64 {
+        const at = std.Io.Timestamp.now(io, .awake);
+        return @intCast(@divTrunc(at.nanoseconds, std.time.ns_per_ms));
     }
 
     fn noteResolve(
