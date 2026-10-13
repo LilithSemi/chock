@@ -1,12 +1,12 @@
 # An organisation above a project
 
 `chock.zon` is written by the developer who owns the directory. An organisation
-decides once and every project receives, so the outermost layer cannot be a
-file inside the thing it is meant to bound.
+decides once and every project receives that decision, so the outermost layer
+cannot be a file inside the thing it is meant to bound.
 
 An org policy bundle is that outer layer. It lives in the data directory,
-written by whatever installed Chock and beyond the reach of the project.
-`chock run --org-bundle <path>` reads one instead.
+written by whatever installed Chock, and it sits beyond the reach of the
+project. `chock run --org-bundle <path>` reads one instead.
 
 It is the same ratchet one level up, with the same arithmetic and no second
 policy system:
@@ -18,29 +18,29 @@ policy system:
 
 That last line is why `sandbox.jit` is a policy row rather than a key in
 `chock.zon`. One rule in the bundle,
-`.{ .action = "sandbox.jit", .decision = .deny }`, forbids the sandbox
-hardening being given up in every project of the installation, and no project
-can take that back. [actions.md](actions.md) has that row and every other one.
+`.{ .action = "sandbox.jit", .decision = .deny }`, forbids giving up the sandbox
+hardening in every project of the installation, and no project can take that
+back. [actions.md](actions.md) has that row and every other one.
 
-A bundle is read as a ceiling and never as a decision. An action no bundle rule
-names answers `allow`, which is no ceiling at all, and not `ask`, which is what
-`chock.zon` answers for an action nobody named.
+A bundle is read as a ceiling, never as a decision. An action no bundle rule
+names answers `allow`, which is no ceiling at all, rather than `ask`, which is
+what `chock.zon` answers for an action nobody named.
 
-Chock builds no identity system. The organisation issues the credential, so the
-hub that issued it already knows who the subject is. The bundle travels with
-the credential and states that subject. Chock reads it and never checks it: a
-bundle is trusted exactly as far as the file it was written into. The subject
-is a record, so a session log says whose credential the session ran under, and
-it is not a control.
+Chock builds no identity system. The organisation issues the credential, so
+the hub that issued it already knows who the subject is. The bundle travels
+with the credential and states that subject. Chock reads it and never checks
+it: a bundle is trusted exactly as far as the file it was written into. The
+subject is a record rather than a control, so a session log says whose
+credential the session ran under.
 
-An expired bundle keeps binding, in full and for ever, and it is said out loud
-on every start. A bundle only narrows, so dropping an expired one can only
+An expired bundle keeps binding, in full and for ever, and Chock says so out
+loud on every start. A bundle only narrows, so dropping an expired one can only
 widen. A bundle that has already expired when it is first given to Chock is
 refused instead.
 
 A bundle can also require an audit sink. A session whose required sink still
-held none of the tail of the log at the end exits `9`, which is a status and
-never a refusal to run. The exit codes are in [running.md](../running.md).
+held none of the tail of the log at the end exits `9`, which is a status rather
+than a refusal to run. The exit codes are in [running.md](../running.md).
 
 ## The ceilings that are fields and not rules
 
@@ -49,15 +49,15 @@ narrow a number. A bundle therefore carries four blocks of its own:
 
 - `budget` sets the most a session of this installation may spend. A project
   that asks for more is refused when it starts, and both numbers are in what
-  the person reads. It is not lowered quietly, because a session that ran at
-  the lower number would stop in the middle of the work with nothing said about
-  why.
+  the person reads. The bundle's number is not lowered quietly, because a
+  session that ran at the lower number would stop in the middle of the work
+  with nothing said about why.
 - `subagents` sets the largest spawn tree any project may ask for, with
   `max_depth` and `max_width`. Each is optional on its own. A project above
   either one is held to the bundle's number and is not refused, because a spawn
-  this stops says so at the moment it happens. The message names the bundle as
-  the source, so nobody is sent to edit a `chock.zon` that does not hold that
-  limit.
+  this rule stops says so at the moment it happens. The message names the
+  bundle as the source, so nobody is sent to edit a `chock.zon` that does not
+  hold that limit.
 - `limits` sets the most a sandboxed program of this installation may use: how
   many processes and threads, and how much resident memory.
   [Sandbox resource limits](#sandbox-resource-limits) below has the block
@@ -73,10 +73,11 @@ narrow a number. A bundle therefore carries four blocks of its own:
 - `sandbox` sets which ways of sandboxing a session may use, as
   `.{ .drivers = .{ .microvm } }`. This one **refuses** rather than holding a
   session to a number: a driver is not a quantity, and an installation that
-  requires a guest requires it, so a machine that cannot boot one does not start
-  a session. A bundle that says nothing permits every driver, because absent is
-  not empty. The operator names their own choice in `config.zon`, never a
-  project: see [microvm.md](../security/microvm.md#who-chooses-the-driver).
+  requires a guest requires it, so a machine that cannot boot one does not
+  start a session at all. A bundle that says nothing permits every driver,
+  because absent is not empty. The operator names their own choice in
+  `config.zon`, never a project: see
+  [microvm.md](../security/microvm.md#who-chooses-the-driver).
 
 ## Sandbox resource limits
 
@@ -124,8 +125,8 @@ file being read, the same rule every other block in `chock.zon` keeps.
 The numbers this fold answers are what every tool call of the session runs
 under. `chock run` reads the two files once, before the first call, and writes
 the result into the sandbox it builds. A session the org ceiling lowered says
-so on its own output, once, with the number it was held to, because the program
-the number bounds cannot read it from inside the sandbox.
+so on its own output, once, with the number it was held to, because the
+program the number bounds cannot read it from inside the sandbox.
 
 ## Nix store byte caps
 
@@ -145,9 +146,9 @@ store:
 derivation, or a build output. It is checked against
 `chock_nix.backend.Driver` before the object reaches a store at all.
 `max_session_bytes` bounds the total a whole session may add across every
-object, and every build of one session spends against the same number. A build
-whose derivation would pass it is refused while it is being written, so nothing
-is built.
+object, and every build of one session spends against that same number. A
+build whose derivation would pass it is refused while it is being written, so
+nothing is built.
 
 Neither field takes a percentage, because a store object has no quantity on the
 machine to be a share of. A percentage here is refused when the file is read,

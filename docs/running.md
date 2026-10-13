@@ -66,12 +66,12 @@ is in [sandbox.md](security/sandbox.md).
 A device is picked up at the start of each tool call, and never in the middle of
 one. A sandbox is built fresh for every tool call and the call blocks until the
 sandboxed program exits, so the machine is scanned once, at the moment that call
-starts, for every device a project named and a policy rule allows. Plug a board
-in while a long running call is already going and that call does not see it. The
-next tool call does, because it scans the machine again from nothing. There is
-no live watch inside a call that is already running.
+starts, for every device a project named and a policy rule allows. If you plug
+a board in while a long running call is already going, that call does not see
+it. The next tool call does, because it scans the machine again from nothing.
+There is no live watch inside a call that is already running.
 
-A program must wait for the device to answer, and never for its path to appear.
+A program must wait for the device to answer, never for its path to appear.
 The device is bound over a file that has to exist first, so for a moment the
 path opens and reads nothing at all. A program that takes a successful open as
 the signal can read an empty file where it expects the device.

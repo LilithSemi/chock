@@ -6,7 +6,7 @@ not trusted." The sandbox is not built to catch a mistake. It is built for a
 model that means to escape, whatever put that intent there: a prompt hidden in
 a file the model read, a dependency that talks back, or the model's own
 behaviour with no outside cause at all. The document does not try to tell those
-apart, and neither does the sandbox. It treats every tool call as if it might
+apart, and neither does the sandbox: it treats every tool call as if it might
 be adversarial and holds the same layers either way.
 
 A hostile repository is in scope only through the model. Chock does not defend
@@ -46,17 +46,17 @@ same session created it, the bind lands on whatever that link points to, not
 on the name the project wrote. A directory the project never asked to touch
 gets a notice file mounted into it, and mounting is a write. The two calls
 being sequential does not by itself create the hole. What creates it is that
-each call resolves the name freshly, so nothing guarantees the second
+each call resolves the name freshly, so nothing guarantees that the second
 resolution lands on what the first one inspected.
 
 Checking twice does not close this. A caller might try `statx` before the
 mount and `lstat` after, comparing the two, and conclude the mount is safe
 because both readings agree. That comparison only detects a change that
-already happened. It cannot stop the mount from being issued in the first
+already happened: it cannot stop the mount from being issued in the first
 place, because `mount` itself still resolves the name a third time when it
 runs, independent of either check. Two name based checks around a
-name based mount are three name resolutions of the same mutable path, not one.
-Nothing pins any of them to the same inode.
+name based mount are three name resolutions of the same mutable path, not one,
+and nothing pins any of them to the same inode.
 
 The fix pins the inode before the mount, and never resolves the name again.
 `pinDenyTarget` opens the target once with
@@ -89,7 +89,8 @@ describes, because a target name only decides where the fixed, already
 checked source lands. `markReadOnly`'s own lookup either finds the mount
 `applyDenyMounts` just made or finds nothing there at all, and the second
 case answers `EINVAL`, which this code reads as a fault and aborts on rather
-than pressing ahead. Fails safe, not free of a second name.
+than pressing ahead. So the failure is a safe one: the worst a second name can
+do here is stop the mount, never redirect it.
 
 The lesson generalises past this one function: a security check on a path
 name and an operation on that same path name are two different lookups unless
@@ -114,9 +115,9 @@ that relaxed this rule and did nothing else must never be scored the same as
 a session that broke out. Landlock, the namespaces, the 31 seccomp calls that
 kill the process outright, and the two argument-inspecting rules that kill on
 `execveat`'s `AT_EMPTY_PATH` and `socket`'s `AF_VSOCK` are boundaries. Their
-absence, or a kernel that degrades one of them, is what `chock doctor` reports
-as a blocking row, and what a real defeat of one of them is a security bug
-under `SECURITY.md`'s own definition.
+absence, or a kernel that degrades one of them, is what `chock doctor`
+reports as a blocking row, and a real defeat of any of them is a security
+bug under `SECURITY.md`'s own definition.
 
 Reading a relaxed boundary and a relaxed piece of hardening as the same kind
 of fact is the mistake this section exists to prevent. A project that allows
@@ -133,9 +134,9 @@ server config is built by `lib/chock-core/tools.zig`'s `prepare`, which carries
 the session's network mode through and attaches no router, because only a tool
 call has one. So the config is `filtered` with no seam, and
 `lib/chock-sandbox/linux/driver.zig` refuses it before the fork rather than
-running a server with a network nothing filters. The refusal is the correct end
-of a wrong state. A language server needs no socket and should be given
-`Network.none`, which is not what the code does today.
+running a server with a network nothing filters. The refusal is the right
+response to a state that should not exist: a language server needs no socket
+and should be given `Network.none`, which is not what the code does today.
 
 The session log is tamper evident and not confidential. It is created readable by
 anybody with an account on the machine, and the directory holding it is too, while
@@ -186,8 +187,8 @@ A session with nobody to ask runs no such tool at all. The asker is
 filled in by `src/run.zig`, and the session log handle inside it arrives from
 `chock_core.Loop.GiveLocked` once the loop holds the lock. Until both are
 there, `chock_core.arbiter.Asker.decide` answers `not_asked`, which does not
-permit. So a wiring nobody finished is a supplier of tools that stops
-working, and never a tool that runs ungated.
+permit. So a wiring nobody finished leaves a session with no working third
+party tools, and never a tool that runs ungated.
 
 Two limits stay. A plugin tool's declared capabilities decide the import set
 the whole plugin is instantiated with, once, before any guest code runs, so a
@@ -211,10 +212,10 @@ without asking anybody: a host outside the permitted set is not a question a
 person can answer yes to, it is a refusal at the resolver. So a single `net`
 rule opens the hosts that rule names and no others.
 
-A background `run_command` call gets the same router, not `Network.none`. What
-makes it safe is narrower: a background slot has nobody to ask, so only a table
-`allow` passes and a host that would have raised a question is refused instead
-of queued.
+A background `run_command` call gets the same router, not `Network.none`.
+What makes it safe is narrower than that: a background slot has nobody to ask,
+so only a table `allow` passes, and a host that would have raised a question
+is refused instead of queued.
 
 If any point above stops being true, this document is wrong until it is
 corrected. Each one was checked against the code, not carried forward from an

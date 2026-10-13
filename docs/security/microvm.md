@@ -7,7 +7,7 @@ built for, and it is what every caller that names none gets.
 
 ## A guest is a layer, not an alternative
 
-A microVM driver does not replace the Linux driver, it runs it. A guest has a
+A microVM driver does not replace the Linux driver. It runs it. A guest has a
 kernel of its own, so namespaces, seccomp, Landlock and cgroups all work
 inside it, and `lib/chock-sandbox/linux/driver.zig` runs there unchanged,
 built from the same `Config` by the same code. Mirage treats a guest as root
@@ -72,7 +72,7 @@ Two things in the image follow the guest's architecture rather than being
 fixed: the kernel's own name, `bzImage` on x86 and `Image` on arm64, and its
 console, `ttyS0` on x86 and `ttyAMA0` on arm, matching `src/vmm.zig`'s own
 default cmdline. An architecture neither file names is refused rather than
-given arm's.
+being given arm's.
 
 ### Where the images are built
 
@@ -95,8 +95,9 @@ naming the two files by their architecture's own names, `Image` and
 }
 ```
 
-Nothing reads the store path as a store path. The one test that boots a guest
-takes the same two paths, because a build script cannot guess them:
+Nothing reads the store path as a store path, only as a file path. The one test
+that boots a guest takes the same two paths, because a build script cannot
+guess them:
 
 ```bash
 zig build test-guest -Dguest-kernel=./result/Image -Dguest-initrd=./result-1/initrd
@@ -176,8 +177,8 @@ because no reachable `/dev/sev` has opened. And SEV-ES is not selected, on
 purpose: it
 also encrypts register state and needs the guest to handle `#VC` exceptions
 the guest kernel here is unverified for, so taking it automatically could
-swap a guest that boots for one that does not, so choosing it is left to
-whoever can test it. A daemon is the useful place to enable any of this,
+swap a guest that boots for one that does not. Choosing it is left to whoever
+can test it. A daemon is the useful place to enable any of this,
 since the forked process that runs a guest inherits its credentials.
 
 ### What Apple's hypervisor does not do that KVM does
@@ -231,7 +232,7 @@ Darwin dev shell, and a Linux guest cannot execute one of those, so a reader
 on a Mac should not finish this page believing their own toolchain runs in a
 guest today.
 
-Two routes toward answering it exist in part already: a Linux dev shell
+Two routes toward an answer exist in part already: a Linux dev shell
 closure built on a Linux builder and copied over, and a container image,
 which `lib/chock-container.zig` already reads. Neither is wired to the
 microVM driver yet. Also untested on a Mac: a tool call that reaches the

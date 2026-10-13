@@ -1,8 +1,8 @@
 # Approvals
 
-An action a rule answers `ask` is put to a person before it happens, wherever
-there is a moment at which a person can be asked. The broker knows eight
-actions: `git.commit`, `git.push`, `git.branch.delete`, `net.fetch`,
+When a rule answers `ask`, the action is put to a person before it happens,
+wherever there is a moment at which a person can be asked. The broker knows
+eight actions: `git.commit`, `git.push`, `git.branch.delete`, `net.fetch`,
 `nix.build`, `file.write`, `workspace.apply` and `model.select`. It answers one
 more, `policy.widen`, which is a session asking to be let out of a promise it
 made to itself. The [policy table](../configure/policy.md) in `chock.zon` says
@@ -10,10 +10,10 @@ which of them is allowed, denied or asked.
 
 Two of those are read before the work they govern, at a moment when nobody is
 waiting to answer, so `ask` is a refusal for `nix.build` and `model.select`.
-`net.fetch` is asked live for the host the agent named, and stays a refusal for
-every redirect hop after it: see [actions.md](../configure/actions.md). `workspace.apply` is asked at the end of a session, and again
+`net.fetch` is asked live for the host the agent named, and it stays a refusal
+for every redirect hop after it: see [actions.md](../configure/actions.md). `workspace.apply` is asked at the end of a session, and again
 during one when the agent asks for it with `request_action`. `policy.widen` is
-asked during one.
+asked during one too.
 
 An ordinary tool call is gated as well. `gateToolCall` asks the same arbiter
 about every one, so a project rule of `ask` on `call.write_file`, `exec.*`, or
@@ -54,9 +54,9 @@ answers yes and remembers this exact action for the rest of the session, so a
 later `workspace.apply` in the same session does not ask again. Anything
 else, a bare Enter included, is a no, and a no leaves your repository exactly
 as it was. The work is still in the session's workspace either way, and the
-line printed after a refusal says where. `chock approve`, answering over a
-socket instead of a keyboard, is never offered the session letter: only the
-terminal that holds the session's own lock can keep that promise.
+line printed after a refusal says where. `chock approve`, which answers over
+a socket instead of a keyboard, is never offered the session letter, because
+only the terminal that holds the session's own lock can keep that promise.
 
 A question that comes from a part of Chock rather than from the agent's own
 tool call carries a `source` line naming it: the sandbox, a Nix build, a Nix
@@ -64,8 +64,8 @@ flake input, git, an MCP server or a plugin. An action name alone does not say
 who wanted it, and the answer can turn on that. A host a Nix build wants is not
 a host your agent wants.
 
-Ctrl-C at the prompt ends the run with the question unanswered, which is a
-refusal, and keeps the workspace.
+Ctrl-C at the prompt ends the run with the question unanswered, which counts
+as a refusal, and keeps the workspace.
 
 ### Where the work lands, and how to change it
 
@@ -91,7 +91,7 @@ Three modes and one question:
 | `squash` | parks the work, then puts all of it on that branch as one commit. |
 | `ask` | Chock asks you which of the three, at the moment of the apply. |
 
-There is no mode that means "move nothing". There are two ways to say that:
+There is no mode that means "move nothing". You have two ways to say that:
 answer `n` to the apply, or write
 `.{ .action = "workspace.integrate", .decision = .deny }` on the policy table.
 
@@ -99,8 +99,8 @@ The prompt says which one you are approving. The `summary` line names the
 landing and the branch, and the detail has a paragraph of its own about your
 branch: which branch, where it is, where it moves to, and what happens to your
 working tree. An apply that moves no branch says so in the same place, and says
-why. The questions do not read alike, because the same `y` does not mean the
-same thing.
+why. The questions are deliberately not worded alike, because the same `y` does
+not mean the same thing in each of them.
 
 Every mode parks the work at the ref first. That is why `merge` is safe as the
 default: nothing is ever lost, and the fallback is one `git reset --hard`
@@ -132,7 +132,7 @@ work rather than integrating into it.
 `ask` needs somebody at the keyboard. A subagent, a session the daemon started,
 a `chock run` behind a pipe and a session with the full screen interface up all
 have nobody to ask, and all of them keep the work at the ref. So does an answer
-that is not one of the three words.
+that names none of the three modes.
 
 `chock run` prints what happened either way, and says how to put your branch
 back:
@@ -164,7 +164,7 @@ choose how the work lands. The mode comes from
 the one thing an agent fills in for an apply is its reason. There is no field of
 the request a mode could arrive in, and the build fails if one is ever added.
 
-Two answers never reach you at all. An agent that asks for any other action is
+Two answers never reach you at all: an agent that asks for any other action is
 refused by name, and an agent that asks having made no commit is told how many
 files it has left uncommitted, because there is nothing to put in front of you.
 

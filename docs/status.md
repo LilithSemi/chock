@@ -260,7 +260,7 @@ them as not built.
   overwrites a `chock.zon` that is already there: it prints the rows it would
   have added and writes nothing instead.
 
-  A stance that covers a whole session carries into no row. Codex's
+  A setting that covers a whole session becomes no row. Codex's
   `sandbox_mode` and `approval_policy`, and Claude Code's `defaultMode`, are
   each refused and named in the report. A row for an action this build does
   not define would read as a carried stance and match nothing, which is worse

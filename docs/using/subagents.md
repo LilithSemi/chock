@@ -27,7 +27,7 @@ the reason and does the work itself.
 The agent cannot change these. `chock.zon` is bound into the workspace read
 only, the same way the policy table and the budget are.
 
-The money is divided and never copied. A parent hands each child a slice of
+The budget is divided and never copied. A parent hands each child a slice of
 what the parent has left, and the project's own cap in `chock.zon` still binds
 every session, so the answer is the smaller of the two. Each agent is a process
 of its own with no shared memory, and a cap has to be applied before a request

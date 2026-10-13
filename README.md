@@ -8,8 +8,9 @@ Zig 0.16 and builds with `zig build`.
 ## Why
 
 A coding agent runs commands, writes files, and wants to reach the network.
-Most harnesses ask the agent to be careful. Chock takes the boundary out of the
-agent's hands. On Linux a tool call gets a user namespace, a mount
+Most harnesses ask the agent to be careful. Chock instead takes the boundary out
+of the agent's hands, and puts it where the agent cannot turn it off. On Linux
+a tool call gets a user namespace, a mount
 namespace, a PID namespace, an IPC namespace and an empty network namespace,
 under Landlock and a system call filter, in a workspace that is a copy. On
 macOS it gets Seatbelt for paths, for the network and for signals, and Darwin's
@@ -17,7 +18,7 @@ own resource limits. macOS gives no bind mount and no usable system call
 filter, so Chock does not claim those two layers there. Your real project is
 never written by a tool call, unless you approved a `workspace` bind in write
 mode. Every layer that confines the call fails the call if it cannot be applied.
-The limit layer is the exception: cgroups are best effort, and `chock doctor`
+The limit layer is the one exception: cgroups are best effort, and `chock doctor`
 says so on its own row.
 
 The other half is that every action is reviewable. The session log is the
@@ -25,8 +26,8 @@ session: every turn, every tool call, every approval and every cost is an
 event in it. What an agent may do is a static table in `chock.zon`. Chock reads
 that table from your project before the sandbox exists, and binds the file into
 the workspace read only, so the agent can read the rules and cannot change
-them. The answer is written into the log before the act happens. An approval
-nobody answers is a refusal.
+them. The answer is written into the log before the act happens, and an
+approval nobody answers is a refusal.
 
 ## Features
 

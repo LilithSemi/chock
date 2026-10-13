@@ -5,15 +5,15 @@ tool call writes your real project unless you approved a `workspace` bind in
 write mode. This page says what the boundary is made of.
 
 The layers below are the Linux ones. macOS builds the boundary out of Seatbelt,
-and it gives less.
+and it gives less:
 [The sandbox on macOS](#the-sandbox-on-macos-and-what-it-does-not-do) says what
 it holds and what it cannot.
 
-The layers are separate on purpose. Each one is tested, each one can be absent
-on a given machine, and `chock doctor` says which are on. A red team run set up
-an io_uring ring inside a tool call, which is the classic way past a system
-call filter, and the paths were still refused by Landlock and the network was
-still unreachable. That is what layers are for.
+The layers are separate on purpose. Each one is tested on its own, each one can
+be absent on a given machine, and `chock doctor` says which are on. A red team
+run set up an io_uring ring inside a tool call, which is the classic way past a
+system call filter, and the paths were still refused by Landlock and the
+network was still unreachable. That is what the layers are for.
 
 ## Namespaces
 
@@ -40,7 +40,7 @@ the path you would expect, and nothing else of the machine is in the tree.
 ## The network
 
 A tool call gets a fresh network namespace. Nothing brings an interface up in
-it. Chock configures no interface at all, so a call reaches no host.
+it, because Chock configures no interface at all, so a call reaches no host.
 
 There are three modes, and a tool call gets the first:
 
@@ -61,20 +61,20 @@ a process the agent cannot reach, and the host is a row on the
 
 So a program that opens a socket in a tool call fails. `ping` answers
 `socktype: SOCK_RAW` and exits 2, and `curl` cannot resolve a name. That is the
-boundary and not a fault in the command. Chock says so in a line of its own
-beside the result, because the program's own words do not.
+boundary working, not a fault in the command. Chock says so in a line of its
+own beside the result, because the program's own words do not.
 
 ## Landlock
 
-Landlock is the kernel naming which paths a tool call may open, in the kernel
-rather than in Chock.
+Landlock is the kernel deciding which paths a tool call may open. The rule
+lives in the kernel rather than in Chock.
 
 Chock asks the kernel which ABI it has and takes the answer, rather than
 requesting a version. The ruleset then handles every filesystem right that
-kernel knows, masked to the ABI it reported, because an unhandled right stays
-permitted everywhere. Rights the running kernel does not have are masked out of
-each rule, with no error. `chock doctor` prints the ABI version it found, and a
-session does not report which rights it did
+kernel knows, masked to the ABI it reported, because a right the ruleset does
+not handle stays permitted everywhere. Rights the running kernel does not have
+are masked out of each rule, with no error. `chock doctor` prints the ABI
+version it found, and a session does not report which rights it did
 not get.
 
 Three grant sets are used: read only, read only for one regular file, and read
@@ -139,7 +139,7 @@ each closes a boundary and not a cost:
   policy rule in front of it. Codex also refuses `AF_VSOCK` for this reason,
   even when its own network policy allows a connection.
 
-Three more are refused with `EPERM`, and io_uring is all three:
+Three more are refused with `EPERM`, and io_uring is all three of them:
 `io_uring_setup`, `io_uring_enter`, `io_uring_register`. A ring lets a kernel
 worker perform the operation, so the filter never sees the system call at all.
 The refusal makes no ring, submits no operation, and gives no ring a buffer, so
@@ -150,8 +150,8 @@ The reason is Node v24.19.0. libuv calls `io_uring_setup` six times while Node
 starts, before it runs one line, and `UV_USE_IO_URING=0` does not stop it. The
 probe is meant to fail on a kernel older than 5.1, and libuv then falls back to
 its thread pool. So Node does not need a ring: it needs the probe to fail
-survivably. A kill ended every Node, Deno and Bun program at startup and bought
-nothing, because a hostile program can leave io_uring alone.
+survivably. A kill ended every Node, Deno and Bun program at startup and
+bought nothing, because a hostile program can simply leave io_uring alone.
 
 Four rules inspect an argument and answer `EPERM` instead of killing, so a
 program can recover: `personality` asking for `READ_IMPLIES_EXEC`, `shmat` with
@@ -189,7 +189,7 @@ project and a parent over a child, so three things come free:
 - `allow` and nothing else turns the rule off. An action nobody named answers
   `ask`, so a project that has never heard of this row keeps the hardening.
 
-A session that gave the rule up says so, three times. `chock run` prints a
+A session that gave the rule up says so in three places. `chock run` prints a
 warning at start, the session log carries a `sandbox.open` event naming
 `relaxed` and the policy answer behind it, and `chock doctor` reads the same
 rules and prints `write^execute OFF` before a session starts. Nothing else in
@@ -245,10 +245,10 @@ not in the tree at all.
 
 ## Limits
 
-Two mechanisms, and the smaller one always applies.
+There are two mechanisms, and the smaller one always applies.
 
-cgroup v2 is the better answer, and it needs the `memory` and `pids`
-controllers, both, delegated to a directory Chock can make its own below. Chock
+cgroup v2 is the better answer, and it needs both the `memory` and `pids`
+controllers delegated to a directory Chock can make its own below. Chock
 never writes `subtree_control` itself. It sets `memory.max`, `memory.swap.max`
 to zero, and `pids.max`. After a call ends it reads `memory.events` and
 `pids.events`, so a bare SIGKILL can be named for what it was.
@@ -303,7 +303,7 @@ Everything above is for the cgroup Chock makes. A program that embeds
 | the default | Chock | Chock | after the fork, first act of the child | the program runs with the rlimit floor |
 | a supplied cgroup | the caller | the caller | at creation | `spawn` refuses |
 
-Chock writes no limit file into a cgroup it was given. Not `memory.max`, not
+Chock writes no limit file into a cgroup it was given: not `memory.max`, not
 `memory.swap.max`, not `pids.max`. The caller owns that tree and the numbers in
 it, and a second writer is how two numbers stop agreeing. Chock reads nothing
 out of it either, so a program the caller's own `memory.max` killed arrives as
@@ -343,7 +343,7 @@ real node on top of it, read and write.
 [actions.md](../configure/actions.md) has the two-block shape that has to agree
 before any of this runs.
 
-The grant is the whole device, and never a part of it. A device node is a
+The grant is the whole device, never a part of it. A device node is a
 direct channel to a kernel driver, and most of what the sandbox reasons about
 does not reach past it. seccomp filters `ioctl` by its request number, and a
 filter has no way to read which file descriptor a call was made on, so "let the
@@ -360,10 +360,10 @@ exactly as it does outside the sandbox, and it is not a control Chock adds.
 
 ## The sandbox on macOS, and what it does not do
 
-A session runs on macOS, with four layers on. Seatbelt holds the paths, the
-network including unix sockets, the signals and shared memory. Darwin's own
-resource limits bound what a program can consume. The driver declares exactly
-four guarantees, and a test on a real Mac tries to break each one, in
+A session runs on macOS with four layers on. Seatbelt holds the paths, the
+network including unix sockets, the signals and shared memory, and Darwin's
+own resource limits bound what a program can consume. The driver declares
+exactly four guarantees, and a test on a real Mac tries to break each one, in
 `test/sandbox/darwin_escape.zig`:
 
 | Guarantee | On macOS |
@@ -377,7 +377,7 @@ four guarantees, and a test on a real Mac tries to break each one, in
 | Mach services (`mach-lookup`) | yes, no opt in list needed |
 
 The Mach services row is not one of the four declared guarantees, and it is in
-this table anyway. No program a session starts can look up a Mach service by
+this table anyway: no program a session starts can look up a Mach service by
 name, launchd's own bootstrap namespace included, unless a caller later widens
 `Options.mach_services`, which nothing does today. On Apple Silicon, macOS
 15.7.9, arm64, on 2026-09-05: a profile holding `(deny default)` and nothing
@@ -387,12 +387,12 @@ identical lookup outside any profile succeeds. See
 `test/sandbox/darwin_escape.zig`'s own mach-lookup tests.
 
 A layer this driver reports as on, and does not enforce, is worse than a
-refusal. What a driver declares is reported by `chock doctor` and refuses
-nothing: no policy field names a guarantee, and `Sandbox.Guarantee`'s own comment
-says nothing compares against the set yet. What is refused is a config a driver
-cannot express, which is a different question and makes no claim about a driver
-overstating itself. So every claim above comes from a run on Apple Silicon,
-macOS 15.7.9, arm64. Two layers were
+refusal. What a driver declares is reported by `chock doctor`, and a
+declaration on its own refuses nothing: no policy field names a guarantee, and
+`Sandbox.Guarantee`'s own comment says nothing compares against the set yet.
+What is refused is a config a driver cannot express, which is a different
+question and makes no claim about a driver overstating itself. So every claim
+above comes from a run on Apple Silicon, macOS 15.7.9, arm64. Two layers were
 tried and then dropped:
 
 - There is no system call filter. `(deny syscall-unix (syscall-number 26))`
@@ -439,9 +439,9 @@ hand in. Every row above then names something the native driver cannot do, and
 none of them names something a Mac cannot do.
 
 Two things follow from having no mount tree. An absolute path that a program
-writes into a file names a directory that is deleted with the session. `TMPDIR`
-and `CHOCK_SCRATCHPAD` name one directory, and a file written through either
-survives the call. `chock doctor` reports both.
+writes into a file names a directory that is deleted with the session, while
+`TMPDIR` and `CHOCK_SCRATCHPAD` name one directory, and a file written through
+either survives the call. `chock doctor` reports both.
 
 ## Checking a machine
 

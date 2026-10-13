@@ -97,16 +97,16 @@ compiler Chock has never heard of works too.
 
 The host's own `HOME` never reaches a tool call, and that is deliberate. It is
 what keeps an API key in your own shell away from the agent. The fault this
-directory fixes was that nothing was put in its place.
+directory fixes was that nothing was put where `HOME` had been.
 
 The directory is `~/.local/share/chock/cache/<project>/`, never inside your
 project, so nothing of it reaches your diff. It is kept between sessions,
 because an agent that compiles the world again every session is not usable,
 and `chock run` says so the first time a project gets one.
 
-At most 2 GiB per project. A cache over that is emptied at the start of the
-next session, and the session says so: a cache is rebuildable by definition,
-so the only cost is building it again.
+The cache holds at most 2 GiB per project. A cache over that is emptied at the
+start of the next session, and the session says so: a cache is rebuildable by
+definition, so the only cost is building it again.
 
 ```
 chock cache                         # what it holds, and the bound

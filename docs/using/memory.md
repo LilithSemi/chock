@@ -7,11 +7,12 @@ bodies are never in the prompt, so two hundred notes cost two hundred lines.
 This is not a notes directory. It is a knowledgebase: one fact per entry,
 fetched by name, with an index of one line descriptions in the prompt.
 
-Each entry carries a kind, and the kind is not decoration. It is what tells a
-reader how fast the entry goes stale: `insight`, `code_fact`, `convention`,
-`gotcha`, `dead_end` and `environment`. A convention outlives a fact about the
-code, and a dead end outlives both. "We tried X, it does not work, because Y"
-saves the next agent the whole detour, and nobody ever thinks to write it down.
+Each entry carries a kind, and the kind is not decoration: it tells a reader
+how fast the entry goes stale. The kinds are `insight`, `code_fact`,
+`convention`, `gotcha`, `dead_end` and `environment`. A convention outlives a
+fact about the code, and a dead end outlives both. "We tried X, it does not
+work, because Y" saves the next agent the whole detour, and nobody ever thinks
+to write it down.
 
 ## Where notes go, and how many
 
@@ -27,8 +28,8 @@ project.
 
 Writing a name that already exists supersedes that note rather than making a
 second one, and the older version stays in the file. So correcting a fact
-never meets the cap on names, and the whole history of one name is something a
-person reads in one sitting.
+never runs into the cap on names, and the whole history of one name is
+something a person reads in one sitting.
 
 ```
 chock memory                        # one line per note
@@ -45,8 +46,8 @@ also a persistence mechanism, because a note written this session is read next
 session.
 
 An agent that writes its own instructions has written its own prompt for next
-time, which is the same fault as an agent editing `chock.zon` reached by a
-slower route. A memory written by a compromised session is a persistent
+time, which is the same fault as an agent editing `chock.zon`, only reached by
+a slower route. A memory written by a compromised session is a persistent
 injection into every future session, and it survives the sandbox by
 construction, because outliving the sandbox is what memory is for.
 
@@ -57,7 +58,7 @@ Three rules hold it:
    disagree.
 2. It is bounded, by the table above. A memory directory is not a place to move
    a repository through one file at a time, and a name is a plain name.
-3. It is mounted for those two tool calls and for no other. The
+3. It is mounted for those two tool calls and for no others. The
    knowledgebase directory is the one writable path outside the workspace, and
    `run_command` cannot reach it, because it is not in that call's mount tree
    at all. It is not merely read only to the rest of the sandbox: it is not

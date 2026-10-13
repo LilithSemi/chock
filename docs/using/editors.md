@@ -8,8 +8,8 @@ are already looking.
 chock acp
 ```
 
-The editor launches that itself. You point the editor at the `chock` binary and
-it starts one for each project.
+The editor launches that itself: you point the editor at the `chok` binary,
+and it starts one for each project.
 
 ## What it is, and what owns what
 
@@ -30,7 +30,7 @@ and Chock answers with the newest both sides know.
 
 Version 1 is what editors speak today. Version 2 is an alpha whose own fields
 moved between releases, so Chock answers it when an editor asks for it and never
-chooses it over a version the editor offered.
+chooses it over a version the editor also offered.
 
 ## What the editor is told
 
@@ -55,10 +55,10 @@ goes back. The question carries the whole effect, never a command string, which
 is the same rule [approvals.md](approvals.md) describes for every other way of
 answering one.
 
-Every option is answered for that one call. An editor offers "always" and Chock
-does not take it as a standing permission: a standing permission is a policy
-rule, and [policy.md](../configure/policy.md) is where one is written, where it
-can be reviewed. An editor cannot widen what a project allows.
+Every option is answered for that one call. An editor offers "always", and
+Chock does not take it as a standing permission: a standing permission is a
+policy rule, and [policy.md](../configure/policy.md) is where one is written
+and where it can be reviewed. An editor cannot widen what a project allows.
 
 ## What Chock does not take from an editor
 
@@ -91,5 +91,5 @@ log holds as updates before answering, so the editor ends up with the
 conversation it would have had. The same session can be picked up later, by the
 editor or by anything else, because the daemon still has it.
 
-Closing a session in the editor forgets it there. It does not end it, and the log
-stays.
+Closing a session in the editor forgets it there. It does not end the session,
+and the log stays.

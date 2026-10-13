@@ -17,7 +17,7 @@ The block goes in the project's own `chock.zon`, beside the policy:
 ```
 
 Nothing is discovered. An agent has no way to ask for a secret this block does
-not name, and no way to add one: it reads the file it cannot write.
+not name, and no way to add one, because it reads the file it cannot write.
 
 There is no operator layer and no org layer for this block. An org bundle is a
 ceiling and can only narrow what a project may do, so nobody else can add an
@@ -34,7 +34,7 @@ entry that gives a project's tools something new.
 
 `to` is an action name pattern, read by the same table every other permission
 uses. See [actions.md](actions.md). So `exec.path.gh` reaches one program, and
-`exec.*` reaches every program the agent may run. An entry names an action and
+`exec.*` reaches every program the agent may run. An entry names an action,
 never a command string, because a command string says nothing about what the
 command will do.
 
@@ -78,8 +78,8 @@ for. See [credentials.md](../operate/credentials.md) for the stores.
 
 ## Arriving as a file
 
-Some programs will not read a credential out of the environment at all, and want
-a path to a file. `bind = "file"` is that:
+Some programs will not read a credential out of the environment at all and want
+a path to a file instead. `bind = "file"` is that:
 
 ```zon
 .{
@@ -94,18 +94,18 @@ a path to a file. `bind = "file"` is that:
 }
 ```
 
-The variable then names the file and not the value. Chock writes the file before
-the call starts, mounts it read only inside the sandbox, and deletes it when the
-call ends.
+The variable then names the file and not the value. Chock writes the file
+before the call starts, mounts it read only inside the sandbox, and deletes it
+when the call ends.
 
-The file is written under `TMPDIR` on the host, mode `0600`, for as long as the
-one call runs. That is a real difference from `env`: the value is on a filesystem
-for that time, and a delete is a delete and not an erase. A program that reads
-an environment variable should be given one.
+The file is written under `TMPDIR` on the host, mode `0600`, for as long as
+that one call runs. That is a real difference from `env`: the value is on a
+filesystem for that time, and a delete is a delete, not an erase. A program
+that reads an environment variable should be given one.
 
-An MCP server is not given a file. It holds what it is given for a whole session,
-so the file would have to live that long too, and Chock says so and gives the
-server nothing rather than writing one.
+An MCP server is not given a file. It holds what it is given for a whole
+session, so the file would have to live that long too. Chock says so and gives
+the server nothing rather than writing one.
 
 ## What the agent sees
 
@@ -133,8 +133,8 @@ secrets at start rather than per call:
 ```
 
 `mcp.github.*` names one server, and `mcp.*` names every server. An entry that
-reaches nothing under a server's own namespace gives that server nothing, so one
-server's secret does not reach another.
+reaches nothing under a server's own namespace gives that server nothing, so
+one server's secret does not reach another.
 
 A server starts before the loop does, so there is nobody to ask. Only `allow`
 gives a server a secret: an `ask` on `secret.use.<name>` reaches nobody at that
@@ -143,7 +143,8 @@ that way. `nix.build` and `model.select` are read the same way, for the same
 reason. [actions.md](actions.md) has both.
 
 The slot that keeps a server's secret out of the log is its own, and it stays
-filled for the whole session. A tool call's slot is cleared when that call ends.
+filled for the whole session. A tool call's slot is cleared when that call
+ends.
 
 ## What is written down
 

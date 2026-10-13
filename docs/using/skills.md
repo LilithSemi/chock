@@ -16,9 +16,9 @@ review-a-diff/
 
 `SKILL.md` opens with YAML frontmatter. `name` and `description` are required.
 The name must be 1 to 64 characters of lowercase letters, digits and single
-hyphens, must not start or end with one, and must be the name of the directory
-it is in. `license`, `compatibility`, `metadata` and `allowed-tools` are
-optional.
+hyphens, it must not start or end with a hyphen, and it must be the name of
+the directory it is in. `license`, `compatibility`, `metadata` and
+`allowed-tools` are optional.
 
 ```markdown
 ---
@@ -63,7 +63,7 @@ about.
 
 Two skills cannot share a name. The layer that comes first keeps it, so your own
 skill wins over a repository's, and the one that lost is reported rather than
-dropped in silence.
+dropped without a word.
 
 ## What a skill cannot do
 
@@ -75,10 +75,10 @@ the agent's reach.
 So:
 
 - `allowed-tools` is never a grant. The field exists in the format and is
-  marked experimental. Chock keeps the text and acts on none of it. Read as a
-  narrowing, meaning the skill saying it needs no more than these, it is free
-  and costs nothing; read as a permission it would let a downloaded directory
-  widen what an agent may do.
+  marked experimental, and Chock keeps the text and acts on none of it. Read
+  as a narrowing, meaning the skill saying it needs no more than these, it is
+  free and costs nothing. Read as a permission, it would let a downloaded
+  directory widen what an agent may do.
 - A skill reaches the prompt as one line until the agent asks for it. The
   ask is a `read_skill` call, which is a line in the session log, so "the agent
   read a stranger's instructions" is a fact somebody can find afterwards.
@@ -100,8 +100,8 @@ skill.read.project     ask
 skill.read.packaged    ask
 ```
 
-Per layer, because a name a package chose must not become part of the action
-namespace. A project that trusts its own skills writes one rule:
+The names are per layer, because a name a package chose must not become part of
+the action namespace. A project that trusts its own skills writes one rule:
 
 ```zig
 .{
@@ -118,8 +118,8 @@ namespace. A project that trusts its own skills writes one rule:
 - Agent Plugins. Chock has plugins and they are a different thing: a
   WebAssembly module with its metadata in a custom section. See
   [../extend/plugins.md](../extend/plugins.md).
-- Agent Stacks. It is draft 0.1.0 and pins two untagged specifications by
-  commit.
+- Agent Stacks. The format is at draft 0.1.0 and pins two untagged
+  specifications by commit.
 - `compatibility` as a check. It is prose, up to 500 characters. Chock reads
   it and shows it, and a harness that guessed at its meaning would refuse a
   skill that would have worked.

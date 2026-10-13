@@ -16,7 +16,7 @@ $ nix_eval {"expression":"builtins.attrNames { a = 1; b = 2; }"}
 ```
 
 Chock evaluates with `fix`, which is a second implementation of the Nix
-language, and only a build uses the system's own Nix. So a value here can
+language, and only a build uses the system's own Nix, so a value here can
 differ from the one `nix eval` gives. One difference to know about: a flake's
 own source, `self`, keeps the `.git` entry that Nix drops, so a derivation that
 runs git on `self` fails in the build with "not a git repository", and
@@ -44,7 +44,7 @@ reads the same tree every other tool call reads.
 ## What bounds it
 
 An evaluation runs in Chock's own process and not in the sandbox, so it is
-bounded where it runs. A recursion deeper than the call depth stops with an
+bounded where it runs: a recursion deeper than the call depth stops with an
 error, the collector holds the memory an evaluation keeps, and the rendered
 answer stops at 16384 bytes. Nothing bounds how long an evaluation runs, so
 an expression that loops runs until the session is stopped with Ctrl-C.
@@ -90,8 +90,8 @@ A `flake` that is not your project is refused. The agent may write any
 reference, and fetching one means fetching its whole input graph. What that
 graph reaches is written in a lock file inside the flake, which nobody can read
 until the flake has already been fetched, so there is no moment at which your
-rules could answer for those hosts first. The agent is told so in one sentence
-and builds an attribute of your project instead.
+rules could answer for those hosts first. The agent is told so in one
+sentence, and it builds an attribute of your project instead.
 
 ## Two rules, because a build asks two questions
 
@@ -124,8 +124,8 @@ the first ends.
 The derivation hash is in neither name, because it changes on every edit of the
 Nix. The rows answer the two questions a person keeps: may this agent build
 this attribute, and from where. A revision or a `#fragment` on the reference is
-dropped before the name is built, because what a row grants is the repository
-and never the content.
+dropped before the name is built, because what a row grants is the repository,
+never the content.
 
 ## What stops a build of anything else
 
@@ -144,9 +144,9 @@ derivation path and never the attribute, so the attribute is read once. Your
 Nix and Chock's evaluator cannot read one expression differently between the
 two moments, and an unpinned reference cannot move between them.
 
-It says what goes into the build, and never what comes out. The builder runs
-under your Nix, and a substituter may answer for an output instead of building
-it.
+The evaluation says what goes into the build, and never what comes out. The
+builder runs under your Nix, and a substituter may answer for an output instead
+of building it.
 
 ## What a build may fetch while it runs
 
@@ -187,12 +187,12 @@ network request a build can make, including the two below.
 
 The phase word sits where a reversed host's last label sits, so a host under a
 top level domain called `build` or `eval` shares a name with an ordinary host
-in that phase. `build` is delegated today. Chock accepts this rather than
-preventing it.
+in that phase. The `build` domain is delegated today, and Chock accepts this
+rather than trying to prevent it.
 
-This is the rule and not the router. A build runs on your machine, outside the
-sandbox, so `.policy.net.router` says nothing about it: the rules are what
-answer.
+These rules decide, and the router does not. A build runs on your machine,
+outside the sandbox, so `.policy.net.router` says nothing about it: the rules
+are what answer.
 
 A host nobody allowed refuses the build before `nix` is told to build anything,
 and the refusal names the host and the derivation, so the agent can ask you for
@@ -278,7 +278,7 @@ If you want the question back, write it in your own `chock.zon`:
 `.deny` refuses such a build outright. Every derivation that does name a URL is
 unaffected either way and still goes to `nix.net` per host.
 
-The rule is all of it, and there is no backstop under it. Nix has no flag
+The rule is all of it, and there is no backstop underneath. Nix has no flag
 that keeps a fixed output builder off the network. `--offline` turns your
 substituters off and a fixed output derivation still fetches with it set, so
 Chock does not pass it and your binary cache keeps working. A host Chock's
@@ -300,8 +300,8 @@ input with no host of its own is fetched from `api.github.com`, which redirects
 to `codeload.github.com`, so both are named. A lock file sits in your project
 directory beside `chock.zon`, and Chock reads a file there as something an
 attacker may have written, which is why the hosts in it are asked about at all.
-Only `allow` fetches at startup: a session is starting up, so there is nobody
-to prompt, and `ask` is off there the same way it is for a language server.
+Only `allow` fetches at startup, because a session that is starting up has
+nobody to prompt: `ask` is off there the same way it is for a language server.
 
 Everything it fetched goes in your store, and the evaluation takes each input
 from there, by the hash the lock pins. A node Chock cannot turn into a host is
@@ -321,7 +321,7 @@ asks.
 A session whose inputs did not arrive still starts. A project with no flake
 at all is the ordinary case, and nothing else a session start does refuses the
 session because an optional thing was missing. A build that then wants an input
-you said no to says which input and which host, and tells the agent to work
+you said no to names the input and the host, and tells the agent to work
 with what is there rather than to ask you again for the host you just
 refused.
 
@@ -340,7 +340,7 @@ running does not get it, and nothing survives the session.
 
 A program out of a build asks under `exec.nix.store.*` when the agent runs it,
 and not under `exec.devshell.*`. The dev shell is the toolchain your project
-declared. A build is something the agent asked for, and the two are not the
-same class. [actions.md](../configure/actions.md) has both rows.
+declared, while a build is something the agent asked for, and the two are not
+the same class. [actions.md](../configure/actions.md) has both rows.
 
 The turn waits for the build, with no deadline, exactly as `provide_tool` does.

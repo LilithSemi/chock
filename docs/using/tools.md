@@ -9,10 +9,10 @@ write, because a person can review a change and cannot review a shell line.
 
 `read_image` reads a picture out of the workspace, a screenshot, a diagram, a
 rendered chart, and gives it to the model as an image. It is the one tool that
-is not always offered. A model that cannot read a picture never hears the name,
-so it cannot spend a turn calling it: the wire format must have a shape for an
-image, and the provider instance must say it takes one, which is the
-`.capabilities = .{ .images = true }` block of that instance in your
+is not always offered, because a model that cannot read a picture never hears
+the name, so it cannot spend a turn calling it: the wire format must have a
+shape for an image, and the provider instance must say it takes one, which is
+the `.capabilities = .{ .images = true }` block of that instance in your
 configuration. The kind of file is read from the content and never from the
 name, so a text file called `plot.png` is refused. At most 3145728 bytes.
 
@@ -60,9 +60,9 @@ what an agent still cannot ask for.
 ## A program the agent has not got
 
 An agent in a sandbox that wants a program it has not got runs `apt install`
-or `npm install -g`. Neither can work here. Chock is built on Nix, so the agent
-names a package, Chock realises it, and the program is on the `PATH` of every
-tool call after that one.
+or `npm install -g`. Neither can work here, because Chock is built on Nix: the
+agent names a package, Chock realises it, and the program is on the `PATH` of
+every tool call after that one.
 
 ```
 $ run_command {"argv":["rg","token","notes.txt"]}
@@ -111,7 +111,7 @@ needs every time belongs in `flake.nix`. See
 
 A request holds the turn and has no deadline. `nix build` on a cache miss is
 minutes, and the turn waits for it, because the answer has to reach the mount
-set the very next tool call is built from and not the model. A line is printed
-before the wait so the terminal is not silent, and Ctrl-C reaches the `nix`
-child the same way it reaches a subagent. A build that never ends holds the
-session, which [status.md](../status.md) lists as an open item.
+set of the very next tool call, not the model. A line is printed before the
+wait so the terminal is not silent, and Ctrl-C reaches the `nix` child the
+same way it reaches a subagent. A build that never ends holds the session,
+which [status.md](../status.md) lists as an open item.

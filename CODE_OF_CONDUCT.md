@@ -6,7 +6,7 @@ project. It applies to all "collaborative spaces", which are defined as
 community communications channels (such as mailing lists, submitted patches,
 commit comments, etc.).
 
-Note that this Code of Conduct is derived from the [Ruby Code of Conduct](https://www.ruby-lang.org/en/conduct/).
+This Code of Conduct is derived from the [Ruby Code of Conduct](https://www.ruby-lang.org/en/conduct/).
 
 * Participants will be tolerant of opposing views.
 * Participants must ensure that their language and actions are free of personal attacks and disparaging personal remarks.

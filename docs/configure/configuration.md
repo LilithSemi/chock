@@ -18,11 +18,11 @@ instance also needs a `base_url`.
 
 ## The name is the identity
 
-The name is the key and the kind is a property, so two accounts of one kind sit
-side by side with different names. Leave `.name` out and the kind becomes the
-name. Two instances of one kind with no name are refused, and the message says a
-name is needed, because silently replacing the first is how somebody loses a
-credential they cannot get back.
+The name is the key and the kind is a property, so two accounts of one kind
+sit side by side under different names. Leave `.name` out and the kind becomes
+the name. Two instances of one kind with no name are refused, and the message
+says a name is needed, because silently replacing the first is how somebody
+loses a credential they cannot get back.
 
 ## How much the model holds
 
@@ -34,11 +34,11 @@ Add `.context_tokens` to say how much the model behind an instance can hold:
 
 Chock then folds the middle of the context into a summary at three quarters
 of that, before a turn is sent. It tells the agent at three fifths, which is a
-turn or more earlier, so the agent can save what it learned first. Leave it out
-and only the backstop runs: a provider that refuses a request as too
-large is compacted and the turn is taken again, rather than ending the
-session. Either way the session log keeps every turn, so a compaction shortens
-what the model reads and nothing else.
+turn or more earlier, so the agent can save what it learned first. Leave it
+out and only the backstop runs: when a provider refuses a request as too
+large, the context is compacted and the turn is taken again, rather than the
+session ending. Either way the session log keeps every turn, so a compaction
+shortens what the model reads and nothing else.
 
 ## What one instance can do
 
@@ -63,15 +63,16 @@ A provider names its credential one of three ways:
 ```
 
 An instance that gives both `.token` and `.token_file` is refused, because
-which one to read is not decided. A field that is present and holds nothing is
-refused too: absence already means "look it up", so "the field is not there"
-and "the field is there and holds nothing" stay two different facts.
+which one to read would not be decided. A field that is present and holds
+nothing is refused too: absence already means "look it up", so "the field is
+not there" and "the field is there and holds nothing" stay two different
+facts.
 
 The third line above is what a local endpoint needs. `chock run` still refuses
 it for an instance of kind `anthropic` or `aiand` that talks to that kind's
 own address, because those two refuse every request that carries no
-credential. It refuses before it builds anything, so no workspace and no log
-are left behind.
+credential. The refusal comes before anything is built, so no workspace and no
+log are left behind.
 
 Where a lookup goes, and what `chock login` writes, is in
 [credentials.md](../operate/credentials.md).
@@ -90,10 +91,10 @@ Where a lookup goes, and what `chock login` writes, is in
 }
 ```
 
-This is the machine's own default: every project run from this machine which
+This is the machine's own default: every project run from this machine that
 names no `limits` field of its own gets the number here instead of Chock's
 own machine sized default. A project's own `chock.zon` still wins over it, the
-same way a project's own choices win over everything this file sets. See
+same way a project's own choices win over everything else this file sets. See
 [Sandbox resource limits](org.md#sandbox-resource-limits) for the field
 syntax and the full order the layers fold in.
 
@@ -112,7 +113,7 @@ syntax and the full order the layers fold in.
 ```
 
 This is the machine's own default for how much a Nix evaluation may add to
-the store: every project run from this machine which names no `nix` field of
+the store: every project run from this machine that names no `nix` field of
 its own gets the number here instead of Chock's own built in default. A
 project's own `chock.zon` still wins over it. See
 [Nix store byte caps](org.md#nix-store-byte-caps) for the field syntax and
@@ -123,7 +124,7 @@ the full order the layers fold in.
 `config.zon` is yours and it is about providers. `chock.zon`, in the project
 root, is the project's own file and it is about what an agent may do there.
 What an agent may do lives in it: the policy table, the budget, the subagent
-limits and the denied paths. So do the plugin list, the MCP servers, the
+limits and the denied paths, and so do the plugin list, the MCP servers, the
 language servers and the container image. Chock binds it into the workspace
 read only, so the agent works under rules it cannot edit.
 
@@ -191,15 +192,15 @@ be under the project and must not climb out of it:
 }
 ```
 
-At most four. Leave the block out and the project ships none, which is what
-every project does today. [skills.md](../using/skills.md) has the format and the
-three layers.
+There can be at most four. Leave the block out and the project ships none,
+which is what every project does today. [skills.md](../using/skills.md) has
+the format and the three layers.
 
 ### Which way of sandboxing a session uses
 
-`config.zon` is the only file that names this, and it is deliberate: a project
-may only narrow what it may do, and a project that could name its own sandbox
-driver could name a weaker one.
+`config.zon` is the only file that names this, and that is deliberate: a
+project may only narrow what it may do, and a project that could name its own
+sandbox driver could name a weaker one.
 
 ```zon
 .{
@@ -228,8 +229,8 @@ and 1GB, and a guest never gets more than one eighth of the memory of the machin
 it runs on. The processor count is also limited by that share of memory, because a
 build runner starts one job for each processor and a guest with more processors
 than memory loses a compiler to the kernel. `cores` is further limited to 8 on a
-Mac, where the interrupt controller a guest gets has no more. The curves and the
-reasons for them are in
+Mac, where the interrupt controller a guest gets has no more than that. The curves
+and the reasons for them are in
 [microvm.md](../security/microvm.md#how-big-a-guest-is).
 
 ### The dev shell the agent gets
@@ -253,8 +254,8 @@ the session with Nix's own message. See
 ### Paths the worktree does not carry
 
 The agent works in a git worktree at HEAD, so a file git ignores is invisible
-to it. A generated configuration and an automation directory are the two a real
-project needs anyway. The `workspace` block names them:
+to it. A generated configuration and an automation directory are the two such
+paths a real project tends to need. The `workspace` block names them:
 
 ```zon
 .{
@@ -288,9 +289,9 @@ two copying modes copy it whole.
 #### What may be written back
 
 `write` carries the same three answers a policy rule carries: `allow`, `ask`
-and `deny`. It is meaningful for `write` and `copy` alone. On `read_only` or
-`temp_copy` it is refused when the file is read, because neither of those
-reaches your files at all. Leave it out and it is `ask`.
+and `deny`. It is meaningful for `write` and `copy` alone, because on
+`read_only` or `temp_copy` it is refused when the file is read: neither of
+those reaches your files at all. Leave it out and it is `ask`.
 
 The policy table decides beside it, under the action
 `workspace.bind.<name>`, and the narrower of the two answers wins. So an
@@ -317,9 +318,9 @@ that happens to be tracked already is simply in the workspace twice over.
 
 `required` says whether a name matching nothing stops the session. Its default
 is derived: true for a name with no pattern character, false for a pattern. A
-person who wrote `scripts/release` asked for that path, and a pattern matching
-nothing is ordinary. Write `.required` yourself to say otherwise, in either
-direction.
+person who wrote `scripts/release` asked for that path, while a pattern
+matching nothing is ordinary. Write `.required` yourself to say otherwise, in
+either direction.
 
 A match may be a symbolic link. Chock resolves it and binds the real file,
 because a mount source cannot be a link. Every resolved path has to stay inside
@@ -361,14 +362,15 @@ the fault can be in any block of it. A message that names a block, such as
 about that block alone.
 
 A project with no `chock.zon` has no spend cap. The two defaults run in
-opposite directions on purpose. An action no rule names resolves to `ask`, so a
-project that wrote no policy permits nothing by itself. A budget nobody wrote is
-no budget, so a session runs until it finishes. Write a `budget` block to bound
-what a session may spend:
+opposite directions on purpose: an action no rule names resolves to `ask`, so
+a project that wrote no policy permits nothing by itself, while a budget
+nobody wrote is no budget, so a session runs until it finishes. Write a
+`budget` block to bound what a session may spend:
 
 ```zon
 .{ .budget = .{ .max_cost = 5.0, .currency = "USD" } }
 ```
 
 The cap lives in that file and nowhere else, so the model cannot raise it. A
-misspelled field inside the block is refused rather than read as no cap.
+misspelled field inside the block is refused rather than quietly read as no
+cap.

@@ -123,13 +123,13 @@ namespaces, under a Landlock rule set and a seccomp filter, in a throwaway copy
 of the project. The credential store is never mounted into the sandbox.
 
 No tool call writes the real project unless you approved a `workspace` bind in
-write mode, and that sentence is stronger than it was. A git worktree keeps its own metadata inside the real
+write mode, and that sentence is stronger than it used to be. A git worktree keeps its own metadata inside the real
 repository, at `.git/worktrees/<id>`, and git must write the index there for
 `git status` to work at all. Chock used to give that directory to the tool call
 itself. A red team run wrote two files into it, so now the directory is copied
 and the copy is what a tool call sees, on both Linux and macOS. The project's
-own reads byte for byte as `git worktree add` left it, whatever the agent does.
-Linux binds the copy at the path git looks for. macOS has no bind mount, so it
+own copy reads byte for byte as `git worktree add` left it, whatever the agent
+does. Linux binds the copy at the path git looks for. macOS has no bind mount, so it
 names the copy with `GIT_DIR` and `GIT_WORK_TREE` instead and leaves the whole
 of the real `.git` read only.
 
@@ -150,7 +150,7 @@ Two things macOS does not give you, and both are permanent:
 
 The driver reports no guarantee it has not proved, and a config that needs a
 layer macOS does not have is refused rather than quietly accepted. What a driver
-declares is reported and refuses nothing on its own. Run
+declares is reported, but a declaration on its own refuses nothing. Run
 `chock doctor` on the machine you are on: it names each layer and what is lost.
 
 The session log is append only, with one exception: a torn trailing fragment from

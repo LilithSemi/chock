@@ -42,7 +42,8 @@ pub fn ceilingFromLog(text: []const u8) Decision {
     return ceilingNamed(text) orelse .deny;
 }
 
-/// Only a restriction covering the whole of `subject` answers.
+/// A restriction answers only when its pattern covers the whole of `subject`,
+/// so a restriction naming `git.push` leaves `git.*` at its own ceiling.
 pub fn ceilingFor(restrictions: []const Restriction, subject: []const u8) Decision {
     var held: Decision = .allow;
     for (restrictions) |one| {
@@ -66,7 +67,8 @@ pub const Proposal = enum {
     widens,
 };
 
-/// `held` is the self imposed ceiling, never the policy table's answer.
+/// `held` is the ceiling the agent imposed on itself, never the policy table's
+/// answer.
 pub fn classify(held: Decision, proposed: Decision) Proposal {
     if (proposed.rank() < held.rank()) return .narrows;
     if (proposed.rank() == held.rank()) return .no_change;
@@ -114,7 +116,9 @@ comptime {
     }
 }
 
-// A fourth member is a route into a rule that enforces something.
+// A fourth member would let a promise carry a clause that enforces something,
+// and a promise has to stay a promise: this tier narrows, and only the policy
+// table warrants.
 comptime {
     const fields = @typeInfo(Restriction).@"struct".field_names;
     const wanted = [_][]const u8{ "action", "ceiling", "reason" };

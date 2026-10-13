@@ -2,12 +2,12 @@
 
 Every question Chock asks carries an action name. A rule in `chock.zon` names
 one of them, or a class of them, and answers it. How a rule is read is in
-[policy.md](policy.md). This page is the reference for the names themselves.
+[policy.md](policy.md), and this page is the reference for the names themselves.
 
 ## What Chock ships
 
-Chock ships default rules for the ordinary tool calls, so a project with no
-`chock.zon` at all still runs them without a prompt.
+Chock ships default rules for the ordinary tool calls, so even a project with
+no `chock.zon` at all runs them without a prompt.
 
 | Namespace | What it names | Shipped |
 |---|---|---|
@@ -32,15 +32,16 @@ Chock ships default rules for the ordinary tool calls, so a project with no
 
 A shipped default is read only when nothing in the project's own rules matches
 the key. A project rule that matches wins outright, whatever it names and
-however wide it is. Writing
+however wide it is. So writing
 `.{ .action = "call.write_file", .decision = .ask }` in your own `chock.zon`
 puts that call back behind a prompt.
 
 ## `call.*`, the ordinary tool calls
 
-One action per tool, named after the tool. These ship as `allow`: `read_file`,
-`read_image`, `list_directory`, `glob`, `grep`, `write_file`, `edit_file`,
-`read_guidance`, `read_memory`, `write_memory`, `provide_tool` and `nix_eval`.
+Each tool gets one action, named after the tool itself. These ship as `allow`:
+`read_file`, `read_image`, `list_directory`, `glob`, `grep`, `write_file`,
+`edit_file`, `read_guidance`, `read_memory`, `write_memory`, `provide_tool` and
+`nix_eval`.
 
 `run_command` has no `call.` action of its own, because a command is named by
 the program it runs. `spawn_agent`, `update_plan`, `restrict_self`,
@@ -56,29 +57,29 @@ closure this session mounted at its start, and it is allowed. `exec.nix.store.*`
 is every other store path, and it is the one shipped rule that is not an
 `allow`.
 
-A store path is immutable, so it names one program for ever, but the set of
-store paths is not: the agent can have an expression evaluated and the result
-built, and a path it made that way is not the toolchain it was given.
+A store path is immutable, so it names one program for ever. The set of store
+paths is not: the agent can have an expression evaluated and the result built,
+and a path it made that way is not the toolchain it was given.
 
 `exec.unparsed` is the class for a path Chock refuses to resolve lexically,
 most often one holding a `..`. It holds no shipped rule, so it asks.
 
 ## `net.connect.*`, `net.fetch.*` and `nix.net.*`
 
-Each of the three names one source. `net.connect` is the sandbox opening a
+Each of the three names one source: `net.connect` is the sandbox opening a
 socket, `net.fetch` is the `fetch_url` tool, and `nix.net` is a Nix build,
 which runs on your machine rather than in the sandbox. A host allowed for one
 is not allowed for the others.
 
-None of the three holds a shipped default, so a project that named nothing
+None of the three holds a shipped default, so a project that says nothing
 about a host meets `ask` there and never `allow`. What an `ask` on
 `net.connect.*` can reach is in
 [threat-model.md](../security/threat-model.md), and the phases a build fetches
 in are in [nix.md](../using/nix.md).
 
 `net.fetch` is `fetch_url`'s action, and the host is part of the name, with the
-labels reversed: `docs.ziglang.org` becomes `net.fetch.org.ziglang.docs`.
-Reversal is what makes a class rule safe: `net.fetch.org.ziglang.*` means any
+labels reversed: `docs.ziglang.org` becomes `net.fetch.org.ziglang.docs`. The
+reversal is what makes a class rule safe: `net.fetch.org.ziglang.*` means any
 host under ziglang.org, and a host somebody else registered cannot match it.
 
 ```zon
@@ -92,18 +93,18 @@ credential, or a body: `fetch_url` reads, and it never writes to a remote
 service.
 
 Only `allow` reads a host with no question. A host that no rule names answers
-`ask`, and for the host the agent itself named that `ask` reaches you while the
-agent waits: you answer once and the fetch goes on.
+`ask`, and when the agent itself named the host, that `ask` reaches you while
+the agent waits: you answer once and the fetch goes on.
 
 **A redirect hop is not asked.** A fetch follows redirects, and each hop is a
-new host. A hop a rule does not name is refused, because a page that could ask
-at every hop would let whoever wrote it chain redirects and turn the prompt
-into a way to tire you out. So you approve reading the host you were told
-about, and never wherever it forwards you.
+new host. A hop no rule names is refused, because a page that could ask at
+every hop would let whoever wrote it chain redirects and turn the prompt into
+a way to wear you down. So you approve reading the host you were told about,
+and never wherever it forwards you.
 
-A rule in `chock.zon` still reads a host with no question at all, which is what
-you want for a host the agent visits often. The refusal on your screen names
-the rule to add, and the block it goes in.
+A rule in `chock.zon` still reads a host with no question at all, which is
+what you want for a host the agent visits often. The refusal on your screen
+names the rule to add, and the block it goes in.
 
 ### Whether a session has a network at all
 
@@ -123,16 +124,16 @@ ruleset and a resolver at all:
 ```
 
 * `.auto` is the default and reads the rules. A project that permits something
-  under `net` is given a router. A project that permits nothing there is not,
-  and pays for none of it.
+  under `net` is given a router, and a project that permits nothing there is
+  not, so it pays for none of it.
 * `.none` refuses a router whatever the rules say.
 * `.filtered` gives one even when no rule permits a host yet, which suits a
   session where a person answers for each host as it comes up.
 
-A router is a mechanism and never a permission. It grants no host by itself:
-every connection is still decided at `net.connect.*`, and a router with nothing
-permitted reaches nothing. A rule that only denies does not make `.auto` build
-one.
+A router is a mechanism, never a permission. It grants no host by itself:
+every connection is still decided at `net.connect.*`, and a router with
+nothing permitted reaches nothing. A rule that only denies does not make
+`.auto` build one.
 
 `.policy.net.background` says what a command started in the background gets,
 and takes the same three words. `.auto`, the default, is whatever the session
@@ -144,15 +145,15 @@ links the conventional path, `/etc/ssl/certs/ca-certificates.crt`, to it too. A
 project that sets `SSL_CERT_FILE` itself keeps its own.
 
 A background command never asks you anything. It runs after the tool call that
-started it has returned, and a question needs the session to be waiting on it.
-So a background command reaches what this policy allows outright, and a host
-that would have asked you is refused instead of queued. Set
-`.background = .none` for a project where a background command should reach
-nothing at all.
+started it has returned, and a question needs the session to be there waiting
+for the answer. So a background command reaches what this policy allows
+outright, and a host that would have asked you is refused rather than queued.
+Set `.background = .none` for a project where a background command should
+reach nothing at all.
 
 ## `web.search`
 
-One name, with no host under it, for the `web_search` tool. It ships as `ask`,
+The `web_search` tool gets one name, with no host under it. It ships as `ask`,
 and the question reaches you at the tool call while the agent waits.
 
 That timing is what lets it be `ask` at all. Two actions, `nix.build` and
@@ -161,29 +162,29 @@ answer, so an `ask` on one of those means "never". `web.search` is not one of
 them.
 
 The engine's own host is not gated under `net.fetch`. You name the engine in
-your own `config.zon` and a project does not get to pick it, so a project does
+your own `config.zon`, and a project does not get to pick it, so a project does
 not have to permit it either. [search.md](search.md) has the block, the kinds,
 and where the key lives.
 
 A result the agent then wants to read is an ordinary `net.fetch` on a host your
-rules probably do not name. Chock asks about that host, once, for the host the
-agent named.
+rules probably do not name. Chock asks about that host once, and only because
+the agent named it.
 
 ## `skill.read.<layer>`
 
-Three names, and only three: `skill.read.operator`, `skill.read.project` and
-`skill.read.packaged`. Each says whether the agent may read a skill that came
-from that layer.
+There are three names, and only three: `skill.read.operator`,
+`skill.read.project` and `skill.read.packaged`. Each says whether the agent may
+read a skill that came from that layer.
 
-**The name is the layer and never the skill.** A per skill action would put a
-name a package chose into your action namespace, which is the thing a policy
+**The name is the layer, never the skill.** A per skill action would put a name
+a package chose into your action namespace, which is the one thing a policy
 namespace must never accept from a stranger. So a project with forty skills adds
 no rows, and one rule covers every skill of a layer.
 
-`skill.read.operator` ships as `allow`, because that directory holds what you put
-there. The other two ship as `ask`, because a repository's or a package's skill
-is a stranger's written instruction. A project that trusts its own writes one
-rule:
+`skill.read.operator` ships as `allow`, because that directory holds what you
+put there yourself. The other two ship as `ask`, because a repository's or a
+package's skill is a stranger's written instruction. A project that trusts its
+own writes one rule:
 
 ```zig
 .{
@@ -201,23 +202,23 @@ the format, the layers and what a skill can never do.
 
 ## `secret.use.*`
 
-One name per secret a project's `secrets` block names, spelled
+Each secret a project's `secrets` block names gets one action, spelled
 `secret.use.<name>`. It says whether a tool call may be given that secret, so a
 project can make the one that matters a question and leave the rest a standing
 permission.
 
-The name after `secret.use.` is the secret's own, and a name holds letters,
-digits and underscore for that reason: a dot in it would name a class of
-actions nobody wrote.
+The name after `secret.use.` is the secret's own, and it holds letters, digits
+and underscore for that reason: a dot in it would name a class of actions
+nobody wrote.
 
 Nothing ships as a default here. A secret nobody granted cannot be asked for at
-all, so an unnamed one needs no row. For a tool call the question reaches you at
+all, so an unnamed one needs no row. On a tool call the question reaches you at
 the call, the same way `web.search` does, and a refusal refuses the call rather
 than running it with the secret missing.
 
 For an MCP server the row is read at start, when nobody is there to answer, so
 `ask` means the server is not given it. That is the same reading `nix.build` and
-`model.select` take, and Chock says which rule read that way.
+`model.select` take, and Chock tells you which rules are read that way.
 
 [secrets.md](secrets.md) has the block, how a secret binds, and what the log
 records.
@@ -245,7 +246,7 @@ records.
 The three `git` actions have a shim in front of them. It reads the argument
 vector of every `run_command` call whose first word is `git`, and it sorts each
 subcommand into one that only reads and one that changes state. The shim
-prevents a mistake and it does not prevent an attack. The sandbox layers are
+prevents a mistake, and it does not prevent an attack: the sandbox layers are
 the boundary. An agent that wants to avoid the shim has several ways and none
 of them is difficult, so nothing in Chock is built as though the shim were a
 control.
@@ -254,8 +255,8 @@ Every subcommand the shim classifies is asked about while the loop runs,
 through the same arbiter an MCP tool call and a plugin tool call go through. A
 read only subcommand asks nobody and runs the real git, so `git status`,
 `git log` and `git diff` cost what they always did. A subcommand the shim does
-not know asks under its own name, such as `git.frobnicate`. An option the shim
-cannot read stops it reading the subcommand at all, and that asks as
+not know asks under its own name, such as `git.frobnicate`, and an option the
+shim cannot read stops it reading the subcommand at all, so that one asks as
 `git.unknown`.
 
 Chock ships `allow` for every git action name that changes only the session's
@@ -273,7 +274,7 @@ the agent proxy, and both are closed again when the call ends.
 Every other subcommand that reaches another host is asked about and still does
 not run, even when a person says yes. `git clone`, `git fetch` and `git pull`
 have no act that carries the effect out, so the agent is told what is missing
-rather than told no. Nothing in a session asks `file.write`.
+rather than just told no. Nothing in a session asks `file.write`.
 
 ### `model.select` and `nix.build`
 
@@ -300,10 +301,10 @@ built before the first turn and there is nobody to ask.
 It is a row here and not a key in `chock.zon` because it widens. An
 organisation writes `.{ .action = "sandbox.jit", .decision = .deny }` in its
 bundle and no project can raise it, because the answer is a minimum over both
-layers. The same fold means a subagent cannot give up hardening its parent
+layers. The same fold means a subagent cannot give away hardening its parent
 kept.
 
-What is given up is documented hardening and it is not a boundary.
+What is given up is documented hardening, not a boundary.
 [sandbox.md](../security/sandbox.md) lists the three ways past the rule, and the
 three places a session that gave it up says so.
 
@@ -321,17 +322,17 @@ nothing", so this row and a `n` at the prompt are the two ways to say it.
 ```
 
 A row nobody wrote answers `allow` here, unlike every action above, because
-this is a question about a capability and not about an act. That is the same
-reading `provider.<instance>` gets. One `deny` in an organisation's bundle
+this is a question about a capability rather than about an act. That is the
+same reading `provider.<instance>` gets. One `deny` in an organisation's bundle
 closes the road for every project under it, and the same fold means a subagent
 moves no branch its parent could not.
 
 This row decides whether, and `.apply.mode` decides where. `deny` is the one
 decision that takes the capability away, so it is the one decision that parks
-the work at the ref. `ask`, `agent_review` and `agent_then_human` each say that
-integration is permitted once somebody says yes, and none of them names a
+the work at the ref. `ask`, `agent_review` and `agent_then_human` each say
+that integration is permitted once somebody says yes, and none of them names a
 landing, so they keep the mode the project configured. The one question an
-apply puts is the `workspace.apply` approval, which is a different row.
+apply asks is the `workspace.apply` approval, which is a different row.
 
 The answer is read once, when the session starts, before an apply is described,
 because the description is what a person reads and it has to say what the apply
@@ -390,7 +391,7 @@ running.
 }
 ```
 
-The action name is the device's identity and never its path. `/dev/ttyUSB0`
+The action name is the device's identity, never its path. `/dev/ttyUSB0`
 changes with plug order and after a reboot, so a rule written against it stops
 being true the moment the board is unplugged and plugged back in. A USB device
 is named `device.usb.<vendor>.<product>`, in lower case hex. A serial adapter
@@ -402,7 +403,8 @@ shape as a USB device.
 Naming a device in the `devices` block only says the project wants it. The
 `policy` rule beside it is what lets a session reach the node. See
 [running.md](../running.md) for when a device that arrives is picked up, and
-[sandbox.md](../security/sandbox.md) for what the grant does and does not bound.
+[sandbox.md](../security/sandbox.md) for what the grant does and does not
+bound.
 
 ## `lsp.*`
 
@@ -421,7 +423,7 @@ that wanted to could point the name `zls` at another binary. `lsp.*` is the
 rule to trust, and `lsp.zls` is a convenience. What bounds the damage is not
 the name: the server runs inside the same sandbox a tool call gets, and reaches
 nothing a tool call cannot. A program whose name cannot be one label of a rule
-does not start at all, and says so.
+does not start at all, and it says so.
 
 ## `mcp.*` and `plugin.*`
 

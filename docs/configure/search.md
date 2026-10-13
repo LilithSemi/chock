@@ -1,8 +1,8 @@
 # Web search
 
 An agent that can read a page it was given a link to still cannot find the
-link. The `web_search` tool is how it looks something up, and this page is how
-you say which engine answers.
+link in the first place. The `web_search` tool is how it looks something up,
+and this page is how you say which engine answers.
 
 ## The engine is yours, so it is named in your own file
 
@@ -35,9 +35,9 @@ read.
 | `api` | a keyed vendor | built, Brave, Kagi and Exa |
 | `scrape` | a results page, read as HTML | built, DuckDuckGo |
 
-Leave the block out and the tool is still offered. It answers that no engine is
-configured and says which file sets one, because "no engine" and "no results"
-must not read the same to an agent.
+Leave the block out and the tool is still offered. It answers that no engine
+is configured and says which file sets one, because "no engine" and "no
+results" must not read the same to an agent.
 
 ### self_hosted
 
@@ -47,8 +47,8 @@ must not read the same to an agent.
 
 Chock calls `GET {base_url}/search?q=...&format=json`.
 
-SearXNG answers 403 to that until you turn JSON on. The format is off by
-default. Add it to `settings.yml`:
+SearXNG answers 403 to that until you turn JSON on, because the format is off
+by default. Add it to `settings.yml`:
 
 ```yaml
 search:
@@ -58,11 +58,12 @@ search:
 ```
 
 Chock names this setting whenever a reply does not parse, because an instance
-that will not speak JSON and a query that found nothing otherwise read alike.
+that will not speak JSON and a query that found nothing otherwise read the
+same.
 
 An `http` base URL is refused unless the host is loopback. A search query says
-what somebody is working on, and in the clear it says it to every hop on the
-way.
+what somebody is working on, and in the clear it says it to every hop along
+the way.
 
 ### api
 
@@ -76,8 +77,8 @@ way.
 ```
 
 `provider` names the vendor. Each one answers in its own shape under its own
-field names, so the kind alone does not say enough to read a reply, and a reader
-that guessed would hand the agent zero results rather than an error.
+field names, so the kind alone does not say enough to read a reply, and a
+reader that guessed would hand the agent zero results rather than an error.
 
 A provider belongs to exactly one kind. `brave`, `kagi` and `exa` are `api`, and
 `duckduckgo` is `scrape`. Naming one beside a kind it does not belong to is
@@ -97,19 +98,19 @@ Put the key in the store with:
 chock login --search brave
 ```
 
-The name you pass is the name the block reads it under. There is no option that
-takes the key on the command line, for the reason
+The name you pass is the name the block reads it under. There is no option
+that takes the key on the command line, for the reason
 [configuration.md](configuration.md) gives for a provider: a command line is
 visible through `ps` and it lands in your shell history.
 
 Unlike a provider login, this one does not ask the engine whether the key
 works. A provider credential that does not work ends a session before it
-starts. A search key that does not work costs one tool call, which comes back
-naming the status the engine answered with.
+starts, while a search key that does not work costs one tool call, which comes
+back naming the status the engine answered with.
 
-Brave bounds a query to 600 characters and 75 words. Chock refuses a longer one
-before the request, and says which bound was passed, so the agent can shorten
-the query rather than read a 422.
+Brave bounds a query to 600 characters and 75 words. Chock refuses a longer
+one before the request, and says which bound was passed, so the agent can
+shorten the query rather than read a 422.
 
 Kagi is configured the same way, with its own base URL:
 
@@ -134,12 +135,12 @@ limit does, so the refusal names both causes.
 
 A title or snippet from Kagi can hold HTML entities such as `&#39;`, because
 Kagi sends them and documents no way to turn them off. They reach the agent as
-written. Chock does not decode them: undoing markup that may not be there would
-corrupt a snippet that legitimately holds one.
+written. Chock does not decode them: undoing markup that may not be there
+would corrupt a snippet that legitimately holds one.
 
 Exa is the third, and it searches differently: it retrieves by meaning rather
-than by keyword, so a query that describes the kind of page you want often finds
-one that a keyword search would miss.
+than by keyword, so a query that describes the kind of page you want often
+finds one that a keyword search would miss.
 
 ```zon
 .search = .{
@@ -150,7 +151,7 @@ one that a keyword search would miss.
 }
 ```
 
-Three things Chock asks Exa for, and three it refuses to.
+There are three things Chock asks Exa for, and three it refuses to ask for.
 
 Chock asks for `highlights`, which are extracts of the page in the page's own
 words. That is Exa's equivalent of the snippet Brave and Kagi return, and a
@@ -158,24 +159,24 @@ result with no extract would be a bare link.
 
 Chock never asks for `text`, which is the whole page. A search is approved
 under `web.search`; reading a page is approved under `net.fetch`, for the one
-host the agent named. Full page text arriving inside a search result would put a
-stranger's page in front of the model under an approval that was given for
+host the agent named. Full page text arriving inside a search result would put
+a stranger's page in front of the model under an approval that was given for
 something else. [actions.md](actions.md) has both actions.
 
 Chock never asks for `summary`, which is written by a model at Exa. It would
-be text with no source to attribute it to, and everything the model reads from a
-search has to be something a person can go and check.
+be text with no source to attribute it to, and everything the model reads from
+a search has to be something a person can go and check.
 
 Chock never asks for the deep search modes. Exa's `type` accepts `deep` and
 `deep-reasoning`, each of which is Exa running an agent of its own: unbounded
-work outside this session's budget, its policy table and its log. The mode is a
-constant in the request builder, so there is no way to name one.
+work outside this session's budget, its policy table and its log. The mode is
+a constant in the request builder, so there is no way to name one.
 
-Exa bills each search and answers 402 when an account is out of credit, which is
-a different fact from a bad key or a rate limit, so the refusal says which.
+Exa bills each search and answers 402 when an account is out of credit, which
+is a different fact from a bad key or a rate limit, so the refusal says which.
 
-Its reply has two shapes: results, or a synthesis. Chock pins the request so the
-results shape is what comes back, and refuses a synthesis body rather than
+Its reply has two shapes: results, or a synthesis. Chock pins the request so
+the results shape is what comes back, and refuses a synthesis body rather than
 reading it as no results found.
 
 ### scrape
@@ -191,7 +192,7 @@ reading it as no results found.
 No key, so no `credential`. Chock posts the query to DuckDuckGo's own
 no-JavaScript results page and reads the result blocks out of the HTML.
 
-It will never be the default, and not on principle. A results page changes
+It will never be the default, and not on principle: a results page changes
 shape without notice, so a scraper works until it quietly does not. Of the four
 harnesses read while this was designed, the one that scrapes needed a headless
 browser with stealth patches to keep it working.
@@ -211,13 +212,13 @@ them apart, so Chock checks for the marker DuckDuckGo puts on a genuine
 no-results page and treats its absence, with nothing parsed, as a fault.
 
 Chock sends its own user agent and does not pretend to be a browser. If
-DuckDuckGo refuses that, you get the first row of the table, which is the honest
-answer. Claiming to be a browser you are not is the road that ends in stealth
-patches.
+DuckDuckGo refuses that, you get the first row of the table, which is the
+honest answer. Claiming to be a browser you are not is the road that ends in
+stealth patches.
 
-Expect this kind to need attention that `self_hosted` and `api` do not. If you
-want search that keeps working without you watching it, run SearXNG or buy a
-key.
+Expect this kind to need attention that `self_hosted` and `api` do not. If
+you want search that keeps working without you watching it, run SearXNG or buy
+a key.
 
 ## Asking before it searches
 
@@ -240,15 +241,15 @@ project does not have to name it in `net.fetch`.
 
 ## Reading a result
 
-A search gives back a title, a URL, and a bounded snippet, at most 8 results. It
-never gives back page text: reading a page stays `fetch_url`'s job, which is
-what keeps reachability a decision made outside the sandbox.
+A search gives back a title, a URL, and a bounded snippet, with at most 8
+results. It never gives back page text: reading a page stays `fetch_url`'s job,
+which is what keeps reachability a decision made outside the sandbox.
 
 Results are marked as text a stranger wrote, and they go through the same
 cleaning a fetched page does. A ranked list is more attacker shaped than an
-ordinary page, because whoever ranks decides what the agent reads first. That
-you chose the engine says something about where the bytes come from and nothing
-about who wrote them.
+ordinary page, because whoever ranks decides what the agent reads first.
+Choosing the engine yourself says something about where the bytes come from and
+nothing about who wrote them.
 
 A result the agent then wants to read is a `net.fetch` on a host your policy
 probably does not name. Chock asks you about that host, once, for the host the
