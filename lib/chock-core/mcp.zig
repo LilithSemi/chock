@@ -6,6 +6,7 @@ const std = @import("std");
 
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
+const chock_zon = @import("chock-zon");
 
 const arbiter = @import("arbiter.zig");
 const lsp = @import("lsp.zig");
@@ -59,8 +60,8 @@ pub const LoadError = ParseError || error{
 };
 
 pub const Diagnostic = union(enum) {
-    file_not_zon: std.zon.parse.Diagnostics,
-    block_not_valid: std.zon.parse.Diagnostics,
+    file_not_zon: ZonFailure,
+    block_not_valid: ZonFailure,
     not_a_struct_literal,
     too_many_servers: usize,
     server_name_unusable,
@@ -69,9 +70,16 @@ pub const Diagnostic = union(enum) {
     file_too_large: usize,
     read_failed: anyerror,
 
+    /// `arena` backs `diag`'s messages and must outlive it; `deinit` frees both together.
+    pub const ZonFailure = struct {
+        arena: std.heap.ArenaAllocator,
+        diag: std.zon.parse.Diagnostics,
+    };
+
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
+        _ = gpa;
         switch (self.*) {
-            .file_not_zon, .block_not_valid => |*zon_diag| zon_diag.deinit(gpa),
+            .file_not_zon, .block_not_valid => |*zf| zf.arena.deinit(),
             else => {},
         }
         self.* = undefined;
@@ -79,13 +87,13 @@ pub const Diagnostic = union(enum) {
 
     pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.*) {
-            .file_not_zon => |*zon_diag| try writer.print(
+            .file_not_zon => |*zf| try writer.print(
                 "{s} is not valid:\n{f}",
-                .{ file_name, zon_diag },
+                .{ file_name, zf.diag.fmt(file_name) },
             ),
-            .block_not_valid => |*zon_diag| try writer.print(
+            .block_not_valid => |*zf| try writer.print(
                 "{s}: the mcp_servers block is not valid:\n{f}",
-                .{ file_name, zon_diag },
+                .{ file_name, zf.diag.fmt(file_name) },
             ),
             .not_a_struct_literal => try writer.print(
                 "{s}: the file must hold a struct literal",
@@ -143,9 +151,9 @@ comptime {
             "land on the rule about that server's network",
     );
 
-    for (@typeInfo(tools.Tool).@"enum".fields) |field| {
-        if (!nameIsUsable(field.name)) @compileError(
-            "the built-in tool \"" ++ field.name ++ "\" is not a name this host builds a policy " ++
+    for (@typeInfo(tools.Tool).@"enum".field_names, @typeInfo(tools.Tool).@"enum".field_values) |field_name, _| {
+        if (!nameIsUsable(field_name)) @compileError(
+            "the built-in tool \"" ++ field_name ++ "\" is not a name this host builds a policy " ++
                 "key out of, so an MCP tool of that name would be refused by the shape rule " ++
                 "rather than by the rule against shadowing a built-in",
         );
@@ -520,48 +528,52 @@ pub fn parse(
     source: [:0]const u8,
     diag: ?*?Diagnostic,
 ) ParseError!?[]const Settings {
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+    var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    var ast_owned = true;
-    defer if (ast_owned) ast.deinit(gpa);
+    defer ast.deinit(gpa);
 
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
-    var zoir_owned = true;
-    defer if (zoir_owned) zoir.deinit(gpa);
+    defer zoir.deinit(gpa);
+
+    // The arena backs the parsed value and the diagnostics; `note` takes it
+    // over on a fault, otherwise it is released here.
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    var arena_owned = true;
+    defer if (arena_owned) arena.deinit();
 
     if (zoir.hasCompileErrors()) {
-        if (note(diag, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
-            ast_owned = false;
-            zoir_owned = false;
-        }
+        var zon_diag: std.zon.parse.Diagnostics = undefined;
+        _ = std.zon.parse.fromZoir([]const WireServer, .{
+            .arena = arena.allocator(),
+            .ast = &ast,
+            .zoir = &zoir,
+            .diagnostics = &zon_diag,
+        }) catch {};
+        if (note(diag, .{ .file_not_zon = .{ .arena = arena, .diag = zon_diag } })) arena_owned = false;
         return error.InvalidMcpServers;
     }
 
     const node = try findBlockNode(zoir, diag) orelse return null;
 
-    var zon_diag: std.zon.parse.Diagnostics = .{};
-    ast_owned = false;
-    zoir_owned = false;
-    var zon_diag_owned = true;
-    defer if (zon_diag_owned) zon_diag.deinit(gpa);
-
-    const wire = std.zon.parse.fromZoirNodeAlloc(
+    var zon_diag: std.zon.parse.Diagnostics = undefined;
+    const wire = chock_zon.fromNode(
         []const WireServer,
         gpa,
-        ast,
-        zoir,
+        arena.allocator(),
+        source,
+        &ast,
+        &zoir,
         node,
         &zon_diag,
         .{},
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => {
-            if (note(diag, .{ .block_not_valid = zon_diag })) zon_diag_owned = false;
+            if (note(diag, .{ .block_not_valid = .{ .arena = arena, .diag = zon_diag } })) arena_owned = false;
             return error.InvalidMcpServers;
         },
     };
-    defer std.zon.parse.free(gpa, wire);
 
     if (wire.len == 0) return null;
     if (wire.len > max_servers) {
@@ -657,10 +669,10 @@ pub fn load(
 
 fn findBlockNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), "mcp_servers")) {
+                if (std.mem.eql(u8, name.get(&zoir), "mcp_servers")) {
                     return fields.vals.at(@intCast(index));
                 }
             }
@@ -1001,7 +1013,7 @@ test "a tool action names the server and the tool, and a tool cannot name the ne
     try testing.expect(actionInto(&buffer, "time", "a.b") == null);
     try testing.expect(actionInto(&buffer, "time", "a*") == null);
     try testing.expect(actionInto(&buffer, "time", "") == null);
-    try testing.expect(actionInto(&buffer, "time", "a" ** (max_name_bytes + 1)) == null);
+    try testing.expect(actionInto(&buffer, "time", &@as([(max_name_bytes + 1)]u8, @splat('a'))) == null);
     try testing.expect(actionInto(&buffer, "", "a") == null);
 }
 
@@ -1022,8 +1034,8 @@ test "a server that declares a built-in's name fails to load, and takes none of 
     try testing.expect(bench.session.isEmpty());
     try testing.expectEqual(@as(usize, 0), bench.policy.asks);
 
-    inline for (@typeInfo(tools.Tool).@"enum".fields) |field| {
-        try testing.expect(shadowsBuiltIn(field.name));
+    inline for (@typeInfo(tools.Tool).@"enum".field_names, @typeInfo(tools.Tool).@"enum".field_values) |field_name, _| {
+        try testing.expect(shadowsBuiltIn(field_name));
     }
     try testing.expect(!shadowsBuiltIn("get_current_time"));
     try testing.expect(!shadowsBuiltIn(""));
@@ -1217,7 +1229,7 @@ test "a tool whose name is not a name is refused, and no policy key is ever buil
         .{ .name = "a*" },
         .{ .name = "" },
         .{ .name = "with space" },
-        .{ .name = "a" ** (max_name_bytes + 1) },
+        .{ .name = &@as([(max_name_bytes + 1)]u8, @splat('a')) },
     });
 
     try testing.expectEqual(@as(usize, 5), bench.session.offers.items.len);
@@ -1363,10 +1375,10 @@ test "a description a server wrote reaches the prompt on one line, and cannot be
     var bench = Bench.init(gpa);
     defer bench.deinit();
 
-    const long = "x" ** (max_description_bytes * 2);
+    const long = @as([(max_description_bytes * 2)]u8, @splat('x'));
     try bench.admit("s", &.{
         .{ .name = "one", .description = "first line\nsecond line\x1b[2J" },
-        .{ .name = "two", .description = long },
+        .{ .name = "two", .description = &long },
     });
 
     const first = bench.session.find("one").?;

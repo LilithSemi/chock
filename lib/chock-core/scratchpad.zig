@@ -463,11 +463,11 @@ test "a scratchpad over the bound is emptied, one under it is kept, and the task
     const scratch_file = try std.fmt.allocPrint(allocator, "{s}/{s}/deep/notes.txt", .{ session_dir, scratch_leaf });
     defer allocator.free(scratch_file);
     try makeLayout(testing.io, std.fs.path.dirname(scratch_file).?, null);
-    try writeBytes(scratch_file, "s" ** 300);
+    try writeBytes(scratch_file, &@as([300]u8, @splat('s')));
 
     const task_file = try std.fmt.allocPrint(allocator, "{s}/{s}/01.out", .{ session_dir, tasks_leaf });
     defer allocator.free(task_file);
-    try writeBytes(task_file, "t" ** 90);
+    try writeBytes(task_file, &@as([90]u8, @splat('t')));
 
     const measured = measureScratch(allocator, testing.io, session_dir, max_bytes);
     try testing.expectEqual(@as(u64, 300), measured.bytes);

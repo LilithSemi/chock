@@ -83,7 +83,7 @@ var decode_buffer: [decode_bytes]u8 align(16) = @splat(0);
 fn thunkFor(comptime tool: meta.Tool) *const fn (tools.Context) tools.Result {
     const body = comptime meta.runOf(tool);
     const Args = tool.type;
-    const takes_nothing = comptime @typeInfo(Args).@"struct".fields.len == 0;
+    const takes_nothing = comptime @typeInfo(Args).@"struct".field_names.len == 0;
 
     return &struct {
         fn call(ctx: tools.Context) tools.Result {

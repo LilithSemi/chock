@@ -24,16 +24,16 @@ pub const widen_action = "policy.widen";
 
 pub const ceiling_names_text = blk: {
     var text: []const u8 = "";
-    for (@typeInfo(Decision).@"enum".fields) |field| {
+    for (@typeInfo(Decision).@"enum".field_names, @typeInfo(Decision).@"enum".field_values) |field_name, _| {
         if (text.len != 0) text = text ++ ", ";
-        text = text ++ "\"" ++ field.name ++ "\"";
+        text = text ++ "\"" ++ field_name ++ "\"";
     }
     break :blk text;
 };
 
 pub fn ceilingNamed(text: []const u8) ?Decision {
-    inline for (@typeInfo(Decision).@"enum".fields) |field| {
-        if (std.mem.eql(u8, field.name, text)) return @field(Decision, field.name);
+    inline for (@typeInfo(Decision).@"enum".field_names, @typeInfo(Decision).@"enum".field_values) |field_name, _| {
+        if (std.mem.eql(u8, field_name, text)) return @field(Decision, field_name);
     }
     return null;
 }
@@ -101,14 +101,14 @@ pub fn refusalFor(restriction: Restriction) ?[]const u8 {
 
 // Fails the build if `Decision` gains a member with no place in this order.
 comptime {
-    const fields = @typeInfo(Decision).@"enum".fields;
+    const fields = @typeInfo(Decision).@"enum".field_values;
     if (fields.len != 5) @compileError(
         "Decision has gained or lost a member. The ratchet compares proposals by rank, so " ++
             "where the new one sits decides whether a promise already in a session log now " ++
             "reads as a narrowing or as a widening. Decide that, then update this count",
     );
-    for (fields, 0..) |field, index| {
-        if (field.value != index) @compileError(
+    for (fields, 0..) |value, index| {
+        if (value != index) @compileError(
             "Decision's members are no longer in rank order, and `rank` is `@intFromEnum`",
         );
     }
@@ -116,7 +116,7 @@ comptime {
 
 // A fourth member is a route into a rule that enforces something.
 comptime {
-    const fields = @typeInfo(Restriction).@"struct".fields;
+    const fields = @typeInfo(Restriction).@"struct".field_names;
     const wanted = [_][]const u8{ "action", "ceiling", "reason" };
     if (fields.len != wanted.len) @compileError(
         "Restriction must hold exactly the action, the ceiling, and the agent's own reason. " ++
@@ -124,7 +124,7 @@ comptime {
             "make a tier that enforces nothing the warrant for a rule that enforces something",
     );
     for (fields, wanted) |field, name| {
-        if (!std.mem.eql(u8, field.name, name)) @compileError(
+        if (!std.mem.eql(u8, field, name)) @compileError(
             "Restriction's members must be, in order: action, ceiling, reason",
         );
     }
@@ -341,15 +341,15 @@ test "a promise that binds nothing, or says nothing, is refused before it is wri
 
     try testing.expect(refusalFor(.{ .action = "net.fetch", .ceiling = .deny, .reason = "" }) != null);
 
-    const long_action = "a" ** (max_action_bytes + 1);
-    try testing.expect(refusalFor(.{ .action = long_action, .ceiling = .deny, .reason = "x" }) != null);
-    const at_bound = "a" ** max_action_bytes;
+    const long_action = @as([(max_action_bytes + 1)]u8, @splat('a'));
+    try testing.expect(refusalFor(.{ .action = &long_action, .ceiling = .deny, .reason = "x" }) != null);
+    const at_bound = @as([max_action_bytes]u8, @splat('a'));
     try testing.expectEqual(
         @as(?[]const u8, null),
-        refusalFor(.{ .action = at_bound, .ceiling = .deny, .reason = "x" }),
+        refusalFor(.{ .action = &at_bound, .ceiling = .deny, .reason = "x" }),
     );
-    const long_reason = "r" ** (max_reason_bytes + 1);
-    try testing.expect(refusalFor(.{ .action = "net.fetch", .ceiling = .deny, .reason = long_reason }) != null);
+    const long_reason = @as([(max_reason_bytes + 1)]u8, @splat('r'));
+    try testing.expect(refusalFor(.{ .action = "net.fetch", .ceiling = .deny, .reason = &long_reason }) != null);
 }
 
 test "the widening action is a name in the same namespace every other act uses" {

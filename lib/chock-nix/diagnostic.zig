@@ -243,9 +243,10 @@ test "no two faults of this module read the same" {
 }
 
 test "every command this library runs reads as itself" {
-    var seen: [std.meta.fields(Diagnostic.What).len][]const u8 = undefined;
-    inline for (std.meta.fields(Diagnostic.What), 0..) |field, i| {
-        const text = (@field(Diagnostic.What, field.name)).text();
+    const names = @typeInfo(Diagnostic.What).@"enum".field_names;
+    var seen: [names.len][]const u8 = undefined;
+    inline for (names, 0..) |name, i| {
+        const text = (@field(Diagnostic.What, name)).text();
         try testing.expect(text.len > 0);
         for (seen[0..i]) |other| try testing.expect(!std.mem.eql(u8, text, other));
         seen[i] = text;

@@ -530,19 +530,19 @@ const TestProject = struct {
         const tmp_path = try absoluteDirPath(&buffer, tmp.dir);
 
         var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const root_path = try std.fmt.bufPrintZ(&root_buffer, "{s}/project", .{tmp_path});
+        const root_path = try std.fmt.bufPrintSentinel(&root_buffer, "{s}/project", .{tmp_path}, 0);
         try makeDir(root_path);
 
         var scratch_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const scratch_path = try std.fmt.bufPrintZ(&scratch_buffer, "{s}/scratch", .{tmp_path});
+        const scratch_path = try std.fmt.bufPrintSentinel(&scratch_buffer, "{s}/scratch", .{tmp_path}, 0);
         try makeDir(scratch_path);
 
         const env = try testEnviron(allocator, tmp_path);
 
         return .{
             .allocator = allocator,
-            .root_path = try allocator.dupeZ(u8, root_path),
-            .scratch_path = try allocator.dupeZ(u8, scratch_path),
+            .root_path = try allocator.dupeSentinel(u8, root_path, 0),
+            .scratch_path = try allocator.dupeSentinel(u8, scratch_path, 0),
             .env = env,
         };
     }
@@ -564,7 +564,7 @@ const TestProject = struct {
         defer config_name.deinit(self.allocator);
 
         var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{self.root_path});
+        const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{self.root_path}, 0);
         var tracked_file = try std.Io.Dir.createFileAbsolute(std.testing.io, tracked_path, .{});
         try tracked_file.writeStreamingAll(std.testing.io, "hello\n");
         tracked_file.close(std.testing.io);
@@ -582,7 +582,7 @@ const TestProject = struct {
 
     fn commitChockZonSaying(self: TestProject, source: []const u8) !void {
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/chock.zon", .{self.root_path});
+        const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/chock.zon", .{self.root_path}, 0);
         var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{});
         try file.writeStreamingAll(std.testing.io, source);
         file.close(std.testing.io);
@@ -790,10 +790,11 @@ test "keeping a workspace leaves the agent's file on disk, and closing one takes
             "kept",
             null,
         );
-        const written = try std.fmt.bufPrintZ(
+        const written = try std.fmt.bufPrintSentinel(
             &kept_path_buffer,
             "{s}/agent-wrote-this.txt",
             .{workspace.workPath()},
+            0,
         );
         var handle = try std.Io.Dir.createFileAbsolute(io, written, .{});
         try handle.writeStreamingAll(io, "work nobody committed\n");
@@ -822,10 +823,11 @@ test "keeping a workspace leaves the agent's file on disk, and closing one takes
             "removed",
             null,
         );
-        const written = try std.fmt.bufPrintZ(
+        const written = try std.fmt.bufPrintSentinel(
             &removed_path_buffer,
             "{s}/agent-wrote-this.txt",
             .{workspace.workPath()},
+            0,
         );
         var handle = try std.Io.Dir.createFileAbsolute(io, written, .{});
         try handle.writeStreamingAll(io, "work about to be discarded\n");
@@ -1012,7 +1014,7 @@ test "adopt takes the worktree a first process left, with the work still in it" 
         var first = try Workspace.open(allocator, io, &project.env, project.root_path, project.scratch_path, "sess1", null);
         defer first.keep(allocator);
 
-        work_path = try std.fmt.bufPrintZ(&work_buffer, "{s}/agent-wrote-this.txt", .{first.workPath()});
+        work_path = try std.fmt.bufPrintSentinel(&work_buffer, "{s}/agent-wrote-this.txt", .{first.workPath()}, 0);
         var handle = try std.Io.Dir.createFileAbsolute(io, work_path, .{});
         try handle.writeStreamingAll(io, "work nobody committed\n");
         handle.close(io);
@@ -1062,7 +1064,7 @@ test "adopt binds a chock.zon the checkout lost, from the project itself" {
 
         try std.testing.expect(first.chock_zon_source != null);
 
-        const path = try std.fmt.bufPrintZ(&deleted_buffer, "{s}/chock.zon", .{first.workPath()});
+        const path = try std.fmt.bufPrintSentinel(&deleted_buffer, "{s}/chock.zon", .{first.workPath()}, 0);
         try std.Io.Dir.deleteFileAbsolute(io, path);
     }
 
@@ -1154,8 +1156,8 @@ test "adopt refuses a chock.zon that is a symlink instead of an ordinary file" {
 
         try std.testing.expect(first.chock_zon_source == null);
 
-        const link_path = try std.fmt.bufPrintZ(&link_buffer, "{s}/chock.zon", .{first.workPath()});
-        const target_path = try std.fmt.bufPrintZ(&target_buffer, "{s}/outside-the-project", .{project.scratch_path});
+        const link_path = try std.fmt.bufPrintSentinel(&link_buffer, "{s}/chock.zon", .{first.workPath()}, 0);
+        const target_path = try std.fmt.bufPrintSentinel(&target_buffer, "{s}/outside-the-project", .{project.scratch_path}, 0);
         try std.Io.Dir.symLinkAbsolute(io, target_path, link_path, .{});
     }
 
@@ -1255,7 +1257,7 @@ test "a path the layer above names is refused by the same rules a project's own 
 
 fn writeChockZon(project: TestProject, source: []const u8) !void {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/chock.zon", .{project.root_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/chock.zon", .{project.root_path}, 0);
     var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{});
     try file.writeStreamingAll(std.testing.io, source);
     file.close(std.testing.io);

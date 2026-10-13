@@ -73,14 +73,14 @@ pub fn writeIdMapsFor(
     var line: [64]u8 = undefined;
     const span: u32 = if (helpers) helper_id_offset + 1 else 1;
 
-    const deny = std.fmt.bufPrintZ(&path, "/proc/{d}/setgroups", .{pid}) catch unreachable;
+    const deny = std.fmt.bufPrintSentinel(&path, "/proc/{d}/setgroups", .{pid}, 0) catch unreachable;
     try writeFile(deny.ptr, "deny", .setgroups_open, .setgroups_write, diag);
 
-    const uid_at = std.fmt.bufPrintZ(&path, "/proc/{d}/uid_map", .{pid}) catch unreachable;
+    const uid_at = std.fmt.bufPrintSentinel(&path, "/proc/{d}/uid_map", .{pid}, 0) catch unreachable;
     const uid_line = std.fmt.bufPrint(&line, "{d} {d} {d}", .{ uid, uid, span }) catch unreachable;
     try writeFile(uid_at.ptr, uid_line, .uid_map_open, .uid_map_write, diag);
 
-    const gid_at = std.fmt.bufPrintZ(&path, "/proc/{d}/gid_map", .{pid}) catch unreachable;
+    const gid_at = std.fmt.bufPrintSentinel(&path, "/proc/{d}/gid_map", .{pid}, 0) catch unreachable;
     const gid_line = std.fmt.bufPrint(&line, "{d} {d} {d}", .{ gid, gid, span }) catch unreachable;
     try writeFile(gid_at.ptr, gid_line, .gid_map_open, .gid_map_write, diag);
 }
@@ -215,14 +215,14 @@ pub fn probeAvailability() Availability {
     }
     _ = linux.close(fds[0]);
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
-    if (linux.errno(wait_rc) != .SUCCESS or !linux.W.IFEXITED(status)) {
+    if (linux.errno(wait_rc) != .SUCCESS or !linux.W.IFEXITED(@bitCast(status))) {
         return .{ .unknown = .child_died };
     }
 
-    return readAnswer(linux.W.EXITSTATUS(status), buffer[0..filled]);
+    return readAnswer(linux.W.EXITSTATUS(@bitCast(status)), buffer[0..filled]);
 }
 
 fn readAnswer(exit_code: ?u32, bytes: []const u8) Availability {
@@ -298,12 +298,12 @@ test "the probe answers for this machine, and asks in a child that is spent by a
         enter(.{}, &diag) catch std.process.exit(1);
         std.process.exit(0);
     }
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
-    try std.testing.expectEqual(@as(u32, 0), linux.W.EXITSTATUS(status));
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+    try std.testing.expectEqual(@as(u32, 0), linux.W.EXITSTATUS(@bitCast(status)));
 }
 
 test "an id map line maps one id to itself" {
@@ -515,7 +515,7 @@ pub fn buildRoot(
 ) MountError!void {
     try mountCall(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0, diag);
 
-    const root_z = try allocator.dupeZ(u8, root);
+    const root_z = try allocator.dupeSentinel(u8, root, 0);
     defer allocator.free(root_z);
     try mountCall(root_z, root_z, null, linux.MS.BIND | linux.MS.REC, 0, diag);
 
@@ -549,7 +549,7 @@ fn applyDenyMounts(
     const source = try std.fs.path.join(allocator, &.{ root, deny_notice_source_name });
     defer allocator.free(source);
 
-    const source_z = try allocator.dupeZ(u8, source);
+    const source_z = try allocator.dupeSentinel(u8, source, 0);
     defer allocator.free(source_z);
     try makeNoticeFile(source_z.ptr, diag);
     defer _ = linux.unlinkat(linux.AT.FDCWD, source_z.ptr, 0);
@@ -564,14 +564,14 @@ fn applyDenyMounts(
         defer _ = linux.close(fd);
 
         var magic_buf: [64]u8 = undefined;
-        const magic_z = std.fmt.bufPrintZ(&magic_buf, "/proc/self/fd/{d}", .{fd}) catch
+        const magic_z = std.fmt.bufPrintSentinel(&magic_buf, "/proc/self/fd/{d}", .{fd}, 0) catch
             return error.Unexpected;
 
         try mountCall(source_z, magic_z, null, linux.MS.BIND, 0, diag);
 
         const target = try std.fs.path.join(allocator, &.{ root, deny.target });
         defer allocator.free(target);
-        const target_z = try allocator.dupeZ(u8, target);
+        const target_z = try allocator.dupeSentinel(u8, target, 0);
         defer allocator.free(target_z);
         try markReadOnly(target_z, diag);
     }
@@ -585,7 +585,7 @@ fn pinDenyTarget(
 ) MountError!i32 {
     std.debug.assert(relative_target.len > 1 and relative_target[0] == '/');
 
-    const root_z = try allocator.dupeZ(u8, root);
+    const root_z = try allocator.dupeSentinel(u8, root, 0);
     defer allocator.free(root_z);
     const root_fd_rc = linux.open(root_z.ptr, .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
     switch (linux.errno(root_fd_rc)) {
@@ -603,7 +603,7 @@ fn pinDenyTarget(
     var component = it.next() orelse return error.Unexpected;
     while (true) {
         const next = it.next();
-        const component_z = try allocator.dupeZ(u8, component);
+        const component_z = try allocator.dupeSentinel(u8, component, 0);
         defer allocator.free(component_z);
 
         if (next == null) return openDenyLeaf(dir_fd, component_z.ptr, diag);
@@ -729,7 +729,7 @@ fn buildBindMount(allocator: std.mem.Allocator, root: []const u8, b: Mount.Bind,
     const target = try std.fs.path.join(allocator, &.{ root, b.target });
     defer allocator.free(target);
 
-    const source_z = try allocator.dupeZ(u8, b.source);
+    const source_z = try allocator.dupeSentinel(u8, b.source, 0);
     defer allocator.free(source_z);
 
     const pinned = try pinBindSource(source_z.ptr, diag);
@@ -737,11 +737,11 @@ fn buildBindMount(allocator: std.mem.Allocator, root: []const u8, b: Mount.Bind,
 
     try makePath(allocator, target, pinned.kind, diag);
 
-    const target_z = try allocator.dupeZ(u8, target);
+    const target_z = try allocator.dupeSentinel(u8, target, 0);
     defer allocator.free(target_z);
 
     var magic_buf: [64]u8 = undefined;
-    const magic_z = std.fmt.bufPrintZ(&magic_buf, "/proc/self/fd/{d}", .{pinned.fd}) catch
+    const magic_z = std.fmt.bufPrintSentinel(&magic_buf, "/proc/self/fd/{d}", .{pinned.fd}, 0) catch
         return error.Unexpected;
 
     try mountCall(magic_z, target_z, null, linux.MS.BIND | linux.MS.REC, 0, diag);
@@ -795,7 +795,7 @@ pub const procfs_option_bytes: usize = 48;
 
 pub fn procfsOptions(into: []u8, hide_other_users: bool, gid: linux.gid_t) ?[:0]const u8 {
     if (!hide_other_users) return null;
-    return std.fmt.bufPrintZ(into, "hidepid=2,gid={d}", .{gid + helper_id_offset}) catch null;
+    return std.fmt.bufPrintSentinel(into, "hidepid=2,gid={d}", .{gid + helper_id_offset}, 0) catch null;
 }
 
 fn buildProcMount(
@@ -810,7 +810,7 @@ fn buildProcMount(
 
     try makePath(allocator, target, .directory, diag);
 
-    const target_z = try allocator.dupeZ(u8, target);
+    const target_z = try allocator.dupeSentinel(u8, target, 0);
     defer allocator.free(target_z);
 
     var option_room: [procfs_option_bytes]u8 = undefined;
@@ -897,7 +897,7 @@ fn placeText(
 ) MountError!void {
     const target = try std.fs.path.join(allocator, &.{ root, text.target });
     defer allocator.free(target);
-    const target_z = try allocator.dupeZ(u8, target);
+    const target_z = try allocator.dupeSentinel(u8, target, 0);
     defer allocator.free(target_z);
 
     if (try pathIsSymlink(target_z.ptr, diag)) return error.BindTargetIsSymlink;
@@ -910,7 +910,7 @@ fn placeText(
         .file, .directory => {
             const source = try std.fs.path.join(allocator, &.{ root, substitute_source_name });
             defer allocator.free(source);
-            const source_z = try allocator.dupeZ(u8, source);
+            const source_z = try allocator.dupeSentinel(u8, source, 0);
             defer allocator.free(source_z);
             try writeSubstitute(source_z.ptr, text.contents, diag);
             defer _ = linux.unlinkat(linux.AT.FDCWD, source_z.ptr, 0);
@@ -927,14 +927,14 @@ fn placeLink(
 ) MountError!void {
     const link_to_full = try std.fs.path.join(allocator, &.{ root, link.link_to });
     defer allocator.free(link_to_full);
-    const link_to_full_z = try allocator.dupeZ(u8, link_to_full);
+    const link_to_full_z = try allocator.dupeSentinel(u8, link_to_full, 0);
     defer allocator.free(link_to_full_z);
 
     if (try existingPathKind(link_to_full_z.ptr, .substitute_stat, diag) == .missing) return;
 
     const target = try std.fs.path.join(allocator, &.{ root, link.target });
     defer allocator.free(target);
-    const target_z = try allocator.dupeZ(u8, target);
+    const target_z = try allocator.dupeSentinel(u8, target, 0);
     defer allocator.free(target_z);
 
     if (std.fs.path.dirname(target)) |parent| {
@@ -958,7 +958,7 @@ fn placeLink(
         },
     }
 
-    const link_to_z = try allocator.dupeZ(u8, link.link_to);
+    const link_to_z = try allocator.dupeSentinel(u8, link.link_to, 0);
     defer allocator.free(link_to_z);
 
     switch (linux.errno(linux.symlinkat(link_to_z.ptr, linux.AT.FDCWD, target_z.ptr))) {
@@ -979,7 +979,7 @@ fn hidePath(
 ) MountError!void {
     const target = try std.fs.path.join(allocator, &.{ root, path });
     defer allocator.free(target);
-    const target_z = try allocator.dupeZ(u8, target);
+    const target_z = try allocator.dupeSentinel(u8, target, 0);
     defer allocator.free(target_z);
 
     const kind = try existingPathKind(target_z.ptr, .substitute_stat, diag);
@@ -988,7 +988,7 @@ fn hidePath(
     const name = if (kind == .directory) substitute_empty_dir_name else substitute_empty_file_name;
     const source = try std.fs.path.join(allocator, &.{ root, name });
     defer allocator.free(source);
-    const source_z = try allocator.dupeZ(u8, source);
+    const source_z = try allocator.dupeSentinel(u8, source, 0);
     defer allocator.free(source_z);
 
     if (kind == .directory) {
@@ -1077,19 +1077,19 @@ pub fn ownDirectory(
 ) MountError!bool {
     const target = try std.fs.path.join(allocator, &.{ root, owned.target });
     defer allocator.free(target);
-    const target_z = try allocator.dupeZ(u8, target);
+    const target_z = try allocator.dupeSentinel(u8, target, 0);
     defer allocator.free(target_z);
 
     if (try existingPathKind(target_z.ptr, .owned_stat, diag) != .directory) return false;
 
     const backing = try std.fs.path.join(allocator, &.{ root, owned_backing_name });
     defer allocator.free(backing);
-    const backing_z = try allocator.dupeZ(u8, backing);
+    const backing_z = try allocator.dupeSentinel(u8, backing, 0);
     defer allocator.free(backing_z);
     try makeDir(backing_z.ptr, diag);
 
     var options_buffer: [32]u8 = undefined;
-    const options = std.fmt.bufPrintZ(&options_buffer, "size={d}", .{owned_backing_bytes}) catch
+    const options = std.fmt.bufPrintSentinel(&options_buffer, "size={d}", .{owned_backing_bytes}, 0) catch
         return error.Unexpected;
     try mountCall(
         "tmpfs",
@@ -1106,13 +1106,13 @@ pub fn ownDirectory(
 
     const upper = try std.fs.path.join(allocator, &.{ backing, "upper" });
     defer allocator.free(upper);
-    const upper_z = try allocator.dupeZ(u8, upper);
+    const upper_z = try allocator.dupeSentinel(u8, upper, 0);
     defer allocator.free(upper_z);
     try makeDir(upper_z.ptr, diag);
 
     const work = try std.fs.path.join(allocator, &.{ backing, "work" });
     defer allocator.free(work);
-    const work_z = try allocator.dupeZ(u8, work);
+    const work_z = try allocator.dupeSentinel(u8, work, 0);
     defer allocator.free(work_z);
     try makeDir(work_z.ptr, diag);
 
@@ -1126,7 +1126,7 @@ pub fn ownDirectory(
     for (owned.remove) |name| {
         const path = try std.fs.path.join(allocator, &.{ root, name });
         defer allocator.free(path);
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
         switch (linux.errno(linux.unlinkat(linux.AT.FDCWD, path_z.ptr, 0))) {
             .SUCCESS, .NOENT, .NOTDIR => {},
@@ -1147,7 +1147,7 @@ fn maskProcEntries(allocator: std.mem.Allocator, root: []const u8, proc_target: 
     const source = try std.fs.path.join(allocator, &.{ root, proc_mask_source_name });
     defer allocator.free(source);
 
-    const source_z = try allocator.dupeZ(u8, source);
+    const source_z = try allocator.dupeSentinel(u8, source, 0);
     defer allocator.free(source_z);
     try makeEmptyFile(source_z.ptr, diag);
     defer _ = linux.unlinkat(linux.AT.FDCWD, source_z.ptr, 0);
@@ -1156,7 +1156,7 @@ fn maskProcEntries(allocator: std.mem.Allocator, root: []const u8, proc_target: 
         const target = try std.fs.path.join(allocator, &.{ proc_target, name });
         defer allocator.free(target);
 
-        const target_z = try allocator.dupeZ(u8, target);
+        const target_z = try allocator.dupeSentinel(u8, target, 0);
         defer allocator.free(target_z);
 
         switch (try existingPathKind(target_z.ptr, .proc_entry_stat, diag)) {
@@ -1225,7 +1225,7 @@ pub fn mountOverlay(allocator: std.mem.Allocator, o: Mount.Overlay, diag: ?*?Dia
     ) catch return error.OutOfMemory;
     defer allocator.free(options);
 
-    const target_z = try allocator.dupeZ(u8, o.target);
+    const target_z = try allocator.dupeSentinel(u8, o.target, 0);
     defer allocator.free(target_z);
 
     const rc = linux.mount("overlay", target_z, "overlay", 0, @intFromPtr(options.ptr));
@@ -1255,7 +1255,7 @@ pub fn mountScratch(
 
     var options_buffer: [32]u8 = undefined;
     const options: [:0]const u8 = if (size_bytes) |bytes|
-        std.fmt.bufPrintZ(&options_buffer, "size={d}", .{bytes}) catch return error.Unexpected
+        std.fmt.bufPrintSentinel(&options_buffer, "size={d}", .{bytes}, 0) catch return error.Unexpected
     else
         "";
 
@@ -1378,7 +1378,7 @@ fn makePath(allocator: std.mem.Allocator, path: []const u8, kind: PathKind, diag
     while (i <= path.len) : (i += 1) {
         if (i < path.len and path[i] != '/') continue;
 
-        const prefix = try allocator.dupeZ(u8, path[0..i]);
+        const prefix = try allocator.dupeSentinel(u8, path[0..i], 0);
         defer allocator.free(prefix);
 
         const is_leaf = i == path.len;
@@ -1439,9 +1439,9 @@ pub fn pivotInto(allocator: std.mem.Allocator, root: []const u8, diag: ?*?Diagno
     defer allocator.free(old);
     try makePath(allocator, old, .directory, diag);
 
-    const root_z = try allocator.dupeZ(u8, root);
+    const root_z = try allocator.dupeSentinel(u8, root, 0);
     defer allocator.free(root_z);
-    const old_z = try allocator.dupeZ(u8, old);
+    const old_z = try allocator.dupeSentinel(u8, old, 0);
     defer allocator.free(old_z);
 
     switch (linux.errno(linux.pivot_root(root_z, old_z))) {

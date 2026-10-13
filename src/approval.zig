@@ -1189,8 +1189,8 @@ test "an answer longer than the buffer is a refusal, not a wait" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const filler = "x" ** max_answer_bytes;
-    const lines = [_][]const u8{filler};
+    const filler = @as([max_answer_bytes]u8, @splat('x'));
+    const lines = [_][]const u8{&filler};
     var console = FakeConsole{
         .gpa = gpa,
         .replies = &.{.{ .bytes = 0 }},

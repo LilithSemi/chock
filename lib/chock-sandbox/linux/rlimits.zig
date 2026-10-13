@@ -363,9 +363,9 @@ test "apply really sets the limits, in a forked child that cannot take this proc
         std.process.exit(if (ok) 0 else 1);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     const wait_rc = linux.waitpid(pid, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
-    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(status)));
 }

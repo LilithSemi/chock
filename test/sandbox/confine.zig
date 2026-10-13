@@ -29,7 +29,7 @@ fn absoluteDirPath(buffer: []u8, dir_fd: i32) ![:0]u8 {
         return buffer[0..len :0];
     }
     var link_buffer: [64]u8 = undefined;
-    const link = std.fmt.bufPrintZ(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}) catch unreachable;
+    const link = std.fmt.bufPrintSentinel(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}, 0) catch unreachable;
     const rc = linux.readlink(link, buffer.ptr, buffer.len);
     if (linux.errno(rc) != .SUCCESS) return error.ReadlinkFailed;
     const len: usize = @intCast(rc);
@@ -177,11 +177,11 @@ fn waitFor(pid: i32) ?u32 {
         }
         return @bitCast(status);
     }
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var rc = linux.waitpid(@intCast(pid), &status, 0);
     while (linux.errno(rc) == .INTR) rc = linux.waitpid(@intCast(pid), &status, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
-    return status;
+    return @bitCast(status);
 }
 
 /// The signal that ended the child, as a number, or null when nothing did.
@@ -190,8 +190,8 @@ fn killedBy(status: u32) ?u32 {
         if (!std.c.W.IFSIGNALED(status)) return null;
         return @intFromEnum(std.c.W.TERMSIG(status));
     }
-    if (!linux.W.IFSIGNALED(status)) return null;
-    return @intFromEnum(linux.W.TERMSIG(status));
+    if (!linux.W.IFSIGNALED(@bitCast(status))) return null;
+    return @intFromEnum(linux.W.TERMSIG(@bitCast(status)));
 }
 
 fn exitedWith(status: u32) ?u8 {
@@ -199,8 +199,8 @@ fn exitedWith(status: u32) ?u8 {
         if (!std.c.W.IFEXITED(status)) return null;
         return std.c.W.EXITSTATUS(status);
     }
-    if (linux.W.IFSIGNALED(status)) return null;
-    return linux.W.EXITSTATUS(status);
+    if (linux.W.IFSIGNALED(@bitCast(status))) return null;
+    return linux.W.EXITSTATUS(@bitCast(status));
 }
 
 test "a confined VMM cannot run a program, reach a path outside its shares, or write into a read-only one" {
@@ -245,7 +245,7 @@ test "a confined VMM cannot run a program, reach a path outside its shares, or w
         const outside = readsDirectory("/etc");
 
         var probe_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const probe_path = std.fmt.bufPrintZ(&probe_buffer, "{s}/probe", .{ro_share_path}) catch unreachable;
+        const probe_path = std.fmt.bufPrintSentinel(&probe_buffer, "{s}/probe", .{ro_share_path}, 0) catch unreachable;
         const ro_write = makesFile(probe_path);
 
         const fs_held = inside and !outside and !ro_write;

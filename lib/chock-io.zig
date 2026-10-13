@@ -89,7 +89,7 @@ test "the real driver reads free space, and answers nothing for a path that is n
     try std.testing.expect(free.? > 0);
 
     try std.testing.expectEqual(@as(?u64, null), driver.freeBytes("/nonexistent-chock-free-space"));
-    const too_long = [_]u8{'a'} ** (std.fs.max_path_bytes + 1);
+    const too_long = @as([(std.fs.max_path_bytes + 1)]u8, @splat('a'));
     try std.testing.expectEqual(@as(?u64, null), driver.freeBytes(&too_long));
 }
 

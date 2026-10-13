@@ -99,12 +99,12 @@ pub const Boundary = enum {
     }
 };
 
-pub const boundary_count = @typeInfo(Boundary).@"enum".fields.len;
+pub const boundary_count = @typeInfo(Boundary).@"enum".field_names.len;
 
 pub const all_boundaries: [boundary_count]Boundary = blk: {
     var out: [boundary_count]Boundary = undefined;
-    for (@typeInfo(Boundary).@"enum".fields, 0..) |field, index| {
-        out[index] = @field(Boundary, field.name);
+    for (@typeInfo(Boundary).@"enum".field_names, 0..) |field_name, index| {
+        out[index] = @field(Boundary, field_name);
     }
     break :blk out;
 };

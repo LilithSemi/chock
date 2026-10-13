@@ -32,7 +32,6 @@ pub const cache = @import("chock-core/cache.zig");
 
 pub const credentials = @import("chock-core/credentials.zig");
 pub const tool_secrets = @import("chock-core/tool_secrets.zig");
-pub const packages = @import("chock-core/packages.zig");
 pub const scratchpad = @import("chock-core/scratchpad.zig");
 pub const tasks = @import("chock-core/tasks.zig");
 pub const subagent = @import("chock-core/subagent.zig");

@@ -92,9 +92,9 @@ fn cloneTree(
     destination: []const u8,
     diag: ?*?Diagnostic,
 ) Error!void {
-    const source_z = allocator.dupeZ(u8, source) catch return error.OutOfMemory;
+    const source_z = allocator.dupeSentinel(u8, source, 0) catch return error.OutOfMemory;
     defer allocator.free(source_z);
-    const destination_z = allocator.dupeZ(u8, destination) catch return error.OutOfMemory;
+    const destination_z = allocator.dupeSentinel(u8, destination, 0) catch return error.OutOfMemory;
     defer allocator.free(destination_z);
 
     const result = clonefile(source_z.ptr, destination_z.ptr, 0);
@@ -486,7 +486,7 @@ pub fn nestedMounts(
 }
 
 fn deviceOf(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?Diagnostic) Error!i32 {
-    const path_z = allocator.dupeZ(u8, absolute_path) catch return error.OutOfMemory;
+    const path_z = allocator.dupeSentinel(u8, absolute_path, 0) catch return error.OutOfMemory;
     defer allocator.free(path_z);
 
     var stat: DeviceStat = undefined;

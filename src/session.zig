@@ -506,30 +506,30 @@ test "a session identifier sorts by the time it was made, so the newest is the l
 }
 
 test "the time an identifier carries reads back out of it, and the random half does not change it" {
-    try testing.expectEqual(@as(u64, 0), startedMs("0000000000" ++ "A" ** 16));
-    try testing.expectEqual(@as(u64, 1), startedMs("0000000001" ++ "A" ** 16));
-    try testing.expectEqual(@as(u64, 1755000000000), startedMs("01K2F2DKG0" ++ "A" ** 16));
+    try testing.expectEqual(@as(u64, 0), startedMs("0000000000" ++ @as([16]u8, @splat('A'))));
+    try testing.expectEqual(@as(u64, 1), startedMs("0000000001" ++ @as([16]u8, @splat('A'))));
+    try testing.expectEqual(@as(u64, 1755000000000), startedMs("01K2F2DKG0" ++ @as([16]u8, @splat('A'))));
 
-    try testing.expectEqual(@as(u64, (1 << 50) - 1), startedMs("ZZZZZZZZZZ" ++ "A" ** 16));
-    try testing.expectEqual(@as(u64, 1 << 45), startedMs("1000000000" ++ "A" ** 16));
-    try testing.expectEqual(@as(u64, 31), startedMs("000000000Z" ++ "A" ** 16));
+    try testing.expectEqual(@as(u64, (1 << 50) - 1), startedMs("ZZZZZZZZZZ" ++ @as([16]u8, @splat('A'))));
+    try testing.expectEqual(@as(u64, 1 << 45), startedMs("1000000000" ++ @as([16]u8, @splat('A'))));
+    try testing.expectEqual(@as(u64, 31), startedMs("000000000Z" ++ @as([16]u8, @splat('A'))));
 
-    const one = "01K2F2DKG0" ++ "A" ** 16;
-    const other = "01K2F2DKG0" ++ "Z" ** 16;
+    const one = "01K2F2DKG0" ++ @as([16]u8, @splat('A'));
+    const other = "01K2F2DKG0" ++ @as([16]u8, @splat('Z'));
     try testing.expect(!std.mem.eql(u8, one, other));
     try testing.expectEqual(startedMs(one), startedMs(other));
 
-    try testing.expectEqual(std.math.Order.lt, std.mem.order(u8, one, "01K3CW3600" ++ "A" ** 16));
-    try testing.expect(startedMs(one) < startedMs("01K3CW3600" ++ "A" ** 16));
+    try testing.expectEqual(std.math.Order.lt, std.mem.order(u8, one, "01K3CW3600" ++ @as([16]u8, @splat('A'))));
+    try testing.expect(startedMs(one) < startedMs("01K3CW3600" ++ @as([16]u8, @splat('A'))));
 }
 
 test "an identifier that is not one this build made is refused before it reaches a path" {
     try testing.expect(!isValidId(""));
     try testing.expect(!isValidId("../../../etc/passwd"));
     try testing.expect(!isValidId("01JQ")); // too short
-    try testing.expect(!isValidId("01JQ" ++ "A" ** 30)); // too long
+    try testing.expect(!isValidId("01JQ" ++ @as([30]u8, @splat('A')))); // too long
     try testing.expect(!isValidId("01JQIIIIIIIIIIIIIIIIIIIIII"));
-    try testing.expect(isValidId("01JQ" ++ "A" ** 22));
+    try testing.expect(isValidId("01JQ" ++ @as([22]u8, @splat('A'))));
 }
 
 test "a project key carries the project's own name and a hash, so two projects of one name differ" {
@@ -644,7 +644,7 @@ test "a session log goes under the state directory and never beside the credenti
     defer env.deinit();
     try env.put("HOME", "/home/somebody");
 
-    var paths = try pathsFor(gpa, &env, "/home/somebody/work/parser", "01JQ" ++ "A" ** 22);
+    var paths = try pathsFor(gpa, &env, "/home/somebody/work/parser", "01JQ" ++ @as([22]u8, @splat('A')));
     defer paths.deinit();
 
     const data = try chock_auth.paths.dataDir(gpa, &env);
@@ -668,8 +668,8 @@ test "a scratchpad is in the temp directory, keyed by session, and never beside 
     try env.put("TMPDIR", "/tmp/nix-shell.qHnEsN");
 
     const project = "/home/somebody/work/parser";
-    const first_id = "01JQ" ++ "A" ** 22;
-    const second_id = "01JQ" ++ "B" ** 22;
+    const first_id = "01JQ" ++ @as([22]u8, @splat('A'));
+    const second_id = "01JQ" ++ @as([22]u8, @splat('B'));
 
     const first = try scratchpadDir(gpa, &env, first_id);
     defer gpa.free(first);
@@ -712,7 +712,7 @@ test "a project is listed by the path its marker names, and by its directory whe
     try env.put("XDG_STATE_HOME", state);
 
     const project = "/home/somebody/work/parser";
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
 
     var paths = try pathsFor(gpa, &env, project, id);
     defer paths.deinit();
@@ -774,7 +774,7 @@ test "a recovered project is only taken when hashing it gives the directory back
     try env.put("XDG_STATE_HOME", state);
 
     const project = "/home/somebody/work/parser";
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
 
     var paths = try pathsFor(gpa, &env, project, id);
     defer paths.deinit();

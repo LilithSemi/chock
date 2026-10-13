@@ -989,9 +989,9 @@ test "serializeInto refuses a buffer one byte short" {
 }
 
 test "serialize refuses a record parse would refuse" {
-    const long = "x" ** (max_string_bytes + 1);
+    const long = @as([(max_string_bytes + 1)]u8, @splat('x'));
     const oversized: Metadata = .{
-        .name = long,
+        .name = &long,
         .version = .{ .major = 0, .minor = 0, .patch = 1 },
         .chock_version = .{ .min = .{ .major = 0, .minor = 1, .patch = 0 } },
         .author = "a",

@@ -70,7 +70,13 @@ pub const Diagnostic = union(enum) {
 
     pub const NotValid = struct {
         path: []const u8,
-        zon: std.zon.parse.Diagnostics,
+        zon: ZonFailure,
+    };
+
+    /// `arena` backs `zon`'s messages and must outlive it; `deinit` frees both together.
+    pub const ZonFailure = struct {
+        arena: std.heap.ArenaAllocator,
+        diag: std.zon.parse.Diagnostics,
     };
 
     pub const NoValueForName = struct {
@@ -130,7 +136,7 @@ pub const Diagnostic = union(enum) {
             .credential_file_readable_by_others => |failure| gpa.free(failure.path),
             .index_not_valid => |*failure| {
                 gpa.free(failure.path);
-                failure.zon.deinit(gpa);
+                failure.zon.arena.deinit();
             },
             .no_value_for_name => |names| {
                 gpa.free(names.name);
@@ -164,7 +170,7 @@ pub const Diagnostic = union(enum) {
             ),
             .index_not_valid => |*failure| try writer.print(
                 "{s} is not valid:\n{f}",
-                .{ failure.path, &failure.zon },
+                .{ failure.path, failure.zon.diag.fmt(failure.path) },
             ),
             .no_value_for_name => |names| try writer.print(
                 "the credential store names the instance {s} and holds no value for it. " ++
@@ -508,10 +514,18 @@ pub const Store = struct {
         };
         defer gpa.free(source);
 
-        var diagnostics: std.zon.parse.Diagnostics = .{};
-        var diagnostics_owned = true;
-        defer if (diagnostics_owned) diagnostics.deinit(gpa);
-        const file = std.zon.parse.fromSliceAlloc(IndexFile, gpa, source, &diagnostics, .{
+        // The arena backs the parsed file and its diagnostics; `note` takes
+        // it over on a fault, otherwise the `Index` keeps it.
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        var arena_owned = true;
+        errdefer if (arena_owned) arena.deinit();
+
+        var diagnostics: std.zon.parse.Diagnostics = undefined;
+        const file = std.zon.parse.fromSlice(IndexFile, .{
+            .gpa = gpa,
+            .arena = arena.allocator(),
+            .source = source,
+            .diagnostics = &diagnostics,
             .ignore_unknown_fields = true,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -520,9 +534,9 @@ pub const Store = struct {
                     const path_copy = try gpa.dupe(u8, path);
                     if (note(diag, .{ .index_not_valid = .{
                         .path = path_copy,
-                        .zon = diagnostics,
+                        .zon = .{ .arena = arena, .diag = diagnostics },
                     } })) {
-                        diagnostics_owned = false;
+                        arena_owned = false;
                     } else {
                         gpa.free(path_copy);
                     }
@@ -530,7 +544,7 @@ pub const Store = struct {
                 return error.StoreCorrupt;
             },
         };
-        return .{ .file = file, .owned = true };
+        return .{ .file = file, .arena = arena };
     }
 
     fn writeIndex(
@@ -590,10 +604,12 @@ pub fn serializeZon(gpa: std.mem.Allocator, value: anytype) Error![]u8 {
 
 const Index = struct {
     file: IndexFile,
-    owned: bool = false,
+    /// Set only when `file`'s slices were parsed, not defaulted; backs them.
+    arena: ?std.heap.ArenaAllocator = null,
 
     fn deinit(self: *Index, gpa: std.mem.Allocator) void {
-        if (self.owned) std.zon.parse.free(gpa, self.file);
+        _ = gpa;
+        if (self.arena) |*a| a.deinit();
         self.* = undefined;
     }
 

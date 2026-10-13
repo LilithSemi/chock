@@ -662,7 +662,7 @@ test "a message that is not the size of a request is refused before it is read" 
     defer _ = linux.close(pair[1]);
 
     var stub = StubSeam{ .address = .{ .ipv4 = .{ 93, 184, 216, 34 } } };
-    const short = [_]u8{0} ** 8;
+    const short = @as([8]u8, @splat(0));
     const rc = linux.sendto(pair[1], &short, short.len, linux.MSG.NOSIGNAL, null, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
     try testing.expectEqual(Outcome.served, serveOne(pair[0], stub.seam()));
@@ -699,7 +699,7 @@ test "an open carries the address and the port, and a descriptor comes back" {
         .family = .ipv4,
         .host_len = 0,
         .port = 443,
-        .address = [_]u8{ 93, 184, 216, 34 } ++ [_]u8{0} ** 12,
+        .address = [_]u8{ 93, 184, 216, 34 } ++ @as([12]u8, @splat(0)),
     });
     try testing.expectEqual(Outcome.served, serveOne(pair[0], stub.seam()));
 
@@ -728,7 +728,7 @@ test "a refusal carries no descriptor and no address" {
         .family = .ipv4,
         .host_len = 0,
         .port = 443,
-        .address = [_]u8{ 93, 184, 216, 34 } ++ [_]u8{0} ** 12,
+        .address = [_]u8{ 93, 184, 216, 34 } ++ @as([12]u8, @splat(0)),
     });
     try testing.expectEqual(Outcome.served, serveOne(pair[0], stub.seam()));
     try testing.expectEqual(@as(usize, 1), stub.opens);

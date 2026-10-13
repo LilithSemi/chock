@@ -158,8 +158,8 @@ fn keyOf(entry: []const u8) []const u8 {
 }
 
 comptime {
-    for (@typeInfo(Grant).@"struct".fields) |field| {
-        const name = field.name;
+    for (@typeInfo(Grant).@"struct".field_names, @typeInfo(Grant).@"struct".field_types) |field_name, _| {
+        const name = field_name;
         if (std.mem.indexOf(u8, name, "secret") != null or
             std.mem.indexOf(u8, name, "password") != null or
             std.mem.indexOf(u8, name, "token") != null or

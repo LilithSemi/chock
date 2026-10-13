@@ -108,7 +108,7 @@ fn applyOp(allocator: std.mem.Allocator, merged: []const u8, op: []const u8) OpE
 }
 
 fn writeFileRaw(allocator: std.mem.Allocator, path: []const u8, contents: []const u8) OpError!void {
-    const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.OutOfMemory;
     const fd_rc = linux.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     if (linux.errno(fd_rc) != .SUCCESS) return error.OpFailed;
     const fd: i32 = @intCast(fd_rc);
@@ -119,27 +119,27 @@ fn writeFileRaw(allocator: std.mem.Allocator, path: []const u8, contents: []cons
 }
 
 fn deleteFileRaw(allocator: std.mem.Allocator, path: []const u8) OpError!void {
-    const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.OutOfMemory;
     if (linux.errno(linux.unlink(path_z.ptr)) != .SUCCESS) return error.OpFailed;
 }
 
 fn symlinkRaw(allocator: std.mem.Allocator, link_target: []const u8, link_path: []const u8) OpError!void {
-    const target_z = allocator.dupeZ(u8, link_target) catch return error.OutOfMemory;
-    const path_z = allocator.dupeZ(u8, link_path) catch return error.OutOfMemory;
+    const target_z = allocator.dupeSentinel(u8, link_target, 0) catch return error.OutOfMemory;
+    const path_z = allocator.dupeSentinel(u8, link_path, 0) catch return error.OutOfMemory;
     if (linux.errno(linux.symlink(target_z.ptr, path_z.ptr)) != .SUCCESS) return error.OpFailed;
 }
 
 fn mkdirRaw(allocator: std.mem.Allocator, path: []const u8) OpError!void {
-    const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.OutOfMemory;
     if (linux.errno(linux.mkdir(path_z.ptr, 0o755)) != .SUCCESS) return error.OpFailed;
 }
 
 fn mkfifoRaw(allocator: std.mem.Allocator, path: []const u8) OpError!void {
-    const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.OutOfMemory;
     if (linux.errno(linux.mknod(path_z.ptr, linux.S.IFIFO | 0o644, 0)) != .SUCCESS) return error.OpFailed;
 }
 
 fn rmdirRaw(allocator: std.mem.Allocator, path: []const u8) OpError!void {
-    const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.OutOfMemory;
     if (linux.errno(linux.rmdir(path_z.ptr)) != .SUCCESS) return error.OpFailed;
 }

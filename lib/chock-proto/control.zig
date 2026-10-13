@@ -787,7 +787,7 @@ test "an address that is not one is refused by name and never guessed at" {
 test "a client can decide exactly two things, and neither of them is the policy's" {
     try testing.expectEqual(@as(usize, 2), std.enums.values(Answer).len);
 
-    var reached = std.EnumSet(std.meta.Tag(event.ApprovalDecision)).initEmpty();
+    var reached = std.EnumSet(std.meta.Tag(event.ApprovalDecision)).empty;
     for (std.enums.values(Answer)) |one| reached.insert(std.meta.activeTag(one.decision()));
     try testing.expect(reached.contains(.approved_by_user));
     try testing.expect(reached.contains(.refused_by_user));
@@ -796,10 +796,10 @@ test "a client can decide exactly two things, and neither of them is the policy'
     try testing.expect(!reached.contains(.unknown));
     try testing.expectEqual(@as(usize, 2), reached.count());
 
-    inline for (@typeInfo(event.ApprovalDecision).@"union".fields) |one| {
-        const permitted = std.mem.eql(u8, one.name, "approved_by_user") or
-            std.mem.eql(u8, one.name, "refused_by_user");
-        if (!permitted) try testing.expect(Answer.parse(one.name) == null);
+    inline for (@typeInfo(event.ApprovalDecision).@"union".field_names, @typeInfo(event.ApprovalDecision).@"union".field_types) |one_name, _| {
+        const permitted = std.mem.eql(u8, one_name, "approved_by_user") or
+            std.mem.eql(u8, one_name, "refused_by_user");
+        if (!permitted) try testing.expect(Answer.parse(one_name) == null);
     }
 }
 
@@ -820,12 +820,12 @@ test "the only words a client can put in an answer are yes and no" {
 
     try testing.expectError(
         error.BadArguments,
-        Request.parse("answer /p\t01JQ" ++ "A" ** 22 ++ "\t128\tallowed_by_policy"),
+        Request.parse("answer /p\t01JQ" ++ @as([22]u8, @splat('A')) ++ "\t128\tallowed_by_policy"),
     );
 }
 
 test "every verb round trips from a request to a line and back" {
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     const requests = [_]Request{
         .{ .start = .{ .project = "/home/ross/chock", .message = "fix the parser please" } },
         .{ .adopt = .{ .project = "/home/ross/chock", .session = id } },
@@ -845,7 +845,7 @@ test "every verb round trips from a request to a line and back" {
         .{ .answer = .{ .project = "/home/ross/chock", .session = id, .request_id = 9, .decision = .no } },
     };
 
-    var seen = std.EnumSet(Verb).initEmpty();
+    var seen = std.EnumSet(Verb).empty;
     for (requests) |one| {
         seen.insert(std.meta.activeTag(one));
 
@@ -924,7 +924,7 @@ test "a listing row survives a daemon that grew a field and a client that has no
     const gpa = testing.allocator;
 
     const row = SessionRow{
-        .id = "01JQ" ++ "A" ** 22,
+        .id = "01JQ" ++ @as([22]u8, @splat('A')),
         .started_ms = 1_700_000_000_000,
         .model = "claude-opus-5",
         .model_alias = "main",
@@ -996,7 +996,7 @@ test "an exchange sends one line and reads every line back, and stops when told"
     var said: Handshake = .{ .unreadable = "" };
     try exchange(&reader, &writer, .{ .watch = .{
         .project = "/p",
-        .session = "01JQ" ++ "A" ** 22,
+        .session = "01JQ" ++ @as([22]u8, @splat('A')),
         .after = 0,
     } }, &said, &all, Collected.take);
 
@@ -1219,9 +1219,9 @@ test "a daemon that is not running is a plain refusal that names what to do" {
         try testing.expect(std.mem.indexOf(u8, said, "--host") != null);
     }
 
-    inline for (@typeInfo(Address.ConnectError).error_set.?) |one| {
+    inline for (@typeInfo(Address.ConnectError).error_set.error_names.?) |one| {
         var writer = std.Io.Writer.fixed(&buffer);
-        const err = @field(Address.ConnectError, one.name);
+        const err = @field(Address.ConnectError, one);
         try refusalFor(&writer, .{ .ip = .{ .host = "127.0.0.1", .port = 7373 } }, err);
         try testing.expect(std.mem.indexOf(u8, writer.buffered(), "127.0.0.1:7373") != null);
         try testing.expect(writer.buffered().len > 20);

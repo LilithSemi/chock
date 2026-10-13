@@ -1,6 +1,7 @@
 //! The `budget` block: session cost ceiling.
 
 const std = @import("std");
+const chock_zon = @import("chock-zon");
 
 pub const file_name = "chock.zon";
 pub const max_file_bytes = 1 << 20;
@@ -34,14 +35,20 @@ pub const CeilingError = error{
 };
 
 pub const Diagnostic = union(enum) {
-    file_not_zon: std.zon.parse.Diagnostics,
-    block_not_valid: std.zon.parse.Diagnostics,
+    file_not_zon: ZonFailure,
+    block_not_valid: ZonFailure,
     not_a_struct_literal,
     max_cost_not_positive: f64,
     file_too_large: usize,
     read_failed: anyerror,
     above_org_ceiling: Ceilinged,
     currency_differs_from_ceiling: Currencies,
+
+    /// `arena` backs `diag`'s messages and must outlive it; `deinit` frees both together.
+    pub const ZonFailure = struct {
+        arena: std.heap.ArenaAllocator,
+        diag: std.zon.parse.Diagnostics,
+    };
 
     pub const Ceilinged = struct {
         asked: f64,
@@ -57,8 +64,9 @@ pub const Diagnostic = union(enum) {
     };
 
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
+        _ = gpa;
         switch (self.*) {
-            .file_not_zon, .block_not_valid => |*zon_diag| zon_diag.deinit(gpa),
+            .file_not_zon, .block_not_valid => |*zf| zf.arena.deinit(),
             else => {},
         }
         self.* = undefined;
@@ -66,13 +74,13 @@ pub const Diagnostic = union(enum) {
 
     pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.*) {
-            .file_not_zon => |*zon_diag| try writer.print(
+            .file_not_zon => |*zf| try writer.print(
                 "{s} is not valid:\n{f}",
-                .{ file_name, zon_diag },
+                .{ file_name, zf.diag.fmt(file_name) },
             ),
-            .block_not_valid => |*zon_diag| try writer.print(
+            .block_not_valid => |*zf| try writer.print(
                 "{s}: the budget block is not valid:\n{f}",
-                .{ file_name, zon_diag },
+                .{ file_name, zf.diag.fmt(file_name) },
             ),
             .not_a_struct_literal => try writer.print(
                 "{s}: the file must hold a struct literal",
@@ -108,8 +116,8 @@ pub const Diagnostic = union(enum) {
     }
 };
 
-/// A site that hands over a `std.zon.parse.Diagnostics` must release it
-/// itself when the answer is false, or the trees leak.
+/// A site that hands over a `Diagnostic.ZonFailure` must release its arena
+/// itself when the answer is false, or it leaks.
 fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     const slot = out orelse return false;
     if (slot.* != null) return false;
@@ -120,51 +128,52 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
 /// The returned `Budget` owns its `currency` string, released by `free`.
 /// A given `diag` must be released with `Diagnostic.deinit`.
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) ParseError!?Budget {
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+    var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    var ast_owned = true;
-    defer if (ast_owned) ast.deinit(gpa);
+    defer ast.deinit(gpa);
 
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
-    var zoir_owned = true;
-    defer if (zoir_owned) zoir.deinit(gpa);
+    defer zoir.deinit(gpa);
+
+    // The arena backs the parsed value and the diagnostics; `note` takes it
+    // over on a fault, otherwise it is released here.
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    var arena_owned = true;
+    defer if (arena_owned) arena.deinit();
 
     if (zoir.hasCompileErrors()) {
-        // The two trees carry the message, line and column, and
-        // `std.zon.parse.Diagnostics` owns both from this point.
-        if (note(diag, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
-            ast_owned = false;
-            zoir_owned = false;
-        }
+        var zon_diag: std.zon.parse.Diagnostics = undefined;
+        _ = std.zon.parse.fromZoir(WireBudget, .{
+            .arena = arena.allocator(),
+            .ast = &ast,
+            .zoir = &zoir,
+            .diagnostics = &zon_diag,
+        }) catch {};
+        if (note(diag, .{ .file_not_zon = .{ .arena = arena, .diag = zon_diag } })) arena_owned = false;
         return error.InvalidBudget;
     }
 
     const node = try findBudgetNode(zoir, diag) orelse return null;
 
-    var zon_diag: std.zon.parse.Diagnostics = .{};
-    // From here the diagnostics own the two trees.
-    ast_owned = false;
-    zoir_owned = false;
-    var zon_diag_owned = true;
-    defer if (zon_diag_owned) zon_diag.deinit(gpa);
-
-    const wire = std.zon.parse.fromZoirNodeAlloc(
+    var zon_diag: std.zon.parse.Diagnostics = undefined;
+    const wire = chock_zon.fromNode(
         WireBudget,
         gpa,
-        ast,
-        zoir,
+        arena.allocator(),
+        source,
+        &ast,
+        &zoir,
         node,
         &zon_diag,
         .{},
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => {
-            if (note(diag, .{ .block_not_valid = zon_diag })) zon_diag_owned = false;
+            if (note(diag, .{ .block_not_valid = .{ .arena = arena, .diag = zon_diag } })) arena_owned = false;
             return error.InvalidBudget;
         },
     };
-    defer std.zon.parse.free(gpa, wire);
 
     if (!(wire.max_cost > 0) or !std.math.isFinite(wire.max_cost)) {
         _ = note(diag, .{ .max_cost_not_positive = wire.max_cost });
@@ -247,10 +256,10 @@ pub fn load(
 
 fn findBudgetNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), "budget")) {
+                if (std.mem.eql(u8, name.get(&zoir), "budget")) {
                     return fields.vals.at(@intCast(index));
                 }
             }
@@ -338,7 +347,9 @@ test "a misspelled field names its line and column, and the trees behind it are 
     var buffer: [512]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{f}", .{&diag.?});
     try testing.expect(std.mem.startsWith(u8, line, "chock.zon: the budget block is not valid:\n"));
-    try testing.expect(std.mem.indexOf(u8, line, "1:18: error:") != null);
+    // Relative to the block's own cut text, not to chock.zon as a whole:
+    // see chock-zon.zig's own note on `fromNode`.
+    try testing.expect(std.mem.indexOf(u8, line, "1:5: error:") != null);
     try testing.expect(std.mem.indexOf(u8, line, "max_cst") != null);
 }
 

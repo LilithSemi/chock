@@ -653,7 +653,7 @@ test "what the server said about a refusal reaches the caller" {
 
 test "a refusal longer than the bound is cut rather than carried whole" {
     const gpa = testing.allocator;
-    const long = "x" ** (max_refusal_bytes + 200);
+    const long = @as([(max_refusal_bytes + 200)]u8, @splat('x'));
     const body = try std.fmt.allocPrint(
         gpa,
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32000,\"message\":\"{s}\"}}}}",

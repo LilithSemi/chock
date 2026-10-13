@@ -985,7 +985,7 @@ test "a schema is asked for in the task the child reads, and prose asks for noth
 test "the reason is one short line of the task, and a task with no newline still gives one" {
     try testing.expectEqualStrings("review the parser", reasonFor("review the parser\nand say why"));
     try testing.expectEqualStrings("review the parser", reasonFor("  review the parser  "));
-    try testing.expectEqual(max_reason_bytes, reasonFor("x" ** 400).len);
+    try testing.expectEqual(max_reason_bytes, reasonFor(&@as([400]u8, @splat('x'))).len);
 }
 
 test "a child's directory is inside its parent's scratchpad and cannot climb out of it" {

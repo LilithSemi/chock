@@ -707,7 +707,7 @@ test "a field past the spec's bound is refused, and the refusal does not quote t
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const long = "a" ** (max_description_bytes + 1);
+    const long = @as([(max_description_bytes + 1)]u8, @splat('a'));
     const document = try std.fmt.allocPrint(
         arena,
         "---\nname: a\ndescription: {s}\n---\n",
@@ -717,7 +717,7 @@ test "a field past the spec's bound is refused, and the refusal does not quote t
     try testing.expectEqual(Fault.description_too_long, read_it.refused.fault);
     try testing.expect(read_it.refused.detail.len < max_detail_bytes + 8);
 
-    const wide = "b" ** (max_name_bytes + 1);
+    const wide = @as([(max_name_bytes + 1)]u8, @splat('b'));
     const named = try std.fmt.allocPrint(arena, "---\nname: {s}\ndescription: d\n---\n", .{wide});
     const second = try parse(arena, .operator, "/skills/a", named);
     try testing.expectEqual(Fault.name_too_long, second.refused.fault);
@@ -738,12 +738,12 @@ test "allowed-tools is kept verbatim and is never split into anything" {
     const read_it = try parse(arena, .project, "/repo/skills/a", document);
     try testing.expectEqualStrings("Bash(git:*) Bash(jq:*) Read", read_it.skill.allowed_tools.?);
 
-    const fields = @typeInfo(Skill).@"struct".fields;
+    const fields = @typeInfo(Skill).@"struct".field_names;
     inline for (fields) |field| {
-        try testing.expect(std.mem.indexOf(u8, field.name, "allow") == null or
-            std.mem.eql(u8, field.name, "allowed_tools"));
-        try testing.expect(std.mem.indexOf(u8, field.name, "permit") == null);
-        try testing.expect(std.mem.indexOf(u8, field.name, "grant") == null);
+        try testing.expect(std.mem.indexOf(u8, field, "allow") == null or
+            std.mem.eql(u8, field, "allowed_tools"));
+        try testing.expect(std.mem.indexOf(u8, field, "permit") == null);
+        try testing.expect(std.mem.indexOf(u8, field, "grant") == null);
     }
 }
 
@@ -752,8 +752,8 @@ test "the action name is per layer, so no skill can put a name of its own in the
     try testing.expectEqualStrings("skill.read.project", Layer.project.actionName());
     try testing.expectEqualStrings("skill.read.packaged", Layer.packaged.actionName());
 
-    inline for (@typeInfo(Layer).@"enum".fields) |field| {
-        const layer = @field(Layer, field.name);
+    inline for (@typeInfo(Layer).@"enum".field_names, @typeInfo(Layer).@"enum".field_values) |field_name, _| {
+        const layer = @field(Layer, field_name);
         try testing.expect(std.mem.startsWith(u8, layer.actionName(), "skill.read."));
         try testing.expect(layer.wroteIt().len != 0);
     }
@@ -1067,8 +1067,8 @@ test "a walk that stops partway says so rather than reporting the skills it did 
 }
 
 test "a heading says who wrote the layer's skills, and never disagrees with wroteIt" {
-    inline for (@typeInfo(Layer).@"enum".fields) |field| {
-        const layer = @field(Layer, field.name);
+    inline for (@typeInfo(Layer).@"enum".field_names, @typeInfo(Layer).@"enum".field_values) |field_name, _| {
+        const layer = @field(Layer, field_name);
         const head = layer.heading();
 
         try testing.expect(std.mem.indexOf(u8, head, layer.wroteIt()) != null);
@@ -1082,7 +1082,7 @@ test "an index line is one line a skill, with the body left behind" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const long = "x" ** 400;
+    const long = @as([400]u8, @splat('x'));
     const document = try std.fmt.allocPrint(
         arena,
         "---\nname: a\ndescription: first line\n  and a second\n---\n{s}",
@@ -1100,7 +1100,7 @@ test "an index line is one line a skill, with the body left behind" {
 
     var rendered: std.ArrayList(u8) = .empty;
     try index.renderInto(arena, &rendered, entries);
-    try testing.expect(std.mem.indexOf(u8, rendered.items, long) == null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, &long) == null);
 }
 
 test "the answer names who wrote it, and a path only when the agent can open it" {

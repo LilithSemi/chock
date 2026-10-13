@@ -49,8 +49,8 @@ step that adds the independence.
 ## The guest image
 
 `pkgs/chock/guest.nix` builds two derivations, `guest-kernel` and
-`guest-initrd`, shaped after DeterminateSystems' cloud-hypervisor-guest: a 6.1
-LTS kernel and an uncompressed initrd from `makeInitrdNG`.
+`guest-initrd`: a 6.1 LTS kernel and an uncompressed initrd from
+`makeInitrdNG`.
 
 `CONFIG_VIRTIO_FS`, `CONFIG_VSOCKETS` and `CONFIG_VIRTIO_VSOCKETS` are modules
 in that kernel, so the initrd must carry them and the init load them by name,

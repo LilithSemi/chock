@@ -4422,8 +4422,8 @@ fn sandboxLayers(
 }
 
 const LayerWitness = struct {
-    probed: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.initEmpty(),
-    unavailable: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.initEmpty(),
+    probed: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.empty,
+    unavailable: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.empty,
 
     fn saw(self: *LayerWitness, guarantee: sandbox.Sandbox.Guarantee, available: bool) void {
         self.probed.insert(guarantee);
@@ -4485,14 +4485,14 @@ const layer_names = [_]struct {
 };
 
 comptime {
-    var seen = sandbox.Sandbox.Guarantees.initEmpty();
+    var seen = sandbox.Sandbox.Guarantees.empty;
     for (layer_names) |named| {
         if (seen.contains(named.guarantee)) @compileError(
             "chock run: two header layers name the same sandbox guarantee",
         );
         seen.insert(named.guarantee);
     }
-    if (seen.count() != @typeInfo(sandbox.Sandbox.Guarantee).@"enum".fields.len) @compileError(
+    if (seen.count() != @typeInfo(sandbox.Sandbox.Guarantee).@"enum".field_names.len) @compileError(
         "chock run: a sandbox guarantee has no layer in the header",
     );
 }
@@ -5100,7 +5100,7 @@ fn reportSyscallRecord(err: anyerror) void {
     );
 }
 
-const syscall_row_count = @typeInfo(sandbox.seccomp.TrapCall).@"enum".fields.len;
+const syscall_row_count = @typeInfo(sandbox.seccomp.TrapCall).@"enum".field_names.len;
 
 const syscall_name_cap = sandbox.Sandbox.SyscallAudit.name_cap;
 
@@ -5112,30 +5112,30 @@ fn syscallEvent(
     names: *[syscall_name_cap][]const u8,
 ) chock_proto.event.Event {
     var filled: usize = 0;
-    inline for (@typeInfo(sandbox.seccomp.TrapCall).@"enum".fields) |field| {
+    inline for (@typeInfo(sandbox.seccomp.TrapCall).@"enum".field_names, @typeInfo(sandbox.seccomp.TrapCall).@"enum".field_values) |field_name, field_value| {
         const first = filled;
         var kept: u32 = 0;
         while (kept < paths.kept) : (kept += 1) {
-            if (paths.name_call[kept] != field.value) continue;
+            if (paths.name_call[kept] != field_value) continue;
             if (filled >= names.len) break;
             names[filled] = paths.names[kept];
             filled += 1;
         }
-        rows[field.value] = .{ .name = field.name, .count = counts.calls[field.value] };
-        path_rows[field.value] = .{
-            .granted = paths.granted[field.value],
-            .ungranted = paths.ungranted[field.value],
-            .ungranted_unnamed = paths.ungranted_unnamed[field.value],
-            .relative = paths.relative[field.value],
-            .unread = paths.unread[field.value],
-            .truncated = paths.truncated[field.value],
+        rows[field_value] = .{ .name = field_name, .count = counts.calls[field_value] };
+        path_rows[field_value] = .{
+            .granted = paths.granted[field_value],
+            .ungranted = paths.ungranted[field_value],
+            .ungranted_unnamed = paths.ungranted_unnamed[field_value],
+            .relative = paths.relative[field_value],
+            .unread = paths.unread[field_value],
+            .truncated = paths.truncated[field_value],
             .ungranted_names = names[first..filled],
         };
-        const row = path_rows[field.value];
+        const row = path_rows[field_value];
         const said_something = row.granted != 0 or row.ungranted != 0 or
             row.ungranted_unnamed != 0 or row.relative != 0 or row.unread != 0 or
             row.truncated != 0 or row.ungranted_names.len != 0;
-        if (said_something) rows[field.value].unverified_paths = row;
+        if (said_something) rows[field_value].unverified_paths = row;
     }
     return .{
         .sandbox_syscalls = .{
@@ -5315,8 +5315,8 @@ test "the syscall event names one row for each call the sandbox can watch, and s
     try std.testing.expectEqual(@as(u64, 1), said.unobserved);
     try std.testing.expectEqual(syscall_row_count, said.calls.len);
 
-    inline for (@typeInfo(sandbox.seccomp.TrapCall).@"enum".fields) |field| {
-        try std.testing.expectEqualStrings(field.name, said.calls[field.value].name);
+    inline for (@typeInfo(sandbox.seccomp.TrapCall).@"enum".field_names, @typeInfo(sandbox.seccomp.TrapCall).@"enum".field_values) |field_name, field_value| {
+        try std.testing.expectEqualStrings(field_name, said.calls[field_value].name);
     }
     try std.testing.expectEqual(
         @as(u64, 900),
@@ -9463,7 +9463,7 @@ const SubagentSpawner = struct {
         defer threaded.deinit();
         const io = threaded.io();
 
-        const path = try allocator.dupeZ(u8, prepared.log_path);
+        const path = try allocator.dupeSentinel(u8, prepared.log_path, 0);
         defer allocator.free(path);
 
         var log = chock_proto.log.Log.open(io, path, prepared.child_session) catch {
@@ -10224,7 +10224,7 @@ fn runSession(
         io,
         started.exe_path,
         gpa,
-    ) catch try gpa.dupeZ(u8, "");
+    ) catch try gpa.dupeSentinel(u8, "", 0);
     defer gpa.free(credential_helper);
 
     const credential_chain = try policyChain(gpa, started, options);
@@ -11696,7 +11696,7 @@ test "--adopt takes over a session that exists, and refuses every shape that is 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try testing.expect(!(try parseOptions(arena, &.{"a message"})).adopt);
     try testing.expect((try parseOptions(arena, &.{ "--adopt", "--session", id })).adopt);
     try testing.expect((try parseOptions(arena, &.{ "--adopt", "--continue" })).adopt);
@@ -11768,8 +11768,8 @@ test "the next owner finds the handed over workspace in the log, and takes nothi
     const len = try tmp.dir.realPath(io, &buffer);
     const dir = buffer[0..len];
 
-    const id = "01JQ" ++ "A" ** 22;
-    const attempt = "01JQ" ++ "B" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
+    const attempt = "01JQ" ++ @as([22]u8, @splat('B'));
     const base_commit = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 
     const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ dir, id }, 0);
@@ -11802,9 +11802,9 @@ test "a workspace opened after the handover belongs to the owner that came next"
     const len = try tmp.dir.realPath(io, &buffer);
     const dir = buffer[0..len];
 
-    const id = "01JQ" ++ "A" ** 22;
-    const first_attempt = "01JQ" ++ "B" ** 22;
-    const second_attempt = "01JQ" ++ "C" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
+    const first_attempt = "01JQ" ++ @as([22]u8, @splat('B'));
+    const second_attempt = "01JQ" ++ @as([22]u8, @splat('C'));
     const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ dir, id }, 0);
     const work = try std.fmt.allocPrint(arena, "{s}/{s}.work", .{ dir, id });
     try std.Io.Dir.createDirAbsolute(io, work, .default_dir);
@@ -11881,8 +11881,8 @@ test "only a session that handed over gives its workspace away" {
         const len = try tmp.dir.realPath(io, &buffer);
         const dir = buffer[0..len];
 
-        const id = "01JQ" ++ "A" ** 22;
-        const attempt = "01JQ" ++ "B" ** 22;
+        const id = "01JQ" ++ @as([22]u8, @splat('A'));
+        const attempt = "01JQ" ++ @as([22]u8, @splat('B'));
         const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ dir, id }, 0);
         const work = try std.fmt.allocPrint(arena, "{s}/{s}.work", .{ dir, id });
         const checkout = try std.fmt.allocPrint(arena, "{s}/{s}", .{ work, attempt });
@@ -11924,7 +11924,7 @@ test "a run that adopted a workspace never removes it, however it fails" {
     try env.put("GIT_CEILING_DIRECTORIES", tmp_path);
     try makeGitProject(arena, io, &env, project);
 
-    const attempt = "01JQ" ++ "B" ** 22;
+    const attempt = "01JQ" ++ @as([22]u8, @splat('B'));
     var first = try chock_workspace.Workspace.open(arena, io, &env, project, scratch, attempt, null);
     const base_commit = try arena.dupe(u8, first.kind.worktree.base_commit);
     const written = try std.fmt.allocPrint(arena, "{s}/agent-wrote-this.txt", .{first.workPath()});
@@ -12046,7 +12046,7 @@ test "an unparsable command line fails, and never runs a session with a guessed 
         .{ .argv = &.{ "--max-turns", "0" }, .names = "--max-turns 0" },
         .{ .argv = &.{"--nonsense"}, .names = "--nonsense" },
         .{
-            .argv = &.{ "--continue", "--session", "01JQ" ++ "A" ** 22 },
+            .argv = &.{ "--continue", "--session", "01JQ" ++ @as([22]u8, @splat('A')) },
             .names = "two different sessions",
         },
     };
@@ -12149,7 +12149,7 @@ test "the flags a parent writes are the flags this parser reads" {
     const arena = arena_state.allocator();
 
     const prepared = chock_core.subagent.Prepared{
-        .child_session = try arena.dupe(u8, "01JQ" ++ "A" ** 22),
+        .child_session = try arena.dupe(u8, "01JQ" ++ @as([22]u8, @splat('A'))),
         .log_path = try arena.dupe(u8, "/tmp/chock/child.jsonl"),
         .scratchpad_path = try arena.dupe(u8, "/tmp/chock/01PARENT/agents/01CHILD"),
     };
@@ -12160,7 +12160,7 @@ test "the flags a parent writes are the flags this parser reads" {
     const argv = try chock_core.subagent.commandLine(arena, .{
         .exe_path = "/nix/store/aaa/bin/chock",
         .project_root = "/home/ross/project",
-        .parent_session = "01JQ" ++ "B" ** 22,
+        .parent_session = "01JQ" ++ @as([22]u8, @splat('B')),
         .parent_chain = &above,
         .provider = "local",
         .model = "a-model",
@@ -12174,7 +12174,7 @@ test "the flags a parent writes are the flags this parser reads" {
     const options = try parseOptions(arena, argv[2..]);
 
     try testing.expectEqualStrings("reviewer", options.agent_kind);
-    try testing.expectEqualStrings("01JQ" ++ "B" ** 22, options.parent_session);
+    try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('B')), options.parent_session);
     try testing.expectEqualStrings("/tmp/chock/01PARENT/agents/01CHILD", options.scratchpad);
     try testing.expectEqual(@as(f64, 1.25), options.max_cost.?);
     try testing.expectEqualStrings("USD", options.currency);
@@ -12339,7 +12339,7 @@ test "a budget slice narrows what chock.zon allows and can never widen it" {
 fn valueFor(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "--max-turns")) return "3";
     if (std.mem.eql(u8, name, subagent.flag.max_cost)) return "1.25";
-    if (std.mem.eql(u8, name, "--session")) return "01JQ" ++ "A" ** 22;
+    if (std.mem.eql(u8, name, "--session")) return "01JQ" ++ @as([22]u8, @splat('A'));
     if (std.mem.eql(u8, name, "--policy-rule")) return "git.push=allow";
     return "a-value";
 }
@@ -13273,7 +13273,7 @@ test "the log records the landing that happened, and not the mode the project co
 
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir = buffer[0..try tmp.dir.realPath(io, &buffer)];
-    const id = "01JQ" ++ "E" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('E'));
     const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ dir, id }, 0);
 
     const log = try chock_proto.log.Log.open(io, log_path, id);
@@ -14704,8 +14704,8 @@ test "the log says which sandbox one attempt ran under, and it says it either wa
     const len = try tmp.dir.realPath(io, &buffer);
     const dir = buffer[0..len];
 
-    const id = "01JQ" ++ "C" ** 22;
-    const attempt = "01JQ" ++ "D" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('C'));
+    const attempt = "01JQ" ++ @as([22]u8, @splat('D'));
     const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ dir, id }, 0);
 
     const log = try chock_proto.log.Log.open(io, log_path, id);
@@ -15350,8 +15350,8 @@ test "a promise a parent made binds its subagents, out of the parent's own log" 
     var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir = dir_buffer[0..try tmp.dir.realPath(io, &dir_buffer)];
 
-    const grandparent = "01JQ" ++ "A" ** 22;
-    const parent = "01JQ" ++ "B" ** 22;
+    const grandparent = "01JQ" ++ @as([22]u8, @splat('A'));
+    const parent = "01JQ" ++ @as([22]u8, @splat('B'));
 
     const Writer = struct {
         fn write(
@@ -15437,7 +15437,7 @@ test "a promise a parent made binds its subagents, out of the parent's own log" 
     said.start(io, gpa);
     defer said.stop(io);
 
-    const gone = "01JQ" ++ "Z" ** 22;
+    const gone = "01JQ" ++ @as([22]u8, @splat('Z'));
     const missing = try promisesFor(gpa, arena, io, dir, gone, &child);
     try std.testing.expectEqual(@as(usize, 1), missing.len);
     try std.testing.expectEqual(
@@ -15474,7 +15474,7 @@ test "a promise a grandparent made binds a grandchild of a tree that really ran"
     const project = try std.fmt.allocPrint(arena, "{s}/project", .{root_dir});
     const dir = try std.fmt.allocPrint(arena, "{s}/sessions", .{root_dir});
 
-    const root_session = "01JQ" ++ "A" ** 22;
+    const root_session = "01JQ" ++ @as([22]u8, @splat('A'));
     try runTreeAgent(arena, io, project, dir, root_session,
         \\promise workspace.apply deny the user asked for a read only review
         \\spawn coder
@@ -15857,7 +15857,7 @@ test "a session with a display asks in it, and never at the prompt as well" {
 }
 
 test "the header names every sandbox layer the driver gives, and says the word off for one it does not" {
-    const every = sandbox.Sandbox.Guarantees.initFull();
+    const every = sandbox.Sandbox.Guarantees.full;
     const all_seen = LayerWitness{ .probed = every };
     const on = sandboxLayers(every, all_seen, .none, "worktree");
     try std.testing.expectEqual(@as(usize, 6), on.len);
@@ -15867,7 +15867,7 @@ test "the header names every sandbox layer the driver gives, and says the word o
     try std.testing.expectEqualStrings("fs", on[1].name);
     try std.testing.expectEqualStrings("worktree", on[1].note);
 
-    const none = sandboxLayers(sandbox.Sandbox.Guarantees.initEmpty(), all_seen, .none, "worktree");
+    const none = sandboxLayers(sandbox.Sandbox.Guarantees.empty, all_seen, .none, "worktree");
     for (none) |one| {
         try std.testing.expectEqual(ui.Layer.State.unsupported, one.state);
         try std.testing.expect(one.state.word().len != 0);
@@ -15886,8 +15886,8 @@ test "the header names every sandbox layer the driver gives, and says the word o
 }
 
 test "a layer the driver gives but this run could not get reads unavailable, not on" {
-    const every = sandbox.Sandbox.Guarantees.initFull();
-    var landlock_only = sandbox.Sandbox.Guarantees.initEmpty();
+    const every = sandbox.Sandbox.Guarantees.full;
+    var landlock_only = sandbox.Sandbox.Guarantees.empty;
     landlock_only.insert(.path_restricted);
 
     const blocked = sandboxLayers(every, .{ .probed = every, .unavailable = landlock_only }, .none, "worktree");
@@ -15911,11 +15911,11 @@ test "a layer the driver gives but this run could not get reads unavailable, not
 }
 
 test "a layer nothing probed still reads on, because the driver dies rather than run without it" {
-    const every = sandbox.Sandbox.Guarantees.initFull();
+    const every = sandbox.Sandbox.Guarantees.full;
     const unprobed = sandboxLayers(every, .{}, .none, "worktree");
     for (unprobed) |one| try std.testing.expectEqual(ui.Layer.State.on, one.state);
 
-    var landlock_only = sandbox.Sandbox.Guarantees.initEmpty();
+    var landlock_only = sandbox.Sandbox.Guarantees.empty;
     landlock_only.insert(.path_restricted);
     const refused = sandboxLayers(
         every,
@@ -15937,7 +15937,7 @@ test "the header of a normal linux session is six ticks and no other mark" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const layers = sandboxLayers(sandbox.Sandbox.Guarantees.initFull(), .{}, .none, "worktree");
+    const layers = sandboxLayers(sandbox.Sandbox.Guarantees.full, .{}, .none, "worktree");
     var said: std.ArrayList(u8) = .empty;
     for (layers) |one| {
         if (said.items.len != 0) try said.appendSlice(arena, "  ");
@@ -15996,7 +15996,7 @@ test "this machine really answers for the layers the witness claims to measure" 
 }
 
 test "a session that gave the network layer up says so, and a filtered one does not" {
-    const every = sandbox.Sandbox.Guarantees.initFull();
+    const every = sandbox.Sandbox.Guarantees.full;
 
     const seen = LayerWitness{ .probed = every };
     const filtered = sandboxLayers(every, seen, .filtered, "overlay");
@@ -16013,7 +16013,7 @@ test "a session that gave the network layer up says so, and a filtered one does 
 }
 
 test "the word beside the net layer is the name of the mode, for every mode there is" {
-    const every = sandbox.Sandbox.Guarantees.initFull();
+    const every = sandbox.Sandbox.Guarantees.full;
     for (std.enums.values(sandbox.namespace.Network)) |mode| {
         const built = sandboxLayers(every, .{ .probed = every }, mode, "worktree");
         try std.testing.expectEqualStrings(@tagName(mode), built[0].note);
@@ -17477,7 +17477,7 @@ test "the two export options really build the two sinks, and neither builds none
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try chock_proto.log.absoluteDirPath(io, &buffer, tmp.dir);
     const wanted = try std.fmt.allocPrint(arena, "{s}/audit", .{dir_path});
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
 
     {
         try testing.expectEqual(
@@ -17549,7 +17549,7 @@ test "a project cannot drop a sink its installation required, and can add one of
     defer tmp.cleanup();
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try chock_proto.log.absoluteDirPath(io, &buffer, tmp.dir);
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
 
     const required_dir = try std.fmt.allocPrint(arena, "{s}/org-audit", .{dir_path});
     const own_dir = try std.fmt.allocPrint(arena, "{s}/my-audit", .{dir_path});
@@ -17615,7 +17615,7 @@ test "an installation with no bundle plans exactly the sinks the command line na
     defer tmp.cleanup();
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try chock_proto.log.absoluteDirPath(io, &buffer, tmp.dir);
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     const wanted = try std.fmt.allocPrint(arena, "{s}/audit", .{dir_path});
 
     const planned = try auditSinks(
@@ -17910,7 +17910,7 @@ test "no line this file writes about redaction can hold a credential" {
     said.start(testing.io, gpa);
     defer said.stop(testing.io);
 
-    for ([_][]const u8{ "Zqx", "ZqxJv", "ZqxJvWk42", "Zqx" ** 70 }) |token| {
+    for ([_][]const u8{ "Zqx", "ZqxJv", "ZqxJvWk42", &repeated("Zqx", 70) }) |token| {
         said.clear();
         const others = [_]chock_auth.config.Instance{.{
             .name = "second",
@@ -18733,7 +18733,7 @@ test "a granted secret reaches the call, and the log says it was used without th
     const value = "gho_not_a_real_token_0123456789";
     var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = value }} };
 
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+    var slots = @as([2]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var log = try PermittingLog.init(gpa);
     defer log.deinit(io);
@@ -18785,7 +18785,7 @@ test "an action the block does not name is given nothing, and the store is not r
     defer block.deinit(gpa);
 
     var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+    var slots = @as([2]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var log = try PermittingLog.init(gpa);
     defer log.deinit(io);
@@ -18832,7 +18832,7 @@ test "a secret the store does not hold refuses the call and says how to put it t
     defer block.deinit(gpa);
 
     var empty = FakeSecretStore{};
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+    var slots = @as([2]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var log = try PermittingLog.init(gpa);
     defer log.deinit(io);
@@ -18874,7 +18874,7 @@ test "a refused ask refuses the call, and no slot is left holding a value" {
 
     const value = "gho_not_a_real_token_0123456789";
     var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = value }} };
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+    var slots = @as([2]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var log = try PermittingLog.init(gpa);
     defer log.deinit(io);
@@ -18921,7 +18921,7 @@ test "more secrets than there are slots is refused rather than served unprotecte
         .{ .name = "ONE", .value = "not-a-real-one-0123456789" },
         .{ .name = "TWO", .value = "not-a-real-two-0123456789" },
     } };
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 1;
+    var slots = @as([1]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var log = try PermittingLog.init(gpa);
     defer log.deinit(io);
@@ -18962,7 +18962,7 @@ test "a secret bound as a file arrives as a file, and the variable names its pat
     defer block.deinit(gpa);
 
     var held = FakeSecretStore{ .held = &.{.{ .name = "GCP_KEY", .value = "not-a-real-key-0123456789" }} };
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+    var slots = @as([2]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var log = try PermittingLog.init(gpa);
     defer log.deinit(io);
@@ -19018,7 +19018,7 @@ test "a grant reaches the one call it was armed for and nothing else" {
     defer block.deinit(gpa);
 
     var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+    var slots = @as([2]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var log = try PermittingLog.init(gpa);
     defer log.deinit(io);
@@ -19079,7 +19079,7 @@ test "a tool that is not a command arms nothing, whatever the block says" {
     defer block.deinit(gpa);
 
     var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+    var slots = @as([2]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var log = try PermittingLog.init(gpa);
     defer log.deinit(io);
@@ -19122,7 +19122,7 @@ test "a background command is not armed, so nobody is asked about a secret it ca
     defer block.deinit(gpa);
 
     var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+    var slots = @as([2]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var log = try PermittingLog.init(gpa);
     defer log.deinit(io);
@@ -19225,7 +19225,7 @@ test "an MCP server is given what a rule allows, and the log says so once the lo
 
     const value = "gho_not_a_real_token_0123456789";
     var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = value }} };
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 1;
+    var slots = @as([1]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -19301,7 +19301,7 @@ test "a server is not given a secret an ask would have to reach nobody for" {
     defer chock_policy.table.Table.destroy(gpa, table);
 
     var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 1;
+    var slots = @as([1]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -19354,7 +19354,7 @@ test "one server's secret does not reach another server" {
     defer chock_policy.table.Table.destroy(gpa, table);
 
     var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
-    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 1;
+    var slots = @as([1]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -19420,4 +19420,14 @@ test "a relative path reaching makeDirAll is refused by name and never asserted"
     try testing.expectError(error.NotAbsolute, makeDirAll(testing.io, "."));
 
     try makeDirAll(testing.io, "");
+}
+
+/// `piece` laid end to end `times` over, at comptime.
+///
+/// Zig 0.17 took the `**` operator away and `@splat` fills an array with ONE
+/// element, so a repeated phrase has no operator of its own any more.
+fn repeated(comptime piece: []const u8, comptime times: usize) [piece.len * times]u8 {
+    var out: [piece.len * times]u8 = undefined;
+    for (0..times) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
+    return out;
 }

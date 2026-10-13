@@ -562,7 +562,7 @@ test "the exit code table has one row for each code, with the number the code ha
         found += 1;
     }
 
-    const codes = @typeInfo(chock_main.Exit).@"enum".fields.len;
+    const codes = @typeInfo(chock_main.Exit).@"enum".field_names.len;
     if (found != codes) {
         try rows.print(arena, "docs/running.md: the table has {d} rows, and Exit has {d} members\n", .{ found, codes });
     }
@@ -577,12 +577,12 @@ test "the tool list names every tool, and counts them right" {
     const docs = try loadDocs(arena, testing.io);
 
     const page = try docText(docs, "docs/using/tools.md");
-    const fields = @typeInfo(chock_core.tools.Tool).@"enum".fields;
+    const fields = @typeInfo(chock_core.tools.Tool).@"enum".field_names;
 
     var wrong: std.ArrayList(u8) = .empty;
     inline for (fields) |field| {
-        if (!try namesInTicks(page, field.name, arena)) {
-            try wrong.print(arena, "docs/using/tools.md names no tool `{s}`\n", .{field.name});
+        if (!try namesInTicks(page, field, arena)) {
+            try wrong.print(arena, "docs/using/tools.md names no tool `{s}`\n", .{field});
         }
     }
     try checkCount(arena, docs, null, "tools", fields.len, &wrong);
@@ -597,18 +597,18 @@ test "the policy page names every decision and every field of a rule, and counts
     const docs = try loadDocs(arena, testing.io);
 
     const policy = try docText(docs, "docs/configure/policy.md");
-    const decisions = @typeInfo(chock_policy.table.Decision).@"enum".fields;
-    const rule_fields = @typeInfo(chock_policy.table.Rule).@"struct".fields;
+    const decisions = @typeInfo(chock_policy.table.Decision).@"enum".field_names;
+    const rule_fields = @typeInfo(chock_policy.table.Rule).@"struct".field_names;
 
     var wrong: std.ArrayList(u8) = .empty;
     inline for (decisions) |field| {
-        if (!try namesInTicks(policy, field.name, arena)) {
-            try wrong.print(arena, "docs/configure/policy.md names no decision `{s}`\n", .{field.name});
+        if (!try namesInTicks(policy, field, arena)) {
+            try wrong.print(arena, "docs/configure/policy.md names no decision `{s}`\n", .{field});
         }
     }
     inline for (rule_fields) |field| {
-        if (!try namesInTicks(policy, field.name, arena)) {
-            try wrong.print(arena, "docs/configure/policy.md names no rule field `{s}`\n", .{field.name});
+        if (!try namesInTicks(policy, field, arena)) {
+            try wrong.print(arena, "docs/configure/policy.md names no rule field `{s}`\n", .{field});
         }
     }
     // Only this page: `fields` and `decisions` are ordinary words elsewhere.
@@ -931,7 +931,7 @@ test "every sandbox block the documentation shows is read the way the page says"
             if (std.mem.indexOf(u8, block.text, ".drivers") != null) continue;
             seen += 1;
 
-            const source = try arena.dupeZ(u8, block.text);
+            const source = try arena.dupeSentinel(u8, block.text, 0);
             var read = chock_policy.sandbox.parse(gpa, source, null) catch |err| {
                 try wrong.print(arena, "{s}:{d}: {t}\n", .{ doc.path, block.line, err });
                 continue;

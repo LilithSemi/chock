@@ -1102,7 +1102,7 @@ test "a peer that is not this user is refused on the socket, and a TCP peer is n
 
 test "a browser can decide exactly two things, and neither of them is the policy's" {
     const project = "/home/ross/chock";
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
 
     const yes = try answerFrom("/api/answer?session=" ++ id ++ "&request=128&decision=yes", project);
     try testing.expectEqual(control.Answer.yes, yes.answer.decision);
@@ -1150,7 +1150,7 @@ test "a browser can decide exactly two things, and neither of them is the policy
 }
 
 test "a browser cannot name a project, so it cannot ask about a directory it was not shown" {
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     const asked = try answerFrom(
         "/api/answer?session=" ++ id ++ "&request=1&decision=yes&project=/etc",
         "/home/ross/chock",
@@ -1197,7 +1197,7 @@ test "every route is one the dispatch has a case for, and a query does not make 
 
     try testing.expectEqual(Route.lines, routeOf("/api/lines?session=01JQ&after=0").?);
 
-    var reached = std.EnumSet(Route).initEmpty();
+    var reached = std.EnumSet(Route).empty;
     for ([_][]const u8{
         "/",
         "/api/sessions",

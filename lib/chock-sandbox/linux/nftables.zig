@@ -323,7 +323,7 @@ const Builder = struct {
 
     fn attribute(b: *Builder, kind: u16, payload: []const u8) void {
         const at = b.len;
-        b.put(&[_]u8{0} ** 4);
+        b.put(&@as([4]u8, @splat(0)));
         b.put(payload);
         std.mem.writeInt(u16, b.buf[at..][0..2], @intCast(4 + payload.len), .little);
         std.mem.writeInt(u16, b.buf[at + 2 ..][0..2], kind, .little);
@@ -344,7 +344,7 @@ const Builder = struct {
 
     fn string(b: *Builder, kind: u16, text: []const u8) void {
         const at = b.len;
-        b.put(&[_]u8{0} ** 4);
+        b.put(&@as([4]u8, @splat(0)));
         b.put(text);
         b.put(&[_]u8{0});
         std.mem.writeInt(u16, b.buf[at..][0..2], @intCast(5 + text.len), .little);
@@ -354,7 +354,7 @@ const Builder = struct {
 
     fn openNested(b: *Builder, kind: u16) usize {
         const at = b.len;
-        b.put(&[_]u8{0} ** 4);
+        b.put(&@as([4]u8, @splat(0)));
         std.mem.writeInt(u16, b.buf[at + 2 ..][0..2], kind | nla_nested, .little);
         return at;
     }
@@ -365,7 +365,7 @@ const Builder = struct {
 
     fn openMessage(b: *Builder, kind: u16, flags: u16, sequence: u32, family: u8, res_id: u16) usize {
         const at = b.len;
-        b.put(&[_]u8{0} ** 16);
+        b.put(&@as([16]u8, @splat(0)));
         std.mem.writeInt(u16, b.buf[at + 4 ..][0..2], kind, .little);
         std.mem.writeInt(u16, b.buf[at + 6 ..][0..2], flags, .little);
         std.mem.writeInt(u32, b.buf[at + 8 ..][0..4], sequence, .little);
@@ -1013,7 +1013,7 @@ fn measure() error{ChildCrashed}!?Measurement {
         filled += rc;
     }
     _ = linux.close(fds[0]);
-    var status: u32 = 0;
+    var status: i32 = 0;
     _ = linux.waitpid(@intCast(child), &status, 0);
 
     if (status != 0) return error.ChildCrashed;
@@ -1153,7 +1153,7 @@ test "allow stores a timeout the kernel gives back as a timeout" {
 test "an address that was never allowed is absent rather than an error" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var buffer: [max_element_message]u8 = undefined;
-    const length = buildElementQuery(&buffer, .{ .ipv6 = .{0xff} ** 16 });
+    const length = buildElementQuery(&buffer, .{ .ipv6 = @as([16]u8, @splat(0xff)) });
     var messages = Messages{ .bytes = buffer[0..length] };
     const query = messages.next() orelse return error.TestUnexpectedResult;
     try testing.expectEqual((subsys_nftables << 8) | msg_getsetelem, query.kind);
@@ -1189,7 +1189,7 @@ test "a refusal names the message the kernel would not take" {
 
 test "an address picks its own set and carries its own key width" {
     const four = Address{ .ipv4 = .{ 192, 0, 2, 1 } };
-    const six = Address{ .ipv6 = .{0x20} ++ .{0} ** 15 };
+    const six = Address{ .ipv6 = .{0x20} ++ @as([15]u8, @splat(0)) };
     try testing.expectEqualStrings(set4_name, four.setName());
     try testing.expectEqualStrings(set6_name, six.setName());
     try testing.expectEqual(@as(usize, 4), four.key().len);

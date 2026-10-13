@@ -1,8 +1,9 @@
 //! A `chock-ui` source that reaches `chock serve` over HTTP.
 //!
-//! The browser half of the seam. Phantom gives the page an `Io` whose sockets
-//! are really `fetch`, so a plain `std.http.Client` works here and the page
-//! needs no wire format of its own.
+//! The browser half of the seam. Every call goes through phantom's own HTTP
+//! client, which the page answers with its `fetch`, so this needs no wire format
+//! of its own. Not `std.http.Client`: that does not compile for
+//! wasm32-freestanding on Zig 0.17.
 
 const std = @import("std");
 const phantom = @import("phantom");
@@ -123,12 +124,9 @@ pub const Web = struct {
         const url = std.fmt.allocPrint(arena, "http://{s}{s}", .{ self.origin, target }) catch
             return error.OutOfMemory;
 
-        var client: std.http.Client = .{ .allocator = self.gpa, .io = self.owner.io };
-        defer client.deinit();
-
         var body: std.Io.Writer.Allocating = .init(arena);
-        const reply = client.fetch(.{
-            .location = .{ .url = url },
+        const reply = self.owner.http().fetch(.{
+            .url = url,
             .response_writer = &body.writer,
         }) catch |err| {
             // The URL and the error together, because "no answer" cannot be told
@@ -332,12 +330,9 @@ pub const Web = struct {
         const url = std.fmt.allocPrint(arena, "http://{s}{s}", .{ self.origin, target }) catch
             return error.OutOfMemory;
 
-        var client: std.http.Client = .{ .allocator = self.gpa, .io = self.owner.io };
-        defer client.deinit();
-
         var body: std.Io.Writer.Allocating = .init(arena);
-        const reply = client.fetch(.{
-            .location = .{ .url = url },
+        const reply = self.owner.http().fetch(.{
+            .url = url,
             .method = .POST,
             .payload = if (payload.len == 0) null else payload,
             .response_writer = &body.writer,

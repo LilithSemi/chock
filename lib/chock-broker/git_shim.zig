@@ -747,9 +747,9 @@ test "the shim tells the user what saying yes does, and never offers to do the a
 }
 
 comptime {
-    for (@typeInfo(Answer).@"union".fields) |field| {
-        if (field.type == actions.Result) {
-            @compileError("the git shim must not perform an act: " ++ field.name);
+    for (@typeInfo(Answer).@"union".field_names, @typeInfo(Answer).@"union".field_types) |field_name, field_type| {
+        if (field_type == actions.Result) {
+            @compileError("the git shim must not perform an act: " ++ field_name);
         }
     }
 }

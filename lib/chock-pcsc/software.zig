@@ -68,7 +68,7 @@ pub const Key = struct {
 const testing = std.testing;
 
 test "a key made from a secret is the same key, public part and all" {
-    const original = try Key.fromSeed([_]u8{0x11} ** 32);
+    const original = try Key.fromSeed(@as([32]u8, @splat(0x11)));
     const secret = original.toSecret();
     const restored = try Key.fromSecret(secret);
     try testing.expectEqualSlices(u8, &original.publicKey(), &restored.publicKey());
@@ -76,20 +76,20 @@ test "a key made from a secret is the same key, public part and all" {
 }
 
 test "two different seeds give two different keys" {
-    const one = try Key.fromSeed([_]u8{0x11} ** 32);
-    const two = try Key.fromSeed([_]u8{0x22} ** 32);
+    const one = try Key.fromSeed(@as([32]u8, @splat(0x11)));
+    const two = try Key.fromSeed(@as([32]u8, @splat(0x22)));
     try testing.expect(!std.mem.eql(u8, &one.publicKey(), &two.publicKey()));
 }
 
 test "a public key is the 65 byte uncompressed SEC-1 form and starts with 04" {
-    const key = try Key.fromSeed([_]u8{0x33} ** 32);
+    const key = try Key.fromSeed(@as([32]u8, @splat(0x33)));
     const public = key.publicKey();
     try testing.expectEqual(@as(usize, 65), public.len);
     try testing.expectEqual(@as(u8, 0x04), public[0]);
 }
 
 test "a signature verifies against the public key, and not against another key" {
-    const key = try Key.fromSeed([_]u8{0x44} ** 32);
+    const key = try Key.fromSeed(@as([32]u8, @splat(0x44)));
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("the head of a chain", &digest, .{});
 
@@ -97,7 +97,7 @@ test "a signature verifies against the public key, and not against another key" 
     const signature = Ecdsa.Signature.fromBytes(raw);
     try signature.verifyPrehashed(digest, key.pair.public_key);
 
-    const other = try Key.fromSeed([_]u8{0x55} ** 32);
+    const other = try Key.fromSeed(@as([32]u8, @splat(0x55)));
     try testing.expectError(
         error.SignatureVerificationFailed,
         signature.verifyPrehashed(digest, other.pair.public_key),
@@ -105,7 +105,7 @@ test "a signature verifies against the public key, and not against another key" 
 }
 
 test "one changed bit of the digest breaks the signature" {
-    const key = try Key.fromSeed([_]u8{0x66} ** 32);
+    const key = try Key.fromSeed(@as([32]u8, @splat(0x66)));
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("the head of a chain", &digest, .{});
     const signature = Ecdsa.Signature.fromBytes(try key.signDigest(digest));
@@ -119,10 +119,10 @@ test "one changed bit of the digest breaks the signature" {
 }
 
 test "signing is deterministic, so the same digest gives the same bytes twice" {
-    const key = try Key.fromSeed([_]u8{0x77} ** 32);
-    const digest = [_]u8{0xab} ** 32;
+    const key = try Key.fromSeed(@as([32]u8, @splat(0x77)));
+    const digest = @as([32]u8, @splat(0xab));
     try testing.expectEqualSlices(u8, &try key.signDigest(digest), &try key.signDigest(digest));
-    try testing.expect(!std.mem.eql(u8, &try key.signDigest(digest), &try key.signDigest([_]u8{0xac} ** 32)));
+    try testing.expect(!std.mem.eql(u8, &try key.signDigest(digest), &try key.signDigest(@as([32]u8, @splat(0xac)))));
 }
 
 test {

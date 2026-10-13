@@ -25,7 +25,7 @@ test "a second process cannot take the lock while the first holds it" {
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try chock_proto.log.absoluteDirPath(std.testing.io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/second-process-lock", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/second-process-lock", .{dir_path}, 0);
 
     // Make the file and its header first, or the helper's open races this one.
     {

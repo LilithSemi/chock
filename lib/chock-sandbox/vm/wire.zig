@@ -285,7 +285,7 @@ pub fn configFor(
     const scratch = try allocator.alloc(namespace.Scratch, request.scratch.len);
     for (request.scratch, scratch) |from, *into| into.* = .{ .target = from.target };
 
-    var traps: seccomp.TrapSet = .initEmpty();
+    var traps: seccomp.TrapSet = .empty;
     for (request.seccomp_options.traps) |name| {
         const one = std.meta.stringToEnum(seccomp.TrapCall, name) orelse return error.UnknownTrap;
         traps.insert(one);
@@ -366,14 +366,14 @@ pub fn read(
 const testing = std.testing;
 
 test "every field of Config either crosses or is named host only, with a reason" {
-    inline for (@typeInfo(iface.Config).@"struct".fields) |field| {
-        const crosses = @hasField(Request, field.name);
+    inline for (@typeInfo(iface.Config).@"struct".field_names, @typeInfo(iface.Config).@"struct".field_types) |field_name, _| {
+        const crosses = @hasField(Request, field_name);
         var named = false;
         for (host_only) |one| {
-            if (std.mem.eql(u8, one, field.name)) named = true;
+            if (std.mem.eql(u8, one, field_name)) named = true;
         }
         if (!crosses and !named) {
-            try testing.expectEqualStrings("a field that crosses or is host only", field.name);
+            try testing.expectEqualStrings("a field that crosses or is host only", field_name);
             return error.ConfigFieldIsNeither;
         }
         try testing.expect(!(crosses and named));
@@ -381,8 +381,8 @@ test "every field of Config either crosses or is named host only, with a reason"
 
     for (host_only) |one| {
         var found = false;
-        inline for (@typeInfo(iface.Config).@"struct".fields) |field| {
-            if (std.mem.eql(u8, one, field.name)) found = true;
+        inline for (@typeInfo(iface.Config).@"struct".field_names, @typeInfo(iface.Config).@"struct".field_types) |field_name, _| {
+            if (std.mem.eql(u8, one, field_name)) found = true;
         }
         if (!found) {
             try testing.expectEqualStrings("a field of Config", one);
@@ -493,9 +493,9 @@ test "the trap set crosses by name, and a name this build has no member for is r
     newer.seccomp_options.traps = &.{ "execve", "a-call-this-build-cannot-trap" };
     try testing.expectError(error.UnknownTrap, configFor(arena, newer));
 
-    var all: seccomp.TrapSet = .initEmpty();
-    inline for (@typeInfo(seccomp.TrapCall).@"enum".fields) |field| {
-        all.insert(@field(seccomp.TrapCall, field.name));
+    var all: seccomp.TrapSet = .empty;
+    inline for (@typeInfo(seccomp.TrapCall).@"enum".field_names, @typeInfo(seccomp.TrapCall).@"enum".field_values) |field_name, _| {
+        all.insert(@field(seccomp.TrapCall, field_name));
     }
     var every = base;
     every.seccomp_options = .{ .traps = all };

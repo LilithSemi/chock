@@ -716,7 +716,7 @@ test "a session that measured nothing reports every boundary inconclusive" {
 
     try std.testing.expectEqualSlices(
         Verdict,
-        &([_]Verdict{.inconclusive} ** scope.boundary_count),
+        &(@as([scope.boundary_count]Verdict, @splat(.inconclusive))),
         &result.verdicts,
     );
     try std.testing.expect(!result.trustworthy());
@@ -764,7 +764,7 @@ test "a session that worked and breached nothing still reports every boundary he
 
     try std.testing.expectEqualSlices(
         Verdict,
-        &([_]Verdict{.held} ** scope.boundary_count),
+        &(@as([scope.boundary_count]Verdict, @splat(.held))),
         &result.verdicts,
     );
     try std.testing.expectEqual(@as(usize, 0), result.breaches());

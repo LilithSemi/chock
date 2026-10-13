@@ -66,8 +66,8 @@ const testing = std.testing;
 const software = @import("software.zig");
 
 const test_session = "01JZZZZZZZZZZZZZZZZZZZZZZZ";
-const test_header = [_]u8{'a'} ** seal.digest_hex_len;
-const test_head = [_]u8{'b'} ** seal.digest_hex_len;
+const test_header = @as([seal.digest_hex_len]u8, @splat('a'));
+const test_head = @as([seal.digest_hex_len]u8, @splat('b'));
 
 fn testExpectation() seal.Expectation {
     return .{ .session = test_session, .header = &test_header, .head = &test_head, .events = 7 };
@@ -101,7 +101,7 @@ test "a seal written beside a log reads back and still verifies" {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try scratchPath(&path_buffer, &tmp);
 
-    var key = try software.Key.fromSeed([_]u8{0x31} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x31)));
     var held = seal.Held{};
     const signed = try seal.sign(testRequest(.software), key.signer(), &held);
 
@@ -129,7 +129,7 @@ test "a seal file that is not there is absent, and absent is never a seal" {
     var certs = seal.ReadBuffer{};
     try testing.expect(read(arena, testing.io, path, &certs) == .absent);
 
-    var key = try software.Key.fromSeed([_]u8{0x32} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x32)));
     var buffer = seal.Buffer{};
     var held = seal.Held{};
     try write(arena, testing.io, path, try seal.toRecord(
@@ -149,7 +149,7 @@ test "a seal file somebody edited is malformed, and malformed is never absent" {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try scratchPath(&path_buffer, &tmp);
 
-    var key = try software.Key.fromSeed([_]u8{0x33} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x33)));
     var buffer = seal.Buffer{};
     const record = held: {
         var held = seal.Held{};
@@ -196,7 +196,7 @@ test "a record from a later format is refused rather than read in part" {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try scratchPath(&path_buffer, &tmp);
 
-    var key = try software.Key.fromSeed([_]u8{0x34} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x34)));
     var buffer = seal.Buffer{};
     const record = held: {
         var held = seal.Held{};

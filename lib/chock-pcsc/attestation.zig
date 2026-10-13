@@ -160,24 +160,24 @@ fn link(subject: Certificate.Parsed, issuer: Certificate.Parsed, now_sec: i64) ?
 const testing = std.testing;
 
 test "no certificates is absent, and absent is never a weaker yes" {
-    const key = [_]u8{0x04} ++ [_]u8{0x11} ** 64;
+    const key = [_]u8{0x04} ++ @as([64]u8, @splat(0x11));
     try testing.expectEqual(Verdict.absent, read(&.{}, &key, null, 0));
     try testing.expectEqual(Verdict.absent, read(&.{}, &key, "root der", 0));
 }
 
 test "a reader with no root proves nothing, and never trusts everything" {
-    const key = [_]u8{0x04} ++ [_]u8{0x11} ** 64;
+    const key = [_]u8{0x04} ++ @as([64]u8, @splat(0x11));
     try testing.expectEqual(Verdict.no_root, read(&.{"not really a certificate"}, &key, null, 0));
 }
 
 test "a chain longer than the bound is refused before anything is parsed" {
-    const key = [_]u8{0x04} ++ [_]u8{0x11} ** 64;
-    const too_many = [_][]const u8{"x"} ** (max_chain_len + 1);
+    const key = [_]u8{0x04} ++ @as([64]u8, @splat(0x11));
+    const too_many = @as([(max_chain_len + 1)][]const u8, @splat("x"));
     try testing.expectEqual(Verdict.malformed, read(&too_many, &key, "root", 0));
 }
 
 test "bytes that are not a certificate are malformed, never untrusted" {
-    const key = [_]u8{0x04} ++ [_]u8{0x11} ** 64;
+    const key = [_]u8{0x04} ++ @as([64]u8, @splat(0x11));
     try testing.expectEqual(
         Verdict.malformed,
         read(&.{"this is not DER at all"}, &key, "nor is this", 0),

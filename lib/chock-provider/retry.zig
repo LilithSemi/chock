@@ -181,7 +181,7 @@ test "Retry-After is read as seconds, and a date form reads as nothing rather th
     try testing.expectEqual(@as(?u64, null), retryAfterSeconds(""));
     try testing.expectEqual(@as(?u64, null), retryAfterSeconds("-1"));
     try testing.expectEqual(@as(?u64, null), retryAfterSeconds("2.5"));
-    try testing.expectEqual(@as(?u64, null), retryAfterSeconds("9" ** 30));
+    try testing.expectEqual(@as(?u64, null), retryAfterSeconds(&@as([30]u8, @splat('9'))));
 }
 
 test "a jitter value is always inside the scale the arithmetic assumes" {

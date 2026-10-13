@@ -2,6 +2,7 @@
 //! from the model.
 
 const std = @import("std");
+const chock_zon = @import("chock-zon");
 
 const ref = @import("reference.zig");
 
@@ -58,16 +59,13 @@ pub fn load(
 
 /// The result borrows nothing from `source`.
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Error!Answer {
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+    var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    // `std.zon.parse.Diagnostics` takes both trees over.
-    var ast_owned = true;
-    defer if (ast_owned) ast.deinit(gpa);
+    defer ast.deinit(gpa);
 
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
-    var zoir_owned = true;
-    defer if (zoir_owned) zoir.deinit(gpa);
+    defer zoir.deinit(gpa);
 
     if (zoir.hasCompileErrors()) {
         return .{ .refused = try gpa.dupe(
@@ -82,16 +80,18 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Err
         .named => |found| found,
     };
 
-    var zon_diag: std.zon.parse.Diagnostics = .{};
-    ast_owned = false;
-    zoir_owned = false;
-    defer zon_diag.deinit(gpa);
-
-    const block = std.zon.parse.fromZoirNodeAlloc(
+    // The refusal below never reads `zon_diag`, so the arena backing it
+    // need not outlive this call.
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var zon_diag: std.zon.parse.Diagnostics = undefined;
+    const block = chock_zon.fromNode(
         Block,
         gpa,
-        ast,
-        zoir,
+        arena_state.allocator(),
+        source,
+        &ast,
+        &zoir,
         node,
         &zon_diag,
         .{},
@@ -104,7 +104,6 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Err
             .{},
         ) },
     };
-    defer std.zon.parse.free(gpa, block);
 
     ref.check(block.image) catch |err| {
         return .{ .refused = try ref.refusalText(gpa, block.image, err) };
@@ -122,10 +121,10 @@ const Located = union(enum) {
 
 fn findBlockNode(gpa: std.mem.Allocator, zoir: std.zig.Zoir) std.mem.Allocator.Error!Located {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), block_name)) {
+                if (std.mem.eql(u8, name.get(&zoir), block_name)) {
                     return .{ .named = fields.vals.at(@intCast(index)) };
                 }
             }

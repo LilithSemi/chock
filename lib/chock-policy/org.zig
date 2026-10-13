@@ -98,7 +98,7 @@ pub const LoadError = ParseError || error{
 };
 
 pub const Diagnostic = union(enum) {
-    not_valid: std.zon.parse.Diagnostics,
+    not_valid: ZonFailure,
     read_failed: anyerror,
     too_many_rules: usize,
     pattern_matches_everything: []const u8,
@@ -134,9 +134,16 @@ pub const Diagnostic = union(enum) {
         bound: usize,
     };
 
+    /// `arena` backs `diag`'s messages and must outlive it; `deinit` frees both together.
+    pub const ZonFailure = struct {
+        arena: std.heap.ArenaAllocator,
+        diag: std.zon.parse.Diagnostics,
+    };
+
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
+        _ = gpa;
         switch (self.*) {
-            .not_valid => |*zon_diag| zon_diag.deinit(gpa),
+            .not_valid => |*zf| zf.arena.deinit(),
             else => {},
         }
         self.* = undefined;
@@ -144,9 +151,9 @@ pub const Diagnostic = union(enum) {
 
     pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.*) {
-            .not_valid => |*zon_diag| try writer.print(
+            .not_valid => |*zf| try writer.print(
                 "the org policy bundle is not valid:\n{f}",
-                .{zon_diag},
+                .{zf.diag.fmt(file_name)},
             ),
             .read_failed => |err| try writer.print(
                 "reading the org policy bundle failed: {s}",
@@ -231,6 +238,14 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     return true;
 }
 
+/// `Bundle` is the wire shape ZON parses directly, so the arena that backs
+/// its slices cannot live inside it; this pairs them so `destroy` can find
+/// the arena again from the bare `*const Bundle` a caller holds.
+const Owned = struct {
+    arena: std.heap.ArenaAllocator,
+    bundle: Bundle,
+};
+
 /// Looser about a field name than `chock.zon`'s reader, on purpose: this
 /// layer is a ceiling, so a misspelled key matching more only narrows more.
 pub fn parse(
@@ -238,28 +253,38 @@ pub fn parse(
     source: [:0]const u8,
     diag: ?*?Diagnostic,
 ) ParseError!*const Bundle {
-    var zon_diag: std.zon.parse.Diagnostics = .{};
-    var diag_owned = true;
-    defer if (diag_owned) zon_diag.deinit(gpa);
+    const owned = try gpa.create(Owned);
+    owned.arena = .init(gpa);
+    var arena_owned = true;
+    defer if (arena_owned) {
+        owned.arena.deinit();
+        gpa.destroy(owned);
+    };
 
-    const bundle = std.zon.parse.fromSliceAlloc(Bundle, gpa, source, &zon_diag, .{
+    var zon_diag: std.zon.parse.Diagnostics = undefined;
+    owned.bundle = std.zon.parse.fromSlice(Bundle, .{
+        .gpa = gpa,
+        .arena = owned.arena.allocator(),
+        .source = source,
+        .diagnostics = &zon_diag,
         // A member this build has no field for is kept out, not refused: only
         // an unknown version refuses.
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => {
-            if (note(diag, .{ .not_valid = zon_diag })) diag_owned = false;
+            if (note(diag, .{ .not_valid = .{ .arena = owned.arena, .diag = zon_diag } })) {
+                arena_owned = false;
+                gpa.destroy(owned);
+            }
             return error.InvalidBundle;
         },
     };
-    errdefer std.zon.parse.free(gpa, bundle);
 
-    try validate(bundle, diag);
+    try validate(owned.bundle, diag);
 
-    const owned = try gpa.create(Bundle);
-    owned.* = bundle;
-    return owned;
+    arena_owned = false;
+    return &owned.bundle;
 }
 
 pub fn load(
@@ -290,8 +315,9 @@ pub fn load(
 }
 
 pub fn destroy(gpa: std.mem.Allocator, self: *const Bundle) void {
-    std.zon.parse.free(gpa, self.*);
-    gpa.destroy(self);
+    const owned: *const Owned = @fieldParentPtr("bundle", self);
+    owned.arena.deinit();
+    gpa.destroy(owned);
 }
 
 fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
@@ -565,7 +591,7 @@ test "a bundle larger than the reader accepts is refused by count and by name le
     try testing.expectError(error.TooManyRules, parse(gpa, too_many, &count_diag));
     try testing.expectEqual(@as(usize, table.max_rules + 1), count_diag.?.too_many_rules);
 
-    const long_subject = "s" ** (max_subject_bytes + 1);
+    const long_subject = @as([(max_subject_bytes + 1)]u8, @splat('s'));
     var name_diag: ?Diagnostic = null;
     defer if (name_diag) |*d| d.deinit(gpa);
     try testing.expectError(
@@ -575,7 +601,7 @@ test "a bundle larger than the reader accepts is refused by count and by name le
     try testing.expectEqualStrings("subject", name_diag.?.name_too_long.field);
     try testing.expectEqual(@as(usize, max_subject_bytes + 1), name_diag.?.name_too_long.held);
 
-    const at_bound = "s" ** max_subject_bytes;
+    const at_bound = @as([max_subject_bytes]u8, @splat('s'));
     const accepted = try parse(gpa, ".{ .subject = \"" ++ at_bound ++ "\", .rules = .{} }", null);
     defer destroy(gpa, accepted);
     try testing.expectEqual(@as(usize, max_subject_bytes), accepted.subject.len);
@@ -693,7 +719,7 @@ test "a required sink that is not an absolute path is refused before it binds" {
     ));
     try testing.expectEqual(@as(usize, 1), empty.?.sink_path_empty);
 
-    const long = "/" ++ "p" ** max_sink_path_bytes;
+    const long = "/" ++ @as([max_sink_path_bytes]u8, @splat('p'));
     var too_long: ?Diagnostic = null;
     defer if (too_long) |*d| d.deinit(gpa);
     try testing.expectError(error.InvalidSinkPath, parse(
@@ -703,7 +729,7 @@ test "a required sink that is not an absolute path is refused before it binds" {
     ));
     try testing.expectEqual(@as(usize, 1), too_long.?.sink_path_too_long);
 
-    const at_bound = "/" ++ "p" ** (max_sink_path_bytes - 1);
+    const at_bound = "/" ++ @as([(max_sink_path_bytes - 1)]u8, @splat('p'));
     const accepted = try parse(
         gpa,
         ".{ .sinks = .{ .{ .kind = .directory, .path = \"" ++ at_bound ++ "\" } }, .rules = .{} }",

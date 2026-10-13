@@ -730,7 +730,7 @@ const ShortTmp = struct {
         const longest = std.fmt.bufPrint(
             &probe,
             "{s}/{s}" ++ chock_broker.socket.dir_suffix ++ "/" ++ chock_broker.handover.socket_name,
-            .{ whole, "0" ** 26 },
+            .{ whole, @as([26]u8, @splat('0')) },
         ) catch return error.SkipZigTest;
         if (!answerableAt(longest)) return error.SkipZigTest;
 
@@ -759,7 +759,7 @@ test "a running session that will not answer is refused, and it keeps running no
     const arena = arena_state.allocator();
 
     const session_dir = tmp.path();
-    const id = "01JQ" ++ "R" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('R'));
 
     const paths = try chock_broker.handover.pathsFor(arena, session_dir, id);
     var endpoint = try chock_broker.handover.Endpoint.open(io, paths, null);
@@ -798,7 +798,7 @@ test "a workspace that does not move yet is refused before the session is ever a
     var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(io, &dir_buffer);
     const dir = dir_buffer[0..dir_len];
-    const id = "01JQ" ++ "W" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('W'));
     const log_path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}.jsonl", .{ dir, id }, 0);
     defer gpa.free(log_path);
 
@@ -816,7 +816,7 @@ test "a workspace that does not move yet is refused before the session is ever a
         var locked = try store.lock(io);
         _ = try locked.append(gpa, io, .{ .workspace_open = .{
             .kind = kind,
-            .attempt = "01JQ" ++ "B" ** 22,
+            .attempt = "01JQ" ++ @as([22]u8, @splat('B')),
             .path = "/state/somewhere",
             .base_commit = "a1b2c3",
         } }, 1);
@@ -868,7 +868,7 @@ test "a running session with no handover socket is refused, and not waited on" {
 
     try testing.expectEqual(
         Asked.not_listening,
-        askRunningSession(arena, io, tmp.path(), "01JQ" ++ "N" ** 22, 0),
+        askRunningSession(arena, io, tmp.path(), "01JQ" ++ @as([22]u8, @splat('N')), 0),
     );
     try testing.expect(std.mem.indexOf(u8, said.err(), "is running") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "not listening") != null);
@@ -887,7 +887,7 @@ test "a live handover moves the lock, and never lets two processes hold it at on
     const arena = arena_state.allocator();
 
     const session_dir = tmp.path();
-    const id = "01JQ" ++ "K" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('K'));
     const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ session_dir, id }, 0);
 
     const first_log = try chock_proto.log.Log.open(io, log_path, id);
@@ -969,7 +969,7 @@ test "a live handover waits for background work, and moves the lock only after i
     const arena = arena_state.allocator();
 
     const session_dir = tmp.path();
-    const id = "01JQ" ++ "W" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('W'));
     const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ session_dir, id }, 0);
 
     const first_log = try chock_proto.log.Log.open(io, log_path, id);
@@ -1050,7 +1050,7 @@ test "the two control sockets share a directory and never share a descriptor" {
     defer tmp.cleanup(io);
 
     const session_dir = tmp.path();
-    const id = "01JQ" ++ "S" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('S'));
 
     var approval_paths = try chock_broker.socket.pathsFor(gpa, session_dir, id);
     defer approval_paths.deinit();
@@ -1090,7 +1090,7 @@ test "a session handed over is answered by chock approve at the path it already 
     defer tmp.cleanup(io);
 
     const session_dir = tmp.path();
-    const id = "01JQ" ++ "T" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('T'));
 
     var client_paths = try chock_broker.socket.pathsFor(gpa, session_dir, id);
     defer client_paths.deinit();
@@ -1152,7 +1152,7 @@ test "a session that handed over is not refused for the workspace its handover k
     var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(io, &dir_buffer);
     const dir = dir_buffer[0..dir_len];
-    const id = "01JQ" ++ "V" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('V'));
     const log_path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}.jsonl", .{ dir, id }, 0);
     defer gpa.free(log_path);
 
@@ -1190,7 +1190,7 @@ test "a session that handed over is not refused for the workspace its handover k
 test "no daemon is found before a running session is asked, and not after" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1307,7 +1307,7 @@ test "a failure after a session was stopped says so, and one before it does not"
 }
 
 test "a daemon that took the session is the only answer that exits finished" {
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     const note = stoppedNote(false);
 
     var said: tty.Capture = undefined;
@@ -1344,12 +1344,12 @@ test "a daemon that took the session is the only answer that exits finished" {
 test "a socket path too long for the machine is measured before the closing advice is given" {
     const gpa = testing.allocator;
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     var short = try chock_broker.socket.pathsFor(gpa, "/state/p", id);
     defer short.deinit();
     try testing.expect(answerableAt(short.socket));
 
-    const deep = try std.fmt.allocPrint(gpa, "/state/{s}", .{"d" ** 120});
+    const deep = try std.fmt.allocPrint(gpa, "/state/{s}", .{@as([120]u8, @splat('d'))});
     defer gpa.free(deep);
     var over = try chock_broker.socket.pathsFor(gpa, deep, id);
     defer over.deinit();
@@ -1381,7 +1381,7 @@ test "a session that is running is refused, and one nobody owns is handed over" 
     const dir_len = try tmp.dir.realPath(io, &dir_buffer);
     const dir = dir_buffer[0..dir_len];
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     const log_path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}.jsonl", .{ dir, id }, 0);
     defer gpa.free(log_path);
 
@@ -1430,7 +1430,7 @@ test "a session whose workspace still holds work is refused, and an empty one is
     const dir_len = try tmp.dir.realPath(io, &dir_buffer);
     const dir = dir_buffer[0..dir_len];
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     const work = try std.fmt.allocPrint(gpa, "{s}/{s}.work", .{ dir, id });
     defer gpa.free(work);
 
@@ -1462,11 +1462,11 @@ test "a session folded by the next owner holds what the last owner held" {
 
     var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(io, &dir_buffer);
-    const id = "01JQ" ++ "H" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('H'));
     const log_path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}.jsonl", .{ dir_buffer[0..dir_len], id }, 0);
     defer gpa.free(log_path);
 
-    const child_id = "01JQ" ++ "K" ** 22;
+    const child_id = "01JQ" ++ @as([22]u8, @splat('K'));
     const user = [_]chock_proto.event.ContentPart{.{ .text = "carry this on" }};
     const answer = [_]chock_proto.event.ContentPart{.{ .text = "reading the parser" }};
     const steps = [_]chock_proto.event.PlanStep{
@@ -1592,7 +1592,7 @@ test "a handover with no daemon to hand to is refused, and it names what to do" 
     said.start(io, gpa);
     defer said.stop(io);
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     const code = try handOver(io, "/some/project", id, .{ .unix = socket_path }, true, false);
     try testing.expectEqual(Exit.usage.code(), code);
     try testing.expect(std.mem.indexOf(u8, said.err(), id) != null);
@@ -1659,7 +1659,7 @@ const FakeDaemon = struct {
 test "a daemon of another control protocol number is never handed a session" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1742,7 +1742,7 @@ test "a session that changed hands is still answered by chock approve, at the sa
     defer tmp.cleanup(io);
 
     const session_dir = tmp.path();
-    const id = "01JQ" ++ "M" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('M'));
 
     var client_paths = try chock_broker.socket.pathsFor(gpa, session_dir, id);
     defer client_paths.deinit();

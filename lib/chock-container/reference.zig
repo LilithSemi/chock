@@ -86,7 +86,7 @@ test "an ordinary reference is accepted in each of the shapes a person writes" {
         "alpine",
         "ghcr.io/owner/name:1.2.3",
         "registry.example.com:5000/team/project/image:latest",
-        "docker.io/library/debian@sha256:" ++ ("a" ** 64),
+        "docker.io/library/debian@sha256:" ++ (@as([64]u8, @splat('a'))),
         "quay.io/org/tool_name:v1.0-rc1",
     }) |good| {
         try testing.expectEqual(@as(anyerror!void, {}), check(good));

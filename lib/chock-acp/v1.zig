@@ -107,8 +107,8 @@ pub const Method = enum {
     }
 
     pub fn fromWireName(name: []const u8) ?Method {
-        inline for (@typeInfo(Method).@"enum".fields) |field| {
-            const one: Method = @enumFromInt(field.value);
+        inline for (@typeInfo(Method).@"enum".field_names, @typeInfo(Method).@"enum".field_values) |_, field_value| {
+            const one: Method = @enumFromInt(field_value);
             if (std.mem.eql(u8, one.wireName(), name)) return one;
         }
         return null;
@@ -157,8 +157,8 @@ const testing = std.testing;
 
 test "every method has a wire name and reads back as itself" {
     // Catches a method added but forgotten in the name table.
-    inline for (@typeInfo(Method).@"enum".fields) |field| {
-        const one: Method = @enumFromInt(field.value);
+    inline for (@typeInfo(Method).@"enum".field_names, @typeInfo(Method).@"enum".field_values) |_, field_value| {
+        const one: Method = @enumFromInt(field_value);
         const name = one.wireName();
         try testing.expect(name.len != 0);
         try testing.expectEqual(one, Method.fromWireName(name).?);
@@ -210,15 +210,15 @@ test "version 1's own enums spell themselves the way its schema does" {
     try testing.expectEqualStrings("in_progress", ToolCallStatus.in_progress.wireName());
 
     inline for (.{ UpdateKind, ToolCallStatus }) |Kind| {
-        inline for (@typeInfo(Kind).@"enum".fields) |field| {
-            const one: Kind = @enumFromInt(field.value);
-            try testing.expectEqualStrings(field.name, one.wireName());
+        inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |field_name, field_value| {
+            const one: Kind = @enumFromInt(field_value);
+            try testing.expectEqualStrings(field_name, one.wireName());
         }
     }
 
     // Reading v2's set as v1's would misread a status.
-    try testing.expectEqual(@as(usize, 4), @typeInfo(ToolCallStatus).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 4), @typeInfo(ToolCallStatus).@"enum".field_names.len);
     // `tool_call` is v1 only; v2 has no such variant.
     try testing.expect(std.mem.indexOf(u8, UpdateKind.tool_call.wireName(), "tool_call") != null);
-    try testing.expectEqual(@as(usize, 11), @typeInfo(UpdateKind).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 11), @typeInfo(UpdateKind).@"enum".field_names.len);
 }

@@ -372,9 +372,9 @@ test "an answer longer than the caller's buffer is refused, never written past" 
 }
 
 test "a card that never stops offering more data is given up on" {
-    const forever = [_]Exchange{
+    const forever = @as([(Card.max_rounds + 2)]Exchange, @splat(
         .{ .send = &.{ 0x00, 0xc0, 0x00, 0x00, 0x01 }, .receive = &.{ 0x00, 0x61, 0x01 } },
-    } ** (Card.max_rounds + 2);
+    ));
     var all: [1 + forever.len]Exchange = undefined;
     all[0] = .{ .send = &.{ 0x00, 0xcb, 0x3f, 0xff, 0x00 }, .receive = &.{ 0x00, 0x61, 0x01 } };
     @memcpy(all[1..], &forever);

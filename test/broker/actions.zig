@@ -220,7 +220,7 @@ test "the broker runs the action, and the agent never holds the capability" {
 
     // Content never committed before, so git cannot skip writing the object.
     var agent_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const agent_path = try std.fmt.bufPrintZ(&agent_path_buffer, "{s}/{s}", .{ wt.path, agent_file });
+    const agent_path = try std.fmt.bufPrintSentinel(&agent_path_buffer, "{s}/{s}", .{ wt.path, agent_file }, 0);
     try writeFileAbsolute(io, agent_path, "the agent wrote this inside the sandbox\n");
 
     var work_root_tmp = testing.tmpDir(.{});
@@ -1080,9 +1080,9 @@ test "the question a person is asked is different in every mode and names the mo
 }
 
 test "the agent cannot name the mode, and the ask it sends carries no way to" {
-    inline for (@typeInfo(actions.Ask).@"struct".fields) |field| {
+    inline for (@typeInfo(actions.Ask).@"struct".field_names) |field_name| {
         inline for (.{ "mode", "landing", "integration", "branch" }) |name| {
-            try testing.expect(!std.ascii.eqlIgnoreCase(field.name, name));
+            try testing.expect(!std.ascii.eqlIgnoreCase(field_name, name));
         }
     }
     const ask = testAsk(.{ .net_fetch = .{ .host = "h.invalid", .url = "https://h.invalid/" } });

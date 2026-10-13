@@ -1233,11 +1233,11 @@ const TestProject = struct {
         const tmp_path = try absoluteDirPath(&buffer, tmp.dir);
 
         var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const root_path = try std.fmt.bufPrintZ(&root_buffer, "{s}/project", .{tmp_path});
+        const root_path = try std.fmt.bufPrintSentinel(&root_buffer, "{s}/project", .{tmp_path}, 0);
         try makeDir(root_path);
 
         var scratch_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const scratch_path = try std.fmt.bufPrintZ(&scratch_buffer, "{s}/scratch", .{tmp_path});
+        const scratch_path = try std.fmt.bufPrintSentinel(&scratch_buffer, "{s}/scratch", .{tmp_path}, 0);
         try makeDir(scratch_path);
 
         var env = try testEnviron(allocator, tmp_path);
@@ -1253,7 +1253,7 @@ const TestProject = struct {
         defer config_email.deinit(allocator);
 
         var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{root_path});
+        const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{root_path}, 0);
         var tracked_file = try std.Io.Dir.createFileAbsolute(std.testing.io, tracked_path, .{});
         try tracked_file.writeStreamingAll(std.testing.io, "hello\n");
         tracked_file.close(std.testing.io);
@@ -1273,8 +1273,8 @@ const TestProject = struct {
 
         return .{
             .allocator = allocator,
-            .root_path = try allocator.dupeZ(u8, root_path),
-            .scratch_path = try allocator.dupeZ(u8, scratch_path),
+            .root_path = try allocator.dupeSentinel(u8, root_path, 0),
+            .scratch_path = try allocator.dupeSentinel(u8, scratch_path, 0),
             .env = env,
             .head_sha = head_sha,
         };
@@ -1774,7 +1774,7 @@ test "create undoes git worktree add when a later step fails" {
     defer project.deinit();
 
     var pointer_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const blocked_pointer_path = try std.fmt.bufPrintZ(&pointer_buffer, "{s}/sess1.gitdir", .{project.scratch_path});
+    const blocked_pointer_path = try std.fmt.bufPrintSentinel(&pointer_buffer, "{s}/sess1.gitdir", .{project.scratch_path}, 0);
     try makeDir(blocked_pointer_path);
 
     try std.testing.expectError(
@@ -1798,7 +1798,7 @@ test "remove frees its memory and deletes the pointer file even when git worktre
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
 
     var commondir_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const commondir_path = try std.fmt.bufPrintZ(&commondir_buffer, "{s}/commondir", .{worktree.worktree_meta_source});
+    const commondir_path = try std.fmt.bufPrintSentinel(&commondir_buffer, "{s}/commondir", .{worktree.worktree_meta_source}, 0);
     var commondir_file = try std.Io.Dir.createFileAbsolute(std.testing.io, commondir_path, .{});
     try commondir_file.writeStreamingAll(std.testing.io, "/nonexistent\n");
     commondir_file.close(std.testing.io);
@@ -1859,7 +1859,7 @@ test "a modified file in the project appears in the worktree with the same conte
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{project.root_path});
+    const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{project.root_path}, 0);
     try writeFile(tracked_path, "hello, modified\n");
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -1871,7 +1871,7 @@ test "a modified file in the project appears in the worktree with the same conte
     try std.testing.expectEqual(@as(usize, 0), report.skipped.items.len);
 
     var worktree_tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_tracked_path = try std.fmt.bufPrintZ(&worktree_tracked_buffer, "{s}/tracked.txt", .{worktree.path});
+    const worktree_tracked_path = try std.fmt.bufPrintSentinel(&worktree_tracked_buffer, "{s}/tracked.txt", .{worktree.path}, 0);
     const worktree_contents = try readFile(allocator, worktree_tracked_path);
     defer allocator.free(worktree_contents);
     try std.testing.expectEqualStrings("hello, modified\n", worktree_contents);
@@ -1889,7 +1889,7 @@ test "a file the user has not committed yet appears in the worktree" {
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var new_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const new_file_path = try std.fmt.bufPrintZ(&new_file_buffer, "{s}/new_work.txt", .{project.root_path});
+    const new_file_path = try std.fmt.bufPrintSentinel(&new_file_buffer, "{s}/new_work.txt", .{project.root_path}, 0);
     try writeFile(new_file_path, "brand new, never committed\n");
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -1899,7 +1899,7 @@ test "a file the user has not committed yet appears in the worktree" {
     try std.testing.expectEqual(@as(usize, 0), report.modified.items.len);
 
     var worktree_new_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_new_file_path = try std.fmt.bufPrintZ(&worktree_new_file_buffer, "{s}/new_work.txt", .{worktree.path});
+    const worktree_new_file_path = try std.fmt.bufPrintSentinel(&worktree_new_file_buffer, "{s}/new_work.txt", .{worktree.path}, 0);
     const worktree_contents = try readFile(allocator, worktree_new_file_path);
     defer allocator.free(worktree_contents);
     try std.testing.expectEqualStrings("brand new, never committed\n", worktree_contents);
@@ -1917,11 +1917,11 @@ test "a deleted file is deleted in the worktree too" {
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var worktree_tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_tracked_path = try std.fmt.bufPrintZ(&worktree_tracked_buffer, "{s}/tracked.txt", .{worktree.path});
+    const worktree_tracked_path = try std.fmt.bufPrintSentinel(&worktree_tracked_buffer, "{s}/tracked.txt", .{worktree.path}, 0);
     try std.testing.expect(try existsOnDisk(std.testing.io, worktree_tracked_path));
 
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{project.root_path});
+    const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{project.root_path}, 0);
     try std.Io.Dir.deleteFileAbsolute(std.testing.io, tracked_path);
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -1947,7 +1947,7 @@ test "the report names how many files came across, so Chock can tell the user" {
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var second_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const second_path = try std.fmt.bufPrintZ(&second_buffer, "{s}/second.txt", .{project.root_path});
+    const second_path = try std.fmt.bufPrintSentinel(&second_buffer, "{s}/second.txt", .{project.root_path}, 0);
     try writeFile(second_path, "second\n");
     var second_add = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "add", "second.txt" }, null);
     defer second_add.deinit(allocator);
@@ -1956,13 +1956,13 @@ test "the report names how many files came across, so Chock can tell the user" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, second_commit.term);
 
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{project.root_path});
+    const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{project.root_path}, 0);
     try writeFile(tracked_path, "modified again\n");
 
     try std.Io.Dir.deleteFileAbsolute(std.testing.io, second_path);
 
     var new_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const new_file_path = try std.fmt.bufPrintZ(&new_file_buffer, "{s}/new_work.txt", .{project.root_path});
+    const new_file_path = try std.fmt.bufPrintSentinel(&new_file_buffer, "{s}/new_work.txt", .{project.root_path}, 0);
     try writeFile(new_file_path, "new work\n");
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -2037,7 +2037,7 @@ test "a symbolic link inside the project is recreated in the worktree, not follo
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var link_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const link_path = try std.fmt.bufPrintZ(&link_path_buffer, "{s}/link_to_tracked", .{project.root_path});
+    const link_path = try std.fmt.bufPrintSentinel(&link_path_buffer, "{s}/link_to_tracked", .{project.root_path}, 0);
     try makeSymlink("tracked.txt", link_path);
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -2047,7 +2047,7 @@ test "a symbolic link inside the project is recreated in the worktree, not follo
     try std.testing.expectEqual(@as(usize, 0), report.skipped.items.len);
 
     var worktree_link_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_link_path = try std.fmt.bufPrintZ(&worktree_link_buffer, "{s}/link_to_tracked", .{worktree.path});
+    const worktree_link_path = try std.fmt.bufPrintSentinel(&worktree_link_buffer, "{s}/link_to_tracked", .{worktree.path}, 0);
     const kind = try classify(std.testing.io, worktree_link_path);
     try std.testing.expectEqual(std.Io.File.Kind.sym_link, kind.?);
 
@@ -2067,14 +2067,14 @@ test "a symbolic link pointing outside the project never lands its target's cont
     var tmp_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = try absoluteDirPath(&tmp_path_buffer, tmp.dir);
     var outside_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const outside_path = try std.fmt.bufPrintZ(&outside_buffer, "{s}/outside_secret.txt", .{tmp_path});
+    const outside_path = try std.fmt.bufPrintSentinel(&outside_buffer, "{s}/outside_secret.txt", .{tmp_path}, 0);
     try writeFile(outside_path, "OUTSIDE SECRET");
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var link_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const link_path = try std.fmt.bufPrintZ(&link_path_buffer, "{s}/key", .{project.root_path});
+    const link_path = try std.fmt.bufPrintSentinel(&link_path_buffer, "{s}/key", .{project.root_path}, 0);
     try makeSymlink(outside_path, link_path);
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -2083,7 +2083,7 @@ test "a symbolic link pointing outside the project never lands its target's cont
     try std.testing.expectEqualStrings("key", report.added.items[0]);
 
     var worktree_key_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_key_path = try std.fmt.bufPrintZ(&worktree_key_buffer, "{s}/key", .{worktree.path});
+    const worktree_key_path = try std.fmt.bufPrintSentinel(&worktree_key_buffer, "{s}/key", .{worktree.path}, 0);
     const kind = try classify(std.testing.io, worktree_key_path);
     try std.testing.expectEqual(std.Io.File.Kind.sym_link, kind.?);
 
@@ -2106,7 +2106,7 @@ test "a broken symbolic link is recreated, not treated as a deletion" {
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var link_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const link_path = try std.fmt.bufPrintZ(&link_path_buffer, "{s}/dangling", .{project.root_path});
+    const link_path = try std.fmt.bufPrintSentinel(&link_path_buffer, "{s}/dangling", .{project.root_path}, 0);
     try makeSymlink("this/path/does/not/exist.txt", link_path);
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -2117,7 +2117,7 @@ test "a broken symbolic link is recreated, not treated as a deletion" {
     try std.testing.expectEqualStrings("dangling", report.added.items[0]);
 
     var worktree_link_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_link_path = try std.fmt.bufPrintZ(&worktree_link_buffer, "{s}/dangling", .{worktree.path});
+    const worktree_link_path = try std.fmt.bufPrintSentinel(&worktree_link_buffer, "{s}/dangling", .{worktree.path}, 0);
     const kind = try classify(std.testing.io, worktree_link_path);
     try std.testing.expectEqual(std.Io.File.Kind.sym_link, kind.?);
 
@@ -2135,17 +2135,17 @@ test "a symbolic link to a directory is recreated as a link, not followed into t
     defer project.deinit();
 
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path = try std.fmt.bufPrintZ(&dir_path_buffer, "{s}/a_directory", .{project.root_path});
+    const dir_path = try std.fmt.bufPrintSentinel(&dir_path_buffer, "{s}/a_directory", .{project.root_path}, 0);
     try makeDir(dir_path);
     var inner_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const inner_file_path = try std.fmt.bufPrintZ(&inner_file_buffer, "{s}/inside.txt", .{dir_path});
+    const inner_file_path = try std.fmt.bufPrintSentinel(&inner_file_buffer, "{s}/inside.txt", .{dir_path}, 0);
     try writeFile(inner_file_path, "inside a directory the link points at\n");
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var link_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const link_path = try std.fmt.bufPrintZ(&link_path_buffer, "{s}/link_to_dir", .{project.root_path});
+    const link_path = try std.fmt.bufPrintSentinel(&link_path_buffer, "{s}/link_to_dir", .{project.root_path}, 0);
     try makeSymlink("a_directory", link_path);
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -2158,7 +2158,7 @@ test "a symbolic link to a directory is recreated as a link, not followed into t
     try std.testing.expect(saw_link);
 
     var worktree_link_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_link_path = try std.fmt.bufPrintZ(&worktree_link_buffer, "{s}/link_to_dir", .{worktree.path});
+    const worktree_link_path = try std.fmt.bufPrintSentinel(&worktree_link_buffer, "{s}/link_to_dir", .{worktree.path}, 0);
     const kind = try classify(std.testing.io, worktree_link_path);
     try std.testing.expectEqual(std.Io.File.Kind.sym_link, kind.?);
     try worktree.remove(allocator, std.testing.io, &project.env, null);
@@ -2174,7 +2174,7 @@ test "a dirty submodule is skipped, not a crash" {
     var tmp_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = try absoluteDirPath(&tmp_path_buffer, tmp.dir);
     var submodule_source_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const submodule_source_path = try std.fmt.bufPrintZ(&submodule_source_buffer, "{s}/submodule_source", .{tmp_path});
+    const submodule_source_path = try std.fmt.bufPrintSentinel(&submodule_source_buffer, "{s}/submodule_source", .{tmp_path}, 0);
     try makeDir(submodule_source_path);
     var sub_init = try git.run(allocator, std.testing.io, &project.env, submodule_source_path, &.{"init"}, null);
     defer sub_init.deinit(allocator);
@@ -2183,7 +2183,7 @@ test "a dirty submodule is skipped, not a crash" {
     var sub_config_email = try git.run(allocator, std.testing.io, &project.env, submodule_source_path, &.{ "config", "user.name", "Test" }, null);
     defer sub_config_email.deinit(allocator);
     var sub_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const sub_file_path = try std.fmt.bufPrintZ(&sub_file_buffer, "{s}/f.txt", .{submodule_source_path});
+    const sub_file_path = try std.fmt.bufPrintSentinel(&sub_file_buffer, "{s}/f.txt", .{submodule_source_path}, 0);
     try writeFile(sub_file_path, "hello from the submodule\n");
     var sub_add = try git.run(allocator, std.testing.io, &project.env, submodule_source_path, &.{ "add", "f.txt" }, null);
     defer sub_add.deinit(allocator);
@@ -2205,7 +2205,7 @@ test "a dirty submodule is skipped, not a crash" {
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var sub_project_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const sub_project_file_path = try std.fmt.bufPrintZ(&sub_project_file_buffer, "{s}/sub/f.txt", .{project.root_path});
+    const sub_project_file_path = try std.fmt.bufPrintSentinel(&sub_project_file_buffer, "{s}/sub/f.txt", .{project.root_path}, 0);
     try writeFile(sub_project_file_path, "hello from the submodule, dirtied\n");
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -2233,13 +2233,13 @@ test "an untracked nested repository is skipped, not a crash" {
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var nested_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const nested_path = try std.fmt.bufPrintZ(&nested_path_buffer, "{s}/nested", .{project.root_path});
+    const nested_path = try std.fmt.bufPrintSentinel(&nested_path_buffer, "{s}/nested", .{project.root_path}, 0);
     try makeDir(nested_path);
     var nested_init = try git.run(allocator, std.testing.io, &project.env, nested_path, &.{"init"}, null);
     defer nested_init.deinit(allocator);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, nested_init.term);
     var nested_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const nested_file_path = try std.fmt.bufPrintZ(&nested_file_buffer, "{s}/f.txt", .{nested_path});
+    const nested_file_path = try std.fmt.bufPrintSentinel(&nested_file_buffer, "{s}/f.txt", .{nested_path}, 0);
     try writeFile(nested_file_path, "vendored\n");
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -2264,11 +2264,11 @@ test "a plain file replaced by a directory is skipped, not a crash" {
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{project.root_path});
+    const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{project.root_path}, 0);
     try std.Io.Dir.deleteFileAbsolute(std.testing.io, tracked_path);
     try makeDir(tracked_path);
     var inner_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const inner_path = try std.fmt.bufPrintZ(&inner_buffer, "{s}/inner.txt", .{tracked_path});
+    const inner_path = try std.fmt.bufPrintSentinel(&inner_buffer, "{s}/inner.txt", .{tracked_path}, 0);
     try writeFile(inner_path, "a file where a directory now is\n");
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -2281,7 +2281,7 @@ test "a plain file replaced by a directory is skipped, not a crash" {
     try std.testing.expect(saw_tracked_skip);
 
     var worktree_tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_tracked_path = try std.fmt.bufPrintZ(&worktree_tracked_buffer, "{s}/tracked.txt", .{worktree.path});
+    const worktree_tracked_path = try std.fmt.bufPrintSentinel(&worktree_tracked_buffer, "{s}/tracked.txt", .{worktree.path}, 0);
     const worktree_contents = try readFile(allocator, worktree_tracked_path);
     defer allocator.free(worktree_contents);
     try std.testing.expectEqualStrings("hello\n", worktree_contents);
@@ -2299,14 +2299,14 @@ test "a file that cannot be read is skipped, and the rest of the import still co
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var unreadable_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const unreadable_path = try std.fmt.bufPrintZ(&unreadable_buffer, "{s}/unreadable.txt", .{project.root_path});
+    const unreadable_path = try std.fmt.bufPrintSentinel(&unreadable_buffer, "{s}/unreadable.txt", .{project.root_path}, 0);
     try writeFile(unreadable_path, "you cannot read this\n");
     // fchmodat by path, since opening the file for read is what the test takes away.
     try std.Io.Dir.cwd().setFilePermissions(std.testing.io, unreadable_path, .fromMode(0o000), .{});
     defer std.Io.Dir.cwd().setFilePermissions(std.testing.io, unreadable_path, .fromMode(0o644), .{}) catch {};
 
     var readable_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const readable_path = try std.fmt.bufPrintZ(&readable_buffer, "{s}/readable.txt", .{project.root_path});
+    const readable_path = try std.fmt.bufPrintSentinel(&readable_buffer, "{s}/readable.txt", .{project.root_path}, 0);
     try writeFile(readable_path, "you can read this\n");
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
@@ -2325,7 +2325,7 @@ test "a file that cannot be read is skipped, and the rest of the import still co
     try std.testing.expect(saw_readable_added);
 
     var worktree_readable_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_readable_path = try std.fmt.bufPrintZ(&worktree_readable_buffer, "{s}/readable.txt", .{worktree.path});
+    const worktree_readable_path = try std.fmt.bufPrintSentinel(&worktree_readable_buffer, "{s}/readable.txt", .{worktree.path}, 0);
     const worktree_contents = try readFile(allocator, worktree_readable_path);
     defer allocator.free(worktree_contents);
     try std.testing.expectEqualStrings("you can read this\n", worktree_contents);
@@ -2340,7 +2340,7 @@ test "a path git rm --cached names twice is imported once, not double counted" {
     defer project.deinit();
 
     var second_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const second_path = try std.fmt.bufPrintZ(&second_buffer, "{s}/second.txt", .{project.root_path});
+    const second_path = try std.fmt.bufPrintSentinel(&second_buffer, "{s}/second.txt", .{project.root_path}, 0);
     try writeFile(second_path, "second\n");
     var second_add = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "add", "second.txt" }, null);
     defer second_add.deinit(allocator);
@@ -2375,7 +2375,7 @@ test "a path git rm --cached names twice is imported once, not double counted" {
     try std.testing.expectEqual(@as(usize, 1), occurrences);
 
     var worktree_second_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_second_path = try std.fmt.bufPrintZ(&worktree_second_buffer, "{s}/second.txt", .{worktree.path});
+    const worktree_second_path = try std.fmt.bufPrintSentinel(&worktree_second_buffer, "{s}/second.txt", .{worktree.path}, 0);
     const worktree_contents = try readFile(allocator, worktree_second_path);
     defer allocator.free(worktree_contents);
     try std.testing.expectEqualStrings("second\n", worktree_contents);
@@ -2394,7 +2394,7 @@ const ProjectSnapshot = struct {
         errdefer allocator.free(tree);
 
         var index_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const index_path = try std.fmt.bufPrintZ(&index_path_buffer, "{s}/.git/index", .{root_path});
+        const index_path = try std.fmt.bufPrintSentinel(&index_path_buffer, "{s}/.git/index", .{root_path}, 0);
         const index_bytes = try readFile(allocator, index_path);
         errdefer allocator.free(index_bytes);
 
@@ -2487,40 +2487,40 @@ test "the project's own tree, index, HEAD, refs, and stash are untouched by an i
     var tmp_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = try absoluteDirPath(&tmp_path_buffer, tmp.dir);
     var outside_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const outside_path = try std.fmt.bufPrintZ(&outside_buffer, "{s}/outside_secret.txt", .{tmp_path});
+    const outside_path = try std.fmt.bufPrintSentinel(&outside_buffer, "{s}/outside_secret.txt", .{tmp_path}, 0);
     try writeFile(outside_path, "OUTSIDE SECRET");
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{project.root_path});
+    const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{project.root_path}, 0);
     try writeFile(tracked_path, "modified before the snapshot\n");
 
     var new_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const new_file_path = try std.fmt.bufPrintZ(&new_file_buffer, "{s}/new_work.txt", .{project.root_path});
+    const new_file_path = try std.fmt.bufPrintSentinel(&new_file_buffer, "{s}/new_work.txt", .{project.root_path}, 0);
     try writeFile(new_file_path, "new work\n");
 
     var inside_link_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const inside_link_path = try std.fmt.bufPrintZ(&inside_link_buffer, "{s}/link_inside", .{project.root_path});
+    const inside_link_path = try std.fmt.bufPrintSentinel(&inside_link_buffer, "{s}/link_inside", .{project.root_path}, 0);
     try makeSymlink("tracked.txt", inside_link_path);
 
     var outside_link_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const outside_link_path = try std.fmt.bufPrintZ(&outside_link_buffer, "{s}/key", .{project.root_path});
+    const outside_link_path = try std.fmt.bufPrintSentinel(&outside_link_buffer, "{s}/key", .{project.root_path}, 0);
     try makeSymlink(outside_path, outside_link_path);
 
     var broken_link_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const broken_link_path = try std.fmt.bufPrintZ(&broken_link_buffer, "{s}/dangling", .{project.root_path});
+    const broken_link_path = try std.fmt.bufPrintSentinel(&broken_link_buffer, "{s}/dangling", .{project.root_path}, 0);
     try makeSymlink("nowhere.txt", broken_link_path);
 
     var nested_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const nested_path = try std.fmt.bufPrintZ(&nested_path_buffer, "{s}/nested", .{project.root_path});
+    const nested_path = try std.fmt.bufPrintSentinel(&nested_path_buffer, "{s}/nested", .{project.root_path}, 0);
     try makeDir(nested_path);
     var nested_init = try git.run(allocator, std.testing.io, &project.env, nested_path, &.{"init"}, null);
     defer nested_init.deinit(allocator);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, nested_init.term);
     var nested_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const nested_file_path = try std.fmt.bufPrintZ(&nested_file_buffer, "{s}/f.txt", .{nested_path});
+    const nested_file_path = try std.fmt.bufPrintSentinel(&nested_file_buffer, "{s}/f.txt", .{nested_path}, 0);
     try writeFile(nested_file_path, "vendored\n");
 
     var before = try ProjectSnapshot.take(allocator, &project.env, project.root_path);
@@ -2550,24 +2550,24 @@ test "a fresh worktree holds the committed state, and neither a modification nor
     defer project.deinit();
 
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{project.root_path});
+    const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{project.root_path}, 0);
     try writeFile(tracked_path, "hello, modified\n");
 
     var new_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const new_file_path = try std.fmt.bufPrintZ(&new_file_buffer, "{s}/new_work.txt", .{project.root_path});
+    const new_file_path = try std.fmt.bufPrintSentinel(&new_file_buffer, "{s}/new_work.txt", .{project.root_path}, 0);
     try writeFile(new_file_path, "brand new, never committed\n");
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var worktree_tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_tracked = try std.fmt.bufPrintZ(&worktree_tracked_buffer, "{s}/tracked.txt", .{worktree.path});
+    const worktree_tracked = try std.fmt.bufPrintSentinel(&worktree_tracked_buffer, "{s}/tracked.txt", .{worktree.path}, 0);
     const contents = try readFile(allocator, worktree_tracked);
     defer allocator.free(contents);
     try std.testing.expectEqualStrings("hello\n", contents);
 
     var worktree_new_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const worktree_new = try std.fmt.bufPrintZ(&worktree_new_buffer, "{s}/new_work.txt", .{worktree.path});
+    const worktree_new = try std.fmt.bufPrintSentinel(&worktree_new_buffer, "{s}/new_work.txt", .{worktree.path}, 0);
     try std.testing.expectError(
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(std.testing.io, worktree_new, .{}),
@@ -2588,12 +2588,12 @@ test "countUncommitted names the split, and a clean project counts zero" {
     try std.testing.expect(!clean.any());
 
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{project.root_path});
+    const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{project.root_path}, 0);
     try writeFile(tracked_path, "hello, modified\n");
 
     var names_buffer: [std.fs.max_path_bytes]u8 = undefined;
     for ([_][]const u8{ "one.txt", "two.txt", "three.txt" }) |name| {
-        const path = try std.fmt.bufPrintZ(&names_buffer, "{s}/{s}", .{ project.root_path, name });
+        const path = try std.fmt.bufPrintSentinel(&names_buffer, "{s}/{s}", .{ project.root_path, name }, 0);
         try writeFile(path, "new\n");
     }
 
@@ -2612,7 +2612,7 @@ test "countUncommitted counts a staged addition as modified, the same way the im
     defer project.deinit();
 
     var staged_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const staged_path = try std.fmt.bufPrintZ(&staged_buffer, "{s}/staged.txt", .{project.root_path});
+    const staged_path = try std.fmt.bufPrintSentinel(&staged_buffer, "{s}/staged.txt", .{project.root_path}, 0);
     try writeFile(staged_path, "staged, not committed\n");
 
     var add_output = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "add", "staged.txt" }, null);
@@ -2658,7 +2658,7 @@ test "an idle session moves no head, and a session that commits names its own co
     try session_env.put("GIT_ALTERNATE_OBJECT_DIRECTORIES", project_objects);
 
     var edited_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const edited_path = try std.fmt.bufPrintZ(&edited_buffer, "{s}/tracked.txt", .{worktree.path});
+    const edited_path = try std.fmt.bufPrintSentinel(&edited_buffer, "{s}/tracked.txt", .{worktree.path}, 0);
     try writeFile(edited_path, "the agent changed this\n");
 
     var add_output = try git.run(allocator, std.testing.io, &session_env, worktree.path, &.{ "add", "tracked.txt" }, null);
@@ -2792,7 +2792,7 @@ test "adopt keeps the work the checkout already holds" {
         var made = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
         defer made.keep(allocator);
 
-        const written = try std.fmt.bufPrintZ(&path_buffer, "{s}/agent-wrote-this.txt", .{made.path});
+        const written = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/agent-wrote-this.txt", .{made.path}, 0);
         try writeFile(written, "work nobody committed\n");
         break :work written;
     };
@@ -2843,7 +2843,7 @@ test "adopt carries the caller's base commit, and never the head the session lef
         try session_env.put("GIT_ALTERNATE_OBJECT_DIRECTORIES", project_objects);
 
         var edited_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const edited_path = try std.fmt.bufPrintZ(&edited_buffer, "{s}/tracked.txt", .{made.path});
+        const edited_path = try std.fmt.bufPrintSentinel(&edited_buffer, "{s}/tracked.txt", .{made.path}, 0);
         try writeFile(edited_path, "the agent changed this\n");
 
         var add_output = try git.run(allocator, std.testing.io, &session_env, made.path, &.{ "add", "tracked.txt" }, null);
@@ -2900,7 +2900,7 @@ test "a path with no checkout, and a checkout with no .git at all, are both refu
     ));
 
     var empty_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const empty_path = try std.fmt.bufPrintZ(&empty_buffer, "{s}/empty", .{project.scratch_path});
+    const empty_path = try std.fmt.bufPrintSentinel(&empty_buffer, "{s}/empty", .{project.scratch_path}, 0);
     try makeDir(empty_path);
 
     try std.testing.expectError(error.NoWorktreeToAdopt, adopt(
@@ -2923,11 +2923,11 @@ test "a checkout whose .git is not a gitdir pointer is refused as not a linked w
     defer project.deinit();
 
     var checkout_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const checkout_path = try std.fmt.bufPrintZ(&checkout_buffer, "{s}/not-linked", .{project.scratch_path});
+    const checkout_path = try std.fmt.bufPrintSentinel(&checkout_buffer, "{s}/not-linked", .{project.scratch_path}, 0);
     try makeDir(checkout_path);
 
     var dotgit_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const dotgit_path = try std.fmt.bufPrintZ(&dotgit_buffer, "{s}/.git", .{checkout_path});
+    const dotgit_path = try std.fmt.bufPrintSentinel(&dotgit_buffer, "{s}/.git", .{checkout_path}, 0);
     try writeFile(dotgit_path, "ref: refs/heads/main\n");
 
     try std.testing.expectError(error.NotALinkedWorktree, adopt(
@@ -2967,10 +2967,11 @@ test "a checkout whose registration the project no longer has is refused, not ad
     made.keep(allocator);
 
     var registration_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const registration_path = try std.fmt.bufPrintZ(
+    const registration_path = try std.fmt.bufPrintSentinel(
         &registration_buffer,
         "{s}/.git/worktrees/sess1",
         .{project.root_path},
+        0,
     );
     try std.Io.Dir.cwd().deleteTree(std.testing.io, registration_path);
 

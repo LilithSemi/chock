@@ -77,8 +77,8 @@ pub const Method = enum {
     }
 
     pub fn fromWireName(name: []const u8) ?Method {
-        inline for (@typeInfo(Method).@"enum".fields) |field| {
-            const one: Method = @enumFromInt(field.value);
+        inline for (@typeInfo(Method).@"enum".field_names, @typeInfo(Method).@"enum".field_values) |_, field_value| {
+            const one: Method = @enumFromInt(field_value);
             if (std.mem.eql(u8, one.wireName(), name)) return one;
         }
         return null;
@@ -131,8 +131,8 @@ pub const ToolCallStatus = enum {
 const testing = std.testing;
 
 test "every method has a wire name and reads back as itself" {
-    inline for (@typeInfo(Method).@"enum".fields) |field| {
-        const one: Method = @enumFromInt(field.value);
+    inline for (@typeInfo(Method).@"enum".field_names, @typeInfo(Method).@"enum".field_values) |_, field_value| {
+        const one: Method = @enumFromInt(field_value);
         const name = one.wireName();
         try testing.expect(name.len != 0);
         try testing.expectEqual(one, Method.fromWireName(name).?);
@@ -184,24 +184,24 @@ test "what version 2 dropped is absent here, not renamed" {
 
 test "version 2's own enums spell themselves the way its schema does" {
     inline for (.{ UpdateKind, ToolCallStatus }) |Kind| {
-        inline for (@typeInfo(Kind).@"enum".fields) |field| {
-            const one: Kind = @enumFromInt(field.value);
-            try testing.expectEqualStrings(field.name, one.wireName());
+        inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |field_name, field_value| {
+            const one: Kind = @enumFromInt(field_value);
+            try testing.expectEqualStrings(field_name, one.wireName());
         }
     }
 
     // Two differences from version 1 a caller must know.
     try testing.expectEqualStrings("cancelled", ToolCallStatus.cancelled.wireName());
-    try testing.expectEqual(@as(usize, 5), @typeInfo(ToolCallStatus).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 5), @typeInfo(ToolCallStatus).@"enum".field_names.len);
     try testing.expectEqualStrings("plan_update", UpdateKind.plan_update.wireName());
-    try testing.expectEqual(@as(usize, 16), @typeInfo(UpdateKind).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 16), @typeInfo(UpdateKind).@"enum".field_names.len);
 }
 
 test "a tool call is reported without a tool_call variant" {
     // Version 2 has only `tool_call_update`; reaching for `tool_call` wouldn't compile.
-    inline for (@typeInfo(UpdateKind).@"enum".fields) |field| {
-        try testing.expect(!std.mem.eql(u8, field.name, "tool_call"));
-        try testing.expect(!std.mem.eql(u8, field.name, "plan"));
-        try testing.expect(!std.mem.eql(u8, field.name, "current_mode_update"));
+    inline for (@typeInfo(UpdateKind).@"enum".field_names, @typeInfo(UpdateKind).@"enum".field_values) |field_name, _| {
+        try testing.expect(!std.mem.eql(u8, field_name, "tool_call"));
+        try testing.expect(!std.mem.eql(u8, field_name, "plan"));
+        try testing.expect(!std.mem.eql(u8, field_name, "current_mode_update"));
     }
 }

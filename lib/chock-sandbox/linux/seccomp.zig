@@ -71,8 +71,8 @@ pub const TrapCall = enum {
     }
 
     pub fn fromNumber(nr: i64) ?TrapCall {
-        inline for (@typeInfo(TrapCall).@"enum".fields) |field| {
-            const call: TrapCall = @enumFromInt(field.value);
+        inline for (@typeInfo(TrapCall).@"enum".field_names, @typeInfo(TrapCall).@"enum".field_values) |_, field_value| {
+            const call: TrapCall = @enumFromInt(field_value);
             if (@intFromEnum(call.number()) == nr) return call;
         }
         return null;
@@ -84,21 +84,21 @@ pub const TrapSet = std.EnumSet(TrapCall);
 pub const bootstrap_calls = [_]linux.SYS{ .read, .write, .close, .sendto };
 
 comptime {
-    for (@typeInfo(TrapCall).@"enum".fields) |field| {
-        const call: TrapCall = @enumFromInt(field.value);
+    for (@typeInfo(TrapCall).@"enum".field_names, @typeInfo(TrapCall).@"enum".field_values) |field_name, field_value| {
+        const call: TrapCall = @enumFromInt(field_value);
         for (bootstrap_calls) |boot| {
             if (call.number() == boot) @compileError(
-                "trapping " ++ field.name ++ " would stop the handover forever. See bootstrap_calls.",
+                "trapping " ++ field_name ++ " would stop the handover forever. See bootstrap_calls.",
             );
         }
         for (blocked_calls) |killed| {
             if (call.number() == killed) @compileError(
-                "a killed call cannot also be an observed call: " ++ field.name,
+                "a killed call cannot also be an observed call: " ++ field_name,
             );
         }
         for (refused_calls) |refused| {
             if (call.number() == refused) @compileError(
-                "a refused call cannot also be an observed call: " ++ field.name,
+                "a refused call cannot also be an observed call: " ++ field_name,
             );
         }
     }
@@ -106,7 +106,15 @@ comptime {
 
 pub const memory_calls = [_]linux.SYS{ .mmap, .mprotect, .pkey_mprotect };
 
-pub const classified_through: usize = 470;
+/// The highest syscall number a person has classified. The test at the end of
+/// this file fails when the kernel headers hold a higher one, so a new call
+/// gets a decision instead of the default, which is to allow it.
+///
+/// 471 is `rseq_slice_yield`. It gives the rest of a time slice back to the
+/// scheduler. It opens nothing, reads and writes nothing, and changes no
+/// credential, so it stays allowed. `sched_yield` is allowed for the same
+/// reason.
+pub const classified_through: usize = 471;
 
 fn nativeAuditArch() u32 {
     const bit_64: u32 = 0x80000000;
@@ -122,7 +130,7 @@ fn nativeAuditArch() u32 {
 pub const Options = struct {
     strict_wx: bool = true,
     block_connect: bool = false,
-    traps: TrapSet = .initEmpty(),
+    traps: TrapSet = .empty,
 };
 
 pub fn build(allocator: std.mem.Allocator, options: Options) ![]bpf.Insn {
@@ -550,7 +558,7 @@ pub fn probeInstall(prog: bpf.Prog) InstallProbe {
     }
     _ = linux.close(fds[0]);
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
 
@@ -1001,9 +1009,9 @@ test "no syscall in std.os.linux.SYS is numbered past classified_through" {
     var found_new: std.ArrayList(u8) = .empty;
     defer found_new.deinit(allocator);
 
-    inline for (info.fields) |field| {
-        if (field.value > classified_through) {
-            try found_new.print(allocator, "{s} = {d}\n", .{ field.name, field.value });
+    inline for (info.field_names, info.field_values) |name, value| {
+        if (value > classified_through) {
+            try found_new.print(allocator, "{s} = {d}\n", .{ name, value });
         }
     }
 
@@ -1011,12 +1019,12 @@ test "no syscall in std.os.linux.SYS is numbered past classified_through" {
 }
 
 fn waitForExitCode(pid: linux.pid_t) !u32 {
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var rc = linux.waitpid(pid, &status, 0);
     while (linux.errno(rc) == .INTR) rc = linux.waitpid(pid, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
-    return linux.W.EXITSTATUS(status);
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+    return linux.W.EXITSTATUS(@bitCast(status));
 }
 
 fn chdirRefusedFilter() [4]bpf.Insn {
@@ -1136,8 +1144,8 @@ test "a trap set puts a user notification return in the filter, and an empty one
 }
 
 test "no call the handover makes can ever be trapped" {
-    inline for (@typeInfo(TrapCall).@"enum".fields) |field| {
-        const call: TrapCall = @enumFromInt(field.value);
+    inline for (@typeInfo(TrapCall).@"enum".field_names, @typeInfo(TrapCall).@"enum".field_values) |_, field_value| {
+        const call: TrapCall = @enumFromInt(field_value);
         for (bootstrap_calls) |boot| {
             try std.testing.expect(call.number() != boot);
         }
@@ -1145,8 +1153,8 @@ test "no call the handover makes can ever be trapped" {
 }
 
 test "nothing on the kill list and nothing on the refusal list can be trapped" {
-    inline for (@typeInfo(TrapCall).@"enum".fields) |field| {
-        const call: TrapCall = @enumFromInt(field.value);
+    inline for (@typeInfo(TrapCall).@"enum".field_names, @typeInfo(TrapCall).@"enum".field_values) |_, field_value| {
+        const call: TrapCall = @enumFromInt(field_value);
         for (blocked_calls) |killed| {
             try std.testing.expect(call.number() != killed);
         }
@@ -1174,8 +1182,8 @@ test "a trapped call is never reached by a filter that already kills or refuses 
 }
 
 test "every syscall number a notification can carry maps back to the call it names" {
-    inline for (@typeInfo(TrapCall).@"enum".fields) |field| {
-        const call: TrapCall = @enumFromInt(field.value);
+    inline for (@typeInfo(TrapCall).@"enum".field_names, @typeInfo(TrapCall).@"enum".field_values) |_, field_value| {
+        const call: TrapCall = @enumFromInt(field_value);
         try std.testing.expectEqual(
             @as(?TrapCall, call),
             TrapCall.fromNumber(@intCast(@intFromEnum(call.number()))),
@@ -1209,14 +1217,14 @@ test "the reader's filter permits its own four calls and kills the rest" {
         std.process.exit(12);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
+    if (linux.W.IFEXITED(@bitCast(status)) and linux.W.EXITSTATUS(@bitCast(status)) == 3) return error.SkipZigTest;
 
-    try std.testing.expect(linux.W.IFSIGNALED(status));
-    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(status));
+    try std.testing.expect(linux.W.IFSIGNALED(@bitCast(status)));
+    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(@bitCast(status)));
 }
 
 test "the keeper filter permits reap wait and readiness calls" {
@@ -1234,7 +1242,7 @@ test "the keeper filter permits reap wait and readiness calls" {
     if (fork_rc == 0) {
         install(bpf.Prog.init(insns)) catch |err| std.process.exit(installFaultCode(err));
 
-        var status: u32 = undefined;
+        var status: i32 = undefined;
         const reap_rc = linux.waitpid(-1, &status, linux.W.NOHANG);
         if (linux.errno(reap_rc) != .CHILD) std.process.exit(11);
 
@@ -1253,13 +1261,13 @@ test "the keeper filter permits reap wait and readiness calls" {
 
     _ = linux.close(pipe[1]);
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
-    try std.testing.expect(linux.W.IFEXITED(status));
-    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    if (linux.W.IFEXITED(@bitCast(status)) and linux.W.EXITSTATUS(@bitCast(status)) == 3) return error.SkipZigTest;
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(status)));
     var byte: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), linux.read(pipe[0], &byte, byte.len));
     _ = linux.close(pipe[0]);
@@ -1280,13 +1288,13 @@ test "the keeper filter kills a call outside its allowlist" {
         std.process.exit(12);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
-    try std.testing.expect(linux.W.IFSIGNALED(status));
-    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(status));
+    if (linux.W.IFEXITED(@bitCast(status)) and linux.W.EXITSTATUS(@bitCast(status)) == 3) return error.SkipZigTest;
+    try std.testing.expect(linux.W.IFSIGNALED(@bitCast(status)));
+    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(@bitCast(status)));
 }
 
 test "the router's filter permits the calls its loop makes and kills the rest" {
@@ -1316,14 +1324,14 @@ test "the router's filter permits the calls its loop makes and kills the rest" {
         std.process.exit(13);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
+    if (linux.W.IFEXITED(@bitCast(status)) and linux.W.EXITSTATUS(@bitCast(status)) == 3) return error.SkipZigTest;
 
-    try std.testing.expect(linux.W.IFSIGNALED(status));
-    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(status));
+    try std.testing.expect(linux.W.IFSIGNALED(@bitCast(status)));
+    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(@bitCast(status)));
 }
 
 test "the router may not open a path, run a program, or write to a descriptor" {
@@ -1380,14 +1388,14 @@ test "the device helper's filter permits the calls it needs and kills the rest" 
     try std.testing.expectEqual(@as(usize, message.len), read_back);
     try std.testing.expectEqualStrings(message, buf[0..read_back]);
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
+    if (linux.W.IFEXITED(@bitCast(status)) and linux.W.EXITSTATUS(@bitCast(status)) == 3) return error.SkipZigTest;
 
-    try std.testing.expect(linux.W.IFSIGNALED(status));
-    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(status));
+    try std.testing.expect(linux.W.IFSIGNALED(@bitCast(status)));
+    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(@bitCast(status)));
 }
 
 test "the device helper may not open a path or make a new channel" {

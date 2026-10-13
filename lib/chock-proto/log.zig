@@ -366,7 +366,7 @@ const TestLog = struct {
         const dir_path = try absoluteDirPath(std.testing.io, &dir_path_buffer, tmp.dir);
 
         var self: TestLog = .{ .tmp = tmp, .log = undefined, .path_len = 0 };
-        const written = try std.fmt.bufPrintZ(&self.path_buffer, "{s}/{s}", .{ dir_path, name });
+        const written = try std.fmt.bufPrintSentinel(&self.path_buffer, "{s}/{s}", .{ dir_path, name }, 0);
         self.path_len = written.len;
 
         self.log = try Log.open(std.testing.io, self.path(), "01TESTSESSION");
@@ -484,7 +484,7 @@ test "append refuses a file whose header names a version this build does not kno
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/future-header", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/future-header", .{dir_path}, 0);
 
     {
         var log = try Log.open(io, path, "01TESTSESSION");
@@ -513,7 +513,7 @@ test "regression: a header naming a version with a leading zero or a leading plu
         var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp.dir);
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/bad-version-{d}", .{ dir_path, i });
+        const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/bad-version-{d}", .{ dir_path, i }, 0);
 
         var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
         try file.writeStreamingAll(io, bad_header);
@@ -624,7 +624,7 @@ test "regression: a torn tail from an interrupted append does not swallow every 
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/torn-tail", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/torn-tail", .{dir_path}, 0);
 
     {
         var seed_file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
@@ -663,7 +663,7 @@ test "regression: open then replay on a torn log reports the tear instead of a d
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/torn-open-then-replay", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/torn-open-then-replay", .{dir_path}, 0);
 
     const allocator = std.testing.allocator;
     _ = try seedTornLog(io, path);
@@ -691,7 +691,7 @@ test "an append after a torn open removes the fragment and lands a valid line at
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/torn-append-truncates", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/torn-append-truncates", .{dir_path}, 0);
 
     const allocator = std.testing.allocator;
     const seed = try seedTornLog(io, path);
@@ -730,7 +730,7 @@ test "a replay after that append reads every event with no tear reported" {
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/torn-append-then-replay", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/torn-append-then-replay", .{dir_path}, 0);
 
     const allocator = std.testing.allocator;
     _ = try seedTornLog(io, path);
@@ -767,7 +767,7 @@ test "regression: a stale torn tail flag on a second handle does not destroy wha
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/handover-stale-tear", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/handover-stale-tear", .{dir_path}, 0);
 
     const allocator = std.testing.allocator;
     _ = try seedTornLog(io, path);
@@ -820,7 +820,7 @@ test "regression: cutting a fresh tear at the offset an earlier open cached dest
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/handover-fresh-tear", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/handover-fresh-tear", .{dir_path}, 0);
 
     const allocator = std.testing.allocator;
 
@@ -876,7 +876,7 @@ test "regression: a tear that appears after this handle's own open is still foun
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/tear-after-open", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/tear-after-open", .{dir_path}, 0);
 
     const allocator = std.testing.allocator;
     var log = try Log.open(io, path, "01TESTSESSION");
@@ -923,7 +923,7 @@ test "regression: a replay resumes once an owner appends past a tear it already 
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/replay-resumes-after-tear", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/replay-resumes-after-tear", .{dir_path}, 0);
 
     const allocator = std.testing.allocator;
     _ = try seedTornLog(io, path);
@@ -1127,7 +1127,7 @@ test "the lock is free again once the holder closes the log" {
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/lock-release-on-close", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/lock-release-on-close", .{dir_path}, 0);
 
     var first = try Log.open(io, path, "01TESTSESSION");
     _ = try first.lock(io);
@@ -1242,7 +1242,7 @@ test "an append after a torn tail chains onto the last whole line, never onto th
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try absoluteDirPath(io, &dir_path_buffer, tmp_dir.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/chain-after-tear", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/chain-after-tear", .{dir_path}, 0);
     const seeded = try seedTornLog(io, path);
 
     var log = try Log.open(io, path, "01TESTSESSION");

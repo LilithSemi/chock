@@ -422,8 +422,8 @@ pub const Session = struct {
     complete: bool = true,
     chain: chain.Report = .{},
     seal: seal.Reading = .{},
-    header_digest: chain.Digest = [_]u8{'?'} ** chain.digest_len,
-    head_digest: chain.Digest = [_]u8{'?'} ** chain.digest_len,
+    header_digest: chain.Digest = @as([chain.digest_len]u8, @splat('?')),
+    head_digest: chain.Digest = @as([chain.digest_len]u8, @splat('?')),
     has_work: bool = false,
     has_root: bool = false,
 };
@@ -2039,9 +2039,9 @@ test "the command line names an action and exactly what that action needs" {
     try testing.expectEqual(Action.list, (try parseOptions(&.{})).action);
     try testing.expectEqual(Action.list, (try parseOptions(&.{"list"})).action);
 
-    const removing = try parseOptions(&.{ "remove", "01JQ" ++ "A" ** 22 });
+    const removing = try parseOptions(&.{ "remove", "01JQ" ++ @as([22]u8, @splat('A')) });
     try testing.expectEqual(Action.remove, removing.action);
-    try testing.expectEqualStrings("01JQ" ++ "A" ** 22, removing.session);
+    try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('A')), removing.session);
     try testing.expect(!removing.yes);
 
     const pruning = try parseOptions(&.{ "prune", "--older-than", "30", "--yes" });
@@ -2049,12 +2049,12 @@ test "the command line names an action and exactly what that action needs" {
     try testing.expectEqual(@as(?u32, 30), pruning.older_than_days);
     try testing.expect(pruning.yes);
 
-    const with_project = try parseOptions(&.{ "--project", "/somewhere", "remove", "01JQ" ++ "B" ** 22 });
+    const with_project = try parseOptions(&.{ "--project", "/somewhere", "remove", "01JQ" ++ @as([22]u8, @splat('B')) });
     try testing.expectEqualStrings("/somewhere", with_project.project.?);
-    try testing.expectEqualStrings("01JQ" ++ "B" ** 22, with_project.session);
+    try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('B')), with_project.session);
 
     try testing.expectError(error.BadArguments, parseOptions(&.{"remove"}));
-    try testing.expectError(error.BadArguments, parseOptions(&.{ "list", "01JQ" ++ "A" ** 22 }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "list", "01JQ" ++ @as([22]u8, @splat('A')) }));
     try testing.expectError(error.BadArguments, parseOptions(&.{"prune"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "prune", "--older-than", "not-a-number" }));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "list", "--older-than", "30" }));
@@ -2073,7 +2073,7 @@ test "a session another process owns reads as live, and the probe leaves its loc
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeLog(arena, testing.io, dir, id, &.{});
     const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}" ++ log_suffix, .{ dir, id }, 0);
 
@@ -2112,7 +2112,7 @@ test "two probes at the same moment never mistake each other for a running sessi
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeLog(arena, testing.io, dir, id, &.{});
     const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}" ++ log_suffix, .{ dir, id }, 0);
 
@@ -2136,7 +2136,7 @@ test "a live session is never removable, and the refusal is not an exit of zero"
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeLog(arena, testing.io, dir, id, &.{});
     const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}" ++ log_suffix, .{ dir, id }, 0);
     _ = try makeWorkspace(arena, testing.io, dir, id);
@@ -2182,7 +2182,7 @@ test "a live session is never removable, and the refusal is not an exit of zero"
 }
 
 test "a session whose lock cannot be tested is not removable either" {
-    const unknown = Session{ .id = "01JQ" ++ "A" ** 22, .started_ms = 0, .live = .unknown };
+    const unknown = Session{ .id = "01JQ" ++ @as([22]u8, @splat('A')), .started_ms = 0, .live = .unknown };
     try testing.expectEqualStrings("no end recorded, lock not tested", stateText(unknown));
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2202,9 +2202,9 @@ test "the listing is oldest first and needs no index of its own" {
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const newest = "01K3CW3600" ++ "C" ** 16;
-    const middle = "01K2F2DKG0" ++ "B" ** 16;
-    const oldest = "01JQAAAAAA" ++ "A" ** 16;
+    const newest = "01K3CW3600" ++ @as([16]u8, @splat('C'));
+    const middle = "01K2F2DKG0" ++ @as([16]u8, @splat('B'));
+    const oldest = "01JQAAAAAA" ++ @as([16]u8, @splat('A'));
     try makeLog(arena, testing.io, dir, newest, &.{});
     try makeLog(arena, testing.io, dir, middle, &.{});
     try makeLog(arena, testing.io, dir, oldest, &.{});
@@ -2233,8 +2233,8 @@ test "a log this build cannot read is listed rather than dropped or fatal" {
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const good = "01JQ" ++ "A" ** 22;
-    const broken = "01JQ" ++ "B" ** 22;
+    const good = "01JQ" ++ @as([22]u8, @splat('A'));
+    const broken = "01JQ" ++ @as([22]u8, @splat('B'));
     try makeLog(arena, testing.io, dir, good, &.{
         .{ .usage = .{ .model = "qwen3", .cost = .free } },
     });
@@ -2289,7 +2289,7 @@ test "a fold says when a session started, what it ran on, how it ended, and what
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01K2F2DKG0" ++ "A" ** 16;
+    const id = "01K2F2DKG0" ++ @as([16]u8, @splat('A'));
     try makeLog(arena, testing.io, dir, id, &.{
         .{ .usage = .{
             .input_tokens = 1000,
@@ -2314,7 +2314,7 @@ test "a fold says when a session started, what it ran on, how it ended, and what
 
     try testing.expectEqualStrings("claude-opus-5 and 1 more", try modelText(arena, one));
 
-    const quiet = "01K2F2DKG0" ++ "B" ** 16;
+    const quiet = "01K2F2DKG0" ++ @as([16]u8, @splat('B'));
     try makeLog(arena, testing.io, dir, quiet, &.{});
     const nothing = (try fold(arena, testing.io, dir, quiet)).?;
     try testing.expectEqualStrings("", nothing.model);
@@ -2331,7 +2331,7 @@ test "a session's title is the last one the agent wrote, and a resumed session k
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01K2F2DKG0" ++ "T" ** 16;
+    const id = "01K2F2DKG0" ++ @as([16]u8, @splat('T'));
     try makeLog(arena, testing.io, dir, id, &.{
         .{ .session_title = .{ .title = "read the parser tests" } },
         .{ .session_end = .{ .reason = .finished, .detail = "" } },
@@ -2347,7 +2347,7 @@ test "a session's title is the last one the agent wrote, and a resumed session k
     try testing.expect(std.mem.indexOf(u8, bytes, "read the parser tests") != null);
     try testing.expect(std.mem.indexOf(u8, bytes, "\"session.title\"") != null);
 
-    const nameless = "01K2F2DKG0" ++ "X" ** 16;
+    const nameless = "01K2F2DKG0" ++ @as([16]u8, @splat('X'));
     try makeLog(arena, testing.io, dir, nameless, &.{});
     const quiet = (try fold(arena, testing.io, dir, nameless)).?;
     try testing.expectEqualStrings("", quiet.title);
@@ -2377,12 +2377,12 @@ test "a hostile title cannot forge a row of the table or drive the terminal" {
 
     try testing.expectEqualStrings(title_not_text, (try titleText(arena, "\xff\xfe name")).?);
 
-    const long = "e" ** (chock_core.Loop.max_title_bytes + 40);
-    const trimmed = (try titleText(arena, long)).?;
+    const long = @as([(chock_core.Loop.max_title_bytes + 40)]u8, @splat('e'));
+    const trimmed = (try titleText(arena, &long)).?;
     try testing.expect(trimmed.len < long.len);
     try testing.expect(std.mem.indexOf(u8, trimmed, "not shown") != null);
-    const exact = "e" ** chock_core.Loop.max_title_bytes;
-    try testing.expectEqualStrings(exact, (try titleText(arena, exact)).?);
+    const exact = @as([chock_core.Loop.max_title_bytes]u8, @splat('e'));
+    try testing.expectEqualStrings(&exact, (try titleText(arena, &exact)).?);
 }
 
 test "the listing prints a title behind the gutter, and says whose words it is" {
@@ -2394,7 +2394,7 @@ test "the listing prints a title behind the gutter, and says whose words it is" 
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01K2F2DKG0" ++ "V" ** 16;
+    const id = "01K2F2DKG0" ++ @as([16]u8, @splat('V'));
     try makeLog(arena, testing.io, dir, id, &.{
         .{ .session_title = .{ .title = "wire the session title tool into the loop" } },
         .{ .session_end = .{ .reason = .finished, .detail = "" } },
@@ -2413,7 +2413,7 @@ test "the listing prints a title behind the gutter, and says whose words it is" 
     try testing.expect(std.mem.indexOf(u8, text, id) != null);
 
     const bare = try scratchDir(arena, &tmp, "bare");
-    try makeLog(arena, testing.io, bare, "01K2F2DKG0" ++ "W" ** 16, &.{});
+    try makeLog(arena, testing.io, bare, "01K2F2DKG0" ++ @as([16]u8, @splat('W')), &.{});
     said.clear();
     _ = try listSessions(arena, testing.io, bare, "/project");
     try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, said.out(), title_legend));
@@ -2429,7 +2429,7 @@ test "removing a session takes its workspace and its sandbox root, and takes the
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeLog(arena, testing.io, dir, id, &.{});
     const wrote = try makeWorkspace(arena, testing.io, dir, id);
     const root = try std.fmt.allocPrint(arena, "{s}/{s}" ++ root_suffix, .{ dir, id });
@@ -2463,7 +2463,7 @@ test "a removal that cannot take the workspace keeps the log, so nothing is left
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeLog(arena, testing.io, dir, id, &.{});
     var plan = (try planRemoval(arena, testing.io, dir, id)).?;
 
@@ -2485,7 +2485,7 @@ test "the question names what will go and says the log is the only copy, and onl
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01K2F2DKG0" ++ "A" ** 16;
+    const id = "01K2F2DKG0" ++ @as([16]u8, @splat('A'));
     try makeLog(arena, testing.io, dir, id, &.{
         .{ .usage = .{ .model = "claude-opus-5", .cost = .free } },
         .{ .session_end = .{ .reason = .finished, .detail = "" } },
@@ -2554,7 +2554,7 @@ test "a removal with nobody to ask and no --yes never happens" {
     try testing.expect(canAsk(true, true));
 
     try testing.expect(!session_paths.isValidId("nope"));
-    try testing.expect(session_paths.isValidId("01M0" ++ "A" ** 22));
+    try testing.expect(session_paths.isValidId("01M0" ++ @as([22]u8, @splat('A'))));
 }
 
 test "a prune shows every session it would take, takes none that is running, and none that is young" {
@@ -2562,9 +2562,9 @@ test "a prune shows every session it would take, takes none that is running, and
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const old = Session{ .id = "01JQ" ++ "A" ** 22, .started_ms = 1_000 * day_ms, .live = .idle };
-    const young = Session{ .id = "01JQ" ++ "B" ** 22, .started_ms = 1_100 * day_ms, .live = .idle };
-    const old_and_running = Session{ .id = "01JQ" ++ "C" ** 22, .started_ms = 900 * day_ms, .live = .live };
+    const old = Session{ .id = "01JQ" ++ @as([22]u8, @splat('A')), .started_ms = 1_000 * day_ms, .live = .idle };
+    const young = Session{ .id = "01JQ" ++ @as([22]u8, @splat('B')), .started_ms = 1_100 * day_ms, .live = .idle };
+    const old_and_running = Session{ .id = "01JQ" ++ @as([22]u8, @splat('C')), .started_ms = 900 * day_ms, .live = .live };
     const sessions = [_]Session{ old, young, old_and_running };
 
     const now = 1_130 * day_ms;
@@ -2585,7 +2585,7 @@ test "a prune shows every session it would take, takes none that is running, and
     const none = try prunable(arena, &sessions, now, 10_000);
     try testing.expectEqual(@as(usize, 0), none.len);
 
-    const future = Session{ .id = "01JQ" ++ "D" ** 22, .started_ms = now + day_ms, .live = .idle };
+    const future = Session{ .id = "01JQ" ++ @as([22]u8, @splat('D')), .started_ms = now + day_ms, .live = .idle };
     try testing.expectEqual(@as(usize, 0), (try prunable(arena, &.{future}, now, 0)).len);
 }
 
@@ -2598,8 +2598,8 @@ test "a prune declined at the question removes nothing, and one accepted removes
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const older = "01JQAAAAAA" ++ "A" ** 16;
-    const newer = "01K2F2DKG0" ++ "B" ** 16;
+    const older = "01JQAAAAAA" ++ @as([16]u8, @splat('A'));
+    const newer = "01K2F2DKG0" ++ @as([16]u8, @splat('B'));
     try makeLog(arena, testing.io, dir, older, &.{});
     try makeLog(arena, testing.io, dir, newer, &.{});
 
@@ -2670,7 +2670,7 @@ test "asking about a session this project never had removes nothing and creates 
     try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
     var env = std.process.Environ.Map.init(arena);
 
-    const never = "01JQ" ++ "Z" ** 22;
+    const never = "01JQ" ++ @as([22]u8, @splat('Z'));
     try testing.expectEqual(@as(?Session, null), try fold(arena, testing.io, dir, never));
     try testing.expectEqual(@as(?Removal, null), try planRemoval(arena, testing.io, dir, never));
 
@@ -2752,7 +2752,7 @@ test "only a session log is read, and a file that is not one is left alone" {
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeLog(arena, testing.io, dir, id, &.{});
     _ = try makeWorkspace(arena, testing.io, dir, id);
     {
@@ -2783,7 +2783,7 @@ test "an empty work directory is not a workspace, and removal still takes it" {
     const arena = fba.allocator();
     const dir = try scratchDir(arena, &tmp, "empty-work");
 
-    const id = "01M0" ++ "B" ** 22;
+    const id = "01M0" ++ @as([22]u8, @splat('B'));
     try makeLog(arena, testing.io, dir, id, &.{});
     const work = try std.fmt.allocPrint(arena, "{s}/{s}" ++ work_suffix, .{ dir, id });
     try std.Io.Dir.createDirAbsolute(testing.io, work, .default_dir);
@@ -2898,7 +2898,7 @@ fn repairLog(
     try writeLog(arena, io, dir, id, bytes);
 }
 
-const test_seal_seed = [_]u8{0x5e} ** 32;
+const test_seal_seed = @as([32]u8, @splat(0x5e));
 
 fn sealForTest(arena: std.mem.Allocator, dir: []const u8, id: []const u8) !u8 {
     var key = try chock_pcsc.software.Key.fromSeed(test_seal_seed);
@@ -2988,7 +2988,7 @@ test "a fold reads the chain in the same pass, and a log written honestly is int
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeCountedLog(arena, testing.io, dir, id, 3);
 
     const one = (try fold(arena, testing.io, dir, id)).?;
@@ -3010,9 +3010,9 @@ test "an edited log and a torn log are two different rows, and the listing does 
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const edited_id = "01JQ" ++ "A" ** 22;
-    const torn_id = "01JQ" ++ "B" ** 22;
-    const clean_id = "01JQ" ++ "C" ** 22;
+    const edited_id = "01JQ" ++ @as([22]u8, @splat('A'));
+    const torn_id = "01JQ" ++ @as([22]u8, @splat('B'));
+    const clean_id = "01JQ" ++ @as([22]u8, @splat('C'));
     try makeCountedLog(arena, testing.io, dir, edited_id, 4);
     try makeCountedLog(arena, testing.io, dir, torn_id, 4);
     try makeCountedLog(arena, testing.io, dir, clean_id, 4);
@@ -3052,7 +3052,7 @@ test "verify names the two events an edit sits between, and never exits zero" {
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeCountedLog(arena, testing.io, dir, id, 4);
     try editLog(arena, testing.io, dir, id, "event number 2", "event number 7");
 
@@ -3086,7 +3086,7 @@ test "verify says a chain is not a signature, on a clean run as well as a bad on
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeCountedLog(arena, testing.io, dir, id, 2);
 
     var said: tty.Capture = undefined;
@@ -3116,7 +3116,7 @@ test "a log this command sealed verifies with only the key in the seal, and the 
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeCountedLog(arena, testing.io, dir, id, 3);
 
     var said: tty.Capture = undefined;
@@ -3164,7 +3164,7 @@ test "a log whose chain was repaired by hand passes the chain and fails the seal
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeCountedLog(arena, testing.io, dir, id, 3);
 
     var said: tty.Capture = undefined;
@@ -3207,7 +3207,7 @@ test "an absent seal is printed as absent and never as a pass, and deleting one 
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeCountedLog(arena, testing.io, dir, id, 2);
 
     const unsealed = (try fold(arena, testing.io, dir, id)).?;
@@ -3461,7 +3461,7 @@ test "a refused card attempt writes no seal file at all, so the next run is a cl
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeCountedLog(arena, testing.io, dir, id, 2);
 
     var said: tty.Capture = undefined;
@@ -3536,7 +3536,7 @@ test "a card seal names the card on the row, and the fallback line is not printe
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeCountedLog(arena, testing.io, dir, id, 2);
 
     var said: tty.Capture = undefined;
@@ -3613,7 +3613,7 @@ test "a signer that refuses part way through says why, and the run stops asking"
     const dir = try scratchDir(arena, &tmp, "sessions");
 
     for (0..3) |i| {
-        const id = try std.fmt.allocPrint(arena, "01JQ{c}" ++ "A" ** 21, .{@as(u8, 'A') + @as(u8, @intCast(i))});
+        const id = try std.fmt.allocPrint(arena, "01JQ{c}" ++ @as([21]u8, @splat('A')), .{@as(u8, 'A') + @as(u8, @intCast(i))});
         try makeCountedLog(arena, testing.io, dir, id, 2);
     }
 
@@ -3659,7 +3659,7 @@ test "the level a seal recorded cannot be raised by editing the record" {
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeCountedLog(arena, testing.io, dir, id, 2);
 
     var said: tty.Capture = undefined;
@@ -3709,7 +3709,7 @@ test "a seal file somebody truncated is reported, and never read as a seal or as
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeCountedLog(arena, testing.io, dir, id, 2);
 
     var said: tty.Capture = undefined;
@@ -3745,7 +3745,7 @@ test "sealing refuses a session that is running now, because that log's head sti
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeCountedLog(arena, testing.io, dir, id, 2);
     const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}" ++ log_suffix, .{ dir, id }, 0);
 
@@ -3827,8 +3827,8 @@ test "two logs sealed by one key carry that one public key, and are still two do
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const first = "01JQ" ++ "A" ** 22;
-    const second = "01JQ" ++ "B" ** 22;
+    const first = "01JQ" ++ @as([22]u8, @splat('A'));
+    const second = "01JQ" ++ @as([22]u8, @splat('B'));
     try makeCountedLog(arena, testing.io, dir, first, 1);
     try makeCountedLog(arena, testing.io, dir, second, 1);
 
@@ -3877,7 +3877,7 @@ test "a log from before the chain verifies as unchained, and is still listed and
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try std.Io.Dir.createDirAbsolute(testing.io, dir, .default_dir);
     try writeLog(arena, testing.io, dir, id, "{\"chock_log\":1}\n" ++
         "{\"id\":0,\"session\":\"" ++ id ++ "\",\"time_ms\":1," ++
@@ -3922,8 +3922,8 @@ test "verify with no session reads every log of the project" {
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const good = "01JQ" ++ "A" ** 22;
-    const bad = "01JQ" ++ "B" ** 22;
+    const good = "01JQ" ++ @as([22]u8, @splat('A'));
+    const bad = "01JQ" ++ @as([22]u8, @splat('B'));
     try makeCountedLog(arena, testing.io, dir, good, 2);
     try makeCountedLog(arena, testing.io, dir, bad, 2);
     try editLog(arena, testing.io, dir, bad, "event number 0", "event number 4");
@@ -3953,7 +3953,7 @@ test "verify refuses a name that is not a session identifier, and one this proje
     said.start(testing.io, testing.allocator);
     defer said.stop(testing.io);
 
-    const missing = "01JQ" ++ "Z" ** 22;
+    const missing = "01JQ" ++ @as([22]u8, @splat('Z'));
     const code = try verifySessions(arena, testing.io, dir, "/home/somebody/work/parser", missing);
     try testing.expect(code != Exit.finished.code());
     try testing.expect(std.mem.indexOf(u8, said.err(), "has no session") != null);
@@ -3964,21 +3964,21 @@ test "verify refuses a name that is not a session identifier, and one this proje
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, path, .{}));
 
     try testing.expectEqual(Action.seal, (try parseOptions(&.{"seal"})).action);
-    const one_named = try parseOptions(&.{ "seal", "01JQ" ++ "A" ** 22 });
+    const one_named = try parseOptions(&.{ "seal", "01JQ" ++ @as([22]u8, @splat('A')) });
     try testing.expectEqual(Action.seal, one_named.action);
-    try testing.expectEqualStrings("01JQ" ++ "A" ** 22, one_named.session);
+    try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('A')), one_named.session);
     try testing.expectError(
         error.BadArguments,
-        parseOptions(&.{ "seal", "01JQ" ++ "A" ** 22, "01JQ" ++ "B" ** 22 }),
+        parseOptions(&.{ "seal", "01JQ" ++ @as([22]u8, @splat('A')), "01JQ" ++ @as([22]u8, @splat('B')) }),
     );
 
     try testing.expectEqual(Action.verify, (try parseOptions(&.{"verify"})).action);
-    const named = try parseOptions(&.{ "verify", "01JQ" ++ "A" ** 22 });
+    const named = try parseOptions(&.{ "verify", "01JQ" ++ @as([22]u8, @splat('A')) });
     try testing.expectEqual(Action.verify, named.action);
-    try testing.expectEqualStrings("01JQ" ++ "A" ** 22, named.session);
+    try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('A')), named.session);
     try testing.expectError(
         error.BadArguments,
-        parseOptions(&.{ "verify", "01JQ" ++ "A" ** 22, "01JQ" ++ "B" ** 22 }),
+        parseOptions(&.{ "verify", "01JQ" ++ @as([22]u8, @splat('A')), "01JQ" ++ @as([22]u8, @splat('B')) }),
     );
 }
 
@@ -4060,7 +4060,7 @@ test "every decision a retention row can hold is answered, and only two of them 
         .allow, .ask, .deny, .agent_review, .agent_then_human,
     };
     try testing.expectEqual(
-        @typeInfo(chock_policy.table.Decision).@"enum".fields.len,
+        @typeInfo(chock_policy.table.Decision).@"enum".field_names.len,
         named.len,
     );
     for (named) |one| _ = retentionAllows(one);
@@ -4103,7 +4103,7 @@ test "a retention row narrowed to one agent kind is read for the kind a person's
 
 test "the org bundle is a command line option here too, and it takes a path" {
     const with_bundle = try parseOptions(&.{
-        "remove",       "01JQ" ++ "A" ** 22,
+        "remove",       "01JQ" ++ @as([22]u8, @splat('A')),
         "--org-bundle", "/somewhere/org-policy.zon",
     });
     try testing.expectEqualStrings("/somewhere/org-policy.zon", with_bundle.org_bundle.?);
@@ -4141,7 +4141,7 @@ test "an exported log is byte for byte the original, and verifies as the copy" {
     try std.Io.Dir.cwd().createDirPath(io, dir);
     try std.Io.Dir.cwd().createDirPath(io, to);
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}" ++ log_suffix, .{ dir, id }, 0);
     {
         var backing = chock_proto.storage.JsonLines{
@@ -4187,7 +4187,7 @@ test "exporting a log takes nothing away and leaves its lock free" {
     try std.Io.Dir.cwd().createDirPath(io, dir);
     try std.Io.Dir.cwd().createDirPath(io, to);
 
-    const id = "01JQ" ++ "B" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('B'));
     const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}" ++ log_suffix, .{ dir, id }, 0);
     var backing = chock_proto.storage.JsonLines{
         .log = try chock_proto.log.Log.open(io, log_path, id),
@@ -4227,7 +4227,7 @@ test "a log somebody edited exports, and the copy says it was edited" {
     try std.Io.Dir.cwd().createDirPath(io, dir);
     try std.Io.Dir.cwd().createDirPath(io, to);
 
-    const id = "01JQ" ++ "C" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('C'));
     const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}" ++ log_suffix, .{ dir, id }, 0);
     {
         var backing = chock_proto.storage.JsonLines{
@@ -4260,7 +4260,7 @@ test "a log somebody edited exports, and the copy says it was edited" {
 }
 
 test "export needs somewhere to write, and no other action may name one" {
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
 
     const whole_project = try parseOptions(&.{ "export", "--to", "/var/audit" });
     try testing.expectEqual(Action.@"export", whole_project.action);
@@ -4319,10 +4319,10 @@ test "a read that failed says what happened, and only an empty answer is a decli
     }
     try testing.expectEqual(@as(usize, 1), declines);
 
-    inline for (@typeInfo(tty.SecretError).error_set.?) |field| {
+    inline for (@typeInfo(tty.SecretError).error_set.error_names.?) |name| {
         var decided = false;
         for (cases) |one| {
-            if (std.mem.eql(u8, @errorName(one.err), field.name)) decided = true;
+            if (std.mem.eql(u8, @errorName(one.err), name)) decided = true;
         }
         try testing.expect(decided);
     }

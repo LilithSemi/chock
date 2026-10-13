@@ -231,7 +231,7 @@ pub fn parseFrom(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Block {
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+    var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer ast.deinit(gpa);
@@ -292,10 +292,10 @@ fn findBlock(
     diag: ?*?Diagnostic,
 ) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), block_name)) {
+                if (std.mem.eql(u8, name.get(&zoir), block_name)) {
                     return fields.vals.at(@intCast(index));
                 }
             }
@@ -316,7 +316,7 @@ fn readEntries(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Block {
-    const items = switch (node.get(zoir)) {
+    const items = switch (node.get(&zoir)) {
         .empty_literal => return .{},
         .array_literal => |list| list,
         else => {
@@ -353,7 +353,7 @@ fn readEntry(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Entry {
-    const fields = switch (node.get(zoir)) {
+    const fields = switch (node.get(&zoir)) {
         .struct_literal => |one| one,
         else => {
             _ = note(diag, source_name, .entry_not_a_struct);
@@ -372,7 +372,7 @@ fn readEntry(
     }
 
     for (fields.names, 0..) |field_id, index| {
-        const field = field_id.get(zoir);
+        const field = field_id.get(&zoir);
         const value = fields.vals.at(@intCast(index));
         if (std.mem.eql(u8, field, "name")) {
             name = try readString(gpa, zoir, value, source_name, .name_not_a_string, diag);
@@ -430,7 +430,7 @@ fn readString(
     fault: Diagnostic.Fault,
     diag: ?*?Diagnostic,
 ) ParseError![]const u8 {
-    switch (node.get(zoir)) {
+    switch (node.get(&zoir)) {
         .string_literal => |text| return gpa.dupe(u8, text),
         else => {
             _ = note(diag, source_name, fault);
@@ -604,8 +604,8 @@ test "an unknown binding is refused, and the message names the two" {
 
     const text = try std.fmt.allocPrint(gpa, "{f}", .{diag.?});
     defer gpa.free(text);
-    inline for (@typeInfo(Bind).@"enum".fields) |field| {
-        try testing.expect(std.mem.indexOf(u8, text, field.name) != null);
+    inline for (@typeInfo(Bind).@"enum".field_names, @typeInfo(Bind).@"enum".field_values) |field_name, _| {
+        try testing.expect(std.mem.indexOf(u8, text, field_name) != null);
     }
 }
 

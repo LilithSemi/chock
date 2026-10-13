@@ -380,7 +380,7 @@ test "an AGENTS.md in a subdirectory is an index line and not a block, so its bo
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const deep_body = "# Parser conventions\n\n" ++ ("every rule in here is long. " ** 40);
+    const deep_body = "# Parser conventions\n\n" ++ (repeated("every rule in here is long. ", 40));
     try writeAt(testing.io, tmp.dir, "src/parser/" ++ file_name, deep_body);
 
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -591,16 +591,26 @@ test "a file chock.zon named that cannot be read refuses, the same as a file --i
 }
 
 test "an instruction file is text and reaches nothing that decides what the agent may do" {
-    inline for (@typeInfo(Loaded).@"struct".fields) |field| {
-        const T = field.type;
+    inline for (@typeInfo(Loaded).@"struct".field_names, @typeInfo(Loaded).@"struct".field_types) |field_name, field_type| {
+        const T = field_type;
         const ok = T == ?Block or T == []const Block or T == []const index.Entry or
             T == usize or T == []const ReadFile;
         if (!ok) @compileError(
-            "Loaded." ++ field.name ++ " is a " ++ @typeName(T) ++ ". An instruction file carries " ++
+            "Loaded." ++ field_name ++ " is a " ++ @typeName(T) ++ ". An instruction file carries " ++
                 "text and an index of files, and nothing that decides what the agent may do: the " ++
                 "policy, the budget, and the tool list come from chock.zon and from the provider " ++
                 "record, both beyond the agent's reach.",
         );
     }
     try testing.expect(true);
+}
+
+/// `piece` laid end to end `times` over, at comptime.
+///
+/// Zig 0.17 took the `**` operator away and `@splat` fills an array with ONE
+/// element, so a repeated phrase has no operator of its own any more.
+fn repeated(comptime piece: []const u8, comptime times: usize) [piece.len * times]u8 {
+    var out: [piece.len * times]u8 = undefined;
+    for (0..times) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
+    return out;
 }

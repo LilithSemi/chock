@@ -152,12 +152,12 @@ test "dropAll clears effective, permitted, and inheritable, in a fresh user name
         std.process.exit(if (all_zero) 0 else 1);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
-    if (linux.errno(wait_rc) != .SUCCESS or !linux.W.IFEXITED(status)) return error.SkipZigTest;
+    if (linux.errno(wait_rc) != .SUCCESS or !linux.W.IFEXITED(@bitCast(status))) return error.SkipZigTest;
 
-    const code = linux.W.EXITSTATUS(status);
+    const code = linux.W.EXITSTATUS(@bitCast(status));
     if (code == 63) return error.SkipZigTest;
     try std.testing.expectEqual(@as(u32, 0), code);
 }
@@ -183,12 +183,12 @@ test "keepOnly leaves one capability and takes every other one away" {
         std.process.exit(0);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
-    if (linux.errno(wait_rc) != .SUCCESS or !linux.W.IFEXITED(status)) return error.SkipZigTest;
+    if (linux.errno(wait_rc) != .SUCCESS or !linux.W.IFEXITED(@bitCast(status))) return error.SkipZigTest;
 
-    const code = linux.W.EXITSTATUS(status);
+    const code = linux.W.EXITSTATUS(@bitCast(status));
     if (code == 63) return error.SkipZigTest;
     try std.testing.expectEqual(@as(u32, 0), code);
 }

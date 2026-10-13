@@ -13,23 +13,24 @@ pub const Extra = struct {
 };
 
 fn hasExtraField(comptime T: type) bool {
-    for (@typeInfo(T).@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.name, "extra")) return true;
+    for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |field_name, _| {
+        if (std.mem.eql(u8, field_name, "extra")) return true;
     }
     return false;
 }
 
 fn ForwardCompatible(comptime T: type) type {
     comptime std.debug.assert(hasExtraField(T));
-    const fields = @typeInfo(T).@"struct".fields;
+    const info = @typeInfo(T).@"struct";
+    const fields = info.field_names;
 
     return struct {
         pub fn jsonStringify(self: T, jw: *std.json.Stringify) std.json.Stringify.Error!void {
             try jw.beginObject();
             inline for (fields) |field| {
-                if (comptime !std.mem.eql(u8, field.name, "extra")) {
-                    try jw.objectField(field.name);
-                    try jw.write(@field(self, field.name));
+                if (comptime !std.mem.eql(u8, field, "extra")) {
+                    try jw.objectField(field);
+                    try jw.write(@field(self, field));
                 }
             }
             // Unknown members go after the known fields, never before them.
@@ -49,7 +50,7 @@ fn ForwardCompatible(comptime T: type) type {
 
             const max_len = options.max_value_len orelse std.json.default_max_value_len;
             var result: T = undefined;
-            var seen = [_]bool{false} ** fields.len;
+            var seen = @as([fields.len]bool, @splat(false));
             var extras: std.ArrayList(ExtraMember) = .empty;
 
             while (true) {
@@ -61,11 +62,11 @@ fn ForwardCompatible(comptime T: type) type {
                 };
 
                 var matched = false;
-                inline for (fields, 0..) |field, i| {
-                    if (comptime !std.mem.eql(u8, field.name, "extra")) {
-                        if (!matched and std.mem.eql(u8, field.name, name)) {
-                            @field(result, field.name) =
-                                try std.json.innerParse(field.type, allocator, source, options);
+                inline for (fields, info.field_types, 0..) |field, field_type, i| {
+                    if (comptime !std.mem.eql(u8, field, "extra")) {
+                        if (!matched and std.mem.eql(u8, field, name)) {
+                            @field(result, field) =
+                                try std.json.innerParse(field_type, allocator, source, options);
                             seen[i] = true;
                             matched = true;
                         }
@@ -80,12 +81,12 @@ fn ForwardCompatible(comptime T: type) type {
                 });
             }
 
-            inline for (fields, 0..) |field, i| {
-                if (comptime std.mem.eql(u8, field.name, "extra")) {
+            inline for (fields, info.field_types, info.field_attrs, 0..) |field, field_type, attrs, i| {
+                if (comptime std.mem.eql(u8, field, "extra")) {
                     result.extra = .{ .members = try extras.toOwnedSlice(allocator) };
                 } else if (!seen[i]) {
-                    const default = field.default_value_ptr orelse return error.MissingField;
-                    @field(result, field.name) = @as(*const field.type, @ptrCast(@alignCast(default))).*;
+                    @field(result, field) = attrs.defaultValue(field_type) orelse
+                        return error.MissingField;
                 }
             }
             return result;
@@ -130,8 +131,8 @@ pub const Kind = enum {
     }
 
     pub fn fromWireName(name: []const u8) ?Kind {
-        inline for (@typeInfo(Kind).@"enum".fields) |field| {
-            const kind: Kind = @enumFromInt(field.value);
+        inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |_, field_value| {
+            const kind: Kind = @enumFromInt(field_value);
             if (kind == .unknown) continue;
             if (std.mem.eql(u8, wire_names.get(kind), name)) return kind;
         }
@@ -195,9 +196,9 @@ fn WireString(comptime T: type) type {
                 .string, .allocated_string => |slice| slice,
                 else => return error.UnexpectedToken,
             };
-            inline for (@typeInfo(T).@"union".fields) |field| {
-                if (comptime std.mem.eql(u8, field.name, "unknown")) continue;
-                if (std.mem.eql(u8, field.name, text)) return @unionInit(T, field.name, {});
+            inline for (@typeInfo(T).@"union".field_names, @typeInfo(T).@"union".field_types) |field_name, _| {
+                if (comptime std.mem.eql(u8, field_name, "unknown")) continue;
+                if (std.mem.eql(u8, field_name, text)) return @unionInit(T, field_name, {});
             }
             return @unionInit(T, "unknown", try allocator.dupe(u8, text));
         }
@@ -1203,8 +1204,8 @@ pub fn fromJson(allocator: std.mem.Allocator, text: []const u8) DecodeError!std.
 }
 
 test "every Kind has a wire name, and every wire name is a Kind" {
-    inline for (@typeInfo(Kind).@"enum".fields) |field| {
-        const kind: Kind = @enumFromInt(field.value);
+    inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |_, field_value| {
+        const kind: Kind = @enumFromInt(field_value);
         if (kind == .unknown) continue;
         const name = kind.wireName();
         try std.testing.expectEqual(kind, Kind.fromWireName(name).?);
@@ -1945,10 +1946,10 @@ test "an envelope with no prev on the wire reads back as no chain, never as a fa
 
     const chained = "{\"id\":0,\"session\":\"01H0\",\"time_ms\":7," ++
         "\"event\":{\"session.end\":{\"reason\":\"finished\",\"detail\":\"\"}},\"version\":1," ++
-        "\"prev\":\"" ++ "ab" ** 32 ++ "\"}";
+        "\"prev\":\"" ++ repeated("ab", 32) ++ "\"}";
     const second = try fromJson(allocator, chained);
     defer second.deinit();
-    try std.testing.expectEqualStrings("ab" ** 32, second.value.prev);
+    try std.testing.expectEqualStrings(&repeated("ab", 32), second.value.prev);
 }
 
 test "a usage event round trips in each of the three cost states, and they stay apart" {
@@ -2038,7 +2039,7 @@ test "a cost state from a future writer keeps its name instead of reading as fre
 test "a task completion records where the output is and how large, and never the output itself" {
     const allocator = std.testing.allocator;
 
-    const build_output = "warning: unused variable\n" ** 4000;
+    const build_output = repeated("warning: unused variable\n", 4000);
     const text = try toJson(allocator, .{
         .id = 0,
         .session = "01H0",
@@ -2348,19 +2349,29 @@ test "a secret use records what reached which tool and never the value" {
     try std.testing.expect(std.mem.indexOf(u8, text, "exec.path.gh") != null);
 
     // Asserts the shape has no field a value could travel in, across every case.
-    inline for (@typeInfo(SecretUsed).@"struct".fields) |field| {
-        try std.testing.expect(!std.mem.eql(u8, field.name, "value"));
-        try std.testing.expect(!std.mem.eql(u8, field.name, "secret"));
+    inline for (@typeInfo(SecretUsed).@"struct".field_names, @typeInfo(SecretUsed).@"struct".field_types) |field_name, _| {
+        try std.testing.expect(!std.mem.eql(u8, field_name, "value"));
+        try std.testing.expect(!std.mem.eql(u8, field_name, "secret"));
     }
 }
 
 test "every event kind has a wire name and reads back as itself" {
     // Catches a kind added to the enum and forgotten in the name table.
-    inline for (@typeInfo(Kind).@"enum".fields) |field| {
-        const kind: Kind = @enumFromInt(field.value);
+    inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |_, field_value| {
+        const kind: Kind = @enumFromInt(field_value);
         if (kind == .unknown) continue;
         const name = kind.wireName();
         try std.testing.expect(name.len != 0);
         try std.testing.expectEqual(kind, Kind.fromWireName(name).?);
     }
+}
+
+/// `piece` laid end to end `times` over, at comptime.
+///
+/// Zig 0.17 took the `**` operator away and `@splat` fills an array with ONE
+/// element, so a repeated phrase has no operator of its own any more.
+fn repeated(comptime piece: []const u8, comptime times: usize) [piece.len * times]u8 {
+    var out: [piece.len * times]u8 = undefined;
+    for (0..times) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
+    return out;
 }

@@ -14,7 +14,7 @@ const escape_probe_path = @import("escape_probe_path").escape_probe_path;
 
 fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
     var link_buffer: [64]u8 = undefined;
-    const link = std.fmt.bufPrintZ(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}) catch unreachable;
+    const link = std.fmt.bufPrintSentinel(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}, 0) catch unreachable;
     const rc = linux.readlink(link, buffer.ptr, buffer.len);
     if (linux.errno(rc) != .SUCCESS) return error.ReadlinkFailed;
     const len: usize = @intCast(rc);
@@ -81,11 +81,11 @@ const TestProject = struct {
         const tmp_path = try absoluteDirPath(&buffer, tmp.dir.handle);
 
         var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const root_path = try std.fmt.bufPrintZ(&root_buffer, "{s}/project", .{tmp_path});
+        const root_path = try std.fmt.bufPrintSentinel(&root_buffer, "{s}/project", .{tmp_path}, 0);
         try makeDir(root_path);
 
         var scratch_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const scratch_path = try std.fmt.bufPrintZ(&scratch_buffer, "{s}/scratch", .{tmp_path});
+        const scratch_path = try std.fmt.bufPrintSentinel(&scratch_buffer, "{s}/scratch", .{tmp_path}, 0);
         try makeDir(scratch_path);
 
         var env = try testEnviron(allocator, tmp_path);
@@ -101,15 +101,15 @@ const TestProject = struct {
         defer config_name.deinit(allocator);
 
         var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{root_path});
+        const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{root_path}, 0);
         try writeFile(std.testing.io, tracked_path, "hello\n");
 
         var secret_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const secret_path = try std.fmt.bufPrintZ(&secret_buffer, "{s}/secret.env", .{root_path});
+        const secret_path = try std.fmt.bufPrintSentinel(&secret_buffer, "{s}/secret.env", .{root_path}, 0);
         try writeFile(std.testing.io, secret_path, secret_content);
 
         var chock_zon_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const chock_zon_path = try std.fmt.bufPrintZ(&chock_zon_buffer, "{s}/chock.zon", .{root_path});
+        const chock_zon_path = try std.fmt.bufPrintSentinel(&chock_zon_buffer, "{s}/chock.zon", .{root_path}, 0);
         try writeFile(std.testing.io, chock_zon_path, chock_zon);
 
         var add_output = try git.run(allocator, std.testing.io, &env, root_path, &.{ "add", "tracked.txt", "secret.env", "chock.zon" }, null);
@@ -122,8 +122,8 @@ const TestProject = struct {
 
         return .{
             .allocator = allocator,
-            .root_path = try allocator.dupeZ(u8, root_path),
-            .scratch_path = try allocator.dupeZ(u8, scratch_path),
+            .root_path = try allocator.dupeSentinel(u8, root_path, 0),
+            .scratch_path = try allocator.dupeSentinel(u8, scratch_path, 0),
             .env = env,
         };
     }
@@ -147,19 +147,19 @@ const PlainProject = struct {
         const tmp_path = try absoluteDirPath(&buffer, tmp.dir.handle);
 
         var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const root_path = try std.fmt.bufPrintZ(&root_buffer, "{s}/project", .{tmp_path});
+        const root_path = try std.fmt.bufPrintSentinel(&root_buffer, "{s}/project", .{tmp_path}, 0);
         try makeDir(root_path);
 
         var scratch_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const scratch_path = try std.fmt.bufPrintZ(&scratch_buffer, "{s}/scratch", .{tmp_path});
+        const scratch_path = try std.fmt.bufPrintSentinel(&scratch_buffer, "{s}/scratch", .{tmp_path}, 0);
         try makeDir(scratch_path);
 
         const env = try testEnviron(allocator, tmp_path);
 
         return .{
             .allocator = allocator,
-            .root_path = try allocator.dupeZ(u8, root_path),
-            .scratch_path = try allocator.dupeZ(u8, scratch_path),
+            .root_path = try allocator.dupeSentinel(u8, root_path, 0),
+            .scratch_path = try allocator.dupeSentinel(u8, scratch_path, 0),
             .env = env,
         };
     }
@@ -380,11 +380,11 @@ test "a read_only bind cannot be written to, and a write bind can" {
 
     // Never committed, so only the bind puts them in front of the agent.
     var read_only_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const read_only_source = try std.fmt.bufPrintZ(&read_only_buffer, "{s}/generated.conf", .{project.root_path});
+    const read_only_source = try std.fmt.bufPrintSentinel(&read_only_buffer, "{s}/generated.conf", .{project.root_path}, 0);
     try writeFile(std.testing.io, read_only_source, "a=1\n");
 
     var writable_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const writable_source = try std.fmt.bufPrintZ(&writable_buffer, "{s}/writable.conf", .{project.root_path});
+    const writable_source = try std.fmt.bufPrintSentinel(&writable_buffer, "{s}/writable.conf", .{project.root_path}, 0);
     try writeFile(std.testing.io, writable_source, "b=1\n");
 
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
@@ -513,7 +513,7 @@ test "a tool call can run git status inside the worktree, and the index is genui
 
     // Same content, so only the mtime changes.
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{wt.path});
+    const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{wt.path}, 0);
     try writeFile(std.testing.io, tracked_path, "hello\n");
 
     var root_tmp = std.testing.tmpDir(.{});
@@ -595,7 +595,7 @@ test "finding 4: git status, git add, and git commit still work inside the sandb
     defer allocator.free(project_head_before);
 
     var agent_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const agent_path = try std.fmt.bufPrintZ(&agent_buffer, "{s}/chock-object-store-test.txt", .{wt.path});
+    const agent_path = try std.fmt.bufPrintSentinel(&agent_buffer, "{s}/chock-object-store-test.txt", .{wt.path}, 0);
     try writeFile(std.testing.io, agent_path, "the agent wrote this inside the sandbox\n");
 
     var root_tmp = std.testing.tmpDir(.{});
@@ -656,7 +656,7 @@ test "a bare git commit inside the sandbox succeeds on a project that states no 
     const wt = workspace.kind.worktree;
 
     var agent_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const agent_path = try std.fmt.bufPrintZ(&agent_buffer, "{s}/chock-object-store-test.txt", .{wt.path});
+    const agent_path = try std.fmt.bufPrintSentinel(&agent_buffer, "{s}/chock-object-store-test.txt", .{wt.path}, 0);
     try writeFile(std.testing.io, agent_path, "the agent wrote this inside the sandbox\n");
 
     var root_tmp = std.testing.tmpDir(.{});
@@ -704,7 +704,7 @@ test "the sandbox identity reaches no commit the user makes on the host" {
     defer allocator.free(config.env);
 
     var host_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const host_path = try std.fmt.bufPrintZ(&host_buffer, "{s}/the-user-wrote-this.txt", .{project.root_path});
+    const host_path = try std.fmt.bufPrintSentinel(&host_buffer, "{s}/the-user-wrote-this.txt", .{project.root_path}, 0);
     try writeFile(std.testing.io, host_path, "mine\n");
     for ([_][]const []const u8{
         &.{ "add", "the-user-wrote-this.txt" },
@@ -823,7 +823,7 @@ test "git add and git commit succeed inside the sandbox, and the object lands on
 
     // Never committed before, so git cannot skip writing the object.
     var new_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const new_file_path = try std.fmt.bufPrintZ(&new_file_buffer, "{s}/chock-object-store-test.txt", .{wt.path});
+    const new_file_path = try std.fmt.bufPrintSentinel(&new_file_buffer, "{s}/chock-object-store-test.txt", .{wt.path}, 0);
     try writeFile(std.testing.io, new_file_path, "chock overlay tamper\n");
 
     const scratch_files_before = try countRegularFiles(allocator, wt.object_store_source);
@@ -870,7 +870,7 @@ test "an agent that renames its own GIT_ALTERNATE_OBJECT_DIRECTORIES gains nothi
     const wt = workspace.kind.worktree;
 
     var new_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const new_file_path = try std.fmt.bufPrintZ(&new_file_buffer, "{s}/chock-object-store-test.txt", .{wt.path});
+    const new_file_path = try std.fmt.bufPrintSentinel(&new_file_buffer, "{s}/chock-object-store-test.txt", .{wt.path}, 0);
     try writeFile(std.testing.io, new_file_path, "chock overlay tamper, alternate\n");
 
     var root_tmp = std.testing.tmpDir(.{});
@@ -893,7 +893,7 @@ test "an agent that renames its own GIT_ALTERNATE_OBJECT_DIRECTORIES gains nothi
 fn allowScratchCleanup(allocator: std.mem.Allocator, ov: chock_workspace.overlay.Overlay) void {
     const kernel_work_dir = std.fs.path.join(allocator, &.{ ov.work, "work" }) catch return;
     defer allocator.free(kernel_work_dir);
-    const path_z = allocator.dupeZ(u8, kernel_work_dir) catch return;
+    const path_z = allocator.dupeSentinel(u8, kernel_work_dir, 0) catch return;
     defer allocator.free(path_z);
     _ = linux.chmod(path_z.ptr, 0o700);
 }
@@ -1086,7 +1086,7 @@ test "the denial survives the agent replacing chock.zon inside its own workspace
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
 
     var edited_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const edited = try std.fmt.bufPrintZ(&edited_buffer, "{s}/chock.zon", .{workspace.workPath()});
+    const edited = try std.fmt.bufPrintSentinel(&edited_buffer, "{s}/chock.zon", .{workspace.workPath()}, 0);
     try writeFile(std.testing.io, edited, chock_zon_content);
     const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, edited, allocator, .limited(4096));
     defer allocator.free(after);
@@ -1142,11 +1142,11 @@ test "the overlay kind denies a file the same way the worktree kind does" {
     defer project.deinit();
 
     var secret_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const secret_path = try std.fmt.bufPrintZ(&secret_buffer, "{s}/secret.env", .{project.root_path});
+    const secret_path = try std.fmt.bufPrintSentinel(&secret_buffer, "{s}/secret.env", .{project.root_path}, 0);
     try writeFile(std.testing.io, secret_path, secret_content);
 
     var zon_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const zon_path = try std.fmt.bufPrintZ(&zon_buffer, "{s}/chock.zon", .{project.root_path});
+    const zon_path = try std.fmt.bufPrintSentinel(&zon_buffer, "{s}/chock.zon", .{project.root_path}, 0);
     try writeFile(std.testing.io, zon_path, chock_zon_with_deny);
 
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
@@ -1184,7 +1184,7 @@ test "a deny_read entry that names a directory refuses the whole session, by nam
     defer project.deinit();
 
     var credentials_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const credentials = try std.fmt.bufPrintZ(&credentials_buffer, "{s}/credentials", .{project.root_path});
+    const credentials = try std.fmt.bufPrintSentinel(&credentials_buffer, "{s}/credentials", .{project.root_path}, 0);
     try makeDir(credentials);
 
     try std.testing.expectError(error.DenyPathIsDirectory, Workspace.open(
@@ -1217,7 +1217,7 @@ test "adopt takes the deny list from the project, not from the checkout it inher
         defer first.keep(allocator);
 
         var edited_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const edited = try std.fmt.bufPrintZ(&edited_buffer, "{s}/chock.zon", .{first.workPath()});
+        const edited = try std.fmt.bufPrintSentinel(&edited_buffer, "{s}/chock.zon", .{first.workPath()}, 0);
         try writeFile(io, edited, chock_zon_content);
     }
 

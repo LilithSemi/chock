@@ -463,28 +463,28 @@ fn boundedTimeout(budget_ms: u64) i32 {
 }
 
 comptime {
-    for (@typeInfo(Grant).@"struct".fields) |field| {
-        if (std.mem.indexOf(u8, field.name, "name") != null) {
-            @compileError("a git credential must have no name for a handle to spell: " ++ field.name);
+    for (@typeInfo(Grant).@"struct".field_names, @typeInfo(Grant).@"struct".field_types) |field_name, _| {
+        if (std.mem.indexOf(u8, field_name, "name") != null) {
+            @compileError("a git credential must have no name for a handle to spell: " ++ field_name);
         }
     }
 }
 
 comptime {
     const forbidden = [_][]const u8{ "secret", "password", "answer", "value", "credential", "token" };
-    for (@typeInfo(event.PromptPassword).@"struct".fields) |field| {
+    for (@typeInfo(event.PromptPassword).@"struct".field_names, @typeInfo(event.PromptPassword).@"struct".field_types) |field_name, _| {
         for (forbidden) |bad| {
-            if (std.mem.indexOf(u8, field.name, bad) != null) {
-                @compileError("the record of a prompt must not hold the answer: " ++ field.name);
+            if (std.mem.indexOf(u8, field_name, bad) != null) {
+                @compileError("the record of a prompt must not hold the answer: " ++ field_name);
             }
         }
     }
 }
 
 comptime {
-    for (@typeInfo(Endpoint).@"struct".fields) |field| {
-        if (field.type == Grants or field.type == Grant or field.type == Asker) {
-            @compileError("the askpass endpoint must hold no credential: " ++ field.name);
+    for (@typeInfo(Endpoint).@"struct".field_names, @typeInfo(Endpoint).@"struct".field_types) |field_name, field_type| {
+        if (field_type == Grants or field_type == Grant or field_type == Asker) {
+            @compileError("the askpass endpoint must hold no credential: " ++ field_name);
         }
     }
 }

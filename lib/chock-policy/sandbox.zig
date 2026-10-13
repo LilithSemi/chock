@@ -20,8 +20,8 @@ pub const Driver = enum {
     }
 
     pub fn fromWireName(text: []const u8) ?Driver {
-        inline for (@typeInfo(Driver).@"enum".fields) |field| {
-            const one: Driver = @enumFromInt(field.value);
+        inline for (@typeInfo(Driver).@"enum".field_names, @typeInfo(Driver).@"enum".field_values) |_, field_value| {
+            const one: Driver = @fromBackingInt(@intCast(field_value));
             if (std.mem.eql(u8, one.wireName(), text)) return one;
         }
         return null;
@@ -249,7 +249,7 @@ pub fn parse(
     var zeroing: Zeroing = .{ .child = gpa };
     const tree = zeroing.allocator();
 
-    var ast = std.zig.Ast.parse(tree, source, .zon) catch |err| switch (err) {
+    var ast = std.zig.Ast.parse(tree, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer ast.deinit(tree);
@@ -264,10 +264,10 @@ pub fn parse(
 
 fn findBlock(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, at| {
-                if (std.mem.eql(u8, name.get(zoir), block_name)) {
+                if (std.mem.eql(u8, name.get(&zoir), block_name)) {
                     return fields.vals.at(@intCast(at));
                 }
             }
@@ -287,7 +287,7 @@ fn readDriver(
     node: std.zig.Zoir.Node.Index,
     diag: ?*?Diagnostic,
 ) ParseError!Block {
-    const fields = switch (node.get(zoir)) {
+    const fields = switch (node.get(&zoir)) {
         .empty_literal => return .{},
         .struct_literal => |it| it,
         else => {
@@ -300,11 +300,11 @@ fn readDriver(
     errdefer block.deinit(gpa);
 
     for (fields.names, 0..) |name, at| {
-        const field = name.get(zoir);
+        const field = name.get(&zoir);
         const value = fields.vals.at(@intCast(at));
 
         if (std.mem.eql(u8, field, "driver")) {
-            const text = switch (value.get(zoir)) {
+            const text = switch (value.get(&zoir)) {
                 .string_literal => |it| it,
                 else => {
                     _ = note(diag, .driver_not_a_string);
@@ -324,7 +324,7 @@ fn readDriver(
         } else if (std.mem.eql(u8, field, "initrd")) {
             block.initrd = try readPath(gpa, zoir, value, "initrd", diag);
         } else if (std.mem.eql(u8, field, "memory_mb")) {
-            block.memory_mb = switch (value.get(zoir)) {
+            block.memory_mb = switch (value.get(&zoir)) {
                 .int_literal => |it| switch (it) {
                     .small => |small| if (small > 0) @intCast(small) else {
                         _ = note(diag, .memory_not_a_number);
@@ -341,7 +341,7 @@ fn readDriver(
                 },
             };
         } else if (std.mem.eql(u8, field, "cores")) {
-            block.cores = switch (value.get(zoir)) {
+            block.cores = switch (value.get(&zoir)) {
                 .int_literal => |it| switch (it) {
                     .small => |small| if (small > 0) @intCast(small) else {
                         _ = note(diag, .cores_not_a_number);
@@ -371,7 +371,7 @@ fn readPath(
     field: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError![]const u8 {
-    const text = switch (value.get(zoir)) {
+    const text = switch (value.get(&zoir)) {
         .string_literal => |it| it,
         else => {
             _ = note(diag, .{ .path_not_a_string = field });
@@ -490,8 +490,8 @@ test "a bundle that names no driver permits every one, and one that names some n
 }
 
 test "every driver has a wire name, and the list in the message names all of them" {
-    inline for (@typeInfo(Driver).@"enum".fields) |field| {
-        const one: Driver = @enumFromInt(field.value);
+    inline for (@typeInfo(Driver).@"enum".field_names, @typeInfo(Driver).@"enum".field_values) |_, field_value| {
+        const one: Driver = @fromBackingInt(@intCast(field_value));
         try testing.expect(one.wireName().len != 0);
         try testing.expectEqual(one, Driver.fromWireName(one.wireName()).?);
         try testing.expect(std.mem.indexOf(u8, Driver.all_wire_names, one.wireName()) != null);

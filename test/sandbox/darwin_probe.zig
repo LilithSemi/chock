@@ -71,11 +71,7 @@ fn machLookup(name: []const u8) u8 {
 /// `Sandbox.Config` carries no field to widen the Mach service list, so the profile text is typed out by hand.
 fn widenedMachLookup(granted: []const u8, target: []const u8) u8 {
     var buffer: [1024]u8 = undefined;
-    const profile = std.fmt.bufPrintZ(
-        &buffer,
-        "(version 1)\n(deny default)\n(allow file-read* (literal \"/\"))\n(deny mach-lookup)\n(allow mach-lookup (global-name \"{s}\"))\n",
-        .{granted},
-    ) catch return profile_unbuildable;
+    const profile = std.fmt.bufPrintSentinel(&buffer, "(version 1)\n(deny default)\n(allow file-read* (literal \"/\"))\n(deny mach-lookup)\n(allow mach-lookup (global-name \"{s}\"))\n", .{granted}, 0) catch return profile_unbuildable;
     var message: ?[*:0]u8 = null;
     if (sandbox_init(profile, 0, &message) != 0) return profile_refused;
     return machLookup(target);

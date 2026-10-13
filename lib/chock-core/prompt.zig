@@ -222,8 +222,8 @@ test "the prompt names every tool the session offers, and the two lists are one 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".fields) |field| {
-        const support = core_tools.Support{ .adapter = @enumFromInt(field.value) };
+    inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".field_names, @typeInfo(chock_provider.Client.Adapter).@"enum".field_values) |_, field_value| {
+        const support = core_tools.Support{ .adapter = @enumFromInt(field_value) };
         const definitions = try core_tools.Registry.definitions(arena, support);
 
         const text = try build(arena, .{}, definitions, .{});
@@ -242,8 +242,8 @@ test "the prompt never names a tool this build does not offer" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".fields) |field| {
-        const adapter: chock_provider.Client.Adapter = @enumFromInt(field.value);
+    inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".field_names, @typeInfo(chock_provider.Client.Adapter).@"enum".field_values) |_, field_value| {
+        const adapter: chock_provider.Client.Adapter = @enumFromInt(field_value);
 
         const silent = try core_tools.Registry.definitions(arena, .{ .adapter = adapter });
         const silent_text = try build(arena, .{}, silent, .{});
@@ -406,7 +406,7 @@ test "the prompt carries the index and not the bodies, and a hundred entries cos
             .name = try std.fmt.allocPrint(arena, "entry-{d:0>3}", .{i}),
             .description = "one line, which is all an index entry ever carries",
         };
-        _ = try arena.dupe(u8, body_marker ** 20);
+        _ = try arena.dupe(u8, &repeated(body_marker, 20));
     }
 
     const full = try build(arena, .{}, &.{}, .{ .memory = &entries });
@@ -447,21 +447,21 @@ test "a skill is one line in the prompt, under a heading saying who wrote it" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = "Step one, and a body long enough to notice. " ** 40;
+    const body = repeated("Step one, and a body long enough to notice. ", 40);
     var found = [_]skills.Skill{
         .{
             .layer = .operator,
             .dir = "/config/skills/deploy",
             .name = "deploy",
             .description = "How the user deploys.",
-            .body = body,
+            .body = &body,
         },
         .{
             .layer = .project,
             .dir = "/project/.chock/skills/review-a-diff",
             .name = "review-a-diff",
             .description = "How this repository reviews a diff.",
-            .body = body,
+            .body = &body,
         },
     };
 
@@ -492,8 +492,8 @@ test "a session with no skill is not given the heading, and never the word" {
 
     const text = try build(arena, .{}, &.{}, .{});
     try std.testing.expect(std.mem.indexOf(u8, text, "read_skill") == null);
-    inline for (@typeInfo(skills.Layer).@"enum".fields) |field| {
-        const layer = @field(skills.Layer, field.name);
+    inline for (@typeInfo(skills.Layer).@"enum".field_names, @typeInfo(skills.Layer).@"enum".field_values) |field_name, _| {
+        const layer = @field(skills.Layer, field_name);
         try std.testing.expect(std.mem.indexOf(u8, text, layer.heading()) == null);
     }
 }
@@ -549,4 +549,14 @@ test "the one act the rules say can be asked for is the one the tool really take
     const bare = try build(allocator, .{}, &.{}, .{});
     defer allocator.free(bare);
     try std.testing.expect(std.mem.indexOf(u8, bare, @tagName(tools.Tool.request_action)) == null);
+}
+
+/// `piece` laid end to end `times` over, at comptime.
+///
+/// Zig 0.17 took the `**` operator away and `@splat` fills an array with ONE
+/// element, so a repeated phrase has no operator of its own any more.
+fn repeated(comptime piece: []const u8, comptime times: usize) [piece.len * times]u8 {
+    var out: [piece.len * times]u8 = undefined;
+    for (0..times) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
+    return out;
 }

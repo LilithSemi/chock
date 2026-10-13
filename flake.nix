@@ -68,7 +68,10 @@
           manifestVersion;
 
       overlays.default = final: prev: {
-        chock = final.callPackage ./pkgs/chock { flakever = flakeverConfig; };
+        chock = final.callPackage ./pkgs/chock {
+          flakever = flakeverConfig;
+          zig = final.zig_0_17;
+        };
       };
 
       devShells = forAllSystems (

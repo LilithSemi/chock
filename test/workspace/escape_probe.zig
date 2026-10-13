@@ -300,7 +300,7 @@ fn runGitCommitFlow(
 
 /// EROFS is the exact errno a read only bind mount gives.
 fn spawnedWrite(target: []const u8) u8 {
-    const target_z = std.heap.page_allocator.dupeZ(u8, target) catch return 5;
+    const target_z = std.heap.page_allocator.dupeSentinel(u8, target, 0) catch return 5;
     defer std.heap.page_allocator.free(target_z);
     const fd_rc = linux.open(target_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
     const open_errno = linux.errno(fd_rc);
@@ -313,7 +313,7 @@ fn spawnedWrite(target: []const u8) u8 {
 
 /// The notice string comes from `chock-sandbox` itself, not a copy that could drift.
 fn spawnedRead(target: []const u8) u8 {
-    const target_z = std.heap.page_allocator.dupeZ(u8, target) catch return 5;
+    const target_z = std.heap.page_allocator.dupeSentinel(u8, target, 0) catch return 5;
     defer std.heap.page_allocator.free(target_z);
 
     const fd_rc = linux.open(target_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
@@ -342,7 +342,7 @@ fn spawnedRead(target: []const u8) u8 {
 
 /// EBUSY is the exact errno a file that is itself a mount point gives.
 fn spawnedDelete(target: []const u8) u8 {
-    const target_z = std.heap.page_allocator.dupeZ(u8, target) catch return 5;
+    const target_z = std.heap.page_allocator.dupeSentinel(u8, target, 0) catch return 5;
     defer std.heap.page_allocator.free(target_z);
     const unlink_errno = linux.errno(linux.unlink(target_z.ptr));
     if (unlink_errno == .SUCCESS) return 0;

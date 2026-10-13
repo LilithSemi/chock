@@ -432,13 +432,13 @@ comptime {
         "action",       "agent_kind", "model_alias", "tool",
         "tool_call_id", "timeout_ms", "self_policy", "source",
     };
-    for (@typeInfo(Request).@"struct".fields) |field| {
+    for (@typeInfo(Request).@"struct".field_names, @typeInfo(Request).@"struct".field_types) |field_name, _| {
         var listed = false;
         for (replaced ++ chock_wrote_it) |name| {
-            if (std.mem.eql(u8, field.name, name)) listed = true;
+            if (std.mem.eql(u8, field_name, name)) listed = true;
         }
         if (!listed) {
-            @compileError("this field of Request is neither replaced nor named as Chock's own: " ++ field.name);
+            @compileError("this field of Request is neither replaced nor named as Chock's own: " ++ field_name);
         }
     }
 }

@@ -2,6 +2,7 @@
 //! and the action, and the answer is the most specific rule that matches.
 
 const std = @import("std");
+const chock_zon = @import("chock-zon");
 const defaults = @import("defaults.zig");
 
 pub const file_name = "chock.zon";
@@ -27,7 +28,7 @@ pub const Decision = enum {
     allow,
 
     pub fn rank(self: Decision) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn needsReview(self: Decision) bool {
@@ -117,8 +118,8 @@ pub const LoadError = ParseError || error{
 
 /// The variants that name an agent kind hold a copy of it.
 pub const Diagnostic = union(enum) {
-    file_not_zon: std.zon.parse.Diagnostics,
-    block_not_valid: std.zon.parse.Diagnostics,
+    file_not_zon: ZonFailure,
+    block_not_valid: ZonFailure,
     not_a_struct_literal,
     read_failed: anyerror,
     too_many_rules: usize,
@@ -131,6 +132,12 @@ pub const Diagnostic = union(enum) {
     agent_cycle: []const u8,
     child_stronger_than_parent: ChildStronger,
     policy_too_complex: TooComplex,
+
+    /// `arena` backs `diag`'s messages and must outlive it; `deinit` frees both together.
+    pub const ZonFailure = struct {
+        arena: std.heap.ArenaAllocator,
+        diag: std.zon.parse.Diagnostics,
+    };
 
     pub const Parent = struct {
         kind: []const u8,
@@ -160,7 +167,7 @@ pub const Diagnostic = union(enum) {
 
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .file_not_zon, .block_not_valid => |*zon_diag| zon_diag.deinit(gpa),
+            .file_not_zon, .block_not_valid => |*zf| zf.arena.deinit(),
             .duplicate_agent_kind, .agent_cycle => |name| gpa.free(name),
             .unknown_parent => |names| {
                 gpa.free(names.kind);
@@ -180,13 +187,13 @@ pub const Diagnostic = union(enum) {
 
     pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.*) {
-            .file_not_zon => |*zon_diag| try writer.print(
+            .file_not_zon => |*zf| try writer.print(
                 "{s} is not valid:\n{f}",
-                .{ file_name, zon_diag },
+                .{ file_name, zf.diag.fmt(file_name) },
             ),
-            .block_not_valid => |*zon_diag| try writer.print(
+            .block_not_valid => |*zf| try writer.print(
                 "{s}: the policy block is not valid:\n{f}",
-                .{ file_name, zon_diag },
+                .{ file_name, zf.diag.fmt(file_name) },
             ),
             .not_a_struct_literal => try writer.print(
                 "{s}: the file must hold a struct literal",
@@ -319,6 +326,8 @@ pub const Table = struct {
     org: []const Rule = &.{},
     hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
     from_file: bool = false,
+    /// Backs `policy`'s slices; `destroy` frees it instead of walking the policy by hand.
+    arena: std.heap.ArenaAllocator,
 
     pub const Layers = struct {
         given: []const Rule = &.{},
@@ -358,30 +367,55 @@ pub const Table = struct {
         from_file: bool,
         diag: ?*?Diagnostic,
     ) ParseError!*const Table {
-        var trees = try Trees.init(gpa, source, diag);
-        var trees_owned = true;
-        defer if (trees_owned) trees.deinit(gpa);
+        var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer ast.deinit(gpa);
+
+        // `parse_str_lits = false`: this file reads only field names.
+        var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
+        defer zoir.deinit(gpa);
+
+        // The arena backs the policy's slices and any diagnostics. On
+        // success the table keeps it; on a fault handed to the caller,
+        // `note` keeps it instead.
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        var arena_owned = true;
+        defer if (arena_owned) arena.deinit();
+
+        if (zoir.hasCompileErrors()) {
+            var zon_diag: std.zon.parse.Diagnostics = undefined;
+            _ = std.zon.parse.fromZoir(Policy, .{
+                .arena = arena.allocator(),
+                .ast = &ast,
+                .zoir = &zoir,
+                .diagnostics = &zon_diag,
+            }) catch {};
+            if (note(diag, .{ .file_not_zon = .{ .arena = arena, .diag = zon_diag } })) arena_owned = false;
+            return error.InvalidPolicy;
+        }
 
         const policy = policy: {
-            const node = try findPolicyNode(trees.zoir, diag) orelse break :policy Policy{};
-            trees.diag_owns_trees = true;
-            break :policy std.zon.parse.fromZoirNodeAlloc(
+            const node = try findPolicyNode(zoir, diag) orelse break :policy Policy{};
+            var zon_diag: std.zon.parse.Diagnostics = undefined;
+            break :policy chock_zon.fromNode(
                 Policy,
                 gpa,
-                trees.ast,
-                trees.zoir,
+                arena.allocator(),
+                source,
+                &ast,
+                &zoir,
                 node,
-                &trees.diag,
+                &zon_diag,
                 .{},
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.ParseZon => {
-                    if (note(diag, .{ .block_not_valid = trees.diag })) trees_owned = false;
+                    if (note(diag, .{ .block_not_valid = .{ .arena = arena, .diag = zon_diag } })) arena_owned = false;
                     return error.InvalidPolicy;
                 },
             };
         };
-        errdefer std.zon.parse.free(gpa, policy);
 
         try validate(gpa, policy, diag);
 
@@ -396,7 +430,9 @@ pub const Table = struct {
             .org = layers.org,
             .hash = hashSource(source),
             .from_file = from_file,
+            .arena = arena,
         };
+        arena_owned = false;
         return table;
     }
 
@@ -451,7 +487,7 @@ pub const Table = struct {
     }
 
     pub fn destroy(gpa: std.mem.Allocator, self: *const Table) void {
-        std.zon.parse.free(gpa, self.policy.*);
+        self.arena.deinit();
         gpa.destroy(self.policy);
         gpa.destroy(self);
     }
@@ -613,7 +649,7 @@ fn keyForKind(key: Key, agent_kind: []const u8) Key {
 // A change to `chock.zon` cannot change a running session's policy.
 comptime {
     const pointer = @typeInfo(@FieldType(Table, "policy")).pointer;
-    if (!pointer.is_const) @compileError(
+    if (!pointer.attrs.@"const") @compileError(
         "Table.policy must point to const, or a caller could rewrite a rule of a live session",
     );
 
@@ -622,19 +658,19 @@ comptime {
 }
 
 fn refuseMutableTable(comptime namespace: type, comptime prefix: []const u8) void {
-    for (@typeInfo(namespace).@"struct".decls) |decl| {
-        const info = switch (@typeInfo(@TypeOf(@field(namespace, decl.name)))) {
+    for (@typeInfo(namespace).@"struct".decl_names) |decl| {
+        const info = switch (@typeInfo(@TypeOf(@field(namespace, decl)))) {
             .@"fn" => |function| function,
             else => continue,
         };
-        for (info.params) |param| {
-            const kind = param.type orelse continue;
+        for (info.param_types) |param| {
+            const kind = param orelse continue;
             const pointer = switch (@typeInfo(kind)) {
                 .pointer => |pointer| pointer,
                 else => continue,
             };
-            if (pointer.child != Table or pointer.is_const) continue;
-            @compileError(prefix ++ decl.name ++
+            if (pointer.child != Table or pointer.attrs.@"const") continue;
+            @compileError(prefix ++ decl ++
                 " takes a mutable *Table, and no function may do that");
         }
     }
@@ -812,9 +848,9 @@ pub fn parseGivenRule(text: []const u8) GivenRuleError!Rule {
     if (action.len == 0) return error.ActionEmpty;
     if (!patternIsWellFormed(action)) return error.ActionMalformed;
 
-    inline for (@typeInfo(Decision).@"enum".fields) |field| {
-        if (std.mem.eql(u8, decision, field.name)) {
-            return .{ .action = action, .decision = @field(Decision, field.name) };
+    inline for (@typeInfo(Decision).@"enum".field_names, @typeInfo(Decision).@"enum".field_values) |field_name, _| {
+        if (std.mem.eql(u8, decision, field_name)) {
+            return .{ .action = action, .decision = @field(Decision, field_name) };
         }
     }
     return error.DecisionUnknown;
@@ -826,53 +862,12 @@ pub fn hashSource(source: []const u8) [std.crypto.hash.sha2.Sha256.digest_length
     return out;
 }
 
-/// `diag_owns_trees` holds which side owns the two trees.
-const Trees = struct {
-    ast: std.zig.Ast,
-    zoir: std.zig.Zoir,
-    diag: std.zon.parse.Diagnostics = .{},
-    diag_owns_trees: bool = false,
-
-    fn init(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) ParseError!Trees {
-        var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-        };
-        var ast_owned = true;
-        errdefer if (ast_owned) ast.deinit(gpa);
-
-        // `parse_str_lits = false`: this file reads only field names.
-        var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
-        var zoir_owned = true;
-        errdefer if (zoir_owned) zoir.deinit(gpa);
-
-        if (zoir.hasCompileErrors()) {
-            if (note(diag, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
-                ast_owned = false;
-                zoir_owned = false;
-            }
-            return error.InvalidPolicy;
-        }
-
-        return .{ .ast = ast, .zoir = zoir };
-    }
-
-    fn deinit(self: *Trees, gpa: std.mem.Allocator) void {
-        if (self.diag_owns_trees) {
-            self.diag.deinit(gpa);
-        } else {
-            self.ast.deinit(gpa);
-            self.zoir.deinit(gpa);
-        }
-        self.* = undefined;
-    }
-};
-
 fn findPolicyNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), "policy")) {
+                if (std.mem.eql(u8, name.get(&zoir), "policy")) {
                     return fields.vals.at(@intCast(index));
                 }
             }
@@ -1218,19 +1213,19 @@ fn mutableTableFunctionNames() []const []const u8 {
     comptime {
         var names: []const []const u8 = &.{};
         for (.{ Table, @This() }) |namespace| {
-            for (@typeInfo(namespace).@"struct".decls) |decl| {
-                const info = switch (@typeInfo(@TypeOf(@field(namespace, decl.name)))) {
+            for (@typeInfo(namespace).@"struct".decl_names) |decl| {
+                const info = switch (@typeInfo(@TypeOf(@field(namespace, decl)))) {
                     .@"fn" => |function| function,
                     else => continue,
                 };
-                for (info.params) |param| {
-                    const kind = param.type orelse continue;
+                for (info.param_types) |param| {
+                    const kind = param orelse continue;
                     const pointer = switch (@typeInfo(kind)) {
                         .pointer => |pointer| pointer,
                         else => continue,
                     };
-                    if (pointer.child != Table or pointer.is_const) continue;
-                    names = names ++ [_][]const u8{decl.name};
+                    if (pointer.child != Table or pointer.attrs.@"const") continue;
+                    names = names ++ [_][]const u8{decl};
                 }
             }
         }
@@ -1645,11 +1640,11 @@ test "the table cannot be changed after a session starts" {
     try std.testing.expectEqualSlices(u8, &hashSource(at_start), &table.sourceHash());
     try std.testing.expect(!std.mem.eql(u8, &hashSource(after_edit), &table.sourceHash()));
 
-    try std.testing.expect(@typeInfo(@FieldType(Table, "policy")).pointer.is_const);
+    try std.testing.expect(@typeInfo(@FieldType(Table, "policy")).pointer.attrs.@"const");
     inline for (.{ Table.parse, Table.load }) |constructor| {
         const returns = @typeInfo(@typeInfo(@TypeOf(constructor)).@"fn".return_type.?)
             .error_union.payload;
-        try std.testing.expect(@typeInfo(returns).pointer.is_const);
+        try std.testing.expect(@typeInfo(returns).pointer.attrs.@"const");
         try std.testing.expectEqual(Table, @typeInfo(returns).pointer.child);
     }
     const mutable = comptime mutableTableFunctionNames();
@@ -2074,7 +2069,9 @@ test "a misspelled decision names its line and column, and the trees behind it a
     var buffer: [512]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{f}", .{&diag.?});
     try std.testing.expect(std.mem.startsWith(u8, line, "chock.zon: the policy block is not valid:\n"));
-    try std.testing.expect(std.mem.indexOf(u8, line, "1:67: error:") != null);
+    // Relative to the block's own cut text, not to chock.zon as a whole:
+    // see chock-zon.zig's own note on `fromNode`.
+    try std.testing.expect(std.mem.indexOf(u8, line, "1:54: error:") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "agent_reveiw") != null);
 }
 

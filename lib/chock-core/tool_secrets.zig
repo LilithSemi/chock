@@ -98,8 +98,8 @@ test "what is recorded names the secret and never carries a value" {
     try testing.expectEqualStrings("GITHUB_TOKEN", record.name);
     try testing.expectEqualStrings("env", record.bind);
 
-    inline for (@typeInfo(Used).@"struct".fields) |field| {
-        try testing.expect(!std.mem.eql(u8, field.name, "value"));
+    inline for (@typeInfo(Used).@"struct".field_names, @typeInfo(Used).@"struct".field_types) |field_name, _| {
+        try testing.expect(!std.mem.eql(u8, field_name, "value"));
     }
     try testing.expect(std.mem.indexOf(u8, given.env[0], "not-a-real-token") != null);
 }
@@ -111,9 +111,9 @@ test "release is called for a call that was granted nothing" {
 }
 
 test "a file bind carries the value and never a path" {
-    inline for (@typeInfo(File).@"struct".fields) |field| {
-        try testing.expect(!std.mem.eql(u8, field.name, "path"));
-        try testing.expect(!std.mem.eql(u8, field.name, "host_path"));
+    inline for (@typeInfo(File).@"struct".field_names, @typeInfo(File).@"struct".field_types) |field_name, _| {
+        try testing.expect(!std.mem.eql(u8, field_name, "path"));
+        try testing.expect(!std.mem.eql(u8, field_name, "host_path"));
     }
 
     const one = File{ .variable = "GOOGLE_APPLICATION_CREDENTIALS", .value = "{}" };

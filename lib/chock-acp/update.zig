@@ -403,7 +403,7 @@ test "every update is something both versions can be asked for" {
         .{ .title = "what this session is about" },
     };
 
-    var seen = std.EnumSet(std.meta.Tag(Update)).initEmpty();
+    var seen = std.EnumSet(std.meta.Tag(Update)).empty;
     for (every) |one| {
         seen.insert(std.meta.activeTag(one));
         for ([_]Version{ .v1, .v2 }) |version| {
@@ -415,7 +415,7 @@ test "every update is something both versions can be asked for" {
             try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, body, '\n'));
         }
     }
-    try testing.expectEqual(@typeInfo(Update).@"union".fields.len, seen.count());
+    try testing.expectEqual(@typeInfo(Update).@"union".field_names.len, seen.count());
 }
 
 test "a newline in what the model said survives as an escape, not as a frame" {

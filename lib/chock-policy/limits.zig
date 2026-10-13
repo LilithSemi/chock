@@ -182,7 +182,7 @@ pub const Diagnostic = struct {
     fault: Fault,
 
     pub const Fault = union(enum) {
-        file_not_zon: std.zon.parse.Diagnostics,
+        file_not_zon: ZonFailure,
         not_a_struct_literal,
         unknown_field: []const u8,
         value_not_string_or_number: []const u8,
@@ -199,9 +199,15 @@ pub const Diagnostic = struct {
         reason: SettingError,
     };
 
+    /// `arena` backs `diag`'s messages and must outlive it; `deinit` frees both together.
+    pub const ZonFailure = struct {
+        arena: std.heap.ArenaAllocator,
+        diag: std.zon.parse.Diagnostics,
+    };
+
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.fault) {
-            .file_not_zon => |*zon_diag| zon_diag.deinit(gpa),
+            .file_not_zon => |*zf| zf.arena.deinit(),
             .unknown_field, .value_not_string_or_number, .negative_setting, .setting_overflow => |name| gpa.free(name),
             .invalid_setting => |setting| {
                 gpa.free(setting.field);
@@ -214,9 +220,9 @@ pub const Diagnostic = struct {
 
     pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.fault) {
-            .file_not_zon => |*zon_diag| try writer.print(
+            .file_not_zon => |*zf| try writer.print(
                 "{s} is not valid:\n{f}",
-                .{ self.source, zon_diag },
+                .{ self.source, zf.diag.fmt(self.source) },
             ),
             .not_a_struct_literal => try writer.print(
                 "{s}: the file must hold a struct literal",
@@ -289,21 +295,28 @@ pub fn parseFrom(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Limits {
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+    var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    var ast_owned = true;
-    defer if (ast_owned) ast.deinit(gpa);
+    defer ast.deinit(gpa);
 
     // Left false, `zoir.string_bytes` is empty and a string field reads "".
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = true });
-    var zoir_owned = true;
-    defer if (zoir_owned) zoir.deinit(gpa);
+    defer zoir.deinit(gpa);
 
     if (zoir.hasCompileErrors()) {
-        if (note(diag, source_name, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
-            ast_owned = false;
-            zoir_owned = false;
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        var arena_owned = true;
+        defer if (arena_owned) arena.deinit();
+        var zon_diag: std.zon.parse.Diagnostics = undefined;
+        _ = std.zon.parse.fromZoir(Limits, .{
+            .arena = arena.allocator(),
+            .ast = &ast,
+            .zoir = &zoir,
+            .diagnostics = &zon_diag,
+        }) catch {};
+        if (note(diag, source_name, .{ .file_not_zon = .{ .arena = arena, .diag = zon_diag } })) {
+            arena_owned = false;
         }
         return error.InvalidLimits;
     }
@@ -320,11 +333,11 @@ fn parseFields(
     diag: ?*?Diagnostic,
 ) ParseError!Limits {
     var limits = Limits{};
-    switch (node.get(zoir)) {
+    switch (node.get(&zoir)) {
         .empty_literal => return limits,
         .struct_literal => |fields| {
             for (fields.names, 0..) |name_id, index| {
-                const name = name_id.get(zoir);
+                const name = name_id.get(&zoir);
                 const value_node = fields.vals.at(@intCast(index));
                 if (std.mem.eql(u8, name, "processes")) {
                     limits.processes = try readSetting(gpa, zoir, "processes", value_node, source_name, diag);
@@ -352,7 +365,7 @@ fn readSetting(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Setting {
-    switch (node.get(zoir)) {
+    switch (node.get(&zoir)) {
         .string_literal => |text| {
             return parseSetting(text) catch |err| {
                 const owned_field = try gpa.dupe(u8, field);
@@ -405,10 +418,10 @@ fn findLimitsNode(
     diag: ?*?Diagnostic,
 ) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), "limits")) {
+                if (std.mem.eql(u8, name.get(&zoir), "limits")) {
                     return fields.vals.at(@intCast(index));
                 }
             }

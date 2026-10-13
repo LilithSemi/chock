@@ -129,14 +129,14 @@ test "a name that could not be a row is refused rather than folded into a decisi
     try testing.expectError(error.NameMalformed, rowsFor("public", "gpt*"));
     try testing.expectError(error.NameMalformed, rowsFor("pub\x00lic", "gpt-5"));
 
-    const long_instance = "i" ** (max_instance_bytes + 1);
-    try testing.expectError(error.NameTooLong, rowsFor(long_instance, "gpt-5"));
-    const long_model = "m" ** (max_model_bytes + 1);
-    try testing.expectError(error.NameTooLong, rowsFor("public", long_model));
+    const long_instance = @as([(max_instance_bytes + 1)]u8, @splat('i'));
+    try testing.expectError(error.NameTooLong, rowsFor(&long_instance, "gpt-5"));
+    const long_model = @as([(max_model_bytes + 1)]u8, @splat('m'));
+    try testing.expectError(error.NameTooLong, rowsFor("public", &long_model));
 
-    const at_instance = "i" ** max_instance_bytes;
-    const at_model = "m" ** max_model_bytes;
-    const rows = try rowsFor(at_instance, at_model);
+    const at_instance = @as([max_instance_bytes]u8, @splat('i'));
+    const at_model = @as([max_model_bytes]u8, @splat('m'));
+    const rows = try rowsFor(&at_instance, &at_model);
     try testing.expectEqual(@as(usize, max_row_bytes), rows.model().len);
     try testing.expectEqual(namespace.len + 1 + max_instance_bytes, rows.instance().len);
 }

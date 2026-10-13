@@ -43,10 +43,10 @@ pub fn wipe(buffer: *Buffer) void {
 // The question a person is shown holds no answer, and there is no shape for one to arrive in. This fails the build if a field appears that could carry one, the same guard chock-broker/askpass.zig keeps over its own log record.
 comptime {
     const forbidden = [_][]const u8{ "pin", "secret", "password", "answer", "value", "code" };
-    for (@typeInfo(Question).@"struct".fields) |field| {
+    for (@typeInfo(Question).@"struct".field_names, @typeInfo(Question).@"struct".field_types) |field_name, _| {
         for (forbidden) |bad| {
-            if (std.mem.indexOf(u8, field.name, bad) != null) {
-                @compileError("a PIN question must not hold the answer: " ++ field.name);
+            if (std.mem.indexOf(u8, field_name, bad) != null) {
+                @compileError("a PIN question must not hold the answer: " ++ field_name);
             }
         }
     }
@@ -63,7 +63,7 @@ test "a count of zero tries left is the same fact as blocked" {
 
 test "the buffer is longer than any PIN a card accepts" {
     try testing.expect(max_pin_bytes > piv.pin_field_len);
-    var buffer: Buffer = [_]u8{'7'} ** max_pin_bytes;
+    var buffer: Buffer = @as([max_pin_bytes]u8, @splat('7'));
     wipe(&buffer);
     for (buffer) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }

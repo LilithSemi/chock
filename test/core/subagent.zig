@@ -24,7 +24,7 @@ const Tree = struct {
     child_log_path: [:0]u8,
     parent_backing: chock_proto.storage.JsonLines,
 
-    const parent_session = "01PARENT" ++ "A" ** 18;
+    const parent_session = "01PARENT" ++ @as([18]u8, @splat('A'));
 
     fn init(gpa: std.mem.Allocator) !Tree {
         var tmp = testing.tmpDir(.{});
@@ -87,7 +87,7 @@ fn runChild(
 /// The caller frees the result with `subagent.freePrepared`.
 fn prepareChild(gpa: std.mem.Allocator, tree: *Tree) !subagent.Prepared {
     return .{
-        .child_session = try gpa.dupe(u8, "01CHILD" ++ "A" ** 19),
+        .child_session = try gpa.dupe(u8, "01CHILD" ++ @as([19]u8, @splat('A'))),
         .log_path = try gpa.dupe(u8, tree.child_log_path),
         .scratchpad_path = try std.fmt.allocPrint(gpa, "{s}/agents/01CHILD", .{tree.root}),
     };
@@ -187,7 +187,7 @@ test "a subagent's turns are in the subagent's own log, and both logs replay on 
     };
 
     try tree.parentAppend(gpa, .{ .session_spawn = .{
-        .child_session = "01CHILD" ++ "A" ** 19,
+        .child_session = "01CHILD" ++ @as([19]u8, @splat('A')),
         .child_agent_kind = request.agent_kind,
         .reason = request.reason,
     } });
@@ -198,7 +198,7 @@ test "a subagent's turns are in the subagent's own log, and both logs replay on 
     try testing.expectEqualStrings("the parser refuses an empty file", report.result);
 
     try tree.parentAppend(gpa, .{ .agent_complete = .{
-        .child_session = "01CHILD" ++ "A" ** 19,
+        .child_session = "01CHILD" ++ @as([19]u8, @splat('A')),
         .child_agent_kind = request.agent_kind,
         .outcome = report.outcome,
         .result = report.result,
@@ -208,7 +208,7 @@ test "a subagent's turns are in the subagent's own log, and both logs replay on 
     var child_log = try chock_proto.log.Log.open(
         testing.io,
         tree.child_log_path,
-        "01CHILD" ++ "A" ** 19,
+        "01CHILD" ++ @as([19]u8, @splat('A')),
     );
     defer child_log.close(testing.io);
     var child_backing = chock_proto.storage.JsonLines{ .log = child_log };
@@ -251,7 +251,7 @@ test "a killed child leaves a log its parent reads as died, and never as finishe
     var child_log = try chock_proto.log.Log.open(
         testing.io,
         tree.child_log_path,
-        "01CHILD" ++ "A" ** 19,
+        "01CHILD" ++ @as([19]u8, @splat('A')),
     );
     defer child_log.close(testing.io);
     var child_backing = chock_proto.storage.JsonLines{ .log = child_log };
@@ -387,7 +387,7 @@ test "everything the parent decided reaches the child, and the child decides non
     var child_log = try chock_proto.log.Log.open(
         testing.io,
         tree.child_log_path,
-        "01CHILD" ++ "A" ** 19,
+        "01CHILD" ++ @as([19]u8, @splat('A')),
     );
     defer child_log.close(testing.io);
     var child_backing = chock_proto.storage.JsonLines{ .log = child_log };

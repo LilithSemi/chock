@@ -104,7 +104,7 @@ pub const Diagnostic = struct {
     fault: Fault,
 
     pub const Fault = union(enum) {
-        file_not_zon: std.zon.parse.Diagnostics,
+        file_not_zon: ZonFailure,
         not_a_struct_literal,
         unknown_field: []const u8,
         inline_secret: []const u8,
@@ -146,9 +146,15 @@ pub const Diagnostic = struct {
         required: []const u8,
     };
 
+    /// `arena` backs `diag`'s messages and must outlive it; `deinit` frees both together.
+    pub const ZonFailure = struct {
+        arena: std.heap.ArenaAllocator,
+        diag: std.zon.parse.Diagnostics,
+    };
+
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.fault) {
-            .file_not_zon => |*zon_diag| zon_diag.deinit(gpa),
+            .file_not_zon => |*zf| zf.arena.deinit(),
             .unknown_field, .inline_secret, .kind_unknown, .provider_unknown => |name| gpa.free(name),
             .base_url_invalid => |invalid| gpa.free(invalid.text),
             else => {},
@@ -158,9 +164,9 @@ pub const Diagnostic = struct {
 
     pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.fault) {
-            .file_not_zon => |*zon_diag| try writer.print(
+            .file_not_zon => |*zf| try writer.print(
                 "{s} is not valid:\n{f}",
-                .{ self.source, zon_diag },
+                .{ self.source, zf.diag.fmt(self.source) },
             ),
             .not_a_struct_literal => try writer.print(
                 "{s}: the file must hold a struct literal",
@@ -296,20 +302,27 @@ pub fn parseFrom(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Search {
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+    var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    var ast_owned = true;
-    defer if (ast_owned) ast.deinit(gpa);
+    defer ast.deinit(gpa);
 
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = true });
-    var zoir_owned = true;
-    defer if (zoir_owned) zoir.deinit(gpa);
+    defer zoir.deinit(gpa);
 
     if (zoir.hasCompileErrors()) {
-        if (note(diag, source_name, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
-            ast_owned = false;
-            zoir_owned = false;
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        var arena_owned = true;
+        defer if (arena_owned) arena.deinit();
+        var zon_diag: std.zon.parse.Diagnostics = undefined;
+        _ = std.zon.parse.fromZoir(Search, .{
+            .arena = arena.allocator(),
+            .ast = &ast,
+            .zoir = &zoir,
+            .diagnostics = &zon_diag,
+        }) catch {};
+        if (note(diag, source_name, .{ .file_not_zon = .{ .arena = arena, .diag = zon_diag } })) {
+            arena_owned = false;
         }
         return error.InvalidSearch;
     }
@@ -324,10 +337,10 @@ fn findSearchNode(
     diag: ?*?Diagnostic,
 ) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), block_name)) {
+                if (std.mem.eql(u8, name.get(&zoir), block_name)) {
                     return fields.vals.at(@intCast(index));
                 }
             }
@@ -359,11 +372,11 @@ fn parseFields(
 ) ParseError!Search {
     var search = Search{};
     errdefer search.deinit(gpa);
-    switch (node.get(zoir)) {
+    switch (node.get(&zoir)) {
         .empty_literal => {},
         .struct_literal => |fields| {
             for (fields.names, 0..) |name_id, index| {
-                const name = name_id.get(zoir);
+                const name = name_id.get(&zoir);
                 const value_node = fields.vals.at(@intCast(index));
                 if (isForbiddenSecretField(name)) {
                     _ = note(diag, source_name, .{ .inline_secret = try gpa.dupe(u8, name) });
@@ -437,7 +450,7 @@ fn readKind(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Kind {
-    const text = switch (node.get(zoir)) {
+    const text = switch (node.get(&zoir)) {
         .string_literal => |text| text,
         else => {
             _ = note(diag, source_name, .kind_not_a_string);
@@ -457,7 +470,7 @@ fn readProvider(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Provider {
-    const text = switch (node.get(zoir)) {
+    const text = switch (node.get(&zoir)) {
         .string_literal => |text| text,
         else => {
             _ = note(diag, source_name, .provider_not_a_string);
@@ -477,7 +490,7 @@ fn readBaseUrl(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError![]const u8 {
-    const text = switch (node.get(zoir)) {
+    const text = switch (node.get(&zoir)) {
         .string_literal => |text| text,
         else => {
             _ = note(diag, source_name, .base_url_not_a_string);
@@ -501,7 +514,7 @@ fn readCredential(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError![]const u8 {
-    const text = switch (node.get(zoir)) {
+    const text = switch (node.get(&zoir)) {
         .string_literal => |text| text,
         else => {
             _ = note(diag, source_name, .credential_not_a_string);
@@ -902,8 +915,8 @@ test "the provider_unknown message names every vendor this reader knows" {
     );
     const text = try std.fmt.allocPrint(gpa, "{f}", .{diag.?});
     defer gpa.free(text);
-    inline for (@typeInfo(Provider).@"enum".fields) |field| {
-        try testing.expect(std.mem.indexOf(u8, text, field.name) != null);
+    inline for (@typeInfo(Provider).@"enum".field_names, @typeInfo(Provider).@"enum".field_values) |field_name, _| {
+        try testing.expect(std.mem.indexOf(u8, text, field_name) != null);
     }
 }
 
@@ -966,8 +979,8 @@ test "a scrape vendor named on an api engine is a mismatch, and the message says
 }
 
 test "every provider belongs to a kind that needs one named" {
-    inline for (@typeInfo(Provider).@"enum".fields) |field| {
-        const provider: Provider = @enumFromInt(field.value);
+    inline for (@typeInfo(Provider).@"enum".field_names, @typeInfo(Provider).@"enum".field_values) |_, field_value| {
+        const provider: Provider = @fromBackingInt(@intCast(field_value));
         try testing.expect(provider.kind() != .self_hosted);
     }
 }

@@ -5,28 +5,28 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .vulcan = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan.git#e78c023a8487e087f53c6d4060d992f31997c904",
-            .hash = "vulcan-0.0.0-d6EfZDVmqQCFNcA8-IWk4jzCrlA7HUqTuwxDKWMxBERn",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan#6a7de466d5b1ad16404ce18d379a1f18f44315f3",
+            .hash = "vulcan-0.0.0-d6EfZPAGqwC0PQ5R-cx6w1kZhW597HsaAIjPHwNa4LEt",
         },
         .phantom = .{
-            .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#18720e9acdc2decdbec05c2d23b15bd9c0bd4b9b",
-            .hash = "phantom-0.1.0-HsUDTFJOIwCPKz6FK7URaS2HzYtAcylJ9HtyyyPx1BCj",
+            .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#6a6a505e8248e5aa01c589d81e5ad4f1762b4e0c",
+            .hash = "phantom-0.1.0-HsUDTIp_IwBZII3g94w-fyVePQPBsn5xdcos---27Y0B",
         },
         .udev = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/udev.zig#67e0061ab53028c93134c9fe8e44a5a89a17137f",
-            .hash = "udev-0.1.0-ZWb7H_1aBwCNMTs30b9SL6tTkvpmDLzz_RfKP1UPC1FZ",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/udev.zig#5b76bbccde9ef7bcb9b6447c0f2454f2ade51733",
+            .hash = "udev-0.1.0-ZWb7H_NaBwBz8odIGbKN2hpRa-3HdrIsuNaml7VzsRTs",
         },
         .fix = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/fix?ref=integration#1c1b7f3a7027e0eb5e5fdfc55b94737d2b7050cb",
-            .hash = "fix-0.3.0-2pqVLGLMVwCRmq8PCXCUZOxs-tBGn9rUTKn7IAj4Kg9E",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/fix?ref=integration#44e97ffb6a96867f1b7e2b79bb6d131831e2d88f",
+            .hash = "fix-0.3.0-2pqVLBL6VwCNhooXswjysWZdJDKoVs9akuKe8__qrcBk",
         },
         .dbus = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/dbus.zig#2d8f179d202f002eb490d4d0636c066003d9fbb4",
-            .hash = "dbus-0.1.0-8F4MwHAvBACyrhHqEeT4UwRn9cHvu5N3mwS7e_hqDyGF",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/dbus.zig#ac21c343ceee75c0a5ea1793096751ca851abfa1",
+            .hash = "dbus-0.1.0-8F4MwG8vBAC1eyINQZ4xQIwrt9zl9M5D1LgTdzoFlvMl",
         },
         .mirage = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/mirage#1bf22e090fc0907a8234ec8ef2cde2893d126de9",
-            .hash = "mirage-0.16.0-ORLT6H5MFgClnw4WGIkWNdiguyJ_xe8jQv-buDWkzCiR",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/mirage#f96e2bd1ff9a159e32cec93dfe665488a2401f2b",
+            .hash = "mirage-0.1.0-ORLT6E02FgBblg4Zls7U4mEBHCboH0-NC5rJ_u4t4uOG",
         },
     },
     .paths = .{

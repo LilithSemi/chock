@@ -83,8 +83,8 @@ test "a description with newlines in it becomes one line, so one entry costs one
 
 test "a description past the bound is cut, and the cut is marked" {
     const allocator = testing.allocator;
-    const long = "x" ** (max_description_bytes * 3);
-    const flat = try oneLine(allocator, long);
+    const long = @as([(max_description_bytes * 3)]u8, @splat('x'));
+    const flat = try oneLine(allocator, &long);
     defer allocator.free(flat);
 
     try testing.expect(flat.len <= max_description_bytes);
@@ -93,8 +93,8 @@ test "a description past the bound is cut, and the cut is marked" {
 
 test "a cut description is still valid text, never half of a character" {
     const allocator = testing.allocator;
-    const long = "\u{00e9}" ** (max_description_bytes * 2);
-    const flat = try oneLine(allocator, long);
+    const long = repeated("\u{00e9}", (max_description_bytes * 2));
+    const flat = try oneLine(allocator, &long);
     defer allocator.free(flat);
 
     try testing.expect(std.unicode.utf8ValidateSlice(flat));
@@ -137,4 +137,14 @@ test "the first meaningful line of a file skips blanks and drops a heading marke
         firstMeaningfulLine("\n\n#  Build rules  \n\nUse zig build test.\n"),
     );
     try testing.expectEqualStrings("", firstMeaningfulLine("\n \n\t\n"));
+}
+
+/// `piece` laid end to end `times` over, at comptime.
+///
+/// Zig 0.17 took the `**` operator away and `@splat` fills an array with ONE
+/// element, so a repeated phrase has no operator of its own any more.
+fn repeated(comptime piece: []const u8, comptime times: usize) [piece.len * times]u8 {
+    var out: [piece.len * times]u8 = undefined;
+    for (0..times) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
+    return out;
 }

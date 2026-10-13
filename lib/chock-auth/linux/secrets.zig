@@ -40,8 +40,9 @@ pub const Driver = struct {
         const file_path = try self.filePath(gpa);
         defer gpa.free(file_path);
 
-        const parsed = try read(gpa, io, file_path, diag) orelse return null;
-        defer std.zon.parse.free(gpa, parsed);
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const parsed = try read(gpa, arena.allocator(), io, file_path, diag) orelse return null;
 
         for (parsed.credentials) |entry| {
             if (std.mem.eql(u8, entry.name, name)) return try gpa.dupe(u8, entry.token);
@@ -64,8 +65,9 @@ pub const Driver = struct {
         var held = try store.takeStoreLock(gpa, io, self.data_dir, lock_file_name, diag);
         defer held.release(io);
 
-        const parsed = try read(gpa, io, file_path, diag);
-        defer if (parsed) |p| std.zon.parse.free(gpa, p);
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const parsed = try read(gpa, arena.allocator(), io, file_path, diag);
 
         var list: std.ArrayList(Entry) = .empty;
         defer list.deinit(gpa);
@@ -94,6 +96,7 @@ pub const Driver = struct {
 
 fn read(
     gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
     io: std.Io,
     file_path: []const u8,
     diag: ?*?store.Diagnostic,
@@ -146,9 +149,12 @@ fn read(
         gpa.free(source);
     }
 
-    var diagnostics: std.zon.parse.Diagnostics = .{};
-    defer diagnostics.deinit(gpa);
-    return std.zon.parse.fromSliceAlloc(File, gpa, source, &diagnostics, .{
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    return std.zon.parse.fromSlice(File, .{
+        .gpa = gpa,
+        .arena = arena,
+        .source = source,
+        .diagnostics = &diagnostics,
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

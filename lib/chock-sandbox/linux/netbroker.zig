@@ -540,15 +540,15 @@ test "a name that is a name is accepted, and every shape rule is a rule that ref
     try testing.expect(hostBytesAreUsable("localhost"));
     try testing.expect(hostBytesAreUsable("a-b.example-1.co.uk"));
     try testing.expect(hostBytesAreUsable("1.2.3.4"));
-    try testing.expect(hostBytesAreUsable("a" ** 63 ++ ".com"));
+    try testing.expect(hostBytesAreUsable(@as([63]u8, @splat('a')) ++ ".com"));
 
     try testing.expect(!hostBytesAreUsable(""));
     try testing.expect(!hostBytesAreUsable("."));
     try testing.expect(!hostBytesAreUsable(".com"));
     try testing.expect(!hostBytesAreUsable("com."));
     try testing.expect(!hostBytesAreUsable("a..com"));
-    try testing.expect(!hostBytesAreUsable("a" ** 64 ++ ".com"));
-    try testing.expect(!hostBytesAreUsable("a" ** 256));
+    try testing.expect(!hostBytesAreUsable(@as([64]u8, @splat('a')) ++ ".com"));
+    try testing.expect(!hostBytesAreUsable(&@as([256]u8, @splat('a'))));
     try testing.expect(!hostBytesAreUsable("a_b.com"));
     try testing.expect(!hostBytesAreUsable("a b.com"));
     try testing.expect(!hostBytesAreUsable("a\x00b.com"));
@@ -580,5 +580,5 @@ test "ask refuses a name it could not put in a request" {
     defer _ = linux.close(pair[1]);
 
     try testing.expectError(error.HostNameUnusable, ask(pair[1], "", 443));
-    try testing.expectError(error.HostNameUnusable, ask(pair[1], "a" ** 256, 443));
+    try testing.expectError(error.HostNameUnusable, ask(pair[1], &@as([256]u8, @splat('a')), 443));
 }

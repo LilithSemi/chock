@@ -54,7 +54,7 @@ fn evaluateFetchDerivation(
         "derivation {{ name = \"{s}\"; builder = \"/bin/sh\"; system = \"{s}\"; " ++
             "outputHashMode = \"flat\"; outputHashAlgo = \"sha256\"; " ++
             "outputHash = \"{s}\"; url = \"{s}\"; }}",
-        .{ name, no_such_system, "0" ** 64, probe_url },
+        .{ name, no_such_system, @as([64]u8, @splat('0')), probe_url },
     );
     defer allocator.free(expression);
 
@@ -391,7 +391,7 @@ fn evaluateMirrorDerivation(
             "system = \"{s}\"; outputHashMode = \"flat\"; outputHashAlgo = \"sha256\"; " ++
             "outputHash = \"{s}\"; url = \"mirror://gnu/hello/hello-2.12.3.tar.gz\"; " ++
             "mirrorsFile = \"{s}\"; }}",
-        .{ no_such_system, "0" ** 64, mirrors_path },
+        .{ no_such_system, @as([64]u8, @splat('0')), mirrors_path },
     );
     defer allocator.free(expression);
 

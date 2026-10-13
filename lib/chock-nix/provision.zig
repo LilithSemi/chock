@@ -457,7 +457,7 @@ test "a name that is not a package name is refused before nix is run at all" {
     try testing.expectError(error.NameNotAPackage, checkName("python3Packages..requests"));
     try testing.expectError(error.NameNotAPackage, checkName("ripgrep."));
     try testing.expectError(error.NameEmpty, checkName(""));
-    try testing.expectError(error.NameTooLong, checkName("a" ** (max_name_bytes + 1)));
+    try testing.expectError(error.NameTooLong, checkName(&@as([(max_name_bytes + 1)]u8, @splat('a'))));
 
     try checkName("ripgrep");
     try checkName("python3Packages.requests");

@@ -46,8 +46,8 @@ pub const PermissionKind = enum {
     }
 
     pub fn fromWireName(name: []const u8) ?PermissionKind {
-        inline for (@typeInfo(PermissionKind).@"enum".fields) |field| {
-            if (std.mem.eql(u8, field.name, name)) return @enumFromInt(field.value);
+        inline for (@typeInfo(PermissionKind).@"enum".field_names, @typeInfo(PermissionKind).@"enum".field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, field_name, name)) return @enumFromInt(field_value);
         }
         return null;
     }
@@ -109,8 +109,8 @@ test "the answer is the newest version both sides speak" {
 }
 
 test "every version this speaks reads back as itself" {
-    inline for (@typeInfo(Version).@"enum".fields) |field| {
-        const one: Version = @enumFromInt(field.value);
+    inline for (@typeInfo(Version).@"enum".field_names, @typeInfo(Version).@"enum".field_values) |_, field_value| {
+        const one: Version = @enumFromInt(field_value);
         try testing.expectEqual(one, Version.fromNumber(one.number()).?);
         // Catches a version added but unreachable by `negotiate`.
         try testing.expect(negotiate(one.number()) != null);
@@ -138,9 +138,9 @@ test "an always answer is a standing one, and a once answer is not" {
 
 test "a shared enum spells itself the way both schemas do" {
     inline for (.{ StopReason, ToolKind, PermissionKind }) |Kind| {
-        inline for (@typeInfo(Kind).@"enum".fields) |field| {
-            const one: Kind = @enumFromInt(field.value);
-            try testing.expectEqualStrings(field.name, one.wireName());
+        inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |field_name, field_value| {
+            const one: Kind = @enumFromInt(field_value);
+            try testing.expectEqualStrings(field_name, one.wireName());
         }
     }
     // Spot checks the schemas, so a rename fails here.

@@ -199,7 +199,7 @@ pub fn spawn(
     const seccomp_options = seccompOptionsFor(config.seccomp_options, config.network, !routed);
 
     var middle_options = seccomp_options;
-    middle_options.traps = .initEmpty();
+    middle_options.traps = .empty;
     const insns = seccomp.build(allocator, middle_options) catch |err| return err;
     defer allocator.free(insns);
 
@@ -703,7 +703,7 @@ pub fn spawn(
         const pidfd_rc = linux.pidfd_open(pid, 0);
         if (linux.errno(pidfd_rc) != .SUCCESS) {
             _ = linux.kill(pid, .KILL);
-            var reap_status: u32 = undefined;
+            var reap_status: i32 = undefined;
             var reap_rc = linux.waitpid(pid, &reap_status, 0);
             while (linux.errno(reap_rc) == .INTR) {
                 reap_rc = linux.waitpid(pid, &reap_status, 0);
@@ -738,7 +738,7 @@ pub fn spawn(
 
     if (maybe_failure) |record| {
         _ = linux.close(middle_read_fd);
-        var reap_status: u32 = undefined;
+        var reap_status: i32 = undefined;
         var reap_rc = linux.waitpid(pid, &reap_status, 0);
         while (linux.errno(reap_rc) == .INTR) {
             reap_rc = linux.waitpid(pid, &reap_status, 0);
@@ -768,7 +768,7 @@ pub fn spawn(
             closeBrokerPair(&device_fds);
             _ = linux.close(middle_read_fd);
             _ = linux.kill(pid, .KILL);
-            var reap_status: u32 = undefined;
+            var reap_status: i32 = undefined;
             var reap_rc = linux.waitpid(pid, &reap_status, 0);
             while (linux.errno(reap_rc) == .INTR) {
                 reap_rc = linux.waitpid(pid, &reap_status, 0);
@@ -780,7 +780,7 @@ pub fn spawn(
         closeBrokerPair(&device_fds);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(pid, &status, 0);
     while (linux.errno(wait_rc) == .INTR) {
         wait_rc = linux.waitpid(pid, &status, 0);
@@ -811,10 +811,10 @@ pub fn spawn(
         if (path_record) |record| audit.recordPaths(record);
     }
 
-    const term: std.process.Child.Term = if (linux.W.IFSIGNALED(status))
-        .{ .signal = linux.W.TERMSIG(status) }
+    const term: std.process.Child.Term = if (linux.W.IFSIGNALED(@bitCast(status)))
+        .{ .signal = linux.W.TERMSIG(@bitCast(status)) }
     else
-        .{ .exited = linux.W.EXITSTATUS(status) };
+        .{ .exited = linux.W.EXITSTATUS(@bitCast(status)) };
     reportLimitOutcome(config, &group, term, middle_report.scratch_full);
     return term;
 }
@@ -1234,7 +1234,7 @@ fn setupErrorFor(step: SetupStep) SetupError {
 }
 
 fn removeContentsBestEffort(allocator: std.mem.Allocator, root: []const u8) void {
-    const root_z = allocator.dupeZ(u8, root) catch return;
+    const root_z = allocator.dupeSentinel(u8, root, 0) catch return;
     defer allocator.free(root_z);
 
     const dir_rc = linux.open(root_z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
@@ -1487,7 +1487,7 @@ fn waitAndRelay(
     middle_write_fd: i32,
     reader: ?ReaderWatch,
 ) noreturn {
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(pid, &status, 0);
     while (linux.errno(wait_rc) == .INTR) {
         wait_rc = linux.waitpid(pid, &status, 0);
@@ -1503,26 +1503,26 @@ fn waitAndRelay(
     if (device.pid >= 0) reapDevice(device);
 
     _ = linux.close(keeper_fd);
-    var keeper_status: u32 = undefined;
+    var keeper_status: i32 = undefined;
     var keeper_wait_rc = linux.waitpid(keeper_pid, &keeper_status, 0);
     while (linux.errno(keeper_wait_rc) == .INTR) {
         keeper_wait_rc = linux.waitpid(keeper_pid, &keeper_status, 0);
     }
-    if (linux.errno(keeper_wait_rc) != .SUCCESS or !linux.W.IFEXITED(keeper_status) or
-        linux.W.EXITSTATUS(keeper_status) != 0)
+    if (linux.errno(keeper_wait_rc) != .SUCCESS or !linux.W.IFEXITED(@bitCast(keeper_status)) or
+        linux.W.EXITSTATUS(@bitCast(keeper_status)) != 0)
     {
         dieRelay(error.Unexpected);
     }
 
     reportScratch(areas, middle_write_fd);
 
-    if (linux.W.IFSIGNALED(status)) {
-        const sig = linux.W.TERMSIG(status);
+    if (linux.W.IFSIGNALED(@bitCast(status))) {
+        const sig = linux.W.TERMSIG(@bitCast(status));
         std.posix.raise(sig) catch |err| dieRelay(err);
         dieRelay(error.Unexpected);
     }
 
-    std.process.exit(linux.W.EXITSTATUS(status));
+    std.process.exit(linux.W.EXITSTATUS(@bitCast(status)));
 }
 
 fn reapRouter(watch: RouterWatch) void {
@@ -1531,7 +1531,7 @@ fn reapRouter(watch: RouterWatch) void {
         _ = linux.close(watch.control_fd);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var rc: usize = 0;
     var tries: usize = 0;
     while (tries < router_drain_tries) : (tries += 1) {
@@ -1568,7 +1568,7 @@ const router_drain_step_ns: isize = 1_000_000;
 fn reapDevice(watch: DeviceWatch) void {
     if (watch.control_fd >= 0) _ = linux.close(watch.control_fd);
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var rc: usize = 0;
     var tries: usize = 0;
     while (tries < router_drain_tries) : (tries += 1) {
@@ -1888,7 +1888,7 @@ fn bindDeviceTree(buffer: []u8, root: []const u8, inside: []const u8, host: []co
     }
 
     var host_buffer: [device_path_capacity]u8 = undefined;
-    const host_z = std.fmt.bufPrintZ(&host_buffer, "{s}", .{host}) catch return false;
+    const host_z = std.fmt.bufPrintSentinel(&host_buffer, "{s}", .{host}, 0) catch return false;
 
     const mount_rc = linux.mount(host_z.ptr, target.ptr, null, linux.MS.BIND, 0);
     return linux.errno(mount_rc) == .SUCCESS;
@@ -2055,7 +2055,7 @@ fn runKeeper(
 
     var watched = [1]linux.pollfd{.{ .fd = control_fd, .events = linux.POLL.IN, .revents = 0 }};
     while (true) {
-        var status: u32 = undefined;
+        var status: i32 = undefined;
         while (true) {
             const wait_rc = linux.waitpid(-1, &status, linux.W.NOHANG);
             switch (linux.errno(wait_rc)) {
@@ -2277,7 +2277,7 @@ fn unmapPathRecord(record: *notify.PathRecord) void {
 }
 
 fn reapReader(watch: ReaderWatch, middle_write_fd: i32) void {
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     const continue_errno = linux.errno(linux.kill(watch.pid, .CONT));
     switch (continue_errno) {
         .SUCCESS, .SRCH => {},
@@ -2307,10 +2307,10 @@ fn reapReader(watch: ReaderWatch, middle_write_fd: i32) void {
 
     const ending: ReaderEnd.Ending = if (linux.errno(rc) != .SUCCESS)
         .unknown
-    else if (linux.W.IFSIGNALED(status))
+    else if (linux.W.IFSIGNALED(@bitCast(status)))
         .signalled
     else
-        .{ .exited = linux.W.EXITSTATUS(status) };
+        .{ .exited = linux.W.EXITSTATUS(@bitCast(status)) };
     if (!readerReported(.{
         .ready = watch.record.ready,
         .ended = watch.record.ended,
@@ -2589,20 +2589,20 @@ fn execute(
 
     const stderr_fd = std.posix.STDERR_FILENO;
 
-    const cwd_z = allocator.dupeZ(u8, config.cwd) catch |err| die(write_fd, stderr_fd, .exec, err);
+    const cwd_z = allocator.dupeSentinel(u8, config.cwd, 0) catch |err| die(write_fd, stderr_fd, .exec, err);
     const chdir_errno = linux.errno(linux.chdir(cwd_z));
     if (chdir_errno != .SUCCESS) dieErrno(write_fd, stderr_fd, .exec, "chdir", chdir_errno);
 
     const argv_z = allocator.allocSentinel(?[*:0]const u8, argv.len, null) catch |err|
         die(write_fd, stderr_fd, .exec, err);
     for (argv, 0..) |arg, i| {
-        argv_z[i] = allocator.dupeZ(u8, arg) catch |err| die(write_fd, stderr_fd, .exec, err);
+        argv_z[i] = allocator.dupeSentinel(u8, arg, 0) catch |err| die(write_fd, stderr_fd, .exec, err);
     }
 
     const env_z = allocator.allocSentinel(?[*:0]const u8, config.env.len, null) catch |err|
         die(write_fd, stderr_fd, .exec, err);
     for (config.env, 0..) |item, i| {
-        env_z[i] = allocator.dupeZ(u8, item) catch |err| die(write_fd, stderr_fd, .exec, err);
+        env_z[i] = allocator.dupeSentinel(u8, item, 0) catch |err| die(write_fd, stderr_fd, .exec, err);
     }
 
     if (broker_fd >= 0) placeBrokerFd(broker_fd, &write_fd, stderr_fd);
@@ -2690,7 +2690,7 @@ fn redirectStandardStreams(config: Config, write_fd: i32) void {
 
 fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
     var link_buffer: [64]u8 = undefined;
-    const link = std.fmt.bufPrintZ(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}) catch unreachable;
+    const link = std.fmt.bufPrintSentinel(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}, 0) catch unreachable;
     const rc = linux.readlink(link, buffer.ptr, buffer.len);
     if (linux.errno(rc) != .SUCCESS) return error.ReadlinkFailed;
     const len: usize = @intCast(rc);
@@ -2833,11 +2833,11 @@ test "closeInheritedFds closes every descriptor above stderr, and leaves stderr 
         std.process.exit(if (closed_the_extras and kept_stderr) 0 else 1);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     const wait_rc = linux.waitpid(pid, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
-    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(status)));
 }
 
 test "closeInheritedFds keeps exactly the middle pipe's write end, and no other" {
@@ -2862,11 +2862,11 @@ test "closeInheritedFds keeps exactly the middle pipe's write end, and no other"
         std.process.exit(if (closed_the_other and kept_the_middle_pipe) 0 else 1);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     const wait_rc = linux.waitpid(pid, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
-    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(status)));
 }
 
 test "closeInheritedFds keeps exactly the device link's own child end, and no other" {
@@ -2891,11 +2891,11 @@ test "closeInheritedFds keeps exactly the device link's own child end, and no ot
         std.process.exit(if (closed_the_other and kept_the_device_fd) 0 else 1);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     const wait_rc = linux.waitpid(pid, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
-    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(status)));
 }
 
 test "closeInheritedFds keeps the channel the second user is asked for on" {
@@ -2920,11 +2920,11 @@ test "closeInheritedFds keeps the channel the second user is asked for on" {
         std.process.exit(if (closed_the_other and kept_the_map_fd) 0 else 1);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     const wait_rc = linux.waitpid(pid, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
-    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(status)));
 }
 
 test "closeInheritedFds keeps exactly the descriptor Config.stdin_fd names, and no other" {
@@ -2949,11 +2949,11 @@ test "closeInheritedFds keeps exactly the descriptor Config.stdin_fd names, and 
         std.process.exit(if (closed_the_other and kept_the_named_one) 0 else 1);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     const wait_rc = linux.waitpid(pid, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
-    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(status)));
 }
 
 test "the broker socket lands on its own number even when the setup pipe is already there" {
@@ -2993,11 +2993,11 @@ test "the broker socket lands on its own number even when the setup pipe is alre
         std.process.exit(0);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     const wait_rc = linux.waitpid(pid, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
-    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(status)));
 
     var one: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), linux.read(pipe_fds[0], &one, 1));
@@ -3288,13 +3288,13 @@ test "a machine that refuses the user namespace says which call it refused, and 
         filled += rc;
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
 
-    const code = linux.W.EXITSTATUS(status);
+    const code = linux.W.EXITSTATUS(@bitCast(status));
     if (code == 3 or code == 4) return error.SkipZigTest;
     try std.testing.expectEqual(@as(u32, 0), code);
 
@@ -3344,12 +3344,12 @@ test "a handle answers Gone once the process it names has been reaped" {
 
     try signalMiddle(middle.fd, std.posix.SIG.KILL);
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(pid, &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(pid, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFSIGNALED(status));
-    try std.testing.expectEqual(linux.SIG.KILL, linux.W.TERMSIG(status));
+    try std.testing.expect(linux.W.IFSIGNALED(@bitCast(status)));
+    try std.testing.expectEqual(linux.SIG.KILL, linux.W.TERMSIG(@bitCast(status)));
 
     try std.testing.expectError(error.Gone, signalMiddle(middle.fd, std.posix.SIG.KILL));
 
@@ -3385,7 +3385,7 @@ test "a reaped number really does name somebody else, and the handle still reach
             if (linux.errno(handle_rc) != .SUCCESS) std.process.exit(23);
             const handle: i32 = @intCast(handle_rc);
 
-            var status: u32 = undefined;
+            var status: i32 = undefined;
             var wait_rc = linux.waitpid(first, &status, 0);
             while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(first, &status, 0);
             if (linux.errno(wait_rc) != .SUCCESS) std.process.exit(24);
@@ -3432,21 +3432,21 @@ test "a reaped number really does name somebody else, and the handle still reach
             std.process.exit(0);
         }
 
-        var status: u32 = undefined;
+        var status: i32 = undefined;
         var wait_rc = linux.waitpid(init_pid, &status, 0);
         while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(init_pid, &status, 0);
         if (linux.errno(wait_rc) != .SUCCESS) std.process.exit(33);
-        if (!linux.W.IFEXITED(status)) std.process.exit(34);
-        std.process.exit(linux.W.EXITSTATUS(status));
+        if (!linux.W.IFEXITED(@bitCast(status))) std.process.exit(34);
+        std.process.exit(linux.W.EXITSTATUS(@bitCast(status)));
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(outer, &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(outer, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
 
-    const code = linux.W.EXITSTATUS(status);
+    const code = linux.W.EXITSTATUS(@bitCast(status));
     if (code == 20 or code == 28) return error.SkipZigTest;
     try std.testing.expectEqual(@as(u8, 0), code);
 }
@@ -3552,13 +3552,13 @@ test "spawn puts the sandboxed program in the caller's own cgroup at creation, a
     }
 
     _ = linux.close(fds[1]);
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
 
-    const code = linux.W.EXITSTATUS(status);
+    const code = linux.W.EXITSTATUS(@bitCast(status));
     if (code == 10 or code == 11) return error.SkipZigTest;
     try std.testing.expectEqual(@as(u32, 0), code);
 
@@ -3856,7 +3856,7 @@ test "placeDevice binds a device read-write out of a hidden tree, once this proc
         if (linux.errno(linux.mount(root_z, root_z, null, linux.MS.BIND | linux.MS.REC, 0)) != .SUCCESS)
             std.process.exit(24);
         var old_root_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const old_root_z = std.fmt.bufPrintZ(&old_root_buf, "{s}/.old_root", .{root_z}) catch std.process.exit(24);
+        const old_root_z = std.fmt.bufPrintSentinel(&old_root_buf, "{s}/.old_root", .{root_z}, 0) catch std.process.exit(24);
         if (linux.errno(linux.mkdir(old_root_z.ptr, 0o755)) != .SUCCESS) std.process.exit(24);
         if (linux.errno(linux.pivot_root(root_z.ptr, old_root_z.ptr)) != .SUCCESS) std.process.exit(24);
         if (linux.errno(linux.chdir("/")) != .SUCCESS) std.process.exit(24);
@@ -3941,13 +3941,13 @@ test "placeDevice binds a device read-write out of a hidden tree, once this proc
         std.process.exit(42); // The escape was not refused.
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(child, &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(child, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
-    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 20) return error.SkipZigTest;
-    try std.testing.expect(linux.W.IFEXITED(status));
-    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    if (linux.W.IFEXITED(@bitCast(status)) and linux.W.EXITSTATUS(@bitCast(status)) == 20) return error.SkipZigTest;
+    try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(status)));
 }
 
 const MountAttrProbe = extern struct {

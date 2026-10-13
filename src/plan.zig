@@ -312,13 +312,13 @@ test "the command line names an action and at most one session" {
     try testing.expectEqual(Action.list, (try parseOptions(&.{})).action);
     try testing.expectEqual(Action.list, (try parseOptions(&.{"list"})).action);
 
-    const shown = try parseOptions(&.{ "show", "01JQ" ++ "A" ** 22 });
+    const shown = try parseOptions(&.{ "show", "01JQ" ++ @as([22]u8, @splat('A')) });
     try testing.expectEqual(Action.show, shown.action);
-    try testing.expectEqualStrings("01JQ" ++ "A" ** 22, shown.session);
+    try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('A')), shown.session);
 
-    const with_project = try parseOptions(&.{ "--project", "/somewhere", "show", "01JQ" ++ "B" ** 22 });
+    const with_project = try parseOptions(&.{ "--project", "/somewhere", "show", "01JQ" ++ @as([22]u8, @splat('B')) });
     try testing.expectEqualStrings("/somewhere", with_project.project.?);
-    try testing.expectEqualStrings("01JQ" ++ "B" ** 22, with_project.session);
+    try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('B')), with_project.session);
 
     try testing.expectError(error.BadArguments, parseOptions(&.{"show"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{"steps"}));
@@ -370,7 +370,7 @@ test "the list this command reads back is the list the session ended with" {
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeLog(arena, testing.io, dir, id, &.{
         .{ .plan_update = .{ .steps = &.{
             .{ .id = "s1", .subject = "read the fold", .status = .in_progress },
@@ -434,8 +434,8 @@ test "a session that kept no list is an ordinary answer, and is not listed as on
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const plain = "01JQ" ++ "A" ** 22;
-    const planned = "01JQ" ++ "B" ** 22;
+    const plain = "01JQ" ++ @as([22]u8, @splat('A'));
+    const planned = "01JQ" ++ @as([22]u8, @splat('B'));
     try makeLog(arena, testing.io, dir, plain, &.{
         .{ .message = .{ .role = .assistant, .content = &.{.{ .text = "renamed the field" }} } },
     });
@@ -466,7 +466,7 @@ test "asking about a session this project never had answers null and creates not
     const dir = try scratchDir(arena, &tmp, "sessions");
     try std.Io.Dir.createDirAbsolute(testing.io, dir, .default_dir);
 
-    const never = "01JQ" ++ "Z" ** 22;
+    const never = "01JQ" ++ @as([22]u8, @splat('Z'));
     try testing.expectEqual(@as(?Kept, null), try fold(arena, testing.io, dir, never));
 
     const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}" ++ log_suffix, .{ dir, never }, 0);

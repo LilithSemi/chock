@@ -138,8 +138,9 @@ fn soundness(
     var wrong: usize = 0;
     const driver = chock_auth.store.Driver{ .data_dir = data_dir };
 
-    const parsed = parseIndex(allocator, io, data_dir) catch return names.len;
-    defer std.zon.parse.free(allocator, parsed);
+    var index_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer index_arena.deinit();
+    const parsed = parseIndex(allocator, index_arena.allocator(), io, data_dir) catch return names.len;
 
     if (parsed.version != 1) wrong += 1;
     if (parsed.instances.len != (if (distinct) names.len else 1)) wrong += 1;
@@ -194,7 +195,7 @@ fn whichLogin(stored_ms: i64, count: usize) ?usize {
     return @intCast(offset);
 }
 
-fn parseIndex(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !ParsedIndex {
+fn parseIndex(allocator: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, data_dir: []const u8) !ParsedIndex {
     const path = try std.fs.path.join(allocator, &.{ data_dir, chock_auth.store.index_file_name });
     defer allocator.free(path);
 
@@ -209,7 +210,13 @@ fn parseIndex(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !P
     defer allocator.free(source);
 
     // No `ignore_unknown_fields`. Trailing bytes are what a mixture leaves.
-    return std.zon.parse.fromSliceAlloc(ParsedIndex, allocator, source, null, .{});
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    return std.zon.parse.fromSlice(ParsedIndex, .{
+        .gpa = allocator,
+        .arena = arena,
+        .source = source,
+        .diagnostics = &diagnostics,
+    });
 }
 
 const Totals = struct {

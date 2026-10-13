@@ -137,7 +137,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, options: Options) Error!Scene {
     fillMagic(io, &magic.credential);
     fillMagic(io, &magic.policy);
 
-    const root = try gpa.dupeZ(u8, options.root);
+    const root = try gpa.dupeSentinel(u8, options.root, 0);
     errdefer gpa.free(root);
 
     const project = try joinZ(gpa, root, "project");

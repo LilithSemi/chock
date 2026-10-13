@@ -191,12 +191,12 @@ fn anything(
         },
         .@"struct" => |info| {
             var out = given;
-            inline for (info.fields) |field| {
-                @field(out, field.name) = try anything(
+            inline for (info.field_names, info.field_types) |field_name, field_type| {
+                @field(out, field_name) = try anything(
                     arena,
                     policy,
-                    field.type,
-                    @field(given, field.name),
+                    field_type,
+                    @field(given, field_name),
                 );
             }
             return out;
@@ -319,7 +319,7 @@ const shapes = struct {
     const aws_too_short = "AKIASHORT";
     const github = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
     const github_too_short = "ghp_short";
-    const github_pat = "github_pat_11ABCDEFG0" ++ "a" ** 22;
+    const github_pat = "github_pat_11ABCDEFG0" ++ @as([22]u8, @splat('a'));
     const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0." ++
         "dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     const jwt_too_short = "eyJhbGci.a.b";

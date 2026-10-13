@@ -417,19 +417,19 @@ test "every session end reason has an exit code, so a new one cannot be forgotte
         .{ .unknown = "" },
     };
     try testing.expectEqual(
-        @typeInfo(chock_proto.event.SessionEndReason).@"union".fields.len,
+        @typeInfo(chock_proto.event.SessionEndReason).@"union".field_names.len,
         named.len,
     );
     for (named) |reason| _ = exitFor(reason);
 }
 
 test "no two exit codes are the same, so a script can tell every outcome apart" {
-    var seen = std.EnumSet(Exit).initEmpty();
-    const field_count = @typeInfo(Exit).@"enum".fields.len;
+    var seen = std.EnumSet(Exit).empty;
+    const field_count = @typeInfo(Exit).@"enum".field_names.len;
     var codes: [field_count]u8 = undefined;
     var count: usize = 0;
-    inline for (@typeInfo(Exit).@"enum".fields) |field| {
-        const value: Exit = @enumFromInt(field.value);
+    inline for (@typeInfo(Exit).@"enum".field_names, @typeInfo(Exit).@"enum".field_values) |_, field_value| {
+        const value: Exit = @enumFromInt(field_value);
         try testing.expect(!seen.contains(value));
         seen.insert(value);
         for (codes[0..count]) |code| try testing.expect(code != value.code());

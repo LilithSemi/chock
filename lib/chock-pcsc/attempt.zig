@@ -547,9 +547,9 @@ comptime {
 
 comptime {
     for ([_]type{ Attempt, piv.CardSigner }) |held| {
-        for (@typeInfo(held).@"struct".fields) |field| {
-            if (field.type == pin.Buffer or field.type == pin.Answer) {
-                @compileError("nothing that outlives one call may hold a PIN: " ++ field.name);
+        for (@typeInfo(held).@"struct".field_names, @typeInfo(held).@"struct".field_types) |field_name, field_type| {
+            if (field_type == pin.Buffer or field_type == pin.Answer) {
+                @compileError("nothing that outlives one call may hold a PIN: " ++ field_name);
             }
         }
     }
@@ -663,12 +663,12 @@ test "an outcome that is not ready yields no signer, even with a card signer in 
         .scratch = &scratch,
         .algorithm = .ecc_p256,
         .pin_policy = .never,
-        .key_bytes = ([_]u8{0x04} ++ [_]u8{0x11} ** 64) ++ [_]u8{0} ** (seal.max_public_key_len - 65),
+        .key_bytes = ([_]u8{0x04} ++ @as([64]u8, @splat(0x11))) ++ @as([(seal.max_public_key_len - 65)]u8, @splat(0)),
         .key_len = 65,
     };
 
-    inline for (@typeInfo(Outcome).@"enum".fields) |field| {
-        const outcome: Outcome = @enumFromInt(field.value);
+    inline for (@typeInfo(Outcome).@"enum".field_names, @typeInfo(Outcome).@"enum".field_values) |_, field_value| {
+        const outcome: Outcome = @enumFromInt(field_value);
         if (outcome != .ready) {
             attempt.outcome = outcome;
             try testing.expectEqual(@as(?seal.Signer, null), attempt.signer());
@@ -682,9 +682,9 @@ test "an outcome that is not ready yields no signer, even with a card signer in 
 }
 
 test "every outcome has its own sentence, and none of them says what this build links" {
-    var seen: [@typeInfo(Outcome).@"enum".fields.len][]const u8 = undefined;
-    inline for (@typeInfo(Outcome).@"enum".fields, 0..) |field, i| {
-        const text = (@as(Outcome, @enumFromInt(field.value))).sentence();
+    var seen: [@typeInfo(Outcome).@"enum".field_names.len][]const u8 = undefined;
+    inline for (@typeInfo(Outcome).@"enum".field_names, @typeInfo(Outcome).@"enum".field_values, 0..) |_, field_value, i| {
+        const text = (@as(Outcome, @enumFromInt(field_value))).sentence();
         try testing.expect(text.len != 0);
         for (seen[0..i]) |earlier| try testing.expect(!std.mem.eql(u8, earlier, text));
         seen[i] = text;
@@ -779,7 +779,7 @@ const CountingPin = struct {
     }
 };
 
-const ec_point = [_]u8{0x04} ++ [_]u8{0x33} ** 64;
+const ec_point = [_]u8{0x04} ++ @as([64]u8, @splat(0x33));
 const ec_metadata = [_]u8{ 0x01, 0x01, 0x11 } ++
     [_]u8{ 0x02, 0x02, 0x03, 0x01 } ++
     [_]u8{ 0x04, 0x43, 0x86, 0x41 } ++ ec_point ++ [_]u8{ 0x90, 0x00 };
@@ -814,8 +814,8 @@ const sign_command = built: {
     break :built encoded[0..bytes.len].*;
 };
 
-const ec_signature_der = [_]u8{ 0x30, 0x44, 0x02, 0x20 } ++ [_]u8{0x33} ** 32 ++
-    [_]u8{ 0x02, 0x20 } ++ [_]u8{0x33} ** 32;
+const ec_signature_der = [_]u8{ 0x30, 0x44, 0x02, 0x20 } ++ @as([32]u8, @splat(0x33)) ++
+    [_]u8{ 0x02, 0x20 } ++ @as([32]u8, @splat(0x33));
 const ec_signature_answer = [_]u8{ 0x7c, 0x48, 0x82, 0x46 } ++ ec_signature_der ++
     [_]u8{ 0x90, 0x00 };
 

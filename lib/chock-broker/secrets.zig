@@ -213,10 +213,10 @@ pub fn appendToolResult(
 // A `Store` that held a path would give a mount builder something to mount.
 comptime {
     const forbidden = [_][]const u8{ "path", "file", "dir", "mount", "source", "target" };
-    for (@typeInfo(Store).@"struct".fields ++ @typeInfo(Store.Entry).@"struct".fields) |field| {
+    for (@typeInfo(Store).@"struct".field_names ++ @typeInfo(Store.Entry).@"struct".field_names) |field| {
         for (forbidden) |bad| {
-            if (std.mem.indexOf(u8, field.name, bad) != null) {
-                @compileError("the credential store holds values and never a path: " ++ field.name);
+            if (std.mem.indexOf(u8, field, bad) != null) {
+                @compileError("the credential store holds values and never a path: " ++ field);
             }
         }
     }

@@ -1308,8 +1308,8 @@ test "every adapter carries a tool call, and every adapter carries an image resu
     // `Adapter.carries` stops a tool being offered on a wire that cannot carry it.
     const Adapter = provider.Client.Adapter;
 
-    inline for (@typeInfo(Adapter).@"enum".fields) |field| {
-        const adapter: Adapter = @enumFromInt(field.value);
+    inline for (@typeInfo(Adapter).@"enum".field_values) |field_value| {
+        const adapter: Adapter = @enumFromInt(field_value);
         try std.testing.expect(adapter.carries(.tool_calls));
         try std.testing.expect(adapter.carries(.image_results));
     }

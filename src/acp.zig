@@ -1400,9 +1400,9 @@ test "every reason a session can end has a stop reason, and none of them lies" {
         stopReasonFor(reason),
     );
 
-    inline for (@typeInfo(event.SessionEndReason).@"union".fields) |field| {
-        const reason: event.SessionEndReason = if (field.type == void)
-            @unionInit(event.SessionEndReason, field.name, {})
+    inline for (@typeInfo(event.SessionEndReason).@"union".field_names, @typeInfo(event.SessionEndReason).@"union".field_types) |field_name, field_type| {
+        const reason: event.SessionEndReason = if (field_type == void)
+            @unionInit(event.SessionEndReason, field_name, {})
         else
             continue;
         try testing.expect(stopReasonFor(reason) != .max_tokens);

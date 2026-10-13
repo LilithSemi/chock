@@ -3277,12 +3277,12 @@ test "an event is in the log before the action it describes happens" {
 test "the API key is in no event in the log" {
     comptime {
         @setEvalBranchQuota(10_000);
-        for (@typeInfo(Deps).@"struct".fields) |field| {
-            const suspect = std.mem.indexOf(u8, field.name, "key") != null or
-                std.mem.indexOf(u8, field.name, "token") != null or
-                std.mem.indexOf(u8, field.name, "secret") != null or
-                std.mem.indexOf(u8, field.name, "credential") != null;
-            if (suspect) @compileError("Loop.Deps must not hold a credential field: " ++ field.name);
+        for (@typeInfo(Deps).@"struct".field_names, @typeInfo(Deps).@"struct".field_types) |field_name, _| {
+            const suspect = std.mem.indexOf(u8, field_name, "key") != null or
+                std.mem.indexOf(u8, field_name, "token") != null or
+                std.mem.indexOf(u8, field_name, "secret") != null or
+                std.mem.indexOf(u8, field_name, "credential") != null;
+            if (suspect) @compileError("Loop.Deps must not hold a credential field: " ++ field_name);
         }
     }
 }
@@ -3711,14 +3711,14 @@ test "the same tool with the same arguments, three times in a row, ends the sess
     const store = backing.storage();
     defer store.close(io);
 
-    const looping_turns = [_]FakeTurn{
+    const looping_turns = @as([10]FakeTurn, @splat(
         .{ .deltas = &.{.{ .tool_call = .{
             .index = 0,
             .id = "call1",
             .name = "run_command",
             .arguments = "{\"argv\":[\"readlink\",\"-f\",\"/proc/self\"]}",
         } }} },
-    } ** 10;
+    ));
     var fake_client = FakeClient{ .turns = &looping_turns };
     var fake_tools = FakeToolRunner{ .output = "ok" };
 
@@ -7701,7 +7701,7 @@ const ActionArbiter = struct {
     refuse_prefix: []const u8 = "",
     calls: usize = 0,
     seen: [4][256]u8 = undefined,
-    seen_len: [4]usize = .{0} ** 4,
+    seen_len: [4]usize = @splat(0),
 
     fn sawAt(self: *const ActionArbiter, index: usize) []const u8 {
         return self.seen[index][0..self.seen_len[index]];
@@ -8595,10 +8595,10 @@ test "an agent cannot answer its own request, whatever it writes in one" {
     try testing.expect(outcome.refused[0]);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "refused_by_user") != null);
 
-    inline for (@typeInfo(tools.RequestActionArgs).@"struct".fields) |field| {
-        try testing.expect(field.type == []const u8);
+    inline for (@typeInfo(tools.RequestActionArgs).@"struct".field_names, @typeInfo(tools.RequestActionArgs).@"struct".field_types) |_, field_type| {
+        try testing.expect(field_type == []const u8);
     }
-    try testing.expectEqual(@as(usize, 2), @typeInfo(tools.RequestActionArgs).@"struct".fields.len);
+    try testing.expectEqual(@as(usize, 2), @typeInfo(tools.RequestActionArgs).@"struct".field_names.len);
 }
 
 test "a request for any other action is refused by name, and nothing is put to anybody" {
@@ -8977,7 +8977,7 @@ test "a title that is not one short line of plain text is refused and nothing is
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const long = "e" ** (max_title_bytes + 1);
+    const long = @as([(max_title_bytes + 1)]u8, @splat('e'));
     const too_long = try std.fmt.allocPrint(arena, "{{\"title\":\"{s}\"}}", .{long});
 
     const cases = [_][]const u8{
@@ -9005,7 +9005,7 @@ test "a title that is not one short line of plain text is refused and nothing is
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[4], "one line") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[5], "control character") != null);
 
-    const at_bound = "e" ** max_title_bytes;
+    const at_bound = @as([max_title_bytes]u8, @splat('e'));
     const allowed = try std.fmt.allocPrint(arena, "{{\"title\":\"{s}\"}}", .{at_bound});
     const kept = try runTitleSession(allocator, arena, io, &.{allowed});
     try testing.expect(!kept.refused[0]);

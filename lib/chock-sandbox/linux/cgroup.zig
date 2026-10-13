@@ -719,7 +719,7 @@ test "the vantage tells this machine's own tree from a namespace's view of it" {
     }
     _ = linux.close(fds[0]);
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
 
@@ -823,7 +823,7 @@ fn testReapedPid() ?linux.pid_t {
     if (rc == 0) std.process.exit(0);
 
     const pid: linux.pid_t = @intCast(rc);
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(pid, &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(pid, &status, 0);
     if (linux.errno(wait_rc) != .SUCCESS) return null;
@@ -847,17 +847,17 @@ fn testSpawnSleeper() ?linux.pid_t {
 
 fn testKillAndReap(pid: linux.pid_t) void {
     _ = linux.kill(pid, .KILL);
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var rc = linux.waitpid(pid, &status, 0);
     while (linux.errno(rc) == .INTR) rc = linux.waitpid(pid, &status, 0);
 }
 
 fn testReap(pid: linux.pid_t) ?u32 {
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var rc = linux.waitpid(pid, &status, 0);
     while (linux.errno(rc) == .INTR) rc = linux.waitpid(pid, &status, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
-    return status;
+    return @bitCast(status);
 }
 
 fn testCgroupHolds(dir: []const u8, pid: linux.pid_t) bool {
@@ -910,8 +910,8 @@ test "a sweep kills what a stale cgroup still holds, and then removes it" {
 
     const status = testReap(victim) orelse return error.SkipZigTest;
     reaped = true;
-    try std.testing.expect(linux.W.IFSIGNALED(status));
-    try std.testing.expectEqual(linux.SIG.KILL, linux.W.TERMSIG(status));
+    try std.testing.expect(linux.W.IFSIGNALED(@bitCast(status)));
+    try std.testing.expectEqual(linux.SIG.KILL, linux.W.TERMSIG(@bitCast(status)));
 
     var after: [max_control_file_bytes]u8 = undefined;
     try std.testing.expectEqual(@as(?[]const u8, null), readFileAt(stale, "cgroup.procs", &after));
@@ -947,8 +947,8 @@ test "the fallback signals every pid the cgroup lists, and nothing else" {
 
     const status = testReap(victim) orelse return error.SkipZigTest;
     reaped = true;
-    try std.testing.expect(linux.W.IFSIGNALED(status));
-    try std.testing.expectEqual(linux.SIG.KILL, linux.W.TERMSIG(status));
+    try std.testing.expect(linux.W.IFSIGNALED(@bitCast(status)));
+    try std.testing.expectEqual(linux.SIG.KILL, linux.W.TERMSIG(@bitCast(status)));
 
     const not_a_cgroup = testOpenDir("/proc/self") orelse return error.SkipZigTest;
     defer _ = linux.close(not_a_cgroup);
@@ -1026,7 +1026,7 @@ test "a child is created inside the supplied cgroup, and is never charged to the
             if (linux.errno(plain_rc) == .AGAIN) {
                 record[1] = 1;
             } else if (linux.errno(plain_rc) == .SUCCESS) {
-                var status: u32 = undefined;
+                var status: i32 = undefined;
                 var rc = linux.waitpid(@intCast(plain_rc), &status, 0);
                 while (linux.errno(rc) == .INTR) rc = linux.waitpid(@intCast(plain_rc), &status, 0);
             }
@@ -1037,11 +1037,11 @@ test "a child is created inside the supplied cgroup, and is never charged to the
             }
             if (linux.errno(into_rc) == .SUCCESS) {
                 record[2] = 1;
-                var status: u32 = undefined;
+                var status: i32 = undefined;
                 var rc = linux.waitpid(@intCast(into_rc), &status, 0);
                 while (linux.errno(rc) == .INTR) rc = linux.waitpid(@intCast(into_rc), &status, 0);
-                if (linux.errno(rc) == .SUCCESS and linux.W.IFEXITED(status) and
-                    linux.W.EXITSTATUS(status) == 0) record[3] = 1;
+                if (linux.errno(rc) == .SUCCESS and linux.W.IFEXITED(@bitCast(status)) and
+                    linux.W.EXITSTATUS(@bitCast(status)) == 0) record[3] = 1;
             }
         }
 
@@ -1061,7 +1061,7 @@ test "a child is created inside the supplied cgroup, and is never charged to the
     }
     _ = linux.close(fds[0]);
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
 

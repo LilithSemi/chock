@@ -5,93 +5,54 @@
 //! startup and hands each member straight to the browser with
 //! `Content-Encoding: gzip`. Nothing is decompressed on the host.
 //!
-//! The caller names every member, because the list belongs to whoever built the
-//! page. Phantom's `addWebDist` answers both the directory and the list, so a
-//! file it adds or renames arrives here without this step guessing.
+//! A program and not a build step: Zig 0.17 closed `Step.Tag`, so a build
+//! carries no code of its own. `build.zig` runs this the way it runs the other
+//! generators, naming every member on the command line. The list belongs to
+//! whoever built the page, and phantom's `addWebDist` answers it, so a file it
+//! adds or renames arrives here without this guessing.
+//!
+//! usage: web-bundle <out> (<name> <path>)...
 
 const std = @import("std");
 
-const Bundle = @This();
-
-/// One file of the page: the name a browser asks for, and where it is now.
-pub const Member = struct {
-    /// Relative to the page root, with `/` separators. This is the name
-    /// `chock serve` matches a request against.
-    name: []const u8,
-    source: std.Build.LazyPath,
-};
-
-step: std.Build.Step,
-members: []const Member,
-output: std.Build.GeneratedFile,
-
 /// The most one member may be. A page asset past this is a mistake rather than
-/// a need, and the limit keeps the whole bundle in memory at build time.
+/// a need, and the limit keeps the whole bundle in memory while it is built.
 const max_member_bytes: std.Io.Limit = .limited(16 * 1024 * 1024);
 
-pub fn create(owner: *std.Build, members: []const Member) *Bundle {
-    const self = owner.allocator.create(Bundle) catch @panic("OOM");
-    self.* = .{
-        .step = .init(.{
-            .id = .custom,
-            .name = "bundle the browser interface",
-            .owner = owner,
-            .makeFn = make,
-        }),
-        .members = owner.allocator.dupe(Member, members) catch @panic("OOM"),
-        .output = .{ .step = &self.step },
-    };
-    for (self.members) |one| one.source.addStepDependencies(&self.step);
-    return self;
-}
+pub fn main(init: std.process.Init) !u8 {
+    const gpa = init.arena.allocator();
+    const io = init.io;
 
-/// Where the packed bundle lands, for `@embedFile` through an anonymous import.
-pub fn path(self: *Bundle) std.Build.LazyPath {
-    return .{ .generated = .{ .file = &self.output } };
-}
-
-fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
-    const b = step.owner;
-    const io = b.graph.io;
-    const gpa = options.gpa;
-    const self: *Bundle = @fieldParentPtr("step", step);
-
-    // A bundle with nothing in it would serve a blank page and report success.
-    if (self.members.len == 0) return step.fail("the browser interface has no files", .{});
+    const args = try init.minimal.args.toSlice(gpa);
+    // The output, then a name and a path for each member.
+    if (args.len < 4 or (args.len - 2) % 2 != 0) {
+        std.debug.print("usage: web-bundle <out> (<name> <path>)...\n", .{});
+        return 2;
+    }
+    const out_path = args[1];
 
     var sink: std.Io.Writer.Allocating = try .initCapacity(gpa, 64 * 1024);
     defer sink.deinit();
     var tar: std.tar.Writer = .{ .underlying_writer = &sink.writer };
 
-    for (self.members) |one| {
-        const from = one.source.getPath3(b, step);
-        const raw = from.root_dir.handle.readFileAlloc(
-            io,
-            from.subPathOrDot(),
-            gpa,
-            max_member_bytes,
-        ) catch |err| {
-            return step.fail("the page's {s} could not be read: {t}", .{ one.name, err });
+    var at: usize = 2;
+    while (at < args.len) : (at += 2) {
+        const name = args[at];
+        const from = args[at + 1];
+        const raw = std.Io.Dir.cwd().readFileAlloc(io, from, gpa, max_member_bytes) catch |err| {
+            std.debug.print("the page's {s} could not be read at {s}: {t}\n", .{ name, from, err });
+            return err;
         };
-        defer gpa.free(raw);
-
         const squeezed = try gzip(gpa, raw);
-        defer gpa.free(squeezed);
-
-        try tar.writeFileBytes(one.name, squeezed, .{});
+        try tar.writeFileBytes(name, squeezed, .{});
     }
     try tar.finishPedantically();
-    const packed_bytes = sink.written();
 
-    var hash = b.graph.cache.hash;
-    hash.addBytes(packed_bytes);
-    const digest = hash.final();
-
-    const sub = try std.fmt.allocPrint(b.allocator, "o/{s}/web.tar", .{&digest});
-    const full = try b.cache_root.join(b.allocator, &.{sub});
-    if (std.fs.path.dirname(full)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full, .data = packed_bytes });
-    self.output.path = full;
+    if (std.fs.path.dirname(out_path)) |parent| {
+        std.Io.Dir.cwd().createDirPath(io, parent) catch {};
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = sink.written() });
+    return 0;
 }
 
 fn gzip(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {

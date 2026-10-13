@@ -350,8 +350,8 @@ test "an error reply names the code and says what happened" {
     try testing.expect(std.mem.indexOf(u8, body, "\"id\":3") != null);
 
     // Every code has a message, so no refusal goes out with an empty one.
-    inline for (@typeInfo(Code).@"enum".fields) |field| {
-        const code: Code = @enumFromInt(field.value);
+    inline for (@typeInfo(Code).@"enum".field_names, @typeInfo(Code).@"enum".field_values) |_, field_value| {
+        const code: Code = @enumFromInt(field_value);
         try testing.expect(code.text().len != 0);
     }
 }

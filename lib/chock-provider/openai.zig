@@ -367,13 +367,13 @@ pub fn toMessage(allocator: std.mem.Allocator, wire: WireMessage) std.mem.Alloca
 
 comptime {
     // Request must hold no field that could carry a credential, so a caller cannot pass an API key into buildRequest even by mistake: the key belongs in the Authorization header, set outside this function and never in the body chockd logs.
-    for (@typeInfo(Request).@"struct".fields) |field| {
-        const suspect = std.mem.indexOf(u8, field.name, "key") != null or
-            std.mem.indexOf(u8, field.name, "token") != null or
-            std.mem.indexOf(u8, field.name, "secret") != null or
-            std.mem.indexOf(u8, field.name, "auth") != null or
-            std.mem.indexOf(u8, field.name, "credential") != null;
-        if (suspect) @compileError("Request must not hold a credential field: " ++ field.name);
+    for (@typeInfo(Request).@"struct".field_names, @typeInfo(Request).@"struct".field_types) |field_name, _| {
+        const suspect = std.mem.indexOf(u8, field_name, "key") != null or
+            std.mem.indexOf(u8, field_name, "token") != null or
+            std.mem.indexOf(u8, field_name, "secret") != null or
+            std.mem.indexOf(u8, field_name, "auth") != null or
+            std.mem.indexOf(u8, field_name, "credential") != null;
+        if (suspect) @compileError("Request must not hold a credential field: " ++ field_name);
     }
 }
 

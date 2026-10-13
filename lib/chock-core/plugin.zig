@@ -6,6 +6,7 @@ const std = @import("std");
 
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
+const chock_zon = @import("chock-zon");
 const core = @import("chock-plugin-core");
 
 const arbiter = @import("arbiter.zig");
@@ -55,9 +56,9 @@ comptime {
             "is measuring against a language that has moved",
     );
 
-    for (@typeInfo(tools.Tool).@"enum".fields) |field| {
-        if (!nameIsUsable(field.name)) @compileError(
-            "the built-in tool \"" ++ field.name ++ "\" is not a name this host builds a policy " ++
+    for (@typeInfo(tools.Tool).@"enum".field_names, @typeInfo(tools.Tool).@"enum".field_values) |field_name, _| {
+        if (!nameIsUsable(field_name)) @compileError(
+            "the built-in tool \"" ++ field_name ++ "\" is not a name this host builds a policy " ++
                 "key out of, so a plugin tool of that name would be refused by the shape rule " ++
                 "rather than by the rule against shadowing a built-in",
         );
@@ -684,8 +685,8 @@ pub const LoadError = ParseError || error{
 };
 
 pub const Diagnostic = union(enum) {
-    file_not_zon: std.zon.parse.Diagnostics,
-    block_not_valid: std.zon.parse.Diagnostics,
+    file_not_zon: ZonFailure,
+    block_not_valid: ZonFailure,
     not_a_struct_literal,
     too_many_plugins: usize,
     plugin_name_unusable,
@@ -694,9 +695,16 @@ pub const Diagnostic = union(enum) {
     file_too_large: usize,
     read_failed: anyerror,
 
+    /// `arena` backs `diag`'s messages and must outlive it; `deinit` frees both together.
+    pub const ZonFailure = struct {
+        arena: std.heap.ArenaAllocator,
+        diag: std.zon.parse.Diagnostics,
+    };
+
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
+        _ = gpa;
         switch (self.*) {
-            .file_not_zon, .block_not_valid => |*zon_diag| zon_diag.deinit(gpa),
+            .file_not_zon, .block_not_valid => |*zf| zf.arena.deinit(),
             else => {},
         }
         self.* = undefined;
@@ -704,13 +712,13 @@ pub const Diagnostic = union(enum) {
 
     pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.*) {
-            .file_not_zon => |*zon_diag| try writer.print(
+            .file_not_zon => |*zf| try writer.print(
                 "{s} is not valid:\n{f}",
-                .{ file_name, zon_diag },
+                .{ file_name, zf.diag.fmt(file_name) },
             ),
-            .block_not_valid => |*zon_diag| try writer.print(
+            .block_not_valid => |*zf| try writer.print(
                 "{s}: the plugins block is not valid:\n{f}",
-                .{ file_name, zon_diag },
+                .{ file_name, zf.diag.fmt(file_name) },
             ),
             .not_a_struct_literal => try writer.print(
                 "{s}: the file must hold a struct literal",
@@ -759,48 +767,52 @@ pub fn parse(
     source: [:0]const u8,
     diag: ?*?Diagnostic,
 ) ParseError!?[]const Settings {
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+    var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    var ast_owned = true;
-    defer if (ast_owned) ast.deinit(gpa);
+    defer ast.deinit(gpa);
 
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
-    var zoir_owned = true;
-    defer if (zoir_owned) zoir.deinit(gpa);
+    defer zoir.deinit(gpa);
+
+    // The arena backs the parsed value and the diagnostics; `note` takes it
+    // over on a fault, otherwise it is released here.
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    var arena_owned = true;
+    defer if (arena_owned) arena.deinit();
 
     if (zoir.hasCompileErrors()) {
-        if (note(diag, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
-            ast_owned = false;
-            zoir_owned = false;
-        }
+        var zon_diag: std.zon.parse.Diagnostics = undefined;
+        _ = std.zon.parse.fromZoir([]const WirePlugin, .{
+            .arena = arena.allocator(),
+            .ast = &ast,
+            .zoir = &zoir,
+            .diagnostics = &zon_diag,
+        }) catch {};
+        if (note(diag, .{ .file_not_zon = .{ .arena = arena, .diag = zon_diag } })) arena_owned = false;
         return error.InvalidPlugins;
     }
 
     const node = try findBlockNode(zoir, diag) orelse return null;
 
-    var zon_diag: std.zon.parse.Diagnostics = .{};
-    ast_owned = false;
-    zoir_owned = false;
-    var zon_diag_owned = true;
-    defer if (zon_diag_owned) zon_diag.deinit(gpa);
-
-    const wire = std.zon.parse.fromZoirNodeAlloc(
+    var zon_diag: std.zon.parse.Diagnostics = undefined;
+    const wire = chock_zon.fromNode(
         []const WirePlugin,
         gpa,
-        ast,
-        zoir,
+        arena.allocator(),
+        source,
+        &ast,
+        &zoir,
         node,
         &zon_diag,
         .{},
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => {
-            if (note(diag, .{ .block_not_valid = zon_diag })) zon_diag_owned = false;
+            if (note(diag, .{ .block_not_valid = .{ .arena = arena, .diag = zon_diag } })) arena_owned = false;
             return error.InvalidPlugins;
         },
     };
-    defer std.zon.parse.free(gpa, wire);
 
     if (wire.len == 0) return null;
     if (wire.len > max_plugins) {
@@ -878,10 +890,10 @@ pub fn load(
 
 fn findBlockNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), "plugins")) {
+                if (std.mem.eql(u8, name.get(&zoir), "plugins")) {
                     return fields.vals.at(@intCast(index));
                 }
             }
@@ -995,7 +1007,7 @@ test "a tool's argument schema is what the model is offered" {
 }
 
 test "a field name this host will not show the model refuses the tool" {
-    for ([_][]const u8{ "who\"s", "who\n", "", "a." ++ "b", "x" ** (max_name_bytes + 1) }) |bad| {
+    for ([_][]const u8{ "who\"s", "who\n", "", "a." ++ "b", &@as([(max_name_bytes + 1)]u8, @splat('x')) }) |bad| {
         var session: Session = .init(testing.allocator);
         defer session.deinit();
         var policy: FakeDecider = .{};
@@ -1019,7 +1031,7 @@ test "a schema larger than this host carries refuses the tool, and does not thin
         _ = std.fmt.bufPrint(name[name.len - 3 ..], "{d:0>3}", .{index}) catch unreachable;
         field.* = .{
             .name = name,
-            .description = "x" ** 400,
+            .description = &@as([400]u8, @splat('x')),
             .required = true,
             .shape = .{ .kind = .string },
         };
@@ -1044,7 +1056,7 @@ test "a field description is flattened and cut like every other third party sent
     defer session.deinit();
     var policy: FakeDecider = .{};
 
-    const long = "a\nb" ++ "x" ** (lsp.max_message_bytes * 4);
+    const long = "a\nb" ++ @as([(lsp.max_message_bytes * 4)]u8, @splat('x'));
     var declared = typedTool("greet", &.{.{
         .name = "who",
         .description = long,
@@ -1130,8 +1142,8 @@ test "a tool named after a built-in fails the whole plugin to load" {
 }
 
 test "the collision rule reads the built-in enum and not a list" {
-    inline for (@typeInfo(tools.Tool).@"enum".fields) |field| {
-        try testing.expect(shadowsBuiltIn(field.name));
+    inline for (@typeInfo(tools.Tool).@"enum".field_names, @typeInfo(tools.Tool).@"enum".field_values) |field_name, _| {
+        try testing.expect(shadowsBuiltIn(field_name));
     }
     try testing.expect(!shadowsBuiltIn("hello"));
     try testing.expect(!shadowsBuiltIn("read_fil"));
@@ -1434,7 +1446,7 @@ test "a description longer than the prompt carries is cut" {
     defer session.deinit();
     var policy: FakeDecider = .{};
 
-    const long = "x" ** (lsp.max_message_bytes * 4);
+    const long = @as([(lsp.max_message_bytes * 4)]u8, @splat('x'));
     const record: core.Metadata = .{
         .name = "hello",
         .version = .{ .major = 1, .minor = 0, .patch = 0 },
@@ -1442,7 +1454,7 @@ test "a description longer than the prompt carries is cut" {
         .author = "somebody",
         .tools = &.{.{
             .name = "greet",
-            .description = &.{.{ .locale = "en", .value = long }},
+            .description = &.{.{ .locale = "en", .value = &long }},
         }},
     };
     _ = try session.admit("hello", record, policy.decider());

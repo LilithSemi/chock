@@ -119,8 +119,8 @@ pub const ImageKind = enum {
 
 const carried_image_types_text = blk: {
     var text: []const u8 = "";
-    for (@typeInfo(ImageKind).@"enum".fields, 0..) |field, i| {
-        const kind: ImageKind = @enumFromInt(field.value);
+    for (@typeInfo(ImageKind).@"enum".field_names, @typeInfo(ImageKind).@"enum".field_values, 0..) |_, field_value, i| {
+        const kind: ImageKind = @enumFromInt(field_value);
         if (i != 0) text = text ++ ", ";
         text = text ++ kind.mediaType();
     }
@@ -745,9 +745,9 @@ const max_versions_text = std.fmt.comptimePrint("{d}", .{memory.max_versions});
 
 const memory_kinds_text = blk: {
     var text: []const u8 = "";
-    for (@typeInfo(memory.Kind).@"enum".fields) |field| {
+    for (@typeInfo(memory.Kind).@"enum".field_names, @typeInfo(memory.Kind).@"enum".field_values) |field_name, _| {
         if (text.len != 0) text = text ++ ", ";
-        text = text ++ field.name;
+        text = text ++ field_name;
     }
     break :blk text;
 };
@@ -760,11 +760,11 @@ pub const Registry = struct {
         var list: std.ArrayList(Definition) = .empty;
         errdefer list.deinit(allocator);
 
-        inline for (@typeInfo(Tool).@"enum".fields) |field| {
-            const tool: Tool = @enumFromInt(field.value);
+        inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |field_name, field_value| {
+            const tool: Tool = @enumFromInt(field_value);
             if (tool.offeredBy(support)) {
                 try list.append(allocator, .{
-                    .name = field.name,
+                    .name = field_name,
                     .description = tool.description(),
                     .parameters = try schemaFor(Tool.Args(tool), allocator),
                 });
@@ -1308,19 +1308,19 @@ const ceiling_names_text = chock_policy.ratchet.ceiling_names_text;
 
 pub const plan_status_names_text = blk: {
     var text: []const u8 = "";
-    for (@typeInfo(chock_proto.event.PlanStatus).@"union".fields) |field| {
-        if (std.mem.eql(u8, field.name, "unknown")) continue;
+    for (@typeInfo(chock_proto.event.PlanStatus).@"union".field_names, @typeInfo(chock_proto.event.PlanStatus).@"union".field_types) |field_name, _| {
+        if (std.mem.eql(u8, field_name, "unknown")) continue;
         if (text.len != 0) text = text ++ ", ";
-        text = text ++ "\"" ++ field.name ++ "\"";
+        text = text ++ "\"" ++ field_name ++ "\"";
     }
     break :blk text;
 };
 
 pub fn planStatusFor(text: []const u8) ?chock_proto.event.PlanStatus {
-    inline for (@typeInfo(chock_proto.event.PlanStatus).@"union".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "unknown")) continue;
-        if (std.mem.eql(u8, field.name, text)) {
-            return @unionInit(chock_proto.event.PlanStatus, field.name, {});
+    inline for (@typeInfo(chock_proto.event.PlanStatus).@"union".field_names, @typeInfo(chock_proto.event.PlanStatus).@"union".field_types) |field_name, _| {
+        if (comptime std.mem.eql(u8, field_name, "unknown")) continue;
+        if (std.mem.eql(u8, field_name, text)) {
+            return @unionInit(chock_proto.event.PlanStatus, field_name, {});
         }
     }
     return null;
@@ -4198,12 +4198,12 @@ test "every tool in the enum is offered, and each one is named exactly once" {
     const arena = arena_state.allocator();
 
     const defs = try Registry.definitions(arena, full_support);
-    try std.testing.expectEqual(@typeInfo(Tool).@"enum".fields.len, defs.len);
+    try std.testing.expectEqual(@typeInfo(Tool).@"enum".field_names.len, defs.len);
 
-    inline for (@typeInfo(Tool).@"enum".fields) |field| {
+    inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |field_name, _| {
         var seen: usize = 0;
         for (defs) |def| {
-            if (std.mem.eql(u8, def.name, field.name)) seen += 1;
+            if (std.mem.eql(u8, def.name, field_name)) seen += 1;
         }
         try std.testing.expectEqual(@as(usize, 1), seen);
     }
@@ -4230,8 +4230,8 @@ test "an arbitrator is offered no tool at all, and a name it invented runs nothi
     everything.role = .arbitrator;
     const defs = try Registry.definitions(arena, everything);
     try std.testing.expectEqual(@as(usize, 0), defs.len);
-    inline for (@typeInfo(Tool).@"enum".fields) |field| {
-        const tool: Tool = @enumFromInt(field.value);
+    inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |_, field_value| {
+        const tool: Tool = @enumFromInt(field_value);
         try std.testing.expect(!tool.offeredBy(everything));
         try std.testing.expect(tool.offeredBy(full_support));
     }
@@ -4279,7 +4279,7 @@ test "a session with no knowledgebase, no Nix, no vision and no skills is offere
     const arena = arena_state.allocator();
 
     const defs = try Registry.definitions(arena, plain_support);
-    try std.testing.expectEqual(@typeInfo(Tool).@"enum".fields.len - 7, defs.len);
+    try std.testing.expectEqual(@typeInfo(Tool).@"enum".field_names.len - 7, defs.len);
     for (defs) |def| {
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_memory"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "write_memory"));
@@ -4328,8 +4328,8 @@ test "a tool's schema names the fields its own parser reads, and no others" {
 
     const defs = try Registry.definitions(arena, full_support);
 
-    inline for (@typeInfo(Tool).@"enum".fields, 0..) |field, index| {
-        const tool: Tool = @enumFromInt(field.value);
+    inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values, 0..) |_, field_value, index| {
+        const tool: Tool = @enumFromInt(field_value);
         const Args = Tool.Args(tool);
         const schema = defs[index].parameters.object;
 
@@ -4337,23 +4337,23 @@ test "a tool's schema names the fields its own parser reads, and no others" {
         const properties = schema.get("properties").?.object;
         const required = schema.get("required").?.array;
 
-        try std.testing.expectEqual(@typeInfo(Args).@"struct".fields.len, properties.count());
+        try std.testing.expectEqual(@typeInfo(Args).@"struct".field_names.len, properties.count());
 
         var required_count: usize = 0;
-        inline for (@typeInfo(Args).@"struct".fields) |arg| {
-            const property = properties.get(arg.name).?.object;
+        inline for (@typeInfo(Args).@"struct".field_names, @typeInfo(Args).@"struct".field_types) |arg_name, arg_type| {
+            const property = properties.get(arg_name).?.object;
             try std.testing.expect(property.get("description").?.string.len != 0);
 
-            const shape = comptime propertiesOf(Args)[std.meta.fieldIndex(Args, arg.name).?].shape;
+            const shape = comptime propertiesOf(Args)[std.meta.fieldIndex(Args, arg_name).?].shape;
             try std.testing.expectEqualStrings(shape.kind.jsonName(), property.get("type").?.string);
             if (shape.kind == .array and shape.items.?.kind == .string) {
                 try std.testing.expectEqualStrings("string", property.get("items").?.object.get("type").?.string);
             }
-            if (@typeInfo(arg.type) != .optional) {
+            if (@typeInfo(arg_type) != .optional) {
                 required_count += 1;
                 var found = false;
                 for (required.items) |item| {
-                    if (std.mem.eql(u8, item.string, arg.name)) found = true;
+                    if (std.mem.eql(u8, item.string, arg_name)) found = true;
                 }
                 try std.testing.expect(found);
             }
@@ -4383,11 +4383,11 @@ test "a plan step is described field by field, from the same struct the loop par
     try std.testing.expectEqualStrings("object", item.get("type").?.string);
     const fields = item.get("properties").?.object;
     try std.testing.expectEqual(
-        @typeInfo(PlanStepArgs).@"struct".fields.len,
+        @typeInfo(PlanStepArgs).@"struct".field_names.len,
         fields.count(),
     );
-    inline for (@typeInfo(PlanStepArgs).@"struct".fields) |arg| {
-        try std.testing.expect(fields.get(arg.name).?.object.get("description").?.string.len != 0);
+    inline for (@typeInfo(PlanStepArgs).@"struct".field_names, @typeInfo(PlanStepArgs).@"struct".field_types) |arg_name, _| {
+        try std.testing.expect(fields.get(arg_name).?.object.get("description").?.string.len != 0);
     }
 
     const status = fields.get("status").?.object.get("description").?.string;
@@ -4414,11 +4414,11 @@ test "a status the model misspells is not a status, and never reaches the log as
     try std.testing.expectEqual(@as(?chock_proto.event.PlanStatus, null), planStatusFor(""));
     try std.testing.expectEqual(@as(?chock_proto.event.PlanStatus, null), planStatusFor("unknown"));
 
-    inline for (@typeInfo(chock_proto.event.PlanStatus).@"union".fields) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "unknown")) {
-            try std.testing.expect(planStatusFor(field.name) != null);
+    inline for (@typeInfo(chock_proto.event.PlanStatus).@"union".field_names, @typeInfo(chock_proto.event.PlanStatus).@"union".field_types) |field_name, _| {
+        if (comptime !std.mem.eql(u8, field_name, "unknown")) {
+            try std.testing.expect(planStatusFor(field_name) != null);
             try std.testing.expect(
-                std.mem.indexOf(u8, plan_status_names_text, "\"" ++ field.name ++ "\"") != null,
+                std.mem.indexOf(u8, plan_status_names_text, "\"" ++ field_name ++ "\"") != null,
             );
         }
     }
@@ -4427,8 +4427,8 @@ test "a status the model misspells is not a status, and never reaches the log as
 test "both gates must pass before a tool is offered, and a silent provider fails the second" {
     const claims_vision = ProviderCapabilities{ .images = true };
 
-    inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".fields) |field| {
-        const adapter: chock_provider.Client.Adapter = @enumFromInt(field.value);
+    inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".field_names, @typeInfo(chock_provider.Client.Adapter).@"enum".field_values) |_, field_value| {
+        const adapter: chock_provider.Client.Adapter = @enumFromInt(field_value);
 
         try std.testing.expect(Support.offers(.{ .adapter = adapter }, .tool_calls));
         try std.testing.expect(!Support.offers(.{ .adapter = adapter }, .image_results));
@@ -4456,8 +4456,8 @@ test "every carried kind is recognised from its own first bytes" {
     try std.testing.expectEqual(ImageKind.gif, sniffImage("GIF89a....").carried);
     try std.testing.expectEqual(ImageKind.webp, sniffImage("RIFF\x24\x00\x00\x00WEBPVP8 ").carried);
 
-    inline for (@typeInfo(ImageKind).@"enum".fields) |field| {
-        const kind: ImageKind = @enumFromInt(field.value);
+    inline for (@typeInfo(ImageKind).@"enum".field_names, @typeInfo(ImageKind).@"enum".field_values) |_, field_value| {
+        const kind: ImageKind = @enumFromInt(field_value);
         try std.testing.expect(std.mem.startsWith(u8, kind.mediaType(), "image/"));
     }
 }
@@ -4473,7 +4473,7 @@ test "the name of a file is never evidence: a text file called like a picture is
 }
 
 test "a real image of a kind neither wire carries is refused by its own name" {
-    var bmp = [_]u8{0} ** 20;
+    var bmp = @as([20]u8, @splat(0));
     @memcpy(bmp[0..2], "BM");
     std.mem.writeInt(u32, bmp[2..6], bmp.len, .little);
     try std.testing.expectEqualStrings("image/bmp", sniffImage(&bmp).other_image);
@@ -4501,15 +4501,15 @@ test "a real image of a kind neither wire carries is refused by its own name" {
         sniffImage("  \n<?xml version=\"1.0\"?>\n<svg></svg>").other_image,
     );
 
-    const mentions = "// this file explains how to draw an <svg> element\n" ++ ("x" ** 600) ++ "<svg>";
+    const mentions = "// this file explains how to draw an <svg> element\n" ++ (@as([600]u8, @splat('x'))) ++ "<svg>";
     try std.testing.expectEqual(Sniffed.not_an_image, sniffImage(mentions));
 }
 
 test "the tool is offered only where both halves of the gate say yes" {
     try std.testing.expectEqual(Capability.image_results, Tool.read_image.needs());
 
-    inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".fields) |field| {
-        const adapter: chock_provider.Client.Adapter = @enumFromInt(field.value);
+    inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".field_names, @typeInfo(chock_provider.Client.Adapter).@"enum".field_values) |_, field_value| {
+        const adapter: chock_provider.Client.Adapter = @enumFromInt(field_value);
 
         try std.testing.expect(!Tool.read_image.offeredBy(.{ .adapter = adapter }));
         try std.testing.expect(Tool.read_image.offeredBy(.{
@@ -4530,8 +4530,8 @@ test "the bound read_image carries sits under what one provider request takes" {
 
     try std.testing.expect(std.mem.indexOf(u8, Tool.read_image.description(), max_image_bytes_text) != null);
 
-    inline for (@typeInfo(ImageKind).@"enum".fields) |field| {
-        const kind: ImageKind = @enumFromInt(field.value);
+    inline for (@typeInfo(ImageKind).@"enum".field_names, @typeInfo(ImageKind).@"enum".field_values) |_, field_value| {
+        const kind: ImageKind = @enumFromInt(field_value);
         try std.testing.expect(
             std.mem.indexOf(u8, Tool.read_image.description(), kind.mediaType()) != null,
         );
@@ -4544,8 +4544,8 @@ test "no tool this build offers needs anything the session cannot do" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".fields) |field| {
-        const support = Support{ .adapter = @enumFromInt(field.value) };
+    inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".field_names, @typeInfo(chock_provider.Client.Adapter).@"enum".field_values) |_, field_value| {
+        const support = Support{ .adapter = @enumFromInt(field_value) };
         const defs = try Registry.definitions(arena, support);
         for (defs) |def| {
             const tool = std.meta.stringToEnum(Tool, def.name).?;
@@ -4566,8 +4566,8 @@ test "every offered tool is one dispatch knows, and every tool dispatch knows is
 
 test "a tool with no argument to read is named after itself, once each" {
     var buffer: [Tool.max_action_bytes]u8 = undefined;
-    inline for (@typeInfo(Tool).@"enum".fields) |f| {
-        const tool: Tool = @enumFromInt(f.value);
+    inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |f_name, f_value| {
+        const tool: Tool = @enumFromInt(f_value);
         if (tool == .run_command) continue;
         if (tool == .nix_build or tool == .read_skill) {
             try std.testing.expect(tool.actionInto(&buffer, null, "", &.{}) == null);
@@ -4581,7 +4581,7 @@ test "a tool with no argument to read is named after itself, once each" {
             continue;
         }
         try std.testing.expectEqualStrings(
-            "call." ++ f.name,
+            "call." ++ f_name,
             tool.actionInto(&buffer, null, "", &.{}).?,
         );
     }
@@ -4821,8 +4821,8 @@ test "a name too long for the buffer is a refusal, and never a truncated key" {
 }
 
 test "every tool has an action name, and every name reaches the table" {
-    inline for (@typeInfo(Tool).@"enum".fields) |f| {
-        const tool: Tool = @enumFromInt(f.value);
+    inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |_, f_value| {
+        const tool: Tool = @enumFromInt(f_value);
         if (tool == .nix_build or tool == .read_skill) continue;
         var buffer: [Tool.max_action_bytes]u8 = undefined;
         const action = tool.actionInto(&buffer, null, "", &.{}) orelse
@@ -5189,14 +5189,14 @@ test "a mount that covers the answer cancels it, so a call never runs a differen
 
 comptime {
     const forbidden = [_][]const u8{ "command", "argv", "args", "cmd", "shell", "script" };
-    for (@typeInfo(Tool).@"enum".fields) |field| {
-        const tool: Tool = @enumFromInt(field.value);
+    for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |field_name, field_value| {
+        const tool: Tool = @enumFromInt(field_value);
         if (tool == .run_command) continue;
-        for (@typeInfo(Tool.Args(tool)).@"struct".fields) |arg| {
+        for (@typeInfo(Tool.Args(tool)).@"struct".field_names) |arg_name| {
             for (forbidden) |bad| {
-                if (std.ascii.eqlIgnoreCase(arg.name, bad)) {
+                if (std.ascii.eqlIgnoreCase(arg_name, bad)) {
                     @compileError("a tool other than run_command names an effect, never a command: " ++
-                        field.name ++ "." ++ arg.name);
+                        field_name ++ "." ++ arg_name);
                 }
             }
         }
@@ -5207,12 +5207,12 @@ test "exactly one tool takes a command, and it is the one named after it" {
     const forbidden = [_][]const u8{ "command", "argv", "args", "cmd", "shell", "script" };
 
     var commanding: usize = 0;
-    inline for (@typeInfo(Tool).@"enum".fields) |field| {
-        const tool: Tool = @enumFromInt(field.value);
+    inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |_, field_value| {
+        const tool: Tool = @enumFromInt(field_value);
         var takes_command = false;
-        inline for (@typeInfo(Tool.Args(tool)).@"struct".fields) |arg| {
+        inline for (@typeInfo(Tool.Args(tool)).@"struct".field_names, @typeInfo(Tool.Args(tool)).@"struct".field_types) |arg_name, _| {
             for (forbidden) |bad| {
-                if (std.ascii.eqlIgnoreCase(arg.name, bad)) takes_command = true;
+                if (std.ascii.eqlIgnoreCase(arg_name, bad)) takes_command = true;
             }
         }
         if (takes_command) {
@@ -5246,8 +5246,8 @@ test "every tool that writes a project file names the file it wrote" {
     try std.testing.expect(try writtenPathIn(gpa, "write_file", "not json at all") == null);
     try std.testing.expect(try writtenPathIn(gpa, "write_file", "{\"path\":\"\"}") == null);
 
-    inline for (@typeInfo(Tool).@"enum".fields) |field| {
-        const tool: Tool = @enumFromInt(field.value);
+    inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |_, field_value| {
+        const tool: Tool = @enumFromInt(field_value);
         if (comptime tool.writesAProjectFile()) {
             try std.testing.expect(@hasField(Tool.Args(tool), "path"));
             try std.testing.expectEqual(
@@ -5650,8 +5650,8 @@ test "a staged file holds exactly the bytes it was given, and is gone afterwards
 
 test "a pattern built to make the matcher backtrack forever gives up instead" {
     const pathological = "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
-    const path = "a" ** 120;
-    try std.testing.expect(!matchGlob(pathological, path));
+    const path = @as([120]u8, @splat('a'));
+    try std.testing.expect(!matchGlob(pathological, &path));
 
     var budget: usize = glob_step_budget;
     try std.testing.expect(matchGlobBudgeted("**/*.zig", "lib/chock-core/tools.zig", &budget));

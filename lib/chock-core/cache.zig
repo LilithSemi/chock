@@ -327,8 +327,8 @@ test "measure counts the bytes below the cache, and stops early when it passes t
     defer allocator.free(shallow);
     const deep = try std.fmt.allocPrint(allocator, "{s}/{s}/deep.bin", .{ cache_dir, xdg_cache_leaf });
     defer allocator.free(deep);
-    try writeBytes(shallow, "a" ** 100);
-    try writeBytes(deep, "b" ** 250);
+    try writeBytes(shallow, &@as([100]u8, @splat('a')));
+    try writeBytes(deep, &@as([250]u8, @splat('b')));
 
     const filled = measure(allocator, testing.io, cache_dir, max_bytes);
     try testing.expectEqual(@as(u64, 350), filled.bytes);
@@ -365,7 +365,7 @@ test "clearing empties the cache, keeps the layout, and answers what went" {
     const deep = try std.fmt.allocPrint(allocator, "{s}/{s}/zig/o/deadbeef/main.o", .{ cache_dir, xdg_cache_leaf });
     defer allocator.free(deep);
     try makeLayout(testing.io, std.fs.path.dirname(deep).?, null);
-    try writeBytes(deep, "c" ** 64);
+    try writeBytes(deep, &@as([64]u8, @splat('c')));
 
     const went = try clear(allocator, testing.io, cache_dir, null);
     try testing.expectEqual(@as(u64, 64), went.bytes);

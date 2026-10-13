@@ -664,14 +664,14 @@ pub const Decoder = struct {
 
 comptime {
     // Request has nowhere to put a credential, so this guard stops a caller from passing one into buildRequest by mistake. The key goes in the x-api-key header instead, set outside this file and never logged.
-    for (@typeInfo(Request).@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.name, "max_tokens")) continue;
-        const suspect = std.mem.indexOf(u8, field.name, "key") != null or
-            std.mem.indexOf(u8, field.name, "token") != null or
-            std.mem.indexOf(u8, field.name, "secret") != null or
-            std.mem.indexOf(u8, field.name, "auth") != null or
-            std.mem.indexOf(u8, field.name, "credential") != null;
-        if (suspect) @compileError("Request must not hold a credential field: " ++ field.name);
+    for (@typeInfo(Request).@"struct".field_names, @typeInfo(Request).@"struct".field_types) |field_name, _| {
+        if (std.mem.eql(u8, field_name, "max_tokens")) continue;
+        const suspect = std.mem.indexOf(u8, field_name, "key") != null or
+            std.mem.indexOf(u8, field_name, "token") != null or
+            std.mem.indexOf(u8, field_name, "secret") != null or
+            std.mem.indexOf(u8, field_name, "auth") != null or
+            std.mem.indexOf(u8, field_name, "credential") != null;
+        if (suspect) @compileError("Request must not hold a credential field: " ++ field_name);
     }
 }
 
@@ -1229,13 +1229,13 @@ test "an explanation longer than the bound is cut, and never dropped" {
     var decoder = Decoder.init(allocator);
     defer decoder.deinit();
 
-    const long = "n" ** (max_stop_explanation + 200);
+    const long = @as([(max_stop_explanation + 200)]u8, @splat('n'));
     const body = try std.fmt.allocPrint(
         allocator,
         "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"refusal\"," ++
             "\"stop_details\":{{\"type\":\"refusal\",\"category\":\"{s}\"," ++
             "\"explanation\":\"{s}\"}}}}}}",
-        .{ "c" ** (max_stop_category + 8), long },
+        .{ @as([(max_stop_category + 8)]u8, @splat('c')), long },
     );
     defer allocator.free(body);
     _ = try feedEvent(&decoder, body);

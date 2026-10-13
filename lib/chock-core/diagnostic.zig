@@ -6,7 +6,6 @@ const std = @import("std");
 pub const Diagnostic = union(enum) {
     scratchpad_directory_not_made: PathFailed,
     cache_directory_not_made: PathFailed,
-    packages_not_resolved: PathFailed,
     subagent_thread_not_tracked,
     subagent_record_not_kept,
     subagent_record_not_built,
@@ -22,7 +21,6 @@ pub const Diagnostic = union(enum) {
         switch (self.*) {
             .scratchpad_directory_not_made,
             .cache_directory_not_made,
-            .packages_not_resolved,
             => |fault| allocator.free(fault.path),
             .subagent_thread_not_tracked,
             .subagent_record_not_kept,
@@ -42,10 +40,6 @@ pub const Diagnostic = union(enum) {
             ),
             .cache_directory_not_made => |fault| try writer.print(
                 "making the cache directory {s} failed: {s}",
-                .{ fault.path, @errorName(fault.err) },
-            ),
-            .packages_not_resolved => |fault| try writer.print(
-                "running {s} to resolve this project's declared packages failed: {s}",
                 .{ fault.path, @errorName(fault.err) },
             ),
             .subagent_thread_not_tracked => try writer.writeAll(
@@ -146,12 +140,12 @@ test "a message is released by the allocator that filled it, and by nothing else
     defer testing.expect(debug.deinit() == .ok) catch @panic("a leak");
     const gpa = debug.allocator();
 
-    inline for (@typeInfo(Diagnostic).@"union".fields) |field| {
+    inline for (@typeInfo(Diagnostic).@"union".field_names, @typeInfo(Diagnostic).@"union".field_types) |field_name, field_type| {
         var diag: ?Diagnostic = null;
-        if (field.type == Diagnostic.PathFailed) {
-            notePath(sinkOf(gpa, &diag), @field(std.meta.Tag(Diagnostic), field.name), "/a/path", error.AccessDenied);
+        if (field_type == Diagnostic.PathFailed) {
+            notePath(sinkOf(gpa, &diag), @field(std.meta.Tag(Diagnostic), field_name), "/a/path", error.AccessDenied);
         } else {
-            note(&diag, @field(std.meta.Tag(Diagnostic), field.name));
+            note(&diag, @field(std.meta.Tag(Diagnostic), field_name));
         }
         try testing.expect(diag != null);
         diag.?.deinit(gpa);
@@ -162,7 +156,6 @@ test "no two faults of this module read the same" {
     const cases: []const Diagnostic = &.{
         .{ .scratchpad_directory_not_made = .{ .path = "/a", .err = error.AccessDenied } },
         .{ .cache_directory_not_made = .{ .path = "/a", .err = error.AccessDenied } },
-        .{ .packages_not_resolved = .{ .path = "/a", .err = error.AccessDenied } },
         .subagent_thread_not_tracked,
         .subagent_record_not_kept,
         .subagent_record_not_built,

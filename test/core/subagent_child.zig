@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const project = valueOf(args, flag.project) orelse "";
     const task = args[args.len - 1];
 
-    const path = try arena.dupeZ(u8, log_path);
+    const path = try arena.dupeSentinel(u8, log_path, 0);
     var log = try chock_proto.log.Log.open(io, path, session);
     defer log.close(io);
     var backing = chock_proto.storage.JsonLines{ .log = log };
@@ -111,7 +111,7 @@ const go_tries: usize = 200_000;
 /// True when the file appeared, false when this gave up on it.
 fn waitForGo(io: std.Io, project: []const u8) bool {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&buffer, "{s}/{s}", .{ project, go_leaf }) catch return false;
+    const path = std.fmt.bufPrintSentinel(&buffer, "{s}/{s}", .{ project, go_leaf }, 0) catch return false;
     var tries: usize = 0;
     while (tries < go_tries) : (tries += 1) {
         var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch {

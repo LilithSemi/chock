@@ -221,7 +221,7 @@ test "topLevel gives the root of a repository from a directory inside it" {
     try initTestRepo(allocator, &env, root_path);
 
     var child_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const child_path = try std.fmt.bufPrintZ(&child_path_buffer, "{s}/child", .{root_path});
+    const child_path = try std.fmt.bufPrintSentinel(&child_path_buffer, "{s}/child", .{root_path}, 0);
     std.Io.Dir.createDirAbsolute(std.testing.io, child_path, .default_dir) catch return error.MkdirFailed;
 
     const found = try topLevel(allocator, std.testing.io, &env, child_path, null);
@@ -242,7 +242,7 @@ test "run reports the exit status and the output of git, and does not use a shel
     try initTestRepo(allocator, &env, repo_path);
 
     var child_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const child_path = try std.fmt.bufPrintZ(&child_path_buffer, "{s}/a name with a space and a 'quote'", .{repo_path});
+    const child_path = try std.fmt.bufPrintSentinel(&child_path_buffer, "{s}/a name with a space and a 'quote'", .{repo_path}, 0);
     std.Io.Dir.createDirAbsolute(std.testing.io, child_path, .default_dir) catch return error.MkdirFailed;
     try std.testing.expect(try isRepository(allocator, std.testing.io, &env, child_path, null));
 

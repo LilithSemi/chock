@@ -28,8 +28,8 @@ pub const Kind = enum(u8) {
 
     /// Null for a JSON type word this project does not write.
     pub fn fromJsonName(word: []const u8) ?Kind {
-        inline for (@typeInfo(Kind).@"enum".fields) |field| {
-            const kind: Kind = @enumFromInt(field.value);
+        inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |_, field_value| {
+            const kind: Kind = @enumFromInt(field_value);
             if (std.mem.eql(u8, kind.jsonName(), word)) return kind;
         }
         return null;
@@ -87,7 +87,7 @@ pub fn propertiesOf(comptime Args: type, comptime whose: []const u8) []const Pro
                 ", and a tool's arguments must be a struct, because the model writes them " ++
                 "as a JSON object");
         }
-        if (info.@"struct".fields.len == 0) return &.{};
+        if (info.@"struct".field_names.len == 0) return &.{};
 
         if (!@hasDecl(Args, "docs")) {
             @compileError(whose ++ " has the argument type " ++ @typeName(Args) ++
@@ -96,18 +96,18 @@ pub fn propertiesOf(comptime Args: type, comptime whose: []const u8) []const Pro
                 "a sentence about is a field it has to guess at");
         }
 
-        var acc: [info.@"struct".fields.len]Property = undefined;
-        for (info.@"struct".fields, &acc) |field, *out| {
-            if (!@hasField(@TypeOf(Args.docs), field.name)) {
-                @compileError(whose ++ " has the field \"" ++ field.name ++ "\" and " ++
+        var acc: [info.@"struct".field_names.len]Property = undefined;
+        for (info.@"struct".field_names, info.@"struct".field_types, &acc) |field_name, field_type, *out| {
+            if (!@hasField(@TypeOf(Args.docs), field_name)) {
+                @compileError(whose ++ " has the field \"" ++ field_name ++ "\" and " ++
                     @typeName(Args) ++ ".docs holds no sentence for it");
             }
             out.* = .{
-                .name = field.name,
-                .description = @field(Args.docs, field.name),
+                .name = field_name,
+                .description = @field(Args.docs, field_name),
                 // From the Zig type only; no second place to disagree.
-                .required = @typeInfo(field.type) != .optional,
-                .shape = shapeOf(field.type, whose, field.name),
+                .required = @typeInfo(field_type) != .optional,
+                .shape = shapeOf(field_type, whose, field_name),
             };
         }
         const frozen = acc;
@@ -293,8 +293,8 @@ test "eql separates an array with an item shape from one without" {
 }
 
 test "every JSON type word reads back as the kind that wrote it" {
-    inline for (@typeInfo(Kind).@"enum".fields) |field| {
-        const kind: Kind = @enumFromInt(field.value);
+    inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |_, field_value| {
+        const kind: Kind = @enumFromInt(field_value);
         try testing.expectEqual(kind, Kind.fromJsonName(kind.jsonName()).?);
     }
     try testing.expectEqual(@as(?Kind, null), Kind.fromJsonName("null"));

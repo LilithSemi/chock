@@ -149,7 +149,7 @@ test "an expected length of 256 is written as the byte zero, and 255 as itself" 
 
 test "data longer than the short form can name is refused, never cut short" {
     var buffer: [512]u8 = undefined;
-    const too_much = [_]u8{0} ** (max_command_data + 1);
+    const too_much = @as([(max_command_data + 1)]u8, @splat(0));
     try testing.expectError(
         error.DataTooLong,
         (Command{ .cla = 0, .ins = 0, .p1 = 0, .p2 = 0, .data = &too_much }).encode(&buffer),

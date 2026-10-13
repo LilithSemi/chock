@@ -288,8 +288,8 @@ pub fn requesterText(outcome: ReviewOutcome) []const u8 {
 pub const ReviewOutcome = enum { approved, refused, unavailable };
 
 comptime {
-    const params = @typeInfo(@TypeOf(requesterText)).@"fn".params;
-    if (params.len != 1 or params[0].type.? != ReviewOutcome) @compileError(
+    const params = @typeInfo(@TypeOf(requesterText)).@"fn".param_types;
+    if (params.len != 1 or params[0].? != ReviewOutcome) @compileError(
         "requesterText must take one ReviewOutcome and nothing else. The rule gives the " ++
             "arbitrator the reasoning and the calling agent only the outcome, and a second " ++
             "parameter here is the route that reasoning would travel back along",
@@ -444,7 +444,7 @@ test "an answer that is not plainly an approval is a refusal" {
     }
 
     {
-        const long = "{\"verdict\":\"approve\",\"why\":\"" ++ ("x" ** 900) ++ "\"}";
+        const long = "{\"verdict\":\"approve\",\"why\":\"" ++ (@as([900]u8, @splat('x'))) ++ "\"}";
         const report = try readAnswer(gpa, long);
         defer freeReport(gpa, report);
         try testing.expectEqual(Verdict.approved, report.verdict);

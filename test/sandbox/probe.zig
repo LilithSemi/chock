@@ -56,7 +56,7 @@ fn enterTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
 }
 
 fn makeTestDir(arena: std.mem.Allocator, path: []const u8) !void {
-    const path_z = try arena.dupeZ(u8, path);
+    const path_z = try arena.dupeSentinel(u8, path, 0);
     switch (linux.errno(linux.mkdir(path_z.ptr, 0o755))) {
         .SUCCESS, .EXIST => {},
         else => return error.SetupFailed,
@@ -64,7 +64,7 @@ fn makeTestDir(arena: std.mem.Allocator, path: []const u8) !void {
 }
 
 fn writeTestFile(arena: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
-    const path_z = try arena.dupeZ(u8, path);
+    const path_z = try arena.dupeSentinel(u8, path, 0);
     const fd_rc = linux.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     if (linux.errno(fd_rc) != .SUCCESS) return error.SetupFailed;
     const fd: i32 = @intCast(fd_rc);
@@ -110,7 +110,7 @@ const max_host_file_bytes = 4 << 20;
 
 /// Follows a link on purpose: the host trust store is a link into the Nix store on a NixOS machine.
 fn readWholeFile(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const path_z = try arena.dupeZ(u8, path);
+    const path_z = try arena.dupeSentinel(u8, path, 0);
     const fd_rc = linux.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
     if (linux.errno(fd_rc) != .SUCCESS) return error.SetupFailed;
     const fd: i32 = @intCast(fd_rc);
@@ -321,7 +321,7 @@ const DeviceSourceStub = struct {
         var self = DeviceSourceStub{ .wakeup_fds = fds };
         for (changes, 0..) |c, i| self.queue[i] = c;
         self.queue_len = changes.len;
-        const marks = [_]u8{1} ** 4;
+        const marks = @as([4]u8, @splat(1));
         const written = linux.write(fds[1], &marks, changes.len);
         if (linux.errno(written) != .SUCCESS or written != changes.len) return error.PipeFailed;
         return self;
@@ -351,7 +351,7 @@ const DeviceSourceStub = struct {
 
         if (queued.write) |w| {
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            if (std.fmt.bufPrintZ(&path_buf, "{s}", .{w.path})) |path_z| {
+            if (std.fmt.bufPrintSentinel(&path_buf, "{s}", .{w.path}, 0)) |path_z| {
                 const fd_rc = linux.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
                 if (linux.errno(fd_rc) == .SUCCESS) {
                     const fd: i32 = @intCast(fd_rc);
@@ -437,7 +437,7 @@ fn deviceEscape(
 /// Zero for a pid this machine has no such file for, which the caller reads as nothing to count.
 fn countChildren(pid: linux.pid_t) usize {
     var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/task/{d}/children", .{ pid, pid }) catch return 0;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/task/{d}/children", .{ pid, pid }, 0) catch return 0;
     const fd_rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY }, 0);
     if (linux.errno(fd_rc) != .SUCCESS) return 0;
     const fd: i32 = @intCast(fd_rc);
@@ -1180,7 +1180,7 @@ const HostileEtc = struct {
         target: []const u8,
     ) !void {
         const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ directory, name }, 0);
-        const target_z = try arena.dupeZ(u8, target);
+        const target_z = try arena.dupeSentinel(u8, target, 0);
         if (linux.errno(linux.symlinkat(target_z.ptr, linux.AT.FDCWD, path.ptr)) != .SUCCESS) {
             return error.SetupFailed;
         }
@@ -1728,7 +1728,7 @@ fn enterSubmountTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
 }
 
 fn mountTmpfs(arena: std.mem.Allocator, path: []const u8) !void {
-    const path_z = try arena.dupeZ(u8, path);
+    const path_z = try arena.dupeSentinel(u8, path, 0);
     if (linux.errno(linux.mount(null, path_z.ptr, "tmpfs", 0, 0)) != .SUCCESS) {
         return error.SetupFailed;
     }
@@ -2069,7 +2069,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         sll.family = linux.AF.PACKET;
         sll.ifindex = ifindex;
         sll.protocol = std.mem.nativeToBig(u16, eth_p_all);
-        var frame = [_]u8{0} ** 32;
+        var frame = @as([32]u8, @splat(0));
         const send_rc = linux.sendto(fd, &frame, frame.len, 0, @ptrCast(&sll), @sizeOf(linux.sockaddr.ll));
         const send_errno = linux.errno(send_rc);
         if (send_errno != .NETDOWN) {
@@ -2086,7 +2086,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             return 3;
         };
 
-        const description_z = arena.dupeZ(u8, id_arg) catch |err| {
+        const description_z = arena.dupeSentinel(u8, id_arg, 0) catch |err| {
             std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
             return 3;
         };
@@ -2253,8 +2253,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         const empty_envp = arena.allocSentinel(?[*:0]const u8, 0, null) catch return 5;
         const disk_argv = arena.allocSentinel(?[*:0]const u8, 2, null) catch return 5;
-        disk_argv[0] = arena.dupeZ(u8, "probe") catch return 5;
-        disk_argv[1] = arena.dupeZ(u8, "spawned-memfd-direct-should-be-refused") catch return 5;
+        disk_argv[0] = arena.dupeSentinel(u8, "probe", 0) catch return 5;
+        disk_argv[1] = arena.dupeSentinel(u8, "spawned-memfd-direct-should-be-refused", 0) catch return 5;
 
         const direct_rc = linux.execve(disk_path, disk_argv, empty_envp);
         const direct_errno = linux.errno(direct_rc);
@@ -2287,8 +2287,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         }
 
         const memfd_argv = arena.allocSentinel(?[*:0]const u8, 2, null) catch return 5;
-        memfd_argv[0] = arena.dupeZ(u8, "memfd-probe") catch return 5;
-        memfd_argv[1] = arena.dupeZ(u8, "spawned-memfd-landed") catch return 5;
+        memfd_argv[0] = arena.dupeSentinel(u8, "memfd-probe", 0) catch return 5;
+        memfd_argv[1] = arena.dupeSentinel(u8, "spawned-memfd-landed", 0) catch return 5;
 
         // `AT_EMPTY_PATH` lets `execveat` take an empty path relative to a descriptor, which is the flag the filter reads.
         const exec_rc = linux.execveat(memfd, "", memfd_argv, empty_envp, .{ .SYMLINK_NOFOLLOW = false, .EMPTY_PATH = true });
@@ -2609,11 +2609,11 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         var made: u8 = 0;
         while (made < disk_file_cap) {
             var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
-            const name = std.fmt.bufPrintZ(&name_buffer, "{s}/f{d}", .{ scratch_target, made }) catch return 3;
+            const name = std.fmt.bufPrintSentinel(&name_buffer, "{s}/f{d}", .{ scratch_target, made }, 0) catch return 3;
             const fd_rc = linux.open(name.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
             if (linux.errno(fd_rc) != .SUCCESS) break;
             const fd: i32 = @intCast(fd_rc);
-            const payload = [_]u8{'d'} ** disk_file_bytes;
+            const payload = @as([disk_file_bytes]u8, @splat('d'));
             const written = linux.write(fd, &payload, payload.len);
             _ = linux.close(fd);
             if (linux.errno(written) != .SUCCESS) break;
@@ -2623,7 +2623,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     }
     if (std.mem.eql(u8, args[1], "spawned-disk-one-bomb")) {
         var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const name = std.fmt.bufPrintZ(&name_buffer, "{s}/one", .{scratch_target}) catch return 3;
+        const name = std.fmt.bufPrintSentinel(&name_buffer, "{s}/one", .{scratch_target}, 0) catch return 3;
         const fd_rc = linux.open(name.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
         if (linux.errno(fd_rc) != .SUCCESS) return 3;
         const fd: i32 = @intCast(fd_rc);
@@ -2631,7 +2631,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         var blocks: u8 = 0;
         while (blocks < disk_one_cap) {
-            const payload = [_]u8{'o'} ** disk_one_block_bytes;
+            const payload = @as([disk_one_block_bytes]u8, @splat('o'));
             const written = linux.write(fd, &payload, payload.len);
             if (linux.errno(written) != .SUCCESS) break;
             if (written != payload.len) break;
@@ -2640,7 +2640,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         return blocks;
     }
     if (std.mem.eql(u8, args[1], "spawned-approval-socket")) {
-        const path_z = arena.dupeZ(u8, id_arg) catch return 3;
+        const path_z = arena.dupeSentinel(u8, id_arg, 0) catch return 3;
         const fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0);
         if (linux.errno(fd) != .SUCCESS) return 5;
         var addr = std.mem.zeroes(linux.sockaddr.un);
@@ -2744,11 +2744,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         if (!appeared) return never_appeared;
 
         var path_buf: [256]u8 = undefined;
-        const hidden_path = std.fmt.bufPrintZ(
-            &path_buf,
-            "{s}/{s}",
-            .{ device_tree_inside, device_probe_source },
-        ) catch return never_appeared;
+        const hidden_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ device_tree_inside, device_probe_source }, 0) catch return never_appeared;
 
         const hidden_rc = linux.open(hidden_path.ptr, .{ .ACCMODE = .RDONLY }, 0);
         if (linux.errno(hidden_rc) == .SUCCESS) {
@@ -2799,11 +2795,11 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         _ = linux.close(pipe[0]);
         if (linux.errno(read_rc) != .SUCCESS or read_rc != @sizeOf(linux.pid_t)) return 8;
 
-        var status: u32 = undefined;
+        var status: i32 = undefined;
         var wait_rc = linux.waitpid(parent_pid, &status, 0);
         while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(parent_pid, &status, 0);
-        if (linux.errno(wait_rc) != .SUCCESS or !linux.W.IFEXITED(status) or
-            linux.W.EXITSTATUS(status) != 0)
+        if (linux.errno(wait_rc) != .SUCCESS or !linux.W.IFEXITED(@bitCast(status)) or
+            linux.W.EXITSTATUS(@bitCast(status)) != 0)
         {
             return 9;
         }
@@ -3001,7 +2997,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         var checked: usize = 0;
         for (sandbox.namespace.masked_proc_entries) |name| {
             var path_buffer: [64]u8 = undefined;
-            const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{s}", .{name}) catch return 5;
+            const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{s}", .{name}, 0) catch return 5;
 
             const fd_rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY }, 0);
             const open_errno = linux.errno(fd_rc);
@@ -3274,13 +3270,13 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const secret_content = "chock outside secret content\n";
         const secret_path = try std.fs.path.join(arena, &.{ id_arg, "secret" });
         try writeTestFile(arena, secret_path, secret_content);
-        const secret_z = try arena.dupeZ(u8, secret_path);
+        const secret_z = try arena.dupeSentinel(u8, secret_path, 0);
 
         // `deny.zig`'s own `check` accepts this shape, since it never stats a link's target.
         const work = try std.fs.path.join(arena, &.{ root_arg, "work" });
         try makeTestDir(arena, work);
         const env_path = try std.fs.path.join(arena, &.{ work, ".env" });
-        const env_z = try arena.dupeZ(u8, env_path);
+        const env_z = try arena.dupeSentinel(u8, env_path, 0);
         if (linux.errno(linux.symlink(secret_z.ptr, env_z.ptr)) != .SUCCESS) return 3;
 
         enterOrEndUnmeasured(.{ .network = .none, .mount = true });
@@ -3310,10 +3306,10 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const secret_content = "chock host secret via a symlinked bind source\n";
         const secret_path = try std.fs.path.join(arena, &.{ id_arg, "secret" });
         try writeTestFile(arena, secret_path, secret_content);
-        const secret_z = try arena.dupeZ(u8, secret_path);
+        const secret_z = try arena.dupeSentinel(u8, secret_path, 0);
 
         const link_path = try std.fs.path.join(arena, &.{ root_arg, "link-chock-zon" });
-        const link_z = try arena.dupeZ(u8, link_path);
+        const link_z = try arena.dupeSentinel(u8, link_path, 0);
         if (linux.errno(linux.symlink(secret_z.ptr, link_z.ptr)) != .SUCCESS) return 3;
 
         enterOrEndUnmeasured(.{ .network = .none, .mount = true });
@@ -3323,7 +3319,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         // Still reachable by that absolute name, since `buildRoot` never pivots.
         const target_path = try std.fs.path.join(arena, &.{ root_arg, "work/chock.zon" });
-        const target_z = try arena.dupeZ(u8, target_path);
+        const target_z = try arena.dupeSentinel(u8, target_path, 0);
         var read_buffer: [secret_content.len]u8 = undefined;
         var read_content: []const u8 = &.{};
         const read_fd = linux.open(target_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
@@ -3345,8 +3341,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         // `deny.zig`'s own `check` is a string check and cannot see that `link` is a link.
         const link_path = try std.fs.path.join(arena, &.{ work, "link" });
-        const link_z = try arena.dupeZ(u8, link_path);
-        const outside_z = try arena.dupeZ(u8, id_arg);
+        const link_z = try arena.dupeSentinel(u8, link_path, 0);
+        const outside_z = try arena.dupeSentinel(u8, id_arg, 0);
         if (linux.errno(linux.symlink(outside_z.ptr, link_z.ptr)) != .SUCCESS) return 3;
 
         enterOrEndUnmeasured(.{ .network = .none, .mount = true });
@@ -3357,7 +3353,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         // Still reachable by that name, since `buildRoot` never pivots.
         const outside_token_path = try std.fs.path.join(arena, &.{ id_arg, "creds/token" });
-        const outside_token_z = try arena.dupeZ(u8, outside_token_path);
+        const outside_token_z = try arena.dupeSentinel(u8, outside_token_path, 0);
         var read_buffer: [sandbox.namespace.deny_notice.len]u8 = undefined;
         var read_content: []const u8 = &.{};
         const read_fd = linux.open(outside_token_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
@@ -3469,7 +3465,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
             return 3;
         };
-        const target_z = arena.dupeZ(u8, target) catch |err| {
+        const target_z = arena.dupeSentinel(u8, target, 0) catch |err| {
             std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
             return 3;
         };
@@ -4429,7 +4425,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .cwd = "/",
             .env = &.{},
             .network = .none,
-            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
+            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.full },
             .syscall_audit = &audit,
             .path_audit = true,
         }, &.{ "/probe", "spawned-leave-daemon" }, null, null);
@@ -4456,7 +4452,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .cwd = "/",
             .env = &.{},
             .network = .none,
-            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
+            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.full },
             .syscall_audit = &audit,
             .path_audit = auditing,
         }, &.{ "/probe", "spawned-name-paths" }, null, null);
@@ -4520,7 +4516,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .cwd = "/",
             .env = &.{},
             .network = .none,
-            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
+            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.full },
             .syscall_audit = &audit,
             .path_audit = true,
         }, &.{"/dynamic"}, null, null);
@@ -4553,7 +4549,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .cwd = "/",
             .env = &.{},
             .network = .none,
-            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
+            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.full },
             .syscall_audit = &audit,
             .path_audit = true,
         }, &.{ "/probe", "spawned-kill-the-reader" }, null, null);
@@ -4591,7 +4587,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .cwd = "/",
             .env = &.{},
             .network = .none,
-            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
+            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.full },
             .syscall_audit = &audit,
             .path_audit = true,
         }, &.{ "/probe", "spawned-stop-the-reader" }, null, null);
@@ -4619,9 +4615,9 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .network = .none,
             .seccomp_options = .{
                 .traps = if (watching)
-                    sandbox.seccomp.TrapSet.initFull()
+                    sandbox.seccomp.TrapSet.full
                 else
-                    sandbox.seccomp.TrapSet.initEmpty(),
+                    sandbox.seccomp.TrapSet.empty,
             },
             .syscall_audit = &audit,
         }, &.{ "/probe", "spawned-count-opens" }, null, null);

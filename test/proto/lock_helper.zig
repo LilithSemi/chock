@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         std.debug.print("usage: lock-helper <log-path>\n", .{});
         return 2;
     }
-    const path = arena.dupeZ(u8, args[1]) catch |err| {
+    const path = arena.dupeSentinel(u8, args[1], 0) catch |err| {
         std.debug.print("lock-helper: could not copy the path: {s}\n", .{@errorName(err)});
         return 3;
     };

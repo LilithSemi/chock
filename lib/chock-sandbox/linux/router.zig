@@ -1511,7 +1511,7 @@ fn measure() error{ChildCrashed}!?Measurement {
         filled += rc;
     }
     _ = linux.close(fds[0]);
-    var status: u32 = 0;
+    var status: i32 = 0;
     _ = linux.waitpid(@intCast(child), &status, 0);
 
     if (status != 0) return error.ChildCrashed;
@@ -1735,7 +1735,7 @@ test "a refusal carries no answer section and no address at all" {
 
 test "a datagram that cannot be parsed still gets an answer" {
     var out: [query_capacity]u8 = undefined;
-    const source = [_]u8{ 0xab, 0xcd } ++ [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff };
+    const source = [_]u8{ 0xab, 0xcd } ++ @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff };
     const written = buildFormatError(&out, &source) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(dns_header_bytes, written);
     try testing.expectEqual(@as(u16, 0xabcd), std.mem.readInt(u16, out[0..2], .big));

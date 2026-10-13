@@ -87,16 +87,16 @@ pub const not_asked = Answer{
 const testing = std.testing;
 
 test "an answer carries only static text, so nothing a reviewer wrote can travel in one" {
-    inline for (@typeInfo(Answer).@"struct".fields) |field| {
-        const ok = field.type == bool or field.type == []const u8;
+    inline for (@typeInfo(Answer).@"struct".field_names, @typeInfo(Answer).@"struct".field_types) |field_name, field_type| {
+        const ok = field_type == bool or field_type == []const u8;
         if (!ok) @compileError(
-            "Answer gained the member \"" ++ field.name ++ "\", which is neither a flag nor " ++
+            "Answer gained the member \"" ++ field_name ++ "\", which is neither a flag nor " ++
                 "borrowed text. The arbitrator gets the reasoning and the calling " ++
                 "agent only the outcome, and a member that owned memory is the route that " ++
                 "reasoning would travel back along",
         );
     }
-    try testing.expect(@typeInfo(Answer).@"struct".fields.len == 3);
+    try testing.expect(@typeInfo(Answer).@"struct".field_names.len == 3);
 }
 
 test "an asker that is not there, and one whose handle has not arrived, both refuse and say nobody was asked" {

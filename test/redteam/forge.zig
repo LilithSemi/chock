@@ -66,9 +66,9 @@ pub const Kind = enum {
 };
 
 pub const all = blk: {
-    const fields = @typeInfo(Kind).@"enum".fields;
+    const fields = @typeInfo(Kind).@"enum".field_names;
     var out: [fields.len]Kind = undefined;
-    for (fields, 0..) |field, index| out[index] = @field(Kind, field.name);
+    for (fields, 0..) |field, index| out[index] = @field(Kind, field);
     break :blk out;
 };
 

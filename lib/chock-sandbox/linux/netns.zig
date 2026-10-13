@@ -259,7 +259,7 @@ const Builder = struct {
 
     fn attribute(b: *Builder, kind: u16, payload: []const u8) void {
         const at = b.len;
-        b.put(&[_]u8{0} ** 4);
+        b.put(&@as([4]u8, @splat(0)));
         b.put(payload);
         std.mem.writeInt(u16, b.buf[at..][0..2], @intCast(4 + payload.len), .little);
         std.mem.writeInt(u16, b.buf[at + 2 ..][0..2], kind, .little);
@@ -274,7 +274,7 @@ const Builder = struct {
 
     fn string(b: *Builder, kind: u16, text: []const u8) void {
         const at = b.len;
-        b.put(&[_]u8{0} ** 4);
+        b.put(&@as([4]u8, @splat(0)));
         b.put(text);
         b.put(&[_]u8{0});
         std.mem.writeInt(u16, b.buf[at..][0..2], @intCast(5 + text.len), .little);
@@ -284,7 +284,7 @@ const Builder = struct {
 
     fn openNested(b: *Builder, kind: u16) usize {
         const at = b.len;
-        b.put(&[_]u8{0} ** 4);
+        b.put(&@as([4]u8, @splat(0)));
         std.mem.writeInt(u16, b.buf[at + 2 ..][0..2], kind | nla_nested, .little);
         return at;
     }
@@ -295,7 +295,7 @@ const Builder = struct {
 
     fn openMessage(b: *Builder, kind: u16, flags: u16, sequence: u32) usize {
         const at = b.len;
-        b.put(&[_]u8{0} ** 16);
+        b.put(&@as([16]u8, @splat(0)));
         std.mem.writeInt(u16, b.buf[at + 4 ..][0..2], kind, .little);
         std.mem.writeInt(u16, b.buf[at + 6 ..][0..2], flags, .little);
         std.mem.writeInt(u32, b.buf[at + 8 ..][0..4], sequence, .little);
@@ -308,7 +308,7 @@ const Builder = struct {
 
     fn linkHeader(b: *Builder, index: u32, flags: u32, change: u32) void {
         const at = b.len;
-        b.put(&[_]u8{0} ** 16);
+        b.put(&@as([16]u8, @splat(0)));
         b.buf[at] = af_unspec;
         std.mem.writeInt(u32, b.buf[at + 4 ..][0..4], index, .little);
         std.mem.writeInt(u32, b.buf[at + 8 ..][0..4], flags, .little);
@@ -317,7 +317,7 @@ const Builder = struct {
 
     fn addressHeader(b: *Builder, family: u8, prefix: u8, flags: u8, index: u32) void {
         const at = b.len;
-        b.put(&[_]u8{0} ** 8);
+        b.put(&@as([8]u8, @splat(0)));
         b.buf[at] = family;
         b.buf[at + 1] = prefix;
         b.buf[at + 2] = flags;
@@ -326,7 +326,7 @@ const Builder = struct {
 
     fn routeHeader(b: *Builder, family: u8, dst_len: u8, scope: u8, kind: u8) void {
         const at = b.len;
-        b.put(&[_]u8{0} ** 12);
+        b.put(&@as([12]u8, @splat(0)));
         b.buf[at] = family;
         b.buf[at + 1] = dst_len;
         b.buf[at + 4] = rt_table_main;
@@ -682,7 +682,7 @@ const Measurement = extern struct {
 };
 
 const unreachable4: [4]u8 = .{ 203, 0, 113, 7 };
-const unreachable6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ .{0} ** 11 ++ .{1};
+const unreachable6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ .{1};
 
 const settle_ms: i32 = 300;
 
@@ -854,7 +854,7 @@ fn measure() error{ChildCrashed}!?Measurement {
         filled += rc;
     }
     _ = linux.close(fds[0]);
-    var status: u32 = 0;
+    var status: i32 = 0;
     _ = linux.waitpid(@intCast(child), &status, 0);
 
     if (status != 0) return error.ChildCrashed;

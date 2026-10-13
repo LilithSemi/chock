@@ -3,6 +3,7 @@
 //! is built, because bytes that never enter the process cannot be missed.
 
 const std = @import("std");
+const chock_zon = @import("chock-zon");
 const diagnostic = @import("diagnostic.zig");
 
 pub const Diagnostic = diagnostic.Diagnostic;
@@ -135,29 +136,33 @@ pub fn parseEntries(
     project_root: []const u8,
     diag: ?*?Diagnostic,
 ) Error![]const []u8 {
-    // trees_owned tracks whether this function or the diagnostics frees ast and zoir.
-    var trees_owned = true;
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+    var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    defer if (trees_owned) ast.deinit(gpa);
+    defer ast.deinit(gpa);
 
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
-    defer if (trees_owned) zoir.deinit(gpa);
+    defer zoir.deinit(gpa);
 
     if (zoir.hasCompileErrors()) {
-        diagnostic.note(diag, .{ .chock_zon_not_valid = saidOf(ast, zoir) });
+        diagnostic.note(diag, .{ .chock_zon_not_valid = saidOf(gpa, ast, zoir) });
         return error.ChockZonNotValid;
     }
 
     const node = try findBlockNode(zoir, diag) orelse return &.{};
 
-    var zon_diag: std.zon.parse.Diagnostics = .{};
-    const entries = std.zon.parse.fromZoirNodeAlloc(
+    // `Said.of` copies the message out below, so the arena need not
+    // outlive this call.
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var zon_diag: std.zon.parse.Diagnostics = undefined;
+    const entries = chock_zon.fromNode(
         []const []const u8,
         gpa,
-        ast,
-        zoir,
+        arena_state.allocator(),
+        source,
+        &ast,
+        &zoir,
         node,
         &zon_diag,
         .{},
@@ -165,12 +170,9 @@ pub fn parseEntries(
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => {
             diagnostic.note(diag, .{ .deny_block_not_valid = .of(&zon_diag) });
-            trees_owned = false;
-            zon_diag.deinit(gpa);
             return error.DenyBlockNotValid;
         },
     };
-    defer std.zon.parse.free(gpa, entries);
 
     if (entries.len > max_paths) return error.TooManyDenyPaths;
 
@@ -227,10 +229,10 @@ pub fn check(entry: []const u8) Error!void {
 
 fn findBlockNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) Error!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), block_name)) {
+                if (std.mem.eql(u8, name.get(&zoir), block_name)) {
                     return fields.vals.at(@intCast(index));
                 }
             }
@@ -246,8 +248,16 @@ fn findBlockNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) Error!?std.zig.Zoir.No
     }
 }
 
-fn saidOf(ast: std.zig.Ast, zoir: std.zig.Zoir) Diagnostic.Said {
-    const zon_diag: std.zon.parse.Diagnostics = .{ .ast = ast, .zoir = zoir };
+fn saidOf(gpa: std.mem.Allocator, ast: std.zig.Ast, zoir: std.zig.Zoir) Diagnostic.Said {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var zon_diag: std.zon.parse.Diagnostics = undefined;
+    _ = std.zon.parse.fromZoir([]const []const u8, .{
+        .arena = arena_state.allocator(),
+        .ast = &ast,
+        .zoir = &zoir,
+        .diagnostics = &zon_diag,
+    }) catch {};
     return .of(&zon_diag);
 }
 
@@ -372,8 +382,10 @@ test "a fault in any block of chock.zon names the file and the line, and no bloc
         , &buffer),
     );
 
+    // Relative to the block's own cut text, not to chock.zon as a whole:
+    // see chock-zon.zig's own note on `fromNode`.
     try testing.expectEqualStrings(
-        "chock.zon: the deny_read block is not valid:\n2:18: error: expected array",
+        "chock.zon: the deny_read block is not valid:\n1:1: error: expected array",
         try messageFor(
             \\.{
             \\    .deny_read = 7,
@@ -382,7 +394,7 @@ test "a fault in any block of chock.zon names the file and the line, and no bloc
     );
 
     try testing.expectEqualStrings(
-        "chock.zon: the deny_read block is not valid:\n2:29: error: expected string",
+        "chock.zon: the deny_read block is not valid:\n1:12: error: expected string",
         try messageFor(
             \\.{
             \\    .deny_read = .{ ".env", 7 },

@@ -1,8 +1,8 @@
 # The kernel and the initrd a microVM guest boots, as two derivations.
 #
-# Shaped after DeterminateSystems/cloud-hypervisor-guest's own `bootinfo.nix`:
-# a 6.1 LTS kernel, an uncompressed initrd from `makeInitrdNG`, and a static
-# busybox for the init to be written in.
+# A 6.1 LTS kernel, an uncompressed initrd from `makeInitrdNG`, and a static
+# busybox for the init to be written in. Uncompressed because the guest unpacks
+# it before anything else runs, and the time that costs is paid on every boot.
 #
 # **The guest binary is in the initrd**, and it is Chock's own one binary built
 # for the guest's Linux target. Not a share and not a store path: a guest must be

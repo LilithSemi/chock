@@ -223,8 +223,8 @@ pub const Proxy = struct {
 };
 
 comptime {
-    for (@typeInfo(Proxy).@"struct".fields) |field| {
-        const name = field.name;
+    for (@typeInfo(Proxy).@"struct".field_names, @typeInfo(Proxy).@"struct".field_types) |field_name, _| {
+        const name = field_name;
         if (std.mem.indexOf(u8, name, "key") != null or
             std.mem.indexOf(u8, name, "secret") != null or
             std.mem.indexOf(u8, name, "signature") != null)

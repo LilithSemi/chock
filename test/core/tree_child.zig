@@ -231,11 +231,7 @@ const Agent = struct {
             std.fmt.parseInt(usize, bound_text, 10) catch return error.BadCount;
 
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const mine = std.fmt.bufPrintZ(
-            &buffer,
-            "{s}/{s}{s}",
-            .{ self.project, rendezvous_prefix, self.session },
-        ) catch return error.PathTooLong;
+        const mine = std.fmt.bufPrintSentinel(&buffer, "{s}/{s}{s}", .{ self.project, rendezvous_prefix, self.session }, 0) catch return error.PathTooLong;
         {
             var file = std.Io.Dir.cwd().createFile(self.io, mine, .{}) catch
                 return error.RendezvousNotMade;
@@ -328,11 +324,7 @@ const Agent = struct {
         self.table = null;
 
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path = std.fmt.bufPrintZ(
-            &buffer,
-            "{s}/{s}",
-            .{ self.project, order_leaf },
-        ) catch return;
+        const path = std.fmt.bufPrintSentinel(&buffer, "{s}/{s}", .{ self.project, order_leaf }, 0) catch return;
         // Under an exclusive lock, or two agents that end together collide.
         var file = std.Io.Dir.cwd().createFile(
             self.io,

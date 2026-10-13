@@ -513,7 +513,7 @@ test "a cache is read back whole, and a stamp that does not match is not read at
     const variables = [_][]const u8{ "MULTI=one\ntwo", "PATH=/usr/bin" };
     const paths = [_][]const u8{dir_path};
 
-    const stamp: [stamp_hex_length]u8 = ("a" ** stamp_hex_length).*;
+    const stamp: [stamp_hex_length]u8 = @splat('a');
     try writeCache(arena, std.testing.io, dir_path, &stamp, &variables, &paths);
 
     const read_back = (try readCache(arena, std.testing.io, dir_path, &stamp)).?;
@@ -522,7 +522,7 @@ test "a cache is read back whole, and a stamp that does not match is not read at
     try std.testing.expectEqualStrings("PATH=/usr/bin", read_back.variables[1]);
     try std.testing.expectEqual(@as(usize, 1), read_back.store_paths.len);
 
-    const other: [stamp_hex_length]u8 = ("b" ** stamp_hex_length).*;
+    const other: [stamp_hex_length]u8 = @splat('b');
     try std.testing.expectEqual(
         @as(?Cached, null),
         try readCache(arena, std.testing.io, dir_path, &other),
@@ -546,7 +546,7 @@ test "a cache whose paths are gone is not used" {
     const variables = [_][]const u8{"PATH=/usr/bin"};
     const paths = [_][]const u8{"/nix/store/00000000000000000000000000000000-not-here"};
 
-    const stamp: [stamp_hex_length]u8 = ("c" ** stamp_hex_length).*;
+    const stamp: [stamp_hex_length]u8 = @splat('c');
     try writeCache(arena, std.testing.io, dir_path, &stamp, &variables, &paths);
 
     try std.testing.expectEqual(

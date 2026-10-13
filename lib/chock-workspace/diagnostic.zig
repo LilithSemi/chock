@@ -43,13 +43,23 @@ pub const Diagnostic = union(enum) {
         pub fn of(zon_diag: *const std.zon.parse.Diagnostics) Said {
             var said: Said = .{};
             var writer = std.Io.Writer.fixed(&said.bytes);
-            // A message longer than the buffer keeps what fits.
-            writer.print("{f}", .{zon_diag}) catch {
+            // A message longer than the buffer keeps what fits. No file
+            // name here: the caller's own format already names the file.
+            writeErrors(&writer, zon_diag) catch {
                 said.truncated = true;
             };
             said.len = @intCast(writer.end);
             said.trimTrailingNewlines();
             return said;
+        }
+
+        fn writeErrors(w: *std.Io.Writer, zon_diag: *const std.zon.parse.Diagnostics) std.Io.Writer.Error!void {
+            for (zon_diag.errors) |e| {
+                try w.print("{d}:{d}: error: {s}\n", .{ e.loc.line + 1, e.loc.column + 1, e.msg });
+                for (e.notes) |one_note| {
+                    try w.print("{d}:{d}: note: {s}\n", .{ one_note.loc.line + 1, one_note.loc.column + 1, one_note.msg });
+                }
+            }
         }
 
         pub fn ofText(words: []const u8) Said {

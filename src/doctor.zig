@@ -2138,7 +2138,7 @@ fn runChild(plan: Plan, probe_root: ?[]const u8, filter: ?[]sandbox.bpf.Insn) Ch
     var report = readReport(fds[0]);
     _ = linux.close(fds[0]);
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
 
@@ -2405,7 +2405,7 @@ const testing = std.testing;
 
 fn healthy() Measured {
     return .{
-        .driver = sandbox.Sandbox.Guarantees.initFull(),
+        .driver = sandbox.Sandbox.Guarantees.full,
         .family = .namespaces,
         .user_namespace = .ok,
         .mount_namespace = .ok,
@@ -2767,7 +2767,7 @@ test "a build whose driver applies no layer gets one sentence and no layer rows"
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var m = Measured{ .driver = sandbox.Sandbox.Guarantees.initEmpty(), .family = .none };
+    var m = Measured{ .driver = sandbox.Sandbox.Guarantees.empty, .family = .none };
     m.credential = .{ .found = "chock login" };
     m.cache = .ok;
     m.free_bytes = 8 * 1024 * 1024 * 1024;

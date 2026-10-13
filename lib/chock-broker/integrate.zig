@@ -572,8 +572,8 @@ test "a plan that moves nothing names why, and one that moves says nothing about
     const moving_plan: Plan = .{ .move = .{
         .landing = .merge,
         .branch = "refs/heads/main",
-        .at = "a" ** 40,
-        .to = "b" ** 40,
+        .at = &@as([40]u8, @splat('a')),
+        .to = &@as([40]u8, @splat('b')),
     } };
     try testing.expectEqual(@as(?Parked, null), moving_plan.parked());
     try testing.expectEqual(@as(?Landing, .merge), moving_plan.wanted());
@@ -592,7 +592,7 @@ test "no landing plans no move, and hands back the reason it was given" {
             .project_object_store = "/nowhere/at/all",
             .wanted = .{ .none = why },
             .ref = "refs/chock/01S",
-            .new_id = "c" ** 40,
+            .new_id = &@as([40]u8, @splat('c')),
         }, null);
         try testing.expectEqual(why, plan.parked().?.why);
         try testing.expectEqual(@as(?Landing, null), plan.wanted());
@@ -609,8 +609,8 @@ test "an outcome that moved holds the whole of what moved" {
     var outcome: Outcome = .{ .moved = .{
         .landing = .rebase,
         .branch = try gpa.dupe(u8, "refs/heads/main"),
-        .from = try gpa.dupe(u8, "a" ** 40),
-        .to = try gpa.dupe(u8, "b" ** 40),
+        .from = try gpa.dupe(u8, &@as([40]u8, @splat('a'))),
+        .to = try gpa.dupe(u8, &@as([40]u8, @splat('b'))),
     } };
     defer outcome.deinit(gpa);
     try testing.expectEqualStrings("refs/heads/main", outcome.moved.branch);

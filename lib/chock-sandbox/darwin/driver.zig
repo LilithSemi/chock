@@ -416,18 +416,18 @@ fn runProgram(
 
     const stderr_fd: std.c.fd_t = 2;
 
-    const cwd_z = allocator.dupeZ(u8, config.cwd) catch die(write_fd, stderr_fd, .exec, "out of memory");
+    const cwd_z = allocator.dupeSentinel(u8, config.cwd, 0) catch die(write_fd, stderr_fd, .exec, "out of memory");
     if (std.c.chdir(cwd_z) != 0) die(write_fd, stderr_fd, .exec, "chdir into the sandbox failed");
 
     const argv_z = allocator.allocSentinel(?[*:0]const u8, argv.len, null) catch
         die(write_fd, stderr_fd, .exec, "out of memory");
     for (argv, 0..) |arg, index| {
-        argv_z[index] = allocator.dupeZ(u8, arg) catch die(write_fd, stderr_fd, .exec, "out of memory");
+        argv_z[index] = allocator.dupeSentinel(u8, arg, 0) catch die(write_fd, stderr_fd, .exec, "out of memory");
     }
     const env_z = allocator.allocSentinel(?[*:0]const u8, config.env.len, null) catch
         die(write_fd, stderr_fd, .exec, "out of memory");
     for (config.env, 0..) |item, index| {
-        env_z[index] = allocator.dupeZ(u8, item) catch die(write_fd, stderr_fd, .exec, "out of memory");
+        env_z[index] = allocator.dupeSentinel(u8, item, 0) catch die(write_fd, stderr_fd, .exec, "out of memory");
     }
 
     const report = limits.apply(config.limits);

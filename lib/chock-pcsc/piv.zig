@@ -720,9 +720,9 @@ test "each of the three rules that refuse a PIN answers with an error of its own
     try padPin("12345678", &padded);
     try testing.expectError(error.PinTooLongForField, padPin("123456789", &padded));
 
-    const sixty_four = [_]u8{'7'} ** 64;
+    const sixty_four = @as([64]u8, @splat('7'));
     try testing.expectError(error.PinTooLongForField, padPin(&sixty_four, &padded));
-    const sixty_five = [_]u8{'7'} ** 65;
+    const sixty_five = @as([65]u8, @splat('7'));
     try testing.expectError(error.PinTooLongForField, padPin(&sixty_five, &padded));
 
     try testing.expectError(
@@ -821,7 +821,7 @@ test "a container with no 53, no 70, or an empty certificate is malformed" {
 }
 
 test "the GENERAL AUTHENTICATE body is the nested template SP 800-73-4 table 7 gives" {
-    const digest = [_]u8{0xab} ** 32;
+    const digest = @as([32]u8, @splat(0xab));
     var body: [64]u8 = undefined;
     const command = try generalAuthenticateCommand(.digital_signature, .ecc_p256, &digest, &body);
 
@@ -846,13 +846,13 @@ test "a challenge that is empty or larger than any key takes is refused" {
         error.Malformed,
         generalAuthenticateCommand(.digital_signature, .ecc_p256, &.{}, &body),
     );
-    const huge = [_]u8{0} ** (max_challenge_len + 1);
+    const huge = @as([(max_challenge_len + 1)]u8, @splat(0));
     try testing.expectError(
         error.Malformed,
         generalAuthenticateCommand(.digital_signature, .ecc_p256, &huge, &body),
     );
     var tight: [37]u8 = undefined;
-    const digest = [_]u8{0} ** 32;
+    const digest = @as([32]u8, @splat(0));
     try testing.expectError(
         error.Malformed,
         generalAuthenticateCommand(.digital_signature, .ecc_p256, &digest, &tight),
@@ -1003,7 +1003,7 @@ test "the PKCS#1 block is the one RFC 8017 section 9.2 gives, to the byte" {
 
 test "an RSA signature request is one command with a two byte length, and it is chained" {
     var body: [max_authenticate_body]u8 = undefined;
-    const block = [_]u8{0xab} ** seal.rsa2048_modulus_len;
+    const block = @as([seal.rsa2048_modulus_len]u8, @splat(0xab));
     const command = try generalAuthenticateCommand(.digital_signature, .rsa2048, &block, &body);
 
     try testing.expectEqual(@as(u8, 0x87), command.ins);
@@ -1017,7 +1017,7 @@ test "an RSA signature request is one command with a two byte length, and it is 
     try testing.expect(command.data.len > apdu.max_command_data);
 
     var short_body: [max_authenticate_body]u8 = undefined;
-    const digest = [_]u8{0xcd} ** 32;
+    const digest = @as([32]u8, @splat(0xcd));
     const short = try generalAuthenticateCommand(
         .digital_signature,
         .ecc_p256,
@@ -1030,7 +1030,7 @@ test "an RSA signature request is one command with a two byte length, and it is 
 }
 
 test "metadata says the algorithm, the policies and the public key of a slot" {
-    const rsa_key = [_]u8{ 0x81, 0x82, 0x01, 0x00 } ++ [_]u8{0x5a} ** 256 ++
+    const rsa_key = [_]u8{ 0x81, 0x82, 0x01, 0x00 } ++ @as([256]u8, @splat(0x5a)) ++
         [_]u8{ 0x82, 0x03, 0x01, 0x00, 0x01 };
     const answer = [_]u8{ 0x01, 0x01, 0x07 } ++
         [_]u8{ 0x02, 0x02, 0x03, 0x01 } ++
@@ -1044,7 +1044,7 @@ test "metadata says the algorithm, the policies and the public key of a slot" {
     try testing.expectEqualSlices(u8, &rsa_key, found.key);
     try testing.expect(found.algorithm.usable());
 
-    const point = [_]u8{0x04} ++ [_]u8{0x33} ** 64;
+    const point = [_]u8{0x04} ++ @as([64]u8, @splat(0x33));
     const ec_answer = [_]u8{ 0x01, 0x01, 0x11 } ++
         [_]u8{ 0x02, 0x02, 0x02, 0x01 } ++
         [_]u8{ 0x04, 0x43, 0x86, 0x41 } ++ point;

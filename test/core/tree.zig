@@ -17,7 +17,7 @@ const child_path = @import("tree_child_path").tree_child_path;
 const testing = std.testing;
 
 /// Twenty six Crockford characters, which is what `src/session.zig` makes.
-const root_session = "01JQ" ++ "A" ** 22;
+const root_session = "01JQ" ++ @as([22]u8, @splat('A'));
 
 const Tree = struct {
     tmp: std.testing.TmpDir,

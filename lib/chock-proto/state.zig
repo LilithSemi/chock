@@ -587,7 +587,7 @@ test "a compaction event replaces the events before it in the context, and the l
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try log.absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/compaction", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/compaction", .{dir_path}, 0);
 
     var chock_log = try log.Log.open(io, path, "01COMPACT");
     defer chock_log.close(io);
@@ -878,7 +878,7 @@ test "the plan folds from the log, and a fresh replay of the same log gives the 
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try log.absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/plan", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/plan", .{dir_path}, 0);
 
     var chock_log = try log.Log.open(io, path, "01PLAN");
     defer chock_log.close(io);
@@ -940,7 +940,7 @@ test "a promise the agent made survives a resume, because it is folded from the 
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try log.absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/promise", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/promise", .{dir_path}, 0);
 
     var chock_log = try log.Log.open(io, path, "01PROMISE");
     defer chock_log.close(io);
@@ -1025,7 +1025,7 @@ test "a grant for the rest of the session survives a resume, because it is folde
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try log.absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/grants", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/grants", .{dir_path}, 0);
 
     var chock_log = try log.Log.open(io, path, "01GRANTS");
     defer chock_log.close(io);

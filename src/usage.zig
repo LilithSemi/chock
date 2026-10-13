@@ -392,13 +392,13 @@ test "the command line names an action and at most one session" {
     try testing.expectEqual(Action.list, (try parseOptions(&.{})).action);
     try testing.expectEqual(Action.list, (try parseOptions(&.{"list"})).action);
 
-    const shown = try parseOptions(&.{ "show", "01JQ" ++ "A" ** 22 });
+    const shown = try parseOptions(&.{ "show", "01JQ" ++ @as([22]u8, @splat('A')) });
     try testing.expectEqual(Action.show, shown.action);
-    try testing.expectEqualStrings("01JQ" ++ "A" ** 22, shown.session);
+    try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('A')), shown.session);
 
-    const with_project = try parseOptions(&.{ "--project", "/somewhere", "show", "01JQ" ++ "B" ** 22 });
+    const with_project = try parseOptions(&.{ "--project", "/somewhere", "show", "01JQ" ++ @as([22]u8, @splat('B')) });
     try testing.expectEqualStrings("/somewhere", with_project.project.?);
-    try testing.expectEqualStrings("01JQ" ++ "B" ** 22, with_project.session);
+    try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('B')), with_project.session);
 
     try testing.expectError(error.BadArguments, parseOptions(&.{"show"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{"total"}));
@@ -450,8 +450,8 @@ test "a free session and an unpriced session are two different answers, and neit
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const local = "01JQ" ++ "A" ** 22;
-    const unpriced = "01JQ" ++ "B" ** 22;
+    const local = "01JQ" ++ @as([22]u8, @splat('A'));
+    const unpriced = "01JQ" ++ @as([22]u8, @splat('B'));
     try makeLog(arena, testing.io, dir, local, &.{
         .{ .input_tokens = 100, .output_tokens = 10, .model = "qwen3", .cost = .free },
         .{ .input_tokens = 200, .output_tokens = 20, .model = "qwen3", .cost = .free },
@@ -494,7 +494,7 @@ test "a priced session reports the money the log holds, model by model" {
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "C" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('C'));
     try makeLog(arena, testing.io, dir, id, &.{
         .{
             .input_tokens = 1000,
@@ -550,7 +550,7 @@ test "one unpriced turn among priced ones leaves the money real and the total in
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "D" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('D'));
     try makeLog(arena, testing.io, dir, id, &.{
         .{ .model = "claude-opus-5", .cost = .{ .known = .{ .value = 0.50, .currency = "USD" } } },
         .{ .model = "a-model-nobody-priced", .cost = .unknown },
@@ -575,8 +575,8 @@ test "two sessions billed in different currencies give no total, rather than a w
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const dollars = "01JQ" ++ "E" ** 22;
-    const euros = "01JQ" ++ "F" ** 22;
+    const dollars = "01JQ" ++ @as([22]u8, @splat('E'));
+    const euros = "01JQ" ++ @as([22]u8, @splat('F'));
     try makeLog(arena, testing.io, dir, dollars, &.{
         .{ .model = "claude-opus-5", .cost = .{ .known = .{ .value = 1.25, .currency = "USD" } } },
     });
@@ -609,7 +609,7 @@ test "a session that got no reply is told apart from one that cost nothing" {
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "G" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('G'));
     try makeLog(arena, testing.io, dir, id, &.{});
 
     const spent = (try fold(arena, testing.io, dir, id)).?;
@@ -629,7 +629,7 @@ test "asking about a session that never ran makes no log and does not report suc
     const dir = try scratchDir(arena, &tmp, "sessions");
     try std.Io.Dir.createDirAbsolute(testing.io, dir, .default_dir);
 
-    const never = "01JQ" ++ "H" ** 22;
+    const never = "01JQ" ++ @as([22]u8, @splat('H'));
     try testing.expectEqual(@as(?Spent, null), try fold(arena, testing.io, dir, never));
 
     const path = try std.fmt.allocPrint(arena, "{s}/{s}" ++ log_suffix, .{ dir, never });
@@ -684,7 +684,7 @@ test "only a session log is read, and a file that is not one is left alone" {
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "J" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('J'));
     try makeLog(arena, testing.io, dir, id, &.{
         .{ .model = "claude-opus-5", .cost = .{ .known = .{ .value = 0.10, .currency = "USD" } } },
     });
@@ -718,7 +718,7 @@ test "a cost the provider gave no currency for is not printed as a bare number" 
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
 
-    const id = "01JQ" ++ "K" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('K'));
     try makeLog(arena, testing.io, dir, id, &.{
         .{ .model = "deepseek-v4-flash", .cost = .{ .known = .{ .value = 0.00021565, .currency = "" } } },
     });
@@ -748,7 +748,7 @@ test "every verdict has its own words, so no two states read alike" {
         .{ .turns = 2, .amount = 1.5, .currency = "USD", .mixed_currency = true },
     };
     const expected = [_]Verdict{ .nothing, .free, .priced, .partly_unknown, .unknown, .mixed_currency };
-    try testing.expectEqual(@typeInfo(Verdict).@"enum".fields.len, expected.len);
+    try testing.expectEqual(@typeInfo(Verdict).@"enum".field_names.len, expected.len);
 
     var texts: [samples.len][]const u8 = undefined;
     for (samples, expected, 0..) |sample, want, index| {

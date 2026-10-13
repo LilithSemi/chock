@@ -114,7 +114,7 @@ test "a signature over a chain head verifies with only a public key" {
     });
     try testing.expectEqual(chain.Verdict.intact, log.verdict());
 
-    var key = try software.Key.fromSeed([_]u8{0x21} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x21)));
     const head = log.head();
     var vheld_1 = seal.Held{};
     const sealed = try seal.sign(requestFor(&log, head, .software), softwareSigner(&key), &vheld_1);
@@ -130,7 +130,7 @@ test "a log whose chain was repaired by hand passes the chain and fails the seal
     });
     try testing.expectEqual(chain.Verdict.intact, original.verdict());
 
-    var key = try software.Key.fromSeed([_]u8{0x22} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x22)));
     const head = original.head();
     var vheld_2 = seal.Held{};
     const sealed = try seal.sign(requestFor(&original, head, .software), softwareSigner(&key), &vheld_2);
@@ -155,7 +155,7 @@ test "cutting the last event off a log changes the head, which no chain notices"
     const whole = try Log.build(.{
         "first", "second", "the thing somebody wants gone",
     });
-    var key = try software.Key.fromSeed([_]u8{0x23} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x23)));
     const head = whole.head();
     var vheld_3 = seal.Held{};
     const sealed = try seal.sign(requestFor(&whole, head, .software), softwareSigner(&key), &vheld_3);
@@ -320,7 +320,7 @@ test "the level a fallback recorded cannot be raised by the person who caused it
         "first", "second", "third",
     });
     const head = log.head();
-    var key = try software.Key.fromSeed([_]u8{0x24} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x24)));
     var vheld_6 = seal.Held{};
     const sealed = try seal.sign(requestFor(&log, head, .software), softwareSigner(&key), &vheld_6);
     const expect = expectationFor(&log, &head);

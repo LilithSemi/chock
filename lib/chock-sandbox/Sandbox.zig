@@ -138,9 +138,9 @@ pub const Config = struct {
         feedCount(&hash, self.scratch.len);
         for (self.scratch) |area| feedText(&hash, area.target);
 
-        inline for (@typeInfo(Limits).@"struct".fields) |field| {
-            const value = @field(self.limits, field.name);
-            feedText(&hash, field.name);
+        inline for (@typeInfo(Limits).@"struct".field_names, @typeInfo(Limits).@"struct".field_types) |field_name, _| {
+            const value = @field(self.limits, field_name);
+            feedText(&hash, field_name);
             if (value) |set| feedCount(&hash, set) else feedText(&hash, "none");
         }
 
@@ -154,9 +154,9 @@ pub const Config = struct {
             feedText(&hash, tree.inside);
         } else feedText(&hash, "no devices");
 
-        inline for (@typeInfo(seccomp.Options).@"struct".fields) |field| {
-            feedText(&hash, field.name);
-            const value = @field(self.seccomp_options, field.name);
+        inline for (@typeInfo(seccomp.Options).@"struct".field_names, @typeInfo(seccomp.Options).@"struct".field_types) |field_name, _| {
+            feedText(&hash, field_name);
+            const value = @field(self.seccomp_options, field_name);
             switch (@typeInfo(@TypeOf(value))) {
                 .bool => feedCount(&hash, @intFromBool(value)),
                 .@"enum" => feedText(&hash, @tagName(value)),
@@ -1564,8 +1564,8 @@ test "what the native driver can say is the driver's own answer, not a second co
     try std.testing.expect(linux_driver.expresses.moved_paths);
     try std.testing.expect(!darwin_driver.expresses.moved_paths);
 
-    inline for (@typeInfo(Expresses).@"struct".fields) |field| {
-        try std.testing.expect(!@field(darwin_driver.expresses, field.name));
-        try std.testing.expect(@field(linux_driver.expresses, field.name));
+    inline for (@typeInfo(Expresses).@"struct".field_names, @typeInfo(Expresses).@"struct".field_types) |field_name, _| {
+        try std.testing.expect(!@field(darwin_driver.expresses, field_name));
+        try std.testing.expect(@field(linux_driver.expresses, field_name));
     }
 }

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const chock_zon = @import("chock-zon");
 const paths = @import("paths.zig");
 
 pub const file_name = "config.zon";
@@ -24,8 +25,8 @@ pub const Kind = enum {
     }
 
     pub fn fromWireName(text: []const u8) ?Kind {
-        inline for (@typeInfo(Kind).@"enum".fields) |field| {
-            const kind: Kind = @enumFromInt(field.value);
+        inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |_, field_value| {
+            const kind: Kind = @fromBackingInt(@intCast(field_value));
             if (std.mem.eql(u8, kind.wireName(), text)) return kind;
         }
         return null;
@@ -137,10 +138,10 @@ pub const LoadError = ParseError || error{
 };
 
 pub const Diagnostic = union(enum) {
-    file_not_zon: std.zon.parse.Diagnostics,
+    file_not_zon: ZonFailure,
     block_not_valid: BlockNotValid,
     not_a_struct_literal,
-    token_file_not_valid: std.zon.parse.Diagnostics,
+    token_file_not_valid: ZonFailure,
     token_file_readable_by_others: ReadableByOthers,
     empty_default: []const u8,
     unknown_provider_kind: []const u8,
@@ -155,7 +156,13 @@ pub const Diagnostic = union(enum) {
 
     pub const BlockNotValid = struct {
         field: []const u8,
-        zon: std.zon.parse.Diagnostics,
+        zon: ZonFailure,
+    };
+
+    /// `arena` backs `diag`'s messages and must outlive it; `deinit` frees both together.
+    pub const ZonFailure = struct {
+        arena: std.heap.ArenaAllocator,
+        diag: std.zon.parse.Diagnostics,
     };
 
     pub const EmptyProviderField = struct {
@@ -193,8 +200,8 @@ pub const Diagnostic = union(enum) {
 
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .file_not_zon, .token_file_not_valid => |*zon_diag| zon_diag.deinit(gpa),
-            .block_not_valid => |*block| block.zon.deinit(gpa),
+            .file_not_zon, .token_file_not_valid => |*zf| zf.arena.deinit(),
+            .block_not_valid => |*block| block.zon.arena.deinit(),
             .unknown_provider_kind, .two_credential_spellings => |name| gpa.free(name),
             .empty_provider_field => |field| gpa.free(field.name),
             .no_base_url => |names| gpa.free(names.name),
@@ -209,21 +216,21 @@ pub const Diagnostic = union(enum) {
 
     pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.*) {
-            .file_not_zon => |*zon_diag| try writer.print(
+            .file_not_zon => |*zf| try writer.print(
                 "{s} is not valid:\n{f}",
-                .{ file_name, zon_diag },
+                .{ file_name, zf.diag.fmt(file_name) },
             ),
             .block_not_valid => |*block| try writer.print(
                 "{s}: .{s} is not valid:\n{f}",
-                .{ file_name, block.field, &block.zon },
+                .{ file_name, block.field, block.zon.diag.fmt(file_name) },
             ),
             .not_a_struct_literal => try writer.print(
                 "{s}: the file must hold a struct literal",
                 .{file_name},
             ),
-            .token_file_not_valid => |*zon_diag| try writer.print(
+            .token_file_not_valid => |*zf| try writer.print(
                 "{s}: the token file is not valid:\n{f}",
-                .{ token_file_name, zon_diag },
+                .{ token_file_name, zf.diag.fmt(token_file_name) },
             ),
             .empty_default => |field| try writer.print(
                 "{s}: .defaults.{s} holds nothing. Leave the field out instead.",
@@ -311,6 +318,10 @@ fn wantsDiagnostic(out: ?*?Diagnostic) bool {
 
 pub const Config = struct {
     gpa: std.mem.Allocator,
+    /// Backs `providers`'s slices.
+    providers_arena: std.heap.ArenaAllocator,
+    /// Backs `defaults`'s slices.
+    defaults_arena: std.heap.ArenaAllocator,
     providers: []const FileInstance,
     credential_store: CredentialStore,
     defaults: FileDefaults,
@@ -320,8 +331,8 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config) void {
         self.gpa.free(self.instances);
-        std.zon.parse.free(self.gpa, self.providers);
-        std.zon.parse.free(self.gpa, self.defaults);
+        self.providers_arena.deinit();
+        self.defaults_arena.deinit();
         self.* = undefined;
     }
 
@@ -341,14 +352,21 @@ pub const Config = struct {
 
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) ParseError!Config {
     // Each top level block is parsed on its own and strictly: a typo in a field name inside a provider must not quietly become a different instance. A top level field this build does not know is ignored instead, because a later milestone writes more into this same file, and std.zon.parse's own ignore_unknown_fields is one setting for the whole tree and cannot tell the two cases apart.
-    const providers = try parseBlock([]const FileInstance, gpa, source, "providers", diag) orelse &.{};
-    errdefer std.zon.parse.free(gpa, providers);
-    const defaults = try parseBlock(FileDefaults, gpa, source, "defaults", diag) orelse FileDefaults{};
-    errdefer std.zon.parse.free(gpa, defaults);
+    const providers_parsed = try parseBlock([]const FileInstance, gpa, source, "providers", diag);
+    var providers_arena: std.heap.ArenaAllocator = if (providers_parsed) |p| p.arena else .init(gpa);
+    errdefer providers_arena.deinit();
+    const providers: []const FileInstance = if (providers_parsed) |p| p.value else &.{};
 
-    const credentials = try parseBlock(FileCredentials, gpa, source, "credentials", diag) orelse
-        FileCredentials{};
-    defer std.zon.parse.free(gpa, credentials);
+    const defaults_parsed = try parseBlock(FileDefaults, gpa, source, "defaults", diag);
+    var defaults_arena: std.heap.ArenaAllocator = if (defaults_parsed) |d| d.arena else .init(gpa);
+    errdefer defaults_arena.deinit();
+    const defaults: FileDefaults = if (defaults_parsed) |d| d.value else FileDefaults{};
+
+    // Nothing of `credentials` outlives `readCredentialStore`, so its own
+    // arena is freed right after, never kept on `Config`.
+    var credentials_parsed = try parseBlock(FileCredentials, gpa, source, "credentials", diag);
+    defer if (credentials_parsed) |*c| c.arena.deinit();
+    const credentials: FileCredentials = if (credentials_parsed) |c| c.value else FileCredentials{};
     const credential_store = try readCredentialStore(gpa, credentials, diag);
 
     const instances = try gpa.alloc(Instance, providers.len);
@@ -372,6 +390,8 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
 
     return .{
         .gpa = gpa,
+        .providers_arena = providers_arena,
+        .defaults_arena = defaults_arena,
         .providers = providers,
         .defaults = defaults,
         .instances = instances,
@@ -406,48 +426,68 @@ fn readCredentialStore(
     return named;
 }
 
+/// On success, the returned `arena` backs `value`'s slices and the caller
+/// keeps it alive for as long as it reads `value`. `null` means the field
+/// is absent, and no arena is made for it.
 fn parseBlock(
     comptime T: type,
     gpa: std.mem.Allocator,
     source: [:0]const u8,
     field_name: []const u8,
     diag: ?*?Diagnostic,
-) ParseError!?T {
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+) ParseError!?struct { value: T, arena: std.heap.ArenaAllocator } {
+    var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    var ast_owned = true;
-    defer if (ast_owned) ast.deinit(gpa);
+    defer ast.deinit(gpa);
 
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
-    var zoir_owned = true;
-    defer if (zoir_owned) zoir.deinit(gpa);
+    defer zoir.deinit(gpa);
+
+    // The arena backs the parsed value and the diagnostics; `note` takes it
+    // over on a fault, otherwise it is released here.
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    var arena_owned = true;
+    defer if (arena_owned) arena.deinit();
 
     if (zoir.hasCompileErrors()) {
-        if (note(diag, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
-            ast_owned = false;
-            zoir_owned = false;
-        }
+        var zon_diag: std.zon.parse.Diagnostics = undefined;
+        _ = std.zon.parse.fromZoir(T, .{
+            .arena = arena.allocator(),
+            .ast = &ast,
+            .zoir = &zoir,
+            .diagnostics = &zon_diag,
+        }) catch {};
+        if (note(diag, .{ .file_not_zon = .{ .arena = arena, .diag = zon_diag } })) arena_owned = false;
         return error.InvalidConfig;
     }
 
     const node = try findField(zoir, field_name, diag) orelse return null;
 
-    var diagnostics: std.zon.parse.Diagnostics = .{};
-    ast_owned = false;
-    zoir_owned = false;
-    var diagnostics_owned = true;
-    defer if (diagnostics_owned) diagnostics.deinit(gpa);
-
-    return std.zon.parse.fromZoirNodeAlloc(T, gpa, ast, zoir, node, &diagnostics, .{}) catch |err| switch (err) {
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const value = chock_zon.fromNode(
+        T,
+        gpa,
+        arena.allocator(),
+        source,
+        &ast,
+        &zoir,
+        node,
+        &diagnostics,
+        .{},
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => {
-            if (note(diag, .{ .block_not_valid = .{ .field = field_name, .zon = diagnostics } })) {
-                diagnostics_owned = false;
-            }
+            if (note(diag, .{ .block_not_valid = .{
+                .field = field_name,
+                .zon = .{ .arena = arena, .diag = diagnostics },
+            } })) arena_owned = false;
             return error.InvalidConfig;
         },
     };
+
+    arena_owned = false;
+    return .{ .value = value, .arena = arena };
 }
 
 fn findField(
@@ -456,10 +496,10 @@ fn findField(
     diag: ?*?Diagnostic,
 ) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), field_name)) return fields.vals.at(@intCast(index));
+                if (std.mem.eql(u8, name.get(&zoir), field_name)) return fields.vals.at(@intCast(index));
             }
             return null;
         },
@@ -591,10 +631,12 @@ pub fn load(
 
 pub const Tokens = struct {
     gpa: std.mem.Allocator,
+    /// Backs `entries`'s slices.
+    arena: std.heap.ArenaAllocator,
     entries: []const TokenEntry,
 
     pub fn deinit(self: *Tokens) void {
-        std.zon.parse.free(self.gpa, self.entries);
+        self.arena.deinit();
         self.* = undefined;
     }
 
@@ -642,17 +684,27 @@ pub fn loadTokens(
     const source = try readWholeFile(gpa, io, path, diag);
     defer gpa.free(source);
 
-    var diagnostics: std.zon.parse.Diagnostics = .{};
-    var diagnostics_owned = true;
-    defer if (diagnostics_owned) diagnostics.deinit(gpa);
-    const entries = std.zon.parse.fromSliceAlloc([]const TokenEntry, gpa, source, &diagnostics, .{}) catch |err| switch (err) {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    var arena_owned = true;
+    defer if (arena_owned) arena.deinit();
+
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const entries = std.zon.parse.fromSlice([]const TokenEntry, .{
+        .gpa = gpa,
+        .arena = arena.allocator(),
+        .source = source,
+        .diagnostics = &diagnostics,
+    }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => {
-            if (note(diag, .{ .token_file_not_valid = diagnostics })) diagnostics_owned = false;
+            if (note(diag, .{ .token_file_not_valid = .{ .arena = arena, .diag = diagnostics } })) {
+                arena_owned = false;
+            }
             return error.InvalidConfig;
         },
     };
-    return .{ .gpa = gpa, .entries = entries };
+    arena_owned = false;
+    return .{ .gpa = gpa, .arena = arena, .entries = entries };
 }
 
 fn readWholeFile(
@@ -976,7 +1028,9 @@ test "a typo inside a provider names its block, its line and its column" {
     var buffer: [512]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{f}", .{&diag.?});
     try testing.expect(std.mem.startsWith(u8, line, "config.zon: .providers is not valid:\n"));
-    try testing.expect(std.mem.indexOf(u8, line, "1:41: error:") != null);
+    // Relative to the block's own cut text, not to config.zon as a whole:
+    // see chock-zon.zig's own note on `fromNode`.
+    try testing.expect(std.mem.indexOf(u8, line, "1:25: error:") != null);
     try testing.expect(std.mem.indexOf(u8, line, "tokn") != null);
 }
 
@@ -1052,8 +1106,8 @@ test "a store this reader does not know is refused, and the message lists them a
 
     const text = try std.fmt.allocPrint(gpa, "{f}", .{diag.?});
     defer gpa.free(text);
-    inline for (@typeInfo(CredentialStore).@"enum".fields) |field| {
-        try testing.expect(std.mem.indexOf(u8, text, field.name) != null);
+    inline for (@typeInfo(CredentialStore).@"enum".field_names, @typeInfo(CredentialStore).@"enum".field_values) |field_name, _| {
+        try testing.expect(std.mem.indexOf(u8, text, field_name) != null);
     }
 }
 
@@ -1074,9 +1128,9 @@ test "a store this platform does not have is refused when the file is read" {
 }
 
 test "every store this platform has is one this platform accepts" {
-    inline for (@typeInfo(CredentialStore).@"enum".fields) |field| {
-        const one: CredentialStore = @enumFromInt(field.value);
-        const listed = std.mem.indexOf(u8, CredentialStore.hereText(), field.name) != null;
+    inline for (@typeInfo(CredentialStore).@"enum".field_names, @typeInfo(CredentialStore).@"enum".field_values) |field_name, field_value| {
+        const one: CredentialStore = @fromBackingInt(@intCast(field_value));
+        const listed = std.mem.indexOf(u8, CredentialStore.hereText(), field_name) != null;
         try testing.expectEqual(one.availableHere(), listed);
     }
     try testing.expect(CredentialStore.default().availableHere());

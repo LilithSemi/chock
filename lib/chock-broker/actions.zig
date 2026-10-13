@@ -1377,11 +1377,11 @@ const TestProject = struct {
         const tmp_path = try absoluteDirPath(io, &buffer, tmp.dir);
 
         var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const root_path = try std.fmt.bufPrintZ(&root_buffer, "{s}/project", .{tmp_path});
+        const root_path = try std.fmt.bufPrintSentinel(&root_buffer, "{s}/project", .{tmp_path}, 0);
         try std.Io.Dir.createDirAbsolute(io, root_path, .default_dir);
 
         var scratch_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const scratch_path = try std.fmt.bufPrintZ(&scratch_buffer, "{s}/scratch", .{tmp_path});
+        const scratch_path = try std.fmt.bufPrintSentinel(&scratch_buffer, "{s}/scratch", .{tmp_path}, 0);
         try std.Io.Dir.createDirAbsolute(io, scratch_path, .default_dir);
 
         var env = try std.testing.environ.createMap(gpa);
@@ -1394,15 +1394,15 @@ const TestProject = struct {
         gpa.free(try gitOk(gpa, &env, root_path, &.{ "config", "user.name", "Test" }));
 
         var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{root_path});
+        const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{root_path}, 0);
         try writeFileAbsolute(io, tracked_path, "hello\n");
         gpa.free(try gitOk(gpa, &env, root_path, &.{ "add", "tracked.txt" }));
         gpa.free(try gitOk(gpa, &env, root_path, &.{ "commit", "-m", "first commit" }));
 
         return .{
             .gpa = gpa,
-            .root_path = try gpa.dupeZ(u8, root_path),
-            .scratch_path = try gpa.dupeZ(u8, scratch_path),
+            .root_path = try gpa.dupeSentinel(u8, root_path, 0),
+            .scratch_path = try gpa.dupeSentinel(u8, scratch_path, 0),
             .env = env,
         };
     }
@@ -1813,10 +1813,10 @@ test "an action names its effect, and the effect is a diff and not a command" {
     try testing.expect(!@hasField(Ask, "detail"));
 
     const forbidden = [_][]const u8{ "command", "argv", "args", "cmd", "shell", "script" };
-    inline for (@typeInfo(Action).@"union".fields) |field| {
-        inline for (@typeInfo(field.type).@"struct".fields) |payload_field| {
+    inline for (@typeInfo(Action).@"union".field_names, @typeInfo(Action).@"union".field_types) |_, field_type| {
+        inline for (@typeInfo(field_type).@"struct".field_names, @typeInfo(field_type).@"struct".field_types) |payload_field_name, _| {
             for (forbidden) |bad| {
-                try testing.expect(!std.ascii.eqlIgnoreCase(payload_field.name, bad));
+                try testing.expect(!std.ascii.eqlIgnoreCase(payload_field_name, bad));
             }
         }
     }
@@ -1934,8 +1934,8 @@ test "an action names its effect, and the effect is a diff and not a command" {
         },
     };
 
-    try testing.expectEqual(@as(usize, 8), @typeInfo(Action).@"union".fields.len);
-    try testing.expectEqual(cases.len, @typeInfo(Action).@"union".fields.len);
+    try testing.expectEqual(@as(usize, 8), @typeInfo(Action).@"union".field_names.len);
+    try testing.expectEqual(cases.len, @typeInfo(Action).@"union".field_names.len);
 
     for (cases) |case| {
         try testing.expectEqualStrings(case.name, case.action.name());
@@ -2132,7 +2132,7 @@ test "an approved git.push moves the approved id onto the remote ref" {
     defer project.deinit();
 
     var remote_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const remote_path = try std.fmt.bufPrintZ(&remote_buffer, "{s}/remote.git", .{project.scratch_path});
+    const remote_path = try std.fmt.bufPrintSentinel(&remote_buffer, "{s}/remote.git", .{project.scratch_path}, 0);
     try std.Io.Dir.createDirAbsolute(io, remote_path, .default_dir);
     gpa.free(try gitOk(gpa, &project.env, remote_path, &.{ "init", "--bare", "-b", "main" }));
     gpa.free(try gitOk(gpa, &project.env, project.root_path, &.{ "remote", "add", "origin", remote_path }));
@@ -2177,7 +2177,7 @@ test "git.push refuses when the remote is no longer where the user was told" {
     defer project.deinit();
 
     var remote_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const remote_path = try std.fmt.bufPrintZ(&remote_buffer, "{s}/remote.git", .{project.scratch_path});
+    const remote_path = try std.fmt.bufPrintSentinel(&remote_buffer, "{s}/remote.git", .{project.scratch_path}, 0);
     try std.Io.Dir.createDirAbsolute(io, remote_path, .default_dir);
     gpa.free(try gitOk(gpa, &project.env, remote_path, &.{ "init", "--bare", "-b", "main" }));
     gpa.free(try gitOk(gpa, &project.env, project.root_path, &.{ "remote", "add", "origin", remote_path }));
@@ -2393,35 +2393,35 @@ test "a refusal is not an error, and the act it refused never runs" {
 // The effect and never a command, enforced by the build and not by a reviewer.
 comptime {
     const forbidden = [_][]const u8{ "command", "argv", "args", "cmd", "shell", "script" };
-    for (@typeInfo(Action).@"union".fields) |field| {
-        const payload = @typeInfo(field.type);
+    for (@typeInfo(Action).@"union".field_names, @typeInfo(Action).@"union".field_types) |field_name, field_type| {
+        const payload = @typeInfo(field_type);
         if (payload != .@"struct") {
-            @compileError("an action payload must be a struct that names an effect: " ++ field.name);
+            @compileError("an action payload must be a struct that names an effect: " ++ field_name);
         }
-        if (payload.@"struct".fields.len == 0) {
-            @compileError("an action payload with no field names no effect: " ++ field.name);
+        if (payload.@"struct".field_names.len == 0) {
+            @compileError("an action payload with no field names no effect: " ++ field_name);
         }
-        for (payload.@"struct".fields) |payload_field| {
+        for (payload.@"struct".field_names) |payload_field_name| {
             for (forbidden) |bad| {
-                if (std.ascii.eqlIgnoreCase(payload_field.name, bad)) {
+                if (std.ascii.eqlIgnoreCase(payload_field_name, bad)) {
                     @compileError("an action names its effect, never a command: " ++
-                        field.name ++ "." ++ payload_field.name);
+                        field_name ++ "." ++ payload_field_name);
                 }
             }
         }
     }
-    for (@typeInfo(Ask).@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.name, "summary") or std.mem.eql(u8, field.name, "detail")) {
+    for (@typeInfo(Ask).@"struct".field_names, @typeInfo(Ask).@"struct".field_types) |field_name, _| {
+        if (std.mem.eql(u8, field_name, "summary") or std.mem.eql(u8, field_name, "detail")) {
             @compileError("Ask must not carry a summary or a detail: both come from the action itself");
         }
     }
 
     const decides = [_][]const u8{ "mode", "landing", "integration", "branch", "merge", "rebase", "squash" };
-    for (@typeInfo(Ask).@"struct".fields) |field| {
+    for (@typeInfo(Ask).@"struct".field_names, @typeInfo(Ask).@"struct".field_types) |field_name, _| {
         for (decides) |bad| {
-            if (std.ascii.eqlIgnoreCase(field.name, bad)) {
+            if (std.ascii.eqlIgnoreCase(field_name, bad)) {
                 @compileError("an Ask carries an argument and never an answer, and \"" ++
-                    field.name ++ "\" would decide how the work lands. The mode comes from " ++
+                    field_name ++ "\" would decide how the work lands. The mode comes from " ++
                     "chock.zon, bounded by the workspace.integrate row");
             }
         }

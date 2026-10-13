@@ -511,9 +511,10 @@ fn everyVariant(gpa: std.mem.Allocator) [12]Diagnostic {
 }
 
 test "every decision a review writes reads as itself" {
-    var seen: [std.meta.fields(Diagnostic.ReviewDecision).len][]const u8 = undefined;
-    inline for (std.meta.fields(Diagnostic.ReviewDecision), 0..) |field, i| {
-        const text = (@field(Diagnostic.ReviewDecision, field.name)).text();
+    const names = @typeInfo(Diagnostic.ReviewDecision).@"enum".field_names;
+    var seen: [names.len][]const u8 = undefined;
+    inline for (names, 0..) |name, i| {
+        const text = (@field(Diagnostic.ReviewDecision, name)).text();
         try testing.expect(text.len > 0);
         for (seen[0..i]) |other| try testing.expect(!std.mem.eql(u8, text, other));
         seen[i] = text;

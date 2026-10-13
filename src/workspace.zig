@@ -688,8 +688,8 @@ test "every kept workspace is listed, oldest first, with what it holds" {
     const len = try tmp.dir.realPath(testing.io, &buffer);
     const root = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
 
-    const newer = "01JQ" ++ "B" ** 22;
-    const older = "01JQ" ++ "A" ** 22;
+    const newer = "01JQ" ++ @as([22]u8, @splat('B'));
+    const older = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeSessionDir(arena, testing.io, root, &.{ newer, older });
 
     {
@@ -779,7 +779,7 @@ test "clearing asks first, and anything that is not a plain yes leaves every fil
     const len = try tmp.dir.realPath(testing.io, &buffer);
     const root = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeSessionDir(arena, testing.io, root, &.{id});
 
     const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
@@ -836,7 +836,7 @@ test "a clear with nobody to answer removes nothing, and --yes is how a script m
     const len = try tmp.dir.realPath(testing.io, &buffer);
     const root = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeSessionDir(arena, testing.io, root, &.{id});
 
     const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
@@ -886,8 +886,8 @@ test "a clear leaves the workspace of a session that is running" {
     const len = try tmp.dir.realPath(testing.io, &buffer);
     const root = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
 
-    const running_id = "01JQ" ++ "A" ** 22;
-    const ended_id = "01JQ" ++ "B" ** 22;
+    const running_id = "01JQ" ++ @as([22]u8, @splat('A'));
+    const ended_id = "01JQ" ++ @as([22]u8, @splat('B'));
     try makeSessionDir(arena, testing.io, root, &.{ running_id, ended_id });
 
     const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
@@ -989,7 +989,7 @@ fn makeOverlaySession(
     var locked = try store.lock(io);
     _ = try locked.append(arena, io, .{ .workspace_open = .{
         .kind = kind,
-        .attempt = "01JQ" ++ "T" ** 22,
+        .attempt = "01JQ" ++ @as([22]u8, @splat('T')),
         .path = "/gone",
         .base_commit = "",
     } }, 500);
@@ -1044,7 +1044,7 @@ fn adoptionRow(
 
 fn makeWhiteoutAt(arena: std.mem.Allocator, upper: []const u8, relative: []const u8) !void {
     const file_path = try std.fs.path.join(arena, &.{ upper, relative });
-    const path_z = try arena.dupeZ(u8, file_path);
+    const path_z = try arena.dupeSentinel(u8, file_path, 0);
     const rc = std.os.linux.mknod(path_z.ptr, std.os.linux.S.IFCHR | 0o600, 0);
     try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc));
 }
@@ -1065,8 +1065,8 @@ test "an overlay a session left behind is adopted, and what it changed and what 
     try writeUnder(arena, testing.io, project, "tracked.txt", "original\n");
     try writeUnder(arena, testing.io, project, "gone.txt", "the agent deleted me\n");
 
-    const id = "01JQ" ++ "A" ** 22;
-    const attempt = "01JQ" ++ "B" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
+    const attempt = "01JQ" ++ @as([22]u8, @splat('B'));
     const upper = try makeOverlaySession(arena, testing.io, root, id, attempt, .overlay);
     try writeUnder(arena, testing.io, upper, "tracked.txt", "the agent changed this\n");
     try writeUnder(arena, testing.io, upper, "notes/new.md", "the agent made this\n");
@@ -1146,8 +1146,8 @@ test "a session that worked in a git worktree is refused, and sent to the ref th
     const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
     try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
 
-    const id = "01JQ" ++ "C" ** 22;
-    const attempt = "01JQ" ++ "D" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('C'));
+    const attempt = "01JQ" ++ @as([22]u8, @splat('D'));
     _ = try makeOverlaySession(arena, testing.io, root, id, attempt, .worktree);
 
     var said: tty.Capture = undefined;
@@ -1184,8 +1184,8 @@ test "an adoption that would write over an earlier one is refused by name, and n
     const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
     try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
 
-    const id = "01JQ" ++ "E" ** 22;
-    const attempt = "01JQ" ++ "F" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('E'));
+    const attempt = "01JQ" ++ @as([22]u8, @splat('F'));
     const upper = try makeOverlaySession(arena, testing.io, root, id, attempt, .overlay);
     try writeUnder(arena, testing.io, upper, "tracked.txt", "the agent changed this\n");
 
@@ -1228,8 +1228,8 @@ test "adopt refuses a session nobody named, one that is not an identifier, and o
     const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
     try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
 
-    const id = "01JQ" ++ "G" ** 22;
-    const attempt = "01JQ" ++ "H" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('G'));
+    const attempt = "01JQ" ++ @as([22]u8, @splat('H'));
     _ = try makeOverlaySession(arena, testing.io, root, id, attempt, .overlay);
 
     var said: tty.Capture = undefined;
@@ -1249,7 +1249,7 @@ test "adopt refuses a session nobody named, one that is not an identifier, and o
     );
     try testing.expect(std.mem.indexOf(u8, said.err(), "not a session identifier") != null);
 
-    const never_ran = "01JQ" ++ "Z" ** 22;
+    const never_ran = "01JQ" ++ @as([22]u8, @splat('Z'));
     try testing.expectEqual(
         Exit.usage.code(),
         adoptWorkspace(arena, testing.io, kept, project, root, never_ran),
@@ -1277,8 +1277,8 @@ test "a workspace whose overlay has already been cleared is refused, and the cle
     const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
     try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
 
-    const id = "01JQ" ++ "K" ** 22;
-    const attempt = "01JQ" ++ "M" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('K'));
+    const attempt = "01JQ" ++ @as([22]u8, @splat('M'));
     const upper = try makeOverlaySession(arena, testing.io, root, id, attempt, .overlay);
     try std.Io.Dir.cwd().deleteTree(testing.io, upper);
 

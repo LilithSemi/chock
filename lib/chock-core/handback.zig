@@ -50,14 +50,14 @@ pub const not_offered = "this session cannot carry work back at all, so nothing 
 const testing = std.testing;
 
 test "an ask carries an argument and never an answer" {
-    inline for (@typeInfo(Ask).@"struct".fields) |field| {
-        if (field.type != []const u8) @compileError(
-            "Ask gained the member \"" ++ field.name ++ "\", which is not text. Everything in " ++
+    inline for (@typeInfo(Ask).@"struct".field_names, @typeInfo(Ask).@"struct".field_types) |field_name, field_type| {
+        if (field_type != []const u8) @compileError(
+            "Ask gained the member \"" ++ field_name ++ "\", which is not text. Everything in " ++
                 "an Ask is written by the agent, and a member that was not plain text would be " ++
                 "the route a decision travels in along. The agent asks; it never decides",
         );
     }
-    try testing.expect(@typeInfo(Ask).@"struct".fields.len == 2);
+    try testing.expect(@typeInfo(Ask).@"struct".field_names.len == 2);
 }
 
 test "one action is named, and it is the policy key a project writes a rule for" {

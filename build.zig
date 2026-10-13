@@ -1,6 +1,5 @@
 const std = @import("std");
 const phantom_build = @import("phantom");
-const WebBundle = @import("build/web_bundle.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -23,6 +22,12 @@ pub fn build(b: *std.Build) void {
 
     const linux_only = target.result.os.tag == .linux;
 
+    // Where this repository is, as an absolute path, because `zig build` can
+    // start from any directory. `addOptionPath` is wrong for it: that one reads
+    // the path to hash its contents and refuses a directory. The tests want the
+    // string and no dependency on what is in the tree.
+    const repo_root = b.pathResolve(&.{ b.root.root_dir.path orelse ".", b.root.sub_path });
+
     const version_text = b.option(
         []const u8,
         "version",
@@ -37,6 +42,17 @@ pub fn build(b: *std.Build) void {
     const chock_version_options = b.addOptions();
     chock_version_options.addOption([]const u8, "text", version_text);
     const chock_version_module = chock_version_options.createModule();
+
+    // A workaround module for Zig 0.17.0: see its own comment. Delete it once
+    // `std.zon.parse.fromZoir` honours the node it is given. Declared first,
+    // before anything that reads a block out of `chock.zon` needs it.
+    const chock_zon = b.addModule("chock-zon", .{
+        .root_source_file = b.path("lib/chock-zon.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const chock_zon_tests = b.addTest(.{ .root_module = chock_zon });
+    test_step.dependOn(&b.addRunArtifact(chock_zon_tests).step);
 
     // The sandbox for a tool call. It imports no other chock library. It has no
     // build.zig of its own, though: this root build script is the only thing that
@@ -162,6 +178,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("lib/chock-policy.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "chock-zon", .module = chock_zon }},
     });
 
     // The directory the sandbox mounts, and the git and overlay layers that
@@ -178,6 +195,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "chock-sandbox", .module = chock_sandbox },
             .{ .name = "chock-policy", .module = chock_policy },
+            .{ .name = "chock-zon", .module = chock_zon },
         },
     });
 
@@ -220,6 +238,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "chock-sandbox", .module = chock_sandbox },
                 .{ .name = "chock-policy", .module = chock_policy },
+                .{ .name = "chock-zon", .module = chock_zon },
                 .{ .name = "overlay_helper_path", .module = overlay_helper_path_options.createModule() },
             },
         }),
@@ -310,7 +329,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("lib/chock-cost.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "chock-proto", .module = chock_proto }},
+        .imports = &.{
+            .{ .name = "chock-zon", .module = chock_zon },
+            .{ .name = "chock-proto", .module = chock_proto },
+        },
     });
 
     const cost_tests = b.addTest(.{ .root_module = chock_cost });
@@ -798,6 +820,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("lib/chock-auth.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "chock-zon", .module = chock_zon }},
     });
 
     // The Darwin credential driver calls the Keychain through the Security
@@ -952,7 +975,7 @@ pub fn build(b: *std.Build) void {
     nix_path_options.addOption(
         []const u8,
         "nix_path",
-        b.findProgram(&.{"nix"}, &.{}) catch "",
+        b.findProgram(.{ .names = &.{"nix"} }) orelse "",
     );
 
     const nix_real_tests = b.addTest(.{
@@ -987,6 +1010,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("lib/chock-container.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "chock-zon", .module = chock_zon }},
     });
 
     const container_tests = b.addTest(.{ .root_module = chock_container });
@@ -1162,6 +1186,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "chock-io", .module = chock_io },
             .{ .name = "chock-cost", .module = chock_cost },
             .{ .name = "chock-policy", .module = chock_policy },
+            .{ .name = "chock-zon", .module = chock_zon },
             // For chock_core.plugin_module, which reads a plugin's metadata
             // out of a wasm module with the very same reader the guest wrote
             // it with. A second copy of the format on the host side is the
@@ -1314,7 +1339,7 @@ pub fn build(b: *std.Build) void {
         lsp_probe_path_options.addOption(
             ?[]const u8,
             "zls_path",
-            b.findProgram(&.{"zls"}, &.{}) catch null,
+            b.findProgram(.{ .names = &.{"zls"} }),
         );
 
         const lsp_tests = b.addTest(.{
@@ -1352,7 +1377,7 @@ pub fn build(b: *std.Build) void {
     mcp_real_path_options.addOption(
         ?[]const u8,
         "mcp_server_time_path",
-        b.findProgram(&.{"mcp-server-time"}, &.{}) catch null,
+        b.findProgram(.{ .names = &.{"mcp-server-time"} }),
     );
 
     const mcp_real_tests = b.addTest(.{
@@ -1680,11 +1705,25 @@ pub fn build(b: *std.Build) void {
     });
 
     // One file the binary carries, so `chock serve` needs nothing on disk.
-    const web_members = b.allocator.alloc(WebBundle.Member, web_dist.files.len) catch @panic("OOM");
-    for (web_dist.files, web_members) |name, *member| {
-        member.* = .{ .name = name, .source = web_dist.dir.path(b, name) };
+    //
+    // A program the build runs, the way the protocol generators are run. Zig
+    // 0.17 closed `Step.Tag`, so a build carries no code of its own.
+    const web_bundle_tool = b.addExecutable(.{
+        .name = "web-bundle",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build/web_bundle.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_web_bundle = b.addRunArtifact(web_bundle_tool);
+    const web_bundle = run_web_bundle.addOutputFileArg2("web.tar", .{});
+    // The name a browser asks for, then where that file is now. The list is
+    // phantom's, so a file it adds or renames arrives here on its own.
+    for (web_dist.files) |name| {
+        run_web_bundle.addArg(name);
+        run_web_bundle.addFileArg2(web_dist.dir.path(b, name), .{});
     }
-    const web_bundle = WebBundle.create(b, web_members);
 
     const exe_imports = [_]std.Build.Module.Import{
         .{ .name = "chock-vmm", .module = vmm_module },
@@ -1732,13 +1771,18 @@ pub fn build(b: *std.Build) void {
     // built by an ordinary `zig build` rather than by a step somebody has to
     // remember.
     chock_exe_module.addAnonymousImport("web-bundle", .{
-        .root_source_file = web_bundle.path(),
+        .root_source_file = web_bundle,
     });
 
-    const exe = b.addExecutable(.{
+    const exe = std.Build.Step.Compile.create(b, .{
         .name = "chock",
         .root_module = chock_exe_module,
+        .kind = .exe,
         .use_llvm = evaluator_llvm,
+        .entitlements = if (target.result.os.tag == .macos)
+            b.path("build/hypervisor.plist")
+        else
+            null,
     });
     b.installArtifact(exe);
 
@@ -1811,7 +1855,7 @@ pub fn build(b: *std.Build) void {
         // this repository's flake by reference rather than described a second
         // time. So the harness needs to know where the repository is, and a
         // build time constant is the one answer that cannot be a stale copy.
-        redteam_paths.addOptionPath("repo_root", b.path("."));
+        redteam_paths.addOption([]const u8, "repo_root", repo_root);
 
         const redteam_module = b.createModule(.{
             .root_source_file = b.path("test/redteam/main.zig"),
@@ -1842,7 +1886,7 @@ pub fn build(b: *std.Build) void {
         // through to it. That was measured, not assumed: the first version
         // here installed it and failed that test by name.
         const run_harness = b.addRunArtifact(redteam_exe);
-        if (b.args) |args| run_harness.addArgs(args);
+        run_harness.addPassthruArgs();
         const redteam_step = b.step(
             "redteam",
             "The red team exercise. Pass arguments after --.",
@@ -1899,7 +1943,7 @@ pub fn build(b: *std.Build) void {
     });
     chock_exe_test_module.addImport("tree_child_path", tree_child_path);
     chock_exe_test_module.addAnonymousImport("web-bundle", .{
-        .root_source_file = web_bundle.path(),
+        .root_source_file = web_bundle,
     });
 
     const exe_tests = b.addTest(.{
@@ -1935,7 +1979,7 @@ pub fn build(b: *std.Build) void {
     chock_path_options.addOption(
         []const u8,
         "git_path",
-        b.findProgram(&.{"git"}, &.{}) catch "",
+        b.findProgram(.{ .names = &.{"git"} }) orelse "",
     );
 
     const cli_tests = b.addTest(.{
@@ -1981,7 +2025,7 @@ pub fn build(b: *std.Build) void {
     guest_gate_options.addOption(
         []const u8,
         "git_path",
-        b.findProgram(&.{"git"}, &.{}) catch "",
+        b.findProgram(.{ .names = &.{"git"} }) orelse "",
     );
     // The program the one tool call runs. Named here for the reason `git_path`
     // is: a test binary resolves a bare `argv[0]` against an `environ` it has
@@ -1989,7 +2033,7 @@ pub fn build(b: *std.Build) void {
     guest_gate_options.addOption(
         []const u8,
         "wc_path",
-        b.findProgram(&.{"wc"}, &.{}) catch "",
+        b.findProgram(.{ .names = &.{"wc"} }) orelse "",
     );
     guest_gate_options.addOption(
         []const u8,
@@ -2038,7 +2082,7 @@ pub fn build(b: *std.Build) void {
     // started from any directory, so the root is a build time constant. Same
     // shape as `chock_path_options` below.
     const repo_root_options = b.addOptions();
-    repo_root_options.addOptionPath("repo_root", b.path("."));
+    repo_root_options.addOption([]const u8, "repo_root", repo_root);
 
     const docs_tests = b.addTest(.{
         .use_llvm = evaluator_llvm,
@@ -2354,68 +2398,4 @@ pub fn build(b: *std.Build) void {
     const run_one_binary_tests = b.addRunArtifact(one_binary_tests);
     run_one_binary_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_one_binary_tests.step);
-
-    // **No test binary may write a byte to standard error.** `zig build` puts a
-    // `failed command:` line in the log for any run step that wrote there,
-    // whatever the step's exit status, so a note from a passing test reads like
-    // a failure. That has already cost this project one wrong diagnosis, where
-    // a whole suite was called broken because of a single chatty test.
-    //
-    // **Measured and not read.** `test/proto/lock.zig` greps the sources for
-    // two spellings, which is a check of what a line says. This one reads
-    // `result_stderr`, the very field `zig build` reacts to, so it sees the
-    // bytes however they were written: `tty.print` with no stream set,
-    // `std.debug`, a raw `write`, or a child that inherited the descriptor.
-    // The `failed command:` line stops being cosmetic and fails the build.
-    //
-    // **Last in this file, and it has to be**, because it reads the run steps
-    // every call above it hung on `test_step`. Only `.zig_test` steps are
-    // taken: a helper program a test starts is not a test binary, and the
-    // choice of what its output does belongs to the spawn that starts it.
-    const quiet_tests = b.allocator.create(std.Build.Step) catch @panic("OOM");
-    quiet_tests.* = .init(.{
-        .id = .custom,
-        .name = "quiet test binaries",
-        .owner = b,
-        .makeFn = failOnTestStderr,
-    });
-    for (test_step.dependencies.items) |step| {
-        const run = step.cast(std.Build.Step.Run) orelse continue;
-        if (run.stdio != .zig_test) continue;
-        quiet_tests.dependOn(step);
-    }
-    test_step.dependOn(quiet_tests);
-}
-
-/// Fail the build when a test binary this step waited on wrote to standard
-/// error. A dependency that failed on its own never reaches here: the build
-/// runner marks a step with a failed dependency `dependency_failure` and does
-/// not run it, so a real test failure is reported once and not twice.
-///
-/// **What this cannot see is a run step `zig build` did not run.** A cache hit
-/// leaves `result_stderr` empty, exactly as it leaves the `failed command:`
-/// line out of the log, so this answers for the runs of this build alone.
-fn failOnTestStderr(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
-    _ = options;
-    const gpa = step.owner.allocator;
-
-    var noisy: std.ArrayList(u8) = .empty;
-    for (step.dependencies.items) |dep| {
-        if (dep.result_stderr.len == 0) continue;
-        const run = dep.cast(std.Build.Step.Run) orelse continue;
-        const named = named: {
-            const producer = run.producer orelse break :named dep.name;
-            const source = producer.root_module.root_source_file orelse break :named producer.name;
-            break :named source.getDisplayName();
-        };
-        try noisy.print(gpa, "\n{s} wrote to standard error:\n{s}", .{ named, dep.result_stderr });
-    }
-    if (noisy.items.len == 0) return;
-
-    return step.fail(
-        "a passing test binary wrote to standard error, which reads in the build log " ++
-            "like a failure. Give the code under test a writer the test owns, as " ++
-            "`src/tty.zig`'s `Capture` does.\n{s}",
-        .{noisy.items},
-    );
 }

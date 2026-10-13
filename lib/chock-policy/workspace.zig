@@ -122,7 +122,7 @@ pub const Diagnostic = struct {
     };
 
     pub const Fault = union(enum) {
-        file_not_zon: std.zon.parse.Diagnostics,
+        file_not_zon: ZonFailure,
         not_a_struct_literal,
         block_not_a_struct,
         unknown_block_field: []const u8,
@@ -147,9 +147,15 @@ pub const Diagnostic = struct {
         read_failed: anyerror,
     };
 
+    /// `arena` backs `diag`'s messages and must outlive it; `deinit` frees both together.
+    pub const ZonFailure = struct {
+        arena: std.heap.ArenaAllocator,
+        diag: std.zon.parse.Diagnostics,
+    };
+
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.fault) {
-            .file_not_zon => |*zon_diag| zon_diag.deinit(gpa),
+            .file_not_zon => |*zf| zf.arena.deinit(),
             .unknown_block_field,
             .unknown_field,
             .name_not_relative,
@@ -174,9 +180,9 @@ pub const Diagnostic = struct {
 
     pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.fault) {
-            .file_not_zon => |*zon_diag| try writer.print(
+            .file_not_zon => |*zf| try writer.print(
                 "{s} is not valid:\n{f}",
-                .{ self.source, zon_diag },
+                .{ self.source, zf.diag.fmt(self.source) },
             ),
             .not_a_struct_literal => try writer.print(
                 "{s}: the file must hold a struct literal",
@@ -291,21 +297,28 @@ pub fn parseFrom(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Block {
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+    var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    var ast_owned = true;
-    defer if (ast_owned) ast.deinit(gpa);
+    defer ast.deinit(gpa);
 
     // Left false, `zoir.string_bytes` is empty and a name reads back "".
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = true });
-    var zoir_owned = true;
-    defer if (zoir_owned) zoir.deinit(gpa);
+    defer zoir.deinit(gpa);
 
     if (zoir.hasCompileErrors()) {
-        if (note(diag, source_name, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
-            ast_owned = false;
-            zoir_owned = false;
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        var arena_owned = true;
+        defer if (arena_owned) arena.deinit();
+        var zon_diag: std.zon.parse.Diagnostics = undefined;
+        _ = std.zon.parse.fromZoir(Block, .{
+            .arena = arena.allocator(),
+            .ast = &ast,
+            .zoir = &zoir,
+            .diagnostics = &zon_diag,
+        }) catch {};
+        if (note(diag, source_name, .{ .file_not_zon = .{ .arena = arena, .diag = zon_diag } })) {
+            arena_owned = false;
         }
         return error.InvalidWorkspace;
     }
@@ -320,10 +333,10 @@ fn findBlockNode(
     diag: ?*?Diagnostic,
 ) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), block_name)) {
+                if (std.mem.eql(u8, name.get(&zoir), block_name)) {
                     return fields.vals.at(@intCast(index));
                 }
             }
@@ -344,12 +357,12 @@ fn parseBlock(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Block {
-    switch (node.get(zoir)) {
+    switch (node.get(&zoir)) {
         .empty_literal => return .{},
         .struct_literal => |fields| {
             var binds: ?std.zig.Zoir.Node.Index = null;
             for (fields.names, 0..) |name_id, index| {
-                const name = name_id.get(zoir);
+                const name = name_id.get(&zoir);
                 if (!std.mem.eql(u8, name, "binds")) {
                     _ = note(diag, source_name, .{ .unknown_block_field = try gpa.dupe(u8, name) });
                     return error.InvalidWorkspace;
@@ -373,7 +386,7 @@ fn parseBinds(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Block {
-    const elements = switch (node.get(zoir)) {
+    const elements = switch (node.get(&zoir)) {
         .empty_literal => return .{},
         .array_literal => |range| range,
         else => {
@@ -410,7 +423,7 @@ fn parseBind(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Bind {
-    const fields = switch (node.get(zoir)) {
+    const fields = switch (node.get(&zoir)) {
         .struct_literal => |one| one,
         else => {
             _ = note(diag, source_name, .{ .bind_not_a_struct = index });
@@ -424,10 +437,10 @@ fn parseBind(
     var required: ?bool = null;
 
     for (fields.names, 0..) |name_id, field_index| {
-        const field = name_id.get(zoir);
+        const field = name_id.get(&zoir);
         const value = fields.vals.at(@intCast(field_index));
         if (std.mem.eql(u8, field, "name")) {
-            name = switch (value.get(zoir)) {
+            name = switch (value.get(&zoir)) {
                 .string_literal => |text| text,
                 else => {
                     _ = note(diag, source_name, .{ .name_not_a_string = index });
@@ -439,7 +452,7 @@ fn parseBind(
         } else if (std.mem.eql(u8, field, "write")) {
             write = try readEnum(Write, gpa, zoir, value, name, source_name, diag);
         } else if (std.mem.eql(u8, field, "required")) {
-            required = switch (value.get(zoir)) {
+            required = switch (value.get(&zoir)) {
                 .true => true,
                 .false => false,
                 else => {
@@ -493,8 +506,8 @@ fn readEnum(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Enum {
-    const text = switch (node.get(zoir)) {
-        .enum_literal => |id| id.get(zoir),
+    const text = switch (node.get(&zoir)) {
+        .enum_literal => |id| id.get(&zoir),
         else => "",
     };
     if (std.meta.stringToEnum(Enum, text)) |value| return value;

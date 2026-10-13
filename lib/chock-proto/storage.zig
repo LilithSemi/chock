@@ -462,7 +462,7 @@ test "the json lines storage satisfies the storage interface" {
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try log.absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/session.jsonl", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/session.jsonl", .{dir_path}, 0);
 
     var backing = JsonLines{ .log = try log.Log.open(io, path, "01STORAGE") };
     const store: Storage = backing.storage();
@@ -524,7 +524,7 @@ test "a second lock is refused while the first is held, the same way on the fake
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try log.absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/double-lock", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/double-lock", .{dir_path}, 0);
     var json_backing = JsonLines{ .log = try log.Log.open(io, path, "01STORAGE") };
     const json_store: Storage = json_backing.storage();
     defer json_store.close(io);
@@ -549,7 +549,7 @@ test "regression: a caller using only the Storage interface can tell a torn tail
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try log.absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/storage-torn-tail", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/storage-torn-tail", .{dir_path}, 0);
 
     {
         var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
@@ -588,7 +588,7 @@ test "regression: a Locked handle whose generation does not match the backend's 
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try log.absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/forged-generation", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/forged-generation", .{dir_path}, 0);
     var json_backing = JsonLines{ .log = try log.Log.open(io, path, "01STORAGE") };
     const json_store: Storage = json_backing.storage();
     defer json_store.close(io);
@@ -616,7 +616,7 @@ test "regression: closing storage twice is harmless on both backends, not only t
     var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try log.absoluteDirPath(io, &dir_path_buffer, tmp.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/double-close", .{dir_path});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/double-close", .{dir_path}, 0);
     var json_backing = JsonLines{ .log = try log.Log.open(io, path, "01STORAGE") };
     const json_store: Storage = json_backing.storage();
     json_store.close(io);
@@ -631,7 +631,7 @@ fn scratchPath(
     name: []const u8,
 ) ![:0]u8 {
     const dir_path = try log.absoluteDirPath(std.testing.io, dir_buffer, tmp.dir);
-    return std.fmt.bufPrintZ(path_buffer, "{s}/{s}", .{ dir_path, name });
+    return std.fmt.bufPrintSentinel(path_buffer, "{s}/{s}", .{ dir_path, name }, 0);
 }
 
 fn writeWholeFile(io: std.Io, path: [:0]const u8, bytes: []const u8) !void {

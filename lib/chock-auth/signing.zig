@@ -103,13 +103,13 @@ test "a secret saved is the same secret loaded, byte for byte" {
     var fake = FakeSecrets{ .name = try testing.allocator.dupe(u8, ""), .value = try testing.allocator.dupe(u8, "") };
     defer fake.deinit(testing.allocator);
 
-    const secret: Secret = [_]u8{ 0x01, 0x02, 0x03 } ++ [_]u8{0xab} ** 29;
+    const secret: Secret = [_]u8{ 0x01, 0x02, 0x03 } ++ @as([29]u8, @splat(0xab));
     try save(testing.allocator, testing.io, fake.secrets(), secret, null);
 
     const loaded = (try load(testing.allocator, testing.io, fake.secrets(), null)).?;
     try testing.expectEqualSlices(u8, &secret, &loaded);
 
-    const other: Secret = [_]u8{0x77} ** secret_len;
+    const other: Secret = @as([secret_len]u8, @splat(0x77));
     try save(testing.allocator, testing.io, fake.secrets(), other, null);
     try testing.expectEqualSlices(u8, &other, &(try load(testing.allocator, testing.io, fake.secrets(), null)).?);
 }
@@ -135,14 +135,14 @@ test "a stored value of the wrong width or alphabet is corrupt, never a missing 
     );
 
     testing.allocator.free(fake.value);
-    fake.value = try testing.allocator.dupe(u8, &[_]u8{'z'} ** stored_len);
+    fake.value = try testing.allocator.dupe(u8, &@as([stored_len]u8, @splat('z')));
     try testing.expectError(
         error.StoreCorrupt,
         load(testing.allocator, testing.io, fake.secrets(), null),
     );
 
     testing.allocator.free(fake.value);
-    fake.value = try testing.allocator.dupe(u8, &[_]u8{'A'} ** stored_len);
+    fake.value = try testing.allocator.dupe(u8, &@as([stored_len]u8, @splat('A')));
     try testing.expectError(
         error.StoreCorrupt,
         load(testing.allocator, testing.io, fake.secrets(), null),

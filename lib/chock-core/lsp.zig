@@ -451,7 +451,7 @@ test "one enormous message cannot defeat the count, so the block stays small" {
             .line = @intCast(index + 1),
             .column = 1,
             .severity = .err,
-            .message = "x" ** 20_000,
+            .message = &@as([20_000]u8, @splat('x')),
         };
     }
 
@@ -516,15 +516,15 @@ test "a message keeps one line, loses its escape sequences, and survives a bad e
 test "a message cut at the bound is still valid text, whatever alphabet it is written in" {
     const gpa = testing.allocator;
 
-    const message = "型が合いません" ** 40;
+    const message = repeated("型が合いません", 40);
     try testing.expect(message.len > max_message_bytes);
 
-    const cut = try flattenMessage(gpa, message);
+    const cut = try flattenMessage(gpa, &message);
     defer gpa.free(cut);
     try testing.expect(std.unicode.utf8ValidateSlice(cut));
     try testing.expect(std.mem.indexOf(u8, cut, "the message is longer than this") != null);
 
-    const exact = try flattenMessage(gpa, "x" ** max_message_bytes);
+    const exact = try flattenMessage(gpa, &@as([max_message_bytes]u8, @splat('x')));
     defer gpa.free(exact);
     try testing.expectEqual(max_message_bytes, exact.len);
 }
@@ -558,4 +558,14 @@ test "the report reads like a compiler, because that is what a model has already
             "lib/parser.zig:42:9: error: expected type 'u8', found 'void'\n",
         block,
     );
+}
+
+/// `piece` laid end to end `times` over, at comptime.
+///
+/// Zig 0.17 took the `**` operator away and `@splat` fills an array with ONE
+/// element, so a repeated phrase has no operator of its own any more.
+fn repeated(comptime piece: []const u8, comptime times: usize) [piece.len * times]u8 {
+    var out: [piece.len * times]u8 = undefined;
+    for (0..times) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
+    return out;
 }

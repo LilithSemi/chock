@@ -400,13 +400,13 @@ fn dupOne(fd: std.posix.fd_t) ?std.posix.fd_t {
 const testing = std.testing;
 
 test "the driver promises what the driver inside a guest promises, and expresses all five" {
-    inline for (@typeInfo(iface.Expresses).@"struct".fields) |field| {
-        try testing.expect(@field(expresses, field.name));
+    inline for (@typeInfo(iface.Expresses).@"struct".field_names, @typeInfo(iface.Expresses).@"struct".field_types) |field_name, _| {
+        try testing.expect(@field(expresses, field_name));
     }
 
     const darwin_driver = @import("../darwin/driver.zig");
-    inline for (@typeInfo(iface.Expresses).@"struct".fields) |field| {
-        try testing.expect(!@field(darwin_driver.expresses, field.name));
+    inline for (@typeInfo(iface.Expresses).@"struct".field_names, @typeInfo(iface.Expresses).@"struct".field_types) |field_name, _| {
+        try testing.expect(!@field(darwin_driver.expresses, field_name));
     }
 
     if (@import("builtin").os.tag != .linux) return;
@@ -416,8 +416,8 @@ test "the driver promises what the driver inside a guest promises, and expresses
 }
 
 test "every reason a guest cannot be asked for something has words of its own" {
-    inline for (@typeInfo(Guest.NotExpressible).@"enum".fields) |field| {
-        const one = @field(Guest.NotExpressible, field.name);
+    inline for (@typeInfo(Guest.NotExpressible).@"enum".field_names, @typeInfo(Guest.NotExpressible).@"enum".field_values) |field_name, _| {
+        const one = @field(Guest.NotExpressible, field_name);
         try testing.expect(one.sentence().len != 0);
     }
 }

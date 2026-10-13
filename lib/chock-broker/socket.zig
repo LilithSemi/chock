@@ -1023,7 +1023,7 @@ test "a client that goes away before it is shown anything does not end the sessi
         .approval_request = .{
             .action = "workspace.apply",
             .summary = "move 3 objects",
-            .detail = "x" ** 4096,
+            .detail = &@as([4096]u8, @splat('x')),
             .reason = "the session made a commit",
             .agent_kind = "coder",
             .spawn_chain = &.{},
@@ -1392,7 +1392,7 @@ test "a socket path longer than a unix socket path may be is refused and says so
     const io = testing.io;
 
     const long: [200]u8 = @splat('d');
-    var paths = try pathsFor(gpa, "/tmp/" ++ ("x" ** 0), &long);
+    var paths = try pathsFor(gpa, "/tmp/" ++ (@as([0]u8, @splat('x'))), &long);
     defer paths.deinit();
 
     try testing.expectError(error.PathTooLong, Endpoint.open(io, paths, null));

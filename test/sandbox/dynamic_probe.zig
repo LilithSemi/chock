@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // The address is the test, since a lookup answered from the host's own view would also succeed.
     if (args.len == 4 and std.mem.eql(u8, args[1], "resolve")) {
-        const name = fixed.allocator().dupeZ(u8, args[2]) catch return bad_arguments;
+        const name = fixed.allocator().dupeSentinel(u8, args[2], 0) catch return bad_arguments;
         const wanted = parseDotted(args[3]) orelse return bad_arguments;
 
         var hints: c.addrinfo = std.mem.zeroes(c.addrinfo);

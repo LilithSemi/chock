@@ -754,12 +754,12 @@ test "a task longer than the bound is cut and the cut is said out loud" {
     var state = State{};
     defer state.deinit(allocator);
 
-    const goal = "x" ** (goal_max_bytes + 100);
-    const notice = (try render(allocator, .{}, &state, .{ .index = 8, .goal = goal })).?;
+    const goal = @as([(goal_max_bytes + 100)]u8, @splat('x'));
+    const notice = (try render(allocator, .{}, &state, .{ .index = 8, .goal = &goal })).?;
     defer allocator.free(notice);
 
     try testing.expect(std.mem.indexOf(u8, notice, "the task is longer than this") != null);
-    try testing.expect(std.mem.indexOf(u8, notice, goal) == null);
+    try testing.expect(std.mem.indexOf(u8, notice, &goal) == null);
 }
 
 test "a task cut at the bound is still valid text, whatever alphabet it is written in" {
@@ -767,10 +767,10 @@ test "a task cut at the bound is still valid text, whatever alphabet it is writt
     var state = State{};
     defer state.deinit(allocator);
 
-    const goal = "パーサのテストを書いて" ** 40;
+    const goal = repeated("パーサのテストを書いて", 40);
     try testing.expect(goal.len > goal_max_bytes);
 
-    const notice = (try render(allocator, .{}, &state, .{ .index = 8, .goal = goal })).?;
+    const notice = (try render(allocator, .{}, &state, .{ .index = 8, .goal = &goal })).?;
     defer allocator.free(notice);
 
     try testing.expect(std.unicode.utf8ValidateSlice(notice));
@@ -780,15 +780,15 @@ test "a task cut at the bound is still valid text, whatever alphabet it is writt
 test "a task exactly at the bound is not cut, and one byte past it is" {
     const allocator = testing.allocator;
 
-    const exact = "x" ** goal_max_bytes;
-    try testing.expectEqualStrings(exact, cutToCharacter(exact, goal_max_bytes));
+    const exact = @as([goal_max_bytes]u8, @splat('x'));
+    try testing.expectEqualStrings(&exact, cutToCharacter(&exact, goal_max_bytes));
 
-    const over = "x" ** (goal_max_bytes + 1);
-    try testing.expectEqual(goal_max_bytes, cutToCharacter(over, goal_max_bytes).len);
+    const over = @as([(goal_max_bytes + 1)]u8, @splat('x'));
+    try testing.expectEqual(goal_max_bytes, cutToCharacter(&over, goal_max_bytes).len);
 
     var state = State{};
     defer state.deinit(allocator);
-    const notice = (try render(allocator, .{}, &state, .{ .index = 8, .goal = exact })).?;
+    const notice = (try render(allocator, .{}, &state, .{ .index = 8, .goal = &exact })).?;
     defer allocator.free(notice);
     try testing.expect(std.mem.indexOf(u8, notice, "the task is longer than this") == null);
 }
@@ -979,4 +979,14 @@ test "every notice line says the harness is speaking" {
         try testing.expect(std.mem.startsWith(u8, line, prefix));
     }
     try testing.expectEqual(@as(usize, 6), counted);
+}
+
+/// `piece` laid end to end `times` over, at comptime.
+///
+/// Zig 0.17 took the `**` operator away and `@splat` fills an array with ONE
+/// element, so a repeated phrase has no operator of its own any more.
+fn repeated(comptime piece: []const u8, comptime times: usize) [piece.len * times]u8 {
+    var out: [piece.len * times]u8 = undefined;
+    for (0..times) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
+    return out;
 }

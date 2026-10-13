@@ -55,11 +55,11 @@ pub const TestProject = struct {
         const tmp_path = try absoluteDirPath(io, &buffer, tmp.dir);
 
         var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const root_path = try std.fmt.bufPrintZ(&root_buffer, "{s}/project", .{tmp_path});
+        const root_path = try std.fmt.bufPrintSentinel(&root_buffer, "{s}/project", .{tmp_path}, 0);
         try std.Io.Dir.createDirAbsolute(io, root_path, .default_dir);
 
         var scratch_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const scratch_path = try std.fmt.bufPrintZ(&scratch_buffer, "{s}/scratch", .{tmp_path});
+        const scratch_path = try std.fmt.bufPrintSentinel(&scratch_buffer, "{s}/scratch", .{tmp_path}, 0);
         try std.Io.Dir.createDirAbsolute(io, scratch_path, .default_dir);
 
         var env = try std.testing.environ.createMap(gpa);
@@ -71,15 +71,15 @@ pub const TestProject = struct {
         gpa.free(try gitOk(gpa, &env, root_path, &.{ "config", "user.name", "Test" }));
 
         var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{root_path});
+        const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{root_path}, 0);
         try writeFileAbsolute(io, tracked_path, "hello\n");
         gpa.free(try gitOk(gpa, &env, root_path, &.{ "add", "tracked.txt" }));
         gpa.free(try gitOk(gpa, &env, root_path, &.{ "commit", "-m", "first commit" }));
 
         return .{
             .gpa = gpa,
-            .root_path = try gpa.dupeZ(u8, root_path),
-            .scratch_path = try gpa.dupeZ(u8, scratch_path),
+            .root_path = try gpa.dupeSentinel(u8, root_path, 0),
+            .scratch_path = try gpa.dupeSentinel(u8, scratch_path, 0),
             .env = env,
         };
     }

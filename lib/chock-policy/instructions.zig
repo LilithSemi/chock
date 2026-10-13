@@ -50,7 +50,7 @@ pub const Diagnostic = struct {
     };
 
     pub const Fault = union(enum) {
-        file_not_zon: std.zon.parse.Diagnostics,
+        file_not_zon: ZonFailure,
         not_a_struct_literal,
         not_a_list,
         entry_not_a_string: usize,
@@ -64,9 +64,15 @@ pub const Diagnostic = struct {
         read_failed: anyerror,
     };
 
+    /// `arena` backs `diag`'s messages and must outlive it; `deinit` frees both together.
+    pub const ZonFailure = struct {
+        arena: std.heap.ArenaAllocator,
+        diag: std.zon.parse.Diagnostics,
+    };
+
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.fault) {
-            .file_not_zon => |*zon_diag| zon_diag.deinit(gpa),
+            .file_not_zon => |*zf| zf.arena.deinit(),
             .path_not_relative, .path_leaves_project => |name| gpa.free(name),
             .leaves_project, .unreadable => |named| {
                 gpa.free(named.name);
@@ -79,9 +85,9 @@ pub const Diagnostic = struct {
 
     pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.fault) {
-            .file_not_zon => |*zon_diag| try writer.print(
+            .file_not_zon => |*zf| try writer.print(
                 "{s} is not valid:\n{f}",
-                .{ self.source, zon_diag },
+                .{ self.source, zf.diag.fmt(self.source) },
             ),
             .not_a_struct_literal => try writer.print(
                 "{s}: the file must hold a struct literal",
@@ -148,20 +154,27 @@ pub fn parseFrom(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Block {
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+    var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    var ast_owned = true;
-    defer if (ast_owned) ast.deinit(gpa);
+    defer ast.deinit(gpa);
 
     var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = true });
-    var zoir_owned = true;
-    defer if (zoir_owned) zoir.deinit(gpa);
+    defer zoir.deinit(gpa);
 
     if (zoir.hasCompileErrors()) {
-        if (note(diag, source_name, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
-            ast_owned = false;
-            zoir_owned = false;
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        var arena_owned = true;
+        defer if (arena_owned) arena.deinit();
+        var zon_diag: std.zon.parse.Diagnostics = undefined;
+        _ = std.zon.parse.fromZoir(Block, .{
+            .arena = arena.allocator(),
+            .ast = &ast,
+            .zoir = &zoir,
+            .diagnostics = &zon_diag,
+        }) catch {};
+        if (note(diag, source_name, .{ .file_not_zon = .{ .arena = arena, .diag = zon_diag } })) {
+            arena_owned = false;
         }
         return error.InvalidInstructions;
     }
@@ -176,10 +189,10 @@ fn findBlock(
     diag: ?*?Diagnostic,
 ) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
-    switch (root.get(zoir)) {
+    switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, index| {
-                if (std.mem.eql(u8, name.get(zoir), block_name)) {
+                if (std.mem.eql(u8, name.get(&zoir), block_name)) {
                     return fields.vals.at(@intCast(index));
                 }
             }
@@ -200,7 +213,7 @@ fn readFiles(
     source_name: []const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Block {
-    const items = switch (node.get(zoir)) {
+    const items = switch (node.get(&zoir)) {
         .empty_literal => return .{},
         .array_literal => |list| list,
         else => {
@@ -221,7 +234,7 @@ fn readFiles(
     }
 
     for (0..items.len) |index| {
-        const text = switch (items.at(@intCast(index)).get(zoir)) {
+        const text = switch (items.at(@intCast(index)).get(&zoir)) {
             .string_literal => |text| text,
             else => {
                 _ = note(diag, source_name, .{ .entry_not_a_string = index });

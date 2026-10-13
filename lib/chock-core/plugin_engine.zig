@@ -611,7 +611,7 @@ test "a tool that takes nothing is handed no bytes at all" {
     stageAnswer(&guest, 16, .success, "done");
     const outcome = try runner.call(testing.allocator, 0, who);
     try testing.expectEqualStrings("done", outcome.text);
-    try testing.expectEqualSlices(u8, &(.{0} ** 16), guest[512..][0..16]);
+    try testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), guest[512..][0..16]);
 
     const anyway = try runner.call(testing.allocator, 0, "not json");
     try testing.expectEqualStrings("done", anyway.text);

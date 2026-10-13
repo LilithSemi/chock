@@ -195,9 +195,9 @@ pub fn addressIsReachable(address: Transport.Address) bool {
 }
 
 /// `64:ff9b::/96`, the NAT64 well-known prefix of RFC 6052 section 2.1.
-const nat64_well_known_prefix = [_]u8{ 0x00, 0x64, 0xff, 0x9b } ++ [_]u8{0} ** 8;
+const nat64_well_known_prefix = [_]u8{ 0x00, 0x64, 0xff, 0x9b } ++ @as([8]u8, @splat(0));
 
-const ec2_metadata_ip6 = [_]u8{ 0xfd, 0x00, 0x0e, 0xc2 } ++ [_]u8{0} ** 10 ++ [_]u8{ 0x02, 0x54 };
+const ec2_metadata_ip6 = [_]u8{ 0xfd, 0x00, 0x0e, 0xc2 } ++ @as([10]u8, @splat(0)) ++ [_]u8{ 0x02, 0x54 };
 
 fn ip4BytesAreReachable(bytes: [4]u8) bool {
     if (bytes[0] == 127) return false;
@@ -749,21 +749,21 @@ test "known limitation: a host under a build or eval top level domain shares a p
 
 test "a mirror set is named by its site and the hash of that site's list" {
     var buffer: [max_mirror_action_bytes]u8 = undefined;
-    const digest = "a" ** 64;
+    const digest = @as([64]u8, @splat('a'));
 
     try testing.expectEqualStrings(
         "nix.net.build.mirrors.gnu." ++ digest,
-        mirrorActionInto(&buffer, "gnu", digest).?,
+        mirrorActionInto(&buffer, "gnu", &digest).?,
     );
 
-    try testing.expect(mirrorActionInto(&buffer, "gnu.evil", digest) == null);
-    try testing.expect(mirrorActionInto(&buffer, "", digest) == null);
-    try testing.expect(mirrorActionInto(&buffer, "gnu", "a" ** 63) == null);
-    try testing.expect(mirrorActionInto(&buffer, "gnu", "A" ** 64) == null);
-    try testing.expect(mirrorActionInto(&buffer, "gnu", "z" ** 64) == null);
+    try testing.expect(mirrorActionInto(&buffer, "gnu.evil", &digest) == null);
+    try testing.expect(mirrorActionInto(&buffer, "", &digest) == null);
+    try testing.expect(mirrorActionInto(&buffer, "gnu", &@as([63]u8, @splat('a'))) == null);
+    try testing.expect(mirrorActionInto(&buffer, "gnu", &@as([64]u8, @splat('A'))) == null);
+    try testing.expect(mirrorActionInto(&buffer, "gnu", &@as([64]u8, @splat('z'))) == null);
 
     var small: [8]u8 = undefined;
-    try testing.expect(mirrorActionInto(&small, "gnu", digest) == null);
+    try testing.expect(mirrorActionInto(&small, "gnu", &digest) == null);
 }
 
 test "a host name becomes an action whose labels run the other way" {
@@ -967,8 +967,8 @@ test "a permitted name that resolves onto this machine is still refused" {
         .{ .ip4 = .{ .bytes = .{ 172, 16, 3, 4 }, .port = 0 } },
         .{ .ip4 = .{ .bytes = .{ 192, 168, 1, 20 }, .port = 0 } },
         .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } },
-        .{ .ip6 = .{ .bytes = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{1}, .port = 0 } },
-        .{ .ip6 = .{ .bytes = .{ 0xfd, 0x12, 0x34, 0x56, 0x78, 0x9a } ++ [_]u8{0} ** 9 ++ [_]u8{1}, .port = 0 } },
+        .{ .ip6 = .{ .bytes = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1}, .port = 0 } },
+        .{ .ip6 = .{ .bytes = .{ 0xfd, 0x12, 0x34, 0x56, 0x78, 0x9a } ++ @as([9]u8, @splat(0)) ++ [_]u8{1}, .port = 0 } },
         .{ .ip6 = .{ .bytes = nat64_well_known_prefix ++ [_]u8{ 93, 184, 216, 34 }, .port = 0 } },
         .{ .ip4 = .{ .bytes = .{ 100, 64, 0, 1 }, .port = 0 } },
         .{ .ip4 = .{ .bytes = .{ 100, 100, 100, 1 }, .port = 0 } },

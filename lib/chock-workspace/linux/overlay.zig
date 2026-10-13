@@ -256,7 +256,7 @@ fn deviceNumber(stx: linux.Statx) u64 {
 }
 
 fn statNoFollow(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?Diagnostic) Error!linux.Statx {
-    const path_z = allocator.dupeZ(u8, absolute_path) catch return error.OutOfMemory;
+    const path_z = allocator.dupeSentinel(u8, absolute_path, 0) catch return error.OutOfMemory;
     defer allocator.free(path_z);
 
     var stx: linux.Statx = undefined;
@@ -298,7 +298,7 @@ fn existsInProject(
 
 /// True if `absolute_path`, a known character device, is overlayfs's own whiteout.
 fn isWhiteout(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?Diagnostic) Error!bool {
-    const path_z = allocator.dupeZ(u8, absolute_path) catch return error.OutOfMemory;
+    const path_z = allocator.dupeSentinel(u8, absolute_path, 0) catch return error.OutOfMemory;
     defer allocator.free(path_z);
 
     var stx: linux.Statx = undefined;
@@ -316,7 +316,7 @@ fn isWhiteout(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?
 
 /// `userxattr` is required, or overlayfs keeps this bookkeeping in `trusted.overlay.*`, needing `CAP_SYS_ADMIN`.
 fn isOpaqueDir(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?Diagnostic) Error!bool {
-    const path_z = allocator.dupeZ(u8, absolute_path) catch return error.OutOfMemory;
+    const path_z = allocator.dupeSentinel(u8, absolute_path, 0) catch return error.OutOfMemory;
     defer allocator.free(path_z);
 
     var value: [1]u8 = undefined;
@@ -362,7 +362,7 @@ const sandbox = @import("chock-sandbox");
 
 fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
     var link_buffer: [64]u8 = undefined;
-    const link = std.fmt.bufPrintZ(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}) catch unreachable;
+    const link = std.fmt.bufPrintSentinel(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}, 0) catch unreachable;
     const rc = linux.readlink(link, buffer.ptr, buffer.len);
     if (linux.errno(rc) != .SUCCESS) return error.ReadlinkFailed;
     const len: usize = @intCast(rc);
@@ -419,7 +419,7 @@ fn readUpperFile(allocator: std.mem.Allocator, ov: Overlay, name: []const u8) ![
 fn allowScratchCleanup(allocator: std.mem.Allocator, ov: Overlay) void {
     const kernel_work_dir = std.fs.path.join(allocator, &.{ ov.work, "work" }) catch return;
     defer allocator.free(kernel_work_dir);
-    const path_z = allocator.dupeZ(u8, kernel_work_dir) catch return;
+    const path_z = allocator.dupeSentinel(u8, kernel_work_dir, 0) catch return;
     defer allocator.free(path_z);
     _ = linux.chmod(path_z.ptr, 0o700);
 }
@@ -434,7 +434,7 @@ fn xattrsSupported(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) bool {
     var file = std.Io.Dir.createFileAbsolute(std.testing.io, probe_path, .{}) catch return false;
     file.close(std.testing.io);
 
-    const path_z = allocator.dupeZ(u8, probe_path) catch return false;
+    const path_z = allocator.dupeSentinel(u8, probe_path, 0) catch return false;
     defer allocator.free(path_z);
     const rc = linux.setxattr(path_z.ptr, "user.chock_probe", "y", 1, 0);
     return linux.errno(rc) == .SUCCESS;
@@ -819,7 +819,7 @@ fn makeWhiteout(allocator: std.mem.Allocator, ov: Overlay, relative: []const u8)
     if (std.fs.path.dirname(file_path)) |parent| {
         try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
     }
-    const path_z = try allocator.dupeZ(u8, file_path);
+    const path_z = try allocator.dupeSentinel(u8, file_path, 0);
     defer allocator.free(path_z);
     const rc = linux.mknod(path_z.ptr, linux.S.IFCHR | 0o600, 0);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
@@ -1027,7 +1027,7 @@ test "a symbolic link the session made is carried as a link, and an executable f
 
     const script_path = try std.fs.path.join(allocator, &.{ ov.upper, "build.sh" });
     defer allocator.free(script_path);
-    const script_z = try allocator.dupeZ(u8, script_path);
+    const script_z = try allocator.dupeSentinel(u8, script_path, 0);
     defer allocator.free(script_z);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(script_z.ptr, 0o755)));
 
@@ -1050,7 +1050,7 @@ test "a symbolic link the session made is carried as a link, and an executable f
 
     const carried_script = try std.fs.path.join(allocator, &.{ destination, "files", "build.sh" });
     defer allocator.free(carried_script);
-    const carried_script_z = try allocator.dupeZ(u8, carried_script);
+    const carried_script_z = try allocator.dupeSentinel(u8, carried_script, 0);
     defer allocator.free(carried_script_z);
     var stx: linux.Statx = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(
@@ -1075,7 +1075,7 @@ test "a fifo the session made is named in the skipped file rather than dropped" 
 
     const fifo_path = try std.fs.path.join(allocator, &.{ ov.upper, "pipe" });
     defer allocator.free(fifo_path);
-    const fifo_z = try allocator.dupeZ(u8, fifo_path);
+    const fifo_z = try allocator.dupeSentinel(u8, fifo_path, 0);
     defer allocator.free(fifo_z);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknod(fifo_z.ptr, linux.S.IFIFO | 0o600, 0)));
 

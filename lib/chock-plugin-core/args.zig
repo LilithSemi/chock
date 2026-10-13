@@ -131,13 +131,14 @@ pub fn decode(
 
 fn decodeObject(comptime Args: type, cursor: *Cursor, gpa: std.mem.Allocator) DecodeError!Args {
     var out: Args = undefined;
-    inline for (@typeInfo(Args).@"struct".fields) |field| {
+    const args_info = @typeInfo(Args).@"struct";
+    inline for (args_info.field_names, args_info.field_types, args_info.field_attrs) |field_name, field_type, field_attrs| {
         if (try cursor.present()) {
-            @field(out, field.name) = try decodeValue(field.type, cursor, gpa);
-        } else if (field.defaultValue()) |fallback| {
-            @field(out, field.name) = fallback;
-        } else if (@typeInfo(field.type) == .optional) {
-            @field(out, field.name) = null;
+            @field(out, field_name) = try decodeValue(field_type, cursor, gpa);
+        } else if (field_attrs.defaultValue(field_type)) |fallback| {
+            @field(out, field_name) = fallback;
+        } else if (@typeInfo(field_type) == .optional) {
+            @field(out, field_name) = null;
         } else {
             return error.MissingField;
         }

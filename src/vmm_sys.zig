@@ -224,12 +224,12 @@ pub fn reap(pid: std.posix.pid_t, wait_for_it: bool) ?u8 {
         return codeFor(@bitCast(status));
     }
     const options: u32 = if (wait_for_it) 0 else linux.W.NOHANG;
-    var status: u32 = 0;
+    var status: i32 = 0;
     var rc = linux.wait4(pid, &status, options, null);
     while (linux.errno(rc) == .INTR) rc = linux.wait4(pid, &status, options, null);
     if (linux.errno(rc) != .SUCCESS) return 1;
     if (rc == 0) return null;
-    return codeFor(status);
+    return codeFor(@bitCast(status));
 }
 
 fn codeFor(status: u32) u8 {

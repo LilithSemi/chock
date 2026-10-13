@@ -316,7 +316,7 @@ pub fn read(seal: Seal, expect: Expectation, trust: Trust) Reading {
             // This checks the padded block the card signed, not the digest: the block holds the hash of the whole message, which is the same hash digestOf computes here.
             rsa.PKCS1v1_5Signature.verify(
                 rsa2048_modulus_len,
-                seal.signature[0..rsa2048_modulus_len].*,
+                seal.signature[0..rsa2048_modulus_len],
                 bytes,
                 public_key,
                 Sha256,
@@ -459,8 +459,8 @@ pub fn fromRecord(record: Record, held: *ReadBuffer) RecordError!Seal {
 const testing = std.testing;
 const software = @import("software.zig");
 
-const test_header = [_]u8{'a'} ** digest_hex_len;
-const test_head = [_]u8{'b'} ** digest_hex_len;
+const test_header = @as([digest_hex_len]u8, @splat('a'));
+const test_head = @as([digest_hex_len]u8, @splat('b'));
 
 fn testSigner(key: *software.Key) Signer {
     return .{ .ptr = key, .vtable = &test_signer_vtable };
@@ -482,7 +482,7 @@ fn testSignDigest(
     return out[0..signature_len];
 }
 
-const test_key = [_]u8{4} ++ [_]u8{7} ** 64;
+const test_key = [_]u8{4} ++ @as([64]u8, @splat(7));
 
 const test_signer_vtable = Signer.VTable{
     .publicKey = testPublicKey,
@@ -504,7 +504,7 @@ fn testRequest(level: Level) Request {
 }
 
 test "a signature over a chain head verifies with only the public key in the record" {
-    var key = try software.Key.fromSeed([_]u8{0x01} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x01)));
     var held_1 = Held{};
     const seal = try sign(testRequest(.software), testSigner(&key), &held_1);
 
@@ -516,7 +516,7 @@ test "a signature over a chain head verifies with only the public key in the rec
 }
 
 test "one changed byte anywhere in the signed fields breaks the signature" {
-    var key = try software.Key.fromSeed([_]u8{0x02} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x02)));
     var held_2 = Held{};
     const seal = try sign(testRequest(.software), testSigner(&key), &held_2);
     const expect = testExpectation();
@@ -549,7 +549,7 @@ test "one changed byte anywhere in the signed fields breaks the signature" {
 }
 
 test "the recorded level cannot be raised by editing the record" {
-    var key = try software.Key.fromSeed([_]u8{0x03} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x03)));
     var held_3 = Held{};
     const seal = try sign(testRequest(.software), testSigner(&key), &held_3);
     const expect = testExpectation();
@@ -570,7 +570,7 @@ test "the recorded level cannot be raised by editing the record" {
 }
 
 test "an attacker who re-signs with their own key cannot claim a card made it" {
-    var attacker = try software.Key.fromSeed([_]u8{0x04} ** 32);
+    var attacker = try software.Key.fromSeed(@as([32]u8, @splat(0x04)));
     var held_5 = Held{};
     var forged = try sign(testRequest(.card), testSigner(&attacker), &held_5);
     forged.level = .card_attested;
@@ -586,8 +586,8 @@ test "an attacker who re-signs with their own key cannot claim a card made it" {
 }
 
 test "a seal signed by one key does not verify under another key's seal" {
-    var mine = try software.Key.fromSeed([_]u8{0x05} ** 32);
-    var theirs = try software.Key.fromSeed([_]u8{0x06} ** 32);
+    var mine = try software.Key.fromSeed(@as([32]u8, @splat(0x05)));
+    var theirs = try software.Key.fromSeed(@as([32]u8, @splat(0x06)));
     var held_6 = Held{};
     const seal = try sign(testRequest(.software), testSigner(&mine), &held_6);
 
@@ -601,12 +601,12 @@ test "a seal signed by one key does not verify under another key's seal" {
 }
 
 test "a seal about another log is named as such, and the field that disagreed is named" {
-    var key = try software.Key.fromSeed([_]u8{0x07} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x07)));
     var held_7 = Held{};
     const seal = try sign(testRequest(.software), testSigner(&key), &held_7);
 
     var repaired = testExpectation();
-    const other_head = [_]u8{'c'} ** digest_hex_len;
+    const other_head = @as([digest_hex_len]u8, @splat('c'));
     repaired.head = &other_head;
     const reading = read(seal, repaired, .{ .now_sec = 0 });
     try testing.expectEqual(Verdict.head_mismatch, reading.verdict);
@@ -622,7 +622,7 @@ test "a seal about another log is named as such, and the field that disagreed is
     try testing.expectEqual(@as(?Field, .events), read(seal, grown, .{ .now_sec = 0 }).mismatched);
 
     var reheaded = testExpectation();
-    const other_header = [_]u8{'d'} ** digest_hex_len;
+    const other_header = @as([digest_hex_len]u8, @splat('d'));
     reheaded.header = &other_header;
     try testing.expectEqual(@as(?Field, .header), read(seal, reheaded, .{ .now_sec = 0 }).mismatched);
 }
@@ -636,9 +636,9 @@ test "the default reading is absent, and absent is never a pass" {
 }
 
 test "every verdict has its own sentence, and no sentence for an absent seal reads as a pass" {
-    var seen: [@typeInfo(Verdict).@"enum".fields.len][]const u8 = undefined;
-    inline for (@typeInfo(Verdict).@"enum".fields, 0..) |field, i| {
-        const text = (Reading{ .verdict = @enumFromInt(field.value) }).sentence();
+    var seen: [@typeInfo(Verdict).@"enum".field_names.len][]const u8 = undefined;
+    inline for (@typeInfo(Verdict).@"enum".field_names, @typeInfo(Verdict).@"enum".field_values, 0..) |_, field_value, i| {
+        const text = (Reading{ .verdict = @enumFromInt(field_value) }).sentence();
         try testing.expect(text.len != 0);
         for (seen[0..i]) |earlier| try testing.expect(!std.mem.eql(u8, earlier, text));
         seen[i] = text;
@@ -661,7 +661,7 @@ test "every verdict has its own sentence, and no sentence for an absent seal rea
 }
 
 test "signing refuses to record an attestation level with no attestation" {
-    var key = try software.Key.fromSeed([_]u8{0x08} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x08)));
     var held_8 = Held{};
     try testing.expectError(
         error.AttestationMissing,
@@ -703,21 +703,21 @@ test "a session that is empty or too long is refused rather than cut down" {
     var buffer: [max_canonical_len]u8 = undefined;
     try testing.expectError(error.SessionUnusable, canonical(seal, &buffer));
 
-    const long = [_]u8{'x'} ** (max_session_len + 1);
+    const long = @as([(max_session_len + 1)]u8, @splat('x'));
     seal.session = &long;
     try testing.expectError(error.SessionUnusable, canonical(seal, &buffer));
 }
 
 test "a digest of the wrong width or the wrong alphabet is refused" {
     try testing.expect(isDigest(&test_header));
-    try testing.expect(!isDigest("ABCDEF" ++ [_]u8{'a'} ** 58));
+    try testing.expect(!isDigest("ABCDEF" ++ @as([58]u8, @splat('a'))));
     try testing.expect(!isDigest("abc"));
-    try testing.expect(!isDigest(&[_]u8{'a'} ** 65));
+    try testing.expect(!isDigest(&@as([65]u8, @splat('a'))));
     try testing.expect(!isDigest(""));
 
     const seal = Seal{
         .session = "s",
-        .header = [_]u8{'Z'} ** digest_hex_len,
+        .header = @as([digest_hex_len]u8, @splat('Z')),
         .head = test_head,
         .events = 0,
         .level = .software,
@@ -729,10 +729,10 @@ test "a digest of the wrong width or the wrong alphabet is refused" {
 }
 
 test "a key that is not a point on the curve is malformed, never a bad signature" {
-    var key = try software.Key.fromSeed([_]u8{0x09} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x09)));
     var held_9 = Held{};
     var seal = try sign(testRequest(.software), testSigner(&key), &held_9);
-    const junk_key = [_]u8{0xff} ** public_key_len;
+    const junk_key = @as([public_key_len]u8, @splat(0xff));
     seal.key = &junk_key;
     try testing.expectEqual(
         Verdict.malformed,
@@ -752,7 +752,7 @@ test "a level compares by strength, and card_attested is the strongest" {
 }
 
 test "a seal survives the trip through its record with every field intact" {
-    var key = try software.Key.fromSeed([_]u8{0x0a} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x0a)));
     var held_10 = Held{};
     const seal = try sign(testRequest(.card), testSigner(&key), &held_10);
 
@@ -775,7 +775,7 @@ test "a seal survives the trip through its record with every field intact" {
 }
 
 test "a record with a field of the wrong width is refused rather than padded" {
-    var key = try software.Key.fromSeed([_]u8{0x0b} ** 32);
+    var key = try software.Key.fromSeed(@as([32]u8, @splat(0x0b)));
     var held_11 = Held{};
     const seal = try sign(testRequest(.software), testSigner(&key), &held_11);
     var buffer = Buffer{};
@@ -812,7 +812,7 @@ test "a record with a field of the wrong width is refused rather than padded" {
     try testing.expectError(error.SessionUnusable, fromRecord(no_session, &certs));
 
     var not_hex = record;
-    const junk = [_]u8{'z'} ** (public_key_len * 2);
+    const junk = @as([(public_key_len * 2)]u8, @splat('z'));
     not_hex.key = &junk;
     try testing.expectError(error.Malformed, fromRecord(not_hex, &certs));
 }
@@ -822,26 +822,26 @@ test {
 }
 
 test "an elliptic curve key and an RSA key cannot be read as one another" {
-    const ec = [_]u8{0x04} ++ [_]u8{0x11} ** 64;
+    const ec = [_]u8{0x04} ++ @as([64]u8, @splat(0x11));
     try testing.expectEqual(@as(?Scheme, .ecdsa_p256), schemeOf(&ec));
 
-    const rsa_key = [_]u8{ 0x81, 0x82, 0x01, 0x00 } ++ [_]u8{0xab} ** 256 ++
+    const rsa_key = [_]u8{ 0x81, 0x82, 0x01, 0x00 } ++ @as([256]u8, @splat(0xab)) ++
         [_]u8{ 0x82, 0x03, 0x01, 0x00, 0x01 };
     try testing.expectEqual(@as(?Scheme, .rsa2048), schemeOf(&rsa_key));
     const parts = rsaParts(&rsa_key).?;
     try testing.expectEqual(@as(usize, 256), parts.modulus.len);
     try testing.expectEqualSlices(u8, &.{ 0x01, 0x00, 0x01 }, parts.exponent);
 
-    const uncompressed_but_short = [_]u8{0x04} ++ [_]u8{0x11} ** 63;
+    const uncompressed_but_short = [_]u8{0x04} ++ @as([63]u8, @splat(0x11));
     try testing.expectEqual(@as(?Scheme, null), schemeOf(&uncompressed_but_short));
-    const compressed = [_]u8{0x02} ++ [_]u8{0x11} ** 64;
+    const compressed = [_]u8{0x02} ++ @as([64]u8, @splat(0x11));
     try testing.expectEqual(@as(?Scheme, null), schemeOf(&compressed));
     try testing.expectEqual(@as(?Scheme, null), schemeOf(""));
-    const small = [_]u8{ 0x81, 0x81, 0x80 } ++ [_]u8{0xab} ** 128 ++
+    const small = [_]u8{ 0x81, 0x81, 0x80 } ++ @as([128]u8, @splat(0xab)) ++
         [_]u8{ 0x82, 0x03, 0x01, 0x00, 0x01 };
     try testing.expectEqual(@as(?Scheme, null), schemeOf(&small));
     const swapped = [_]u8{ 0x82, 0x03, 0x01, 0x00, 0x01 } ++
-        [_]u8{ 0x81, 0x82, 0x01, 0x00 } ++ [_]u8{0xab} ** 256;
+        [_]u8{ 0x81, 0x82, 0x01, 0x00 } ++ @as([256]u8, @splat(0xab));
     try testing.expectEqual(@as(?Scheme, null), schemeOf(&swapped));
     const trailing = rsa_key ++ [_]u8{ 0x83, 0x01, 0x00 };
     try testing.expectEqual(@as(?Scheme, null), schemeOf(&trailing));

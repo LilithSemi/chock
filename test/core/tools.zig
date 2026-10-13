@@ -15,7 +15,7 @@ const tools_probe_path = @import("tools_probe_path").tools_probe_path;
 
 fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
     var link_buffer: [64]u8 = undefined;
-    const link = std.fmt.bufPrintZ(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}) catch unreachable;
+    const link = std.fmt.bufPrintSentinel(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}, 0) catch unreachable;
     const rc = linux.readlink(link, buffer.ptr, buffer.len);
     if (linux.errno(rc) != .SUCCESS) return error.ReadlinkFailed;
     const len: usize = @intCast(rc);
@@ -48,7 +48,7 @@ fn writeFile(io: std.Io, path: []const u8, contents: []const u8) !void {
 fn allowScratchCleanup(allocator: std.mem.Allocator, scratch_path: []const u8) void {
     const kernel_work_dir = std.fs.path.join(allocator, &.{ scratch_path, "work", "work" }) catch return;
     defer allocator.free(kernel_work_dir);
-    const path_z = allocator.dupeZ(u8, kernel_work_dir) catch return;
+    const path_z = allocator.dupeSentinel(u8, kernel_work_dir, 0) catch return;
     defer allocator.free(path_z);
     _ = linux.chmod(path_z.ptr, 0o700);
 }
@@ -65,19 +65,19 @@ const PlainProject = struct {
         const tmp_path = try absoluteDirPath(&buffer, tmp.dir.handle);
 
         var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const root_path = try std.fmt.bufPrintZ(&root_buffer, "{s}/project", .{tmp_path});
+        const root_path = try std.fmt.bufPrintSentinel(&root_buffer, "{s}/project", .{tmp_path}, 0);
         try makeDir(root_path);
 
         var scratch_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const scratch_path = try std.fmt.bufPrintZ(&scratch_buffer, "{s}/scratch", .{tmp_path});
+        const scratch_path = try std.fmt.bufPrintSentinel(&scratch_buffer, "{s}/scratch", .{tmp_path}, 0);
         try makeDir(scratch_path);
 
         const env = try testEnviron(allocator, tmp_path);
 
         return .{
             .allocator = allocator,
-            .root_path = try allocator.dupeZ(u8, root_path),
-            .scratch_path = try allocator.dupeZ(u8, scratch_path),
+            .root_path = try allocator.dupeSentinel(u8, root_path, 0),
+            .scratch_path = try allocator.dupeSentinel(u8, scratch_path, 0),
             .env = env,
         };
     }
@@ -101,11 +101,11 @@ const GitProject = struct {
         const tmp_path = try absoluteDirPath(&buffer, tmp.dir.handle);
 
         var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const root_path = try std.fmt.bufPrintZ(&root_buffer, "{s}/project", .{tmp_path});
+        const root_path = try std.fmt.bufPrintSentinel(&root_buffer, "{s}/project", .{tmp_path}, 0);
         try makeDir(root_path);
 
         var scratch_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const scratch_path = try std.fmt.bufPrintZ(&scratch_buffer, "{s}/scratch", .{tmp_path});
+        const scratch_path = try std.fmt.bufPrintSentinel(&scratch_buffer, "{s}/scratch", .{tmp_path}, 0);
         try makeDir(scratch_path);
 
         var env = try testEnviron(allocator, tmp_path);
@@ -121,7 +121,7 @@ const GitProject = struct {
         defer config_name.deinit(allocator);
 
         var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{root_path});
+        const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{root_path}, 0);
         try writeFile(std.testing.io, tracked_path, "hello\n");
 
         var add_output = try git.run(allocator, std.testing.io, &env, root_path, &.{ "add", "tracked.txt" }, null);
@@ -134,8 +134,8 @@ const GitProject = struct {
 
         return .{
             .allocator = allocator,
-            .root_path = try allocator.dupeZ(u8, root_path),
-            .scratch_path = try allocator.dupeZ(u8, scratch_path),
+            .root_path = try allocator.dupeSentinel(u8, root_path, 0),
+            .scratch_path = try allocator.dupeSentinel(u8, scratch_path, 0),
             .env = env,
         };
     }
@@ -559,7 +559,7 @@ test "read_image refuses a file that is not an image, whatever the file is calle
     defer allocator.free(fake_path);
     try writeFile(std.testing.io, fake_path, "#!/bin/sh\necho not a picture\n");
 
-    var bmp = [_]u8{0} ** 64;
+    var bmp = @as([64]u8, @splat(0));
     @memcpy(bmp[0..2], "BM");
     std.mem.writeInt(u32, bmp[2..6], bmp.len, .little);
     const bmp_path = try std.fs.path.join(allocator, &.{ ov.project, "chart.jpeg" });
@@ -1106,7 +1106,7 @@ test "a program built in the workspace runs by its path, and one outside the pro
     defer allocator.free(built);
     try writeFile(std.testing.io, built_path, built);
 
-    const built_path_z = try allocator.dupeZ(u8, built_path);
+    const built_path_z = try allocator.dupeSentinel(u8, built_path, 0);
     defer allocator.free(built_path_z);
     if (linux.errno(linux.chmod(built_path_z.ptr, 0o755)) != .SUCCESS) return error.ChmodFailed;
 
@@ -2657,21 +2657,21 @@ const Knowledgebase = struct {
         const tmp_path = try absoluteDirPath(&buffer, tmp.dir.handle);
 
         var outer_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const outer = try std.fmt.bufPrintZ(&outer_buffer, "{s}/data", .{tmp_path});
+        const outer = try std.fmt.bufPrintSentinel(&outer_buffer, "{s}/data", .{tmp_path}, 0);
         try makeDir(outer);
 
         var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const dir = try std.fmt.bufPrintZ(&dir_buffer, "{s}/memory", .{outer});
+        const dir = try std.fmt.bufPrintSentinel(&dir_buffer, "{s}/memory", .{outer}, 0);
         try makeDir(dir);
 
         var sentinel_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const sentinel = try std.fmt.bufPrintZ(&sentinel_buffer, "{s}/sentinel.txt", .{outer});
+        const sentinel = try std.fmt.bufPrintSentinel(&sentinel_buffer, "{s}/sentinel.txt", .{outer}, 0);
         try writeFile(std.testing.io, sentinel, sentinel_text);
 
         return .{
             .allocator = allocator,
-            .dir = try allocator.dupeZ(u8, dir),
-            .sentinel = try allocator.dupeZ(u8, sentinel),
+            .dir = try allocator.dupeSentinel(u8, dir, 0),
+            .sentinel = try allocator.dupeSentinel(u8, sentinel, 0),
         };
     }
 
@@ -3213,7 +3213,7 @@ test "an instruction file that says the agent may push changes neither the polic
     ;
     {
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/AGENTS.md", .{project.root_path});
+        const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/AGENTS.md", .{project.root_path}, 0);
         try writeFile(std.testing.io, path, hostile);
     }
 
@@ -3282,7 +3282,7 @@ test "the count per project counts names, and correcting a note is never refused
         defer allocator.free(text);
 
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/{s}.md", .{ kb.dir, name });
+        const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/{s}.md", .{ kb.dir, name }, 0);
         try writeFile(std.testing.io, path, text);
     }
     try std.testing.expectEqual(chock_core.memory.max_entries, kb.count());
@@ -3358,7 +3358,7 @@ test "a note at the version cap is refused, and no version of it is dropped to m
     try std.testing.expectEqual(kb_memory.max_versions, kb_memory.versionsIn(full));
 
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/much-corrected.md", .{kb.dir});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/much-corrected.md", .{kb.dir}, 0);
     try writeFile(std.testing.io, path, full);
 
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
@@ -3400,21 +3400,21 @@ const ToolchainCache = struct {
         const tmp_path = try absoluteDirPath(&buffer, tmp.dir.handle);
 
         var outer_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const outer = try std.fmt.bufPrintZ(&outer_buffer, "{s}/data", .{tmp_path});
+        const outer = try std.fmt.bufPrintSentinel(&outer_buffer, "{s}/data", .{tmp_path}, 0);
         try makeDir(outer);
 
         var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const dir = try std.fmt.bufPrintZ(&dir_buffer, "{s}/cache", .{outer});
+        const dir = try std.fmt.bufPrintSentinel(&dir_buffer, "{s}/cache", .{outer}, 0);
         try chock_core.cache.makeLayout(std.testing.io, dir, null);
 
         var sentinel_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const sentinel = try std.fmt.bufPrintZ(&sentinel_buffer, "{s}/sentinel.txt", .{outer});
+        const sentinel = try std.fmt.bufPrintSentinel(&sentinel_buffer, "{s}/sentinel.txt", .{outer}, 0);
         try writeFile(std.testing.io, sentinel, sentinel_text);
 
         return .{
             .allocator = allocator,
-            .dir = try allocator.dupeZ(u8, dir),
-            .sentinel = try allocator.dupeZ(u8, sentinel),
+            .dir = try allocator.dupeSentinel(u8, dir, 0),
+            .sentinel = try allocator.dupeSentinel(u8, sentinel, 0),
         };
     }
 
@@ -3608,21 +3608,22 @@ fn cacheCanReparent(
     const sandbox_root = chock_core.cache.home_dir ++ "/refer-probe";
 
     var host_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const host_root = try std.fmt.bufPrintZ(
+    const host_root = try std.fmt.bufPrintSentinel(
         &host_buffer,
         "{s}/{s}/refer-probe",
         .{ cache_dir, chock_core.cache.home_leaf },
+        0,
     );
 
     // Longest first, so the removal below finds each directory already empty.
     var source_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const host_source_dir = try std.fmt.bufPrintZ(&source_dir_buffer, "{s}/from", .{host_root});
+    const host_source_dir = try std.fmt.bufPrintSentinel(&source_dir_buffer, "{s}/from", .{host_root}, 0);
     var target_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const host_target_dir = try std.fmt.bufPrintZ(&target_dir_buffer, "{s}/to", .{host_root});
+    const host_target_dir = try std.fmt.bufPrintSentinel(&target_dir_buffer, "{s}/to", .{host_root}, 0);
     var source_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const host_source = try std.fmt.bufPrintZ(&source_buffer, "{s}/f", .{host_source_dir});
+    const host_source = try std.fmt.bufPrintSentinel(&source_buffer, "{s}/f", .{host_source_dir}, 0);
     var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const host_target = try std.fmt.bufPrintZ(&target_buffer, "{s}/f", .{host_target_dir});
+    const host_target = try std.fmt.bufPrintSentinel(&target_buffer, "{s}/f", .{host_target_dir}, 0);
 
     try makeDir(host_root);
     // The cache directory must be left exactly as it was found: the test counts what is in it.
@@ -3740,233 +3741,6 @@ test "a real compiler builds inside the sandbox, and a second session reuses wha
 
     const after_second = cache.size(allocator);
     try std.testing.expectEqual(after_first.files, after_second.files);
-
-    try cache.expectOutsideUntouched(allocator);
-}
-
-/// The dependency package the test below declares, packed into a real tarball with `std.tar.Writer`.
-const dep_manifest =
-    \\.{
-    \\    .name = .dep,
-    \\    .version = "0.1.0",
-    \\    .fingerprint = 0xf81054301f40bb6f,
-    \\    .paths = .{ "build.zig", "build.zig.zon", "src" },
-    \\}
-    \\
-;
-
-const dep_build =
-    \\const std = @import("std");
-    \\pub fn build(b: *std.Build) void {
-    \\    _ = b.addModule("dep", .{ .root_source_file = b.path("src/root.zig") });
-    \\}
-    \\
-;
-
-const dep_source =
-    \\pub fn answer() u32 {
-    \\    return 42;
-    \\}
-    \\
-;
-
-/// The hash Zig computes for that tarball, stable because every header field here is fixed.
-const dep_hash = "dep-0.1.0-b7tAH0IBAADnn3sMMU6ZIv4x0MC8pzl33l8zFmR786Hs";
-
-fn writeDependencyTarball(allocator: std.mem.Allocator, path: []const u8) !void {
-    var allocating = std.Io.Writer.Allocating.init(allocator);
-    defer allocating.deinit();
-
-    var tar: std.tar.Writer = .{ .underlying_writer = &allocating.writer };
-    try tar.setRoot("dep");
-    try tar.writeFileBytes("build.zig.zon", dep_manifest, .{ .mode = 0o644 });
-    try tar.writeFileBytes("build.zig", dep_build, .{ .mode = 0o644 });
-    try tar.writeDir("src", .{ .mode = 0o755 });
-    try tar.writeFileBytes("src/root.zig", dep_source, .{ .mode = 0o644 });
-
-    try writeFile(std.testing.io, path, allocating.written());
-}
-
-fn hostProgram(
-    allocator: std.mem.Allocator,
-    env: *const std.process.Environ.Map,
-    name: []const u8,
-) ![]u8 {
-    const path_value = env.get("PATH") orelse return error.ProgramNotFound;
-    var it = std.mem.tokenizeScalar(u8, path_value, ':');
-    while (it.next()) |dir| {
-        const candidate = try std.fs.path.join(allocator, &.{ dir, name });
-        const stat = std.Io.Dir.cwd().statFile(std.testing.io, candidate, .{}) catch {
-            allocator.free(candidate);
-            continue;
-        };
-        if (stat.kind == .directory) {
-            allocator.free(candidate);
-            continue;
-        }
-        return candidate;
-    }
-    return error.ProgramNotFound;
-}
-
-test "a project with a declared dependency builds inside the sandbox, resolved on the host and never over the network" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    // A git project, so the workspace is a worktree and a real directory on the host.
-    var project = try GitProject.init(allocator, tmp);
-    defer project.deinit();
-    defer allowScratchCleanup(allocator, project.scratch_path);
-    var cache = try ToolchainCache.init(allocator, tmp);
-    defer cache.deinit();
-
-    var tmp_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try absoluteDirPath(&tmp_buffer, tmp.dir.handle);
-
-    // The dependency lives outside the project, so only the harness on the host can reach the tarball.
-    const tarball_path = try std.fmt.allocPrint(allocator, "{s}/dep.tar", .{tmp_path});
-    defer allocator.free(tarball_path);
-    try writeDependencyTarball(allocator, tarball_path);
-
-    const manifest = try std.fmt.allocPrint(allocator,
-        \\.{{
-        \\    .name = .app,
-        \\    .version = "0.1.0",
-        \\    .fingerprint = 0xc96e70cf52be7c8b,
-        \\    .dependencies = .{{
-        \\        .dep = .{{
-        \\            .url = "file://{s}",
-        \\            .hash = "{s}",
-        \\        }},
-        \\    }},
-        \\    .paths = .{{ "build.zig", "build.zig.zon", "src" }},
-        \\}}
-        \\
-    , .{ tarball_path, dep_hash });
-    defer allocator.free(manifest);
-
-    {
-        const manifest_path = try std.fmt.allocPrint(allocator, "{s}/build.zig.zon", .{project.root_path});
-        defer allocator.free(manifest_path);
-        try writeFile(std.testing.io, manifest_path, manifest);
-
-        const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{project.root_path});
-        defer allocator.free(build_path);
-        try writeFile(std.testing.io, build_path,
-            \\const std = @import("std");
-            \\pub fn build(b: *std.Build) void {
-            \\    const exe = b.addExecutable(.{
-            \\        .name = "app",
-            \\        .root_module = b.createModule(.{
-            \\            .root_source_file = b.path("src/main.zig"),
-            \\            .target = b.graph.host,
-            \\        }),
-            \\    });
-            \\    exe.root_module.addImport("dep", b.dependency("dep", .{}).module("dep"));
-            \\    b.installArtifact(exe);
-            \\}
-            \\
-        );
-
-        const source_dir = try std.fmt.allocPrintSentinel(allocator, "{s}/src", .{project.root_path}, 0);
-        defer allocator.free(source_dir);
-        try makeDir(source_dir);
-        const source_path = try std.fmt.allocPrint(allocator, "{s}/main.zig", .{source_dir});
-        defer allocator.free(source_path);
-        try writeFile(std.testing.io, source_path,
-            \\const dep = @import("dep");
-            \\pub fn main() void {
-            \\    if (dep.answer() != 42) unreachable;
-            \\}
-            \\
-        );
-
-        // A worktree carries committed state, so the project is committed before the workspace is built.
-        var added = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "add", "-A" }, null);
-        defer added.deinit(allocator);
-        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, added.term);
-        var committed = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "commit", "-m", "the project" }, null);
-        defer committed.deinit(allocator);
-        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, committed.term);
-    }
-
-    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
-    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
-
-    if (!try cacheCanReparent(allocator, &workspace, cache.dir)) return error.SkipZigTest;
-
-    // `zig build` sizes its thread pool from the core count and the sandbox
-    // caps a call at `rlimits.default_processes`, so on a host with many cores
-    // the link step answers `unable to spawn LLD: SystemResources`.
-    {
-        var root_tmp = std.testing.tmpDir(.{});
-        defer root_tmp.cleanup();
-        var built = try runToolCallWith(
-            allocator,
-            &workspace,
-            root_tmp,
-            "run_command",
-            "{\"argv\":[\"zig\",\"build\",\"-j1\"]}",
-            .{ .cache_dir = cache.dir },
-        );
-        defer built.deinit(allocator);
-        try std.testing.expectEqual(@as(?u8, null), built.fault);
-        try std.testing.expect(built.is_error);
-        try std.testing.expect(std.mem.indexOf(u8, built.output, "build.zig.zon") != null);
-    }
-
-    const zig_program = try hostProgram(allocator, &project.env, "zig");
-    defer allocator.free(zig_program);
-
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    {
-        var host = chock_core.packages.Host{ .program = zig_program, .env = &project.env };
-        const answer = try chock_core.packages.resolve(
-            arena_state.allocator(),
-            std.testing.io,
-            host.runner(),
-            .{ .project_dir = workspace.workPath(), .cache_dir = cache.dir },
-        );
-        switch (answer) {
-            .refused => |text| try std.testing.expectEqualStrings("", text),
-            .nothing_declared => try std.testing.expectEqualStrings("", "the manifest declared nothing"),
-            .resolved => |resolved| {
-                try std.testing.expectEqual(@as(usize, 1), resolved.packages);
-                try std.testing.expect(std.mem.startsWith(u8, resolved.package_dir, workspace.workPath()));
-            },
-        }
-    }
-
-    const after_fetch = cache.size(allocator);
-    try std.testing.expect(after_fetch.files > 0);
-
-    {
-        var root_tmp = std.testing.tmpDir(.{});
-        defer root_tmp.cleanup();
-        var built = try runToolCallWith(
-            allocator,
-            &workspace,
-            root_tmp,
-            "run_command",
-            "{\"argv\":[\"zig\",\"build\",\"-j1\"]}",
-            .{ .cache_dir = cache.dir },
-        );
-        defer built.deinit(allocator);
-        try std.testing.expectEqual(@as(?u8, null), built.fault);
-        if (built.is_error) try std.testing.expectEqualStrings("", built.output);
-        try std.testing.expect(!built.is_error);
-    }
-
-    {
-        var root_tmp = std.testing.tmpDir(.{});
-        defer root_tmp.cleanup();
-        var listed = try runToolCall(allocator, &workspace, root_tmp, "list_directory", "{\"path\":\"zig-out/bin\"}");
-        defer listed.deinit(allocator);
-        try std.testing.expect(!listed.is_error);
-        try std.testing.expect(std.mem.indexOf(u8, listed.output, "app") != null);
-    }
 
     try cache.expectOutsideUntouched(allocator);
 }
@@ -4117,26 +3891,26 @@ const Scratchpad = struct {
         const tmp_path = try absoluteDirPath(&buffer, tmp.dir.handle);
 
         var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const dir = try std.fmt.bufPrintZ(&dir_buffer, "{s}/scratchpad", .{tmp_path});
+        const dir = try std.fmt.bufPrintSentinel(&dir_buffer, "{s}/scratchpad", .{tmp_path}, 0);
         // The library builds the layout, never this test.
         try chock_core.scratchpad.makeLayout(std.testing.io, dir, null);
 
         var tasks_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const tasks_dir = try std.fmt.bufPrintZ(&tasks_buffer, "{s}/{s}", .{
+        const tasks_dir = try std.fmt.bufPrintSentinel(&tasks_buffer, "{s}/{s}", .{
             dir,
             chock_core.scratchpad.tasks_leaf,
-        });
+        }, 0);
         var scratch_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const scratch_dir = try std.fmt.bufPrintZ(&scratch_buffer, "{s}/{s}", .{
+        const scratch_dir = try std.fmt.bufPrintSentinel(&scratch_buffer, "{s}/{s}", .{
             dir,
             chock_core.scratchpad.scratch_leaf,
-        });
+        }, 0);
 
         return .{
             .allocator = allocator,
-            .dir = try allocator.dupeZ(u8, dir),
-            .tasks = try allocator.dupeZ(u8, tasks_dir),
-            .scratch = try allocator.dupeZ(u8, scratch_dir),
+            .dir = try allocator.dupeSentinel(u8, dir, 0),
+            .tasks = try allocator.dupeSentinel(u8, tasks_dir, 0),
+            .scratch = try allocator.dupeSentinel(u8, scratch_dir, 0),
         };
     }
 

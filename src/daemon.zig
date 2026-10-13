@@ -191,7 +191,7 @@ const Daemon = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.sessions.items) |entry| {
-            if (std.mem.eql(u8, &entry.id, id)) return try self.gpa.dupeZ(u8, entry.log_path);
+            if (std.mem.eql(u8, &entry.id, id)) return try self.gpa.dupeSentinel(u8, entry.log_path, 0);
         }
         return null;
     }
@@ -635,7 +635,7 @@ fn beginSession(
     };
     defer paths.deinit();
 
-    const log_path = daemon.gpa.dupeZ(u8, paths.log) catch {
+    const log_path = daemon.gpa.dupeSentinel(u8, paths.log, 0) catch {
         fail(writer, "out of memory");
         return;
     };
@@ -1783,7 +1783,7 @@ test "adopt refuses a session it may not take, and starts nothing when it does" 
     defer daemon.deinit();
 
     const project = "/some/project";
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     var answer_buffer: [4096]u8 = undefined;
 
     {
@@ -1867,7 +1867,7 @@ test "a listing over the wire says what the local fold says" {
     defer daemon.deinit();
 
     const project = "/some/project";
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
 
     var paths = try session_paths.pathsFor(gpa, &env, project, id);
     defer paths.deinit();
@@ -1967,7 +1967,7 @@ test "answering a session that is not listening is a refusal and never a silent 
     var daemon = Daemon{ .gpa = gpa, .io = io, .exe_path = "/nowhere/chock", .env = &env };
     defer daemon.deinit();
 
-    const id = "01JQ" ++ "A" ** 22;
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
     var answer_buffer: [4096]u8 = undefined;
 
     const got = probeRequest(
@@ -2007,7 +2007,7 @@ test "read serves only a session this daemon started, and never a path a client 
         &daemon,
         arena_state.allocator(),
         &answer_buffer,
-        "read 01JQ" ++ "A" ** 22 ++ " 0",
+        "read 01JQ" ++ @as([22]u8, @splat('A')) ++ " 0",
     );
     try testing.expect(std.mem.indexOf(u8, got.answer, "did not start a session") != null);
 
@@ -2018,12 +2018,12 @@ test "read serves only a session this daemon started, and never a path a client 
 test "the sandbox block holds no pointer into the file it was read from" {
     const gpa = testing.allocator;
 
-    const source = try gpa.dupeZ(u8,
+    const source = try gpa.dupeSentinel(u8,
         \\.{
         \\    .providers = .{ .anthropic = .{ .token = "sk-not-a-real-one" } },
         \\    .sandbox = .{ .driver = "microvm", .kernel = "/opt/chock/Image", .initrd = "/opt/chock/initrd" },
         \\}
-    );
+    , 0);
     defer gpa.free(source);
 
     var block = try chock_policy.sandbox.parse(gpa, source, null);

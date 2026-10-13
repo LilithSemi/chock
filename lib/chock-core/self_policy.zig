@@ -41,10 +41,10 @@ test "every ceiling the wire carries reads back as the decision of the same name
     const wire = [_]event.PolicyCeiling{ .deny, .agent_then_human, .ask, .agent_review, .allow };
     const want = [_]chock_policy.table.Decision{ .deny, .agent_then_human, .ask, .agent_review, .allow };
     try testing.expectEqual(
-        @typeInfo(chock_policy.table.Decision).@"enum".fields.len,
+        @typeInfo(chock_policy.table.Decision).@"enum".field_names.len,
         wire.len,
     );
-    try testing.expectEqual(wire.len + 1, @typeInfo(event.PolicyCeiling).@"union".fields.len);
+    try testing.expectEqual(wire.len + 1, @typeInfo(event.PolicyCeiling).@"union".field_names.len);
 
     var restrictions: [wire.len]event.SelfRestriction = undefined;
     for (wire, &restrictions) |ceiling, *slot| {

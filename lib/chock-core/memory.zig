@@ -553,7 +553,7 @@ test "a name is a plain name, so there is no path to leave the directory through
     try testing.expectError(error.BadName, checkName("a.b"));
     try testing.expectError(error.BadName, checkName("-rf"));
     try testing.expectError(error.BadName, checkName("Upper"));
-    try testing.expectError(error.BadName, checkName("a" ** (max_name_bytes + 1)));
+    try testing.expectError(error.BadName, checkName(&@as([(max_name_bytes + 1)]u8, @splat('a'))));
 }
 
 test "an entry a person edited by hand is still readable, and an unknown kind is not fatal" {

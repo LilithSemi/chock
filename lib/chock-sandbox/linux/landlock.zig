@@ -118,7 +118,7 @@ fn restrictSelfSucceeds(abi: i32) ?bool {
     }
     _ = linux.close(fds[0]);
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
 
@@ -308,7 +308,7 @@ pub const Ruleset = struct {
         diag: ?*?Diagnostic,
     ) RulesetError!void {
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path_z = std.fmt.bufPrintZ(&buffer, "{s}", .{path}) catch return error.PathTooLong;
+        const path_z = std.fmt.bufPrintSentinel(&buffer, "{s}", .{path}, 0) catch return error.PathTooLong;
 
         const dir_fd = linux.open(path_z, .{ .PATH = true, .CLOEXEC = true }, 0);
         switch (linux.errno(dir_fd)) {

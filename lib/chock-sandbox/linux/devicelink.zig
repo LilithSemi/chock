@@ -262,7 +262,7 @@ test "a message of the wrong length is refused outright" {
     defer _ = linux.close(pair[0]);
     defer _ = linux.close(pair[1]);
 
-    const short = [_]u8{0} ** 8;
+    const short = @as([8]u8, @splat(0));
     const rc = linux.sendto(pair[0], &short, short.len, linux.MSG.NOSIGNAL, null, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
 
@@ -362,11 +362,11 @@ test "sendPlace and sendDrop refuse a path they could not put in a message" {
     defer _ = linux.close(pair[1]);
 
     try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, "", "/dev/chock-widget0"));
-    try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, "a" ** (max_path_bytes + 1), "/dev/chock-widget0"));
+    try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, &@as([(max_path_bytes + 1)]u8, @splat('a')), "/dev/chock-widget0"));
     try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, "bus/usb/001/005", ""));
-    try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, "bus/usb/001/005", "a" ** (max_path_bytes + 1)));
+    try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, "bus/usb/001/005", &@as([(max_path_bytes + 1)]u8, @splat('a'))));
     try testing.expectError(error.PathUnusable, sendDrop(pair[0], ""));
-    try testing.expectError(error.PathUnusable, sendDrop(pair[0], "a" ** (max_path_bytes + 1)));
+    try testing.expectError(error.PathUnusable, sendDrop(pair[0], &@as([(max_path_bytes + 1)]u8, @splat('a'))));
 }
 
 test "a channel that has gone answers PeerGone rather than waiting" {

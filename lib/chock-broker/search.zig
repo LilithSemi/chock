@@ -1212,7 +1212,7 @@ test "a result count over the bound is cut" {
 
 test "a snippet over the bound is cut with the cut marked" {
     const gpa = testing.allocator;
-    const long_snippet = "a" ** (max_snippet_bytes + 50);
+    const long_snippet = @as([(max_snippet_bytes + 50)]u8, @splat('a'));
     const body = try std.fmt.allocPrint(
         gpa,
         "{{\"results\":[{{\"title\":\"t\",\"url\":\"https://example.org\",\"content\":\"{s}\"}}]}}",
@@ -1225,8 +1225,8 @@ test "a snippet over the bound is cut with the cut marked" {
 
     try testing.expect(!answer.is_error);
     try testing.expect(std.mem.indexOf(u8, answer.text, "[chock: cut]") != null);
-    try testing.expect(std.mem.indexOf(u8, answer.text, "a" ** max_snippet_bytes) != null);
-    try testing.expect(std.mem.indexOf(u8, answer.text, "a" ** (max_snippet_bytes + 1)) == null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, &@as([max_snippet_bytes]u8, @splat('a'))) != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, &@as([(max_snippet_bytes + 1)]u8, @splat('a'))) == null);
 }
 
 test "an escape sequence in a title does not survive into the text" {
@@ -1340,9 +1340,9 @@ test "Brave 429 and 422 each refuse with their own distinct message" {
 
 test "a query over 75 words is refused with no request made" {
     const gpa = testing.allocator;
-    const long_query = "w " ** 80;
+    const long_query = repeated("w ", 80);
 
-    const answer = try searchBrave(gpa, testing.io, "https://api.search.brave.com", long_query, "secret", testClean);
+    const answer = try searchBrave(gpa, testing.io, "https://api.search.brave.com", &long_query, "secret", testClean);
     defer gpa.free(answer.text);
 
     try testing.expect(answer.is_error);
@@ -1915,4 +1915,14 @@ test "the [chock: ...] prefix marking a stranger's text is present on an Exa ans
 
     // Tells the model these are a stranger's words, not an instruction; every vendor's answer carries it.
     try testing.expect(std.mem.startsWith(u8, answer.text, "[chock:"));
+}
+
+/// `piece` laid end to end `times` over, at comptime.
+///
+/// Zig 0.17 took the `**` operator away and `@splat` fills an array with ONE
+/// element, so a repeated phrase has no operator of its own any more.
+fn repeated(comptime piece: []const u8, comptime times: usize) [piece.len * times]u8 {
+    var out: [piece.len * times]u8 = undefined;
+    for (0..times) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
+    return out;
 }

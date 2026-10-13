@@ -323,7 +323,7 @@ test "the plan folds the middle, protects the head, and names the tail in kept_r
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
 
-    const many = [_]event.Role{.user} ** 10;
+    const many = @as([10]event.Role, @splat(.user));
     var session = try sessionOf(allocator, &many);
     defer session.deinit();
 
@@ -360,7 +360,7 @@ test "a context with nothing worth folding plans nothing, rather than folding in
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
 
-    const four = [_]event.Role{.user} ** 4;
+    const four = @as([4]event.Role, @splat(.user));
     var session = try sessionOf(allocator, &four);
     defer session.deinit();
 
@@ -380,13 +380,13 @@ test "a tail of huge turns is cut by its bytes, so a compaction really does make
     var session = state.Session.init(allocator);
     defer session.deinit();
 
-    const huge = "H" ** 40_000;
+    const huge = @as([40_000]u8, @splat('H'));
     try session.apply(.{ .id = 1, .session = "01S", .time_ms = 1, .event = .{
         .message = .{ .role = .user, .content = &.{.{ .text = "TASK" }} },
     } });
     for (2..11) |id| {
         try session.apply(.{ .id = id, .session = "01S", .time_ms = 1, .event = .{
-            .message = .{ .role = .assistant, .content = &.{.{ .text = huge }} },
+            .message = .{ .role = .assistant, .content = &.{.{ .text = &huge }} },
         } });
     }
 
@@ -415,7 +415,7 @@ test "a policy that keeps no recent entries at all still plans without reading p
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
 
-    const five = [_]event.Role{.user} ** 5;
+    const five = @as([5]event.Role, @splat(.user));
     var session = try sessionOf(allocator, &five);
     defer session.deinit();
 
@@ -431,7 +431,7 @@ test "a second plan over a context that already holds a summary keeps its kept r
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const many = [_]event.Role{.user} ** 10;
+    const many = @as([10]event.Role, @splat(.user));
     var session = try sessionOf(allocator, &many);
     defer session.deinit();
 
@@ -479,7 +479,7 @@ test "a transcript holds each turn once and cuts one huge part rather than the w
     var session = state.Session.init(allocator);
     defer session.deinit();
 
-    const big = "B" ** 8000;
+    const big = @as([8000]u8, @splat('B'));
     try session.apply(.{ .id = 1, .session = "01S", .time_ms = 1, .event = .{
         .message = .{ .role = .assistant, .content = &.{
             .{ .text = "reading the file" },
@@ -488,7 +488,7 @@ test "a transcript holds each turn once and cuts one huge part rather than the w
     } });
     try session.apply(.{ .id = 2, .session = "01S", .time_ms = 2, .event = .{
         .message = .{ .role = .tool, .content = &.{
-            .{ .tool_result = .{ .call_id = "c1", .output = big, .is_error = false } },
+            .{ .tool_result = .{ .call_id = "c1", .output = &big, .is_error = false } },
         } },
     } });
 
@@ -513,7 +513,7 @@ test "a transcript larger than the budget keeps its end and says the front is mi
     } });
     for (2..40) |i| {
         try session.apply(.{ .id = i, .session = "01S", .time_ms = 1, .event = .{
-            .message = .{ .role = .assistant, .content = &.{.{ .text = "M" ** 200 }} },
+            .message = .{ .role = .assistant, .content = &.{.{ .text = &@as([200]u8, @splat('M')) }} },
         } });
     }
     try session.apply(.{ .id = 40, .session = "01S", .time_ms = 1, .event = .{

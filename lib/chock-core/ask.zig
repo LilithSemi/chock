@@ -553,8 +553,8 @@ test "an answer longer than the buffer is taken and marked, not waited on" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const filler = "x" ** max_answer_bytes;
-    const lines = [_][]const u8{filler};
+    const filler = @as([max_answer_bytes]u8, @splat('x'));
+    const lines = [_][]const u8{&filler};
     var console = FakeConsole{ .gpa = gpa, .replies = &.{.{ .bytes = 0 }}, .lines = &lines };
     defer console.deinit();
 
@@ -597,16 +597,16 @@ test "a question cannot be made to look like Chock's own words" {
 }
 
 test "a question nobody could read is refused before it reaches a person" {
-    const long = "x" ** (max_question_bytes + 1);
-    const wide = [_][]const u8{"one"} ** (max_options + 1);
-    const fat = "y" ** (max_option_bytes + 1);
+    const long = @as([(max_question_bytes + 1)]u8, @splat('x'));
+    const wide = @as([(max_options + 1)][]const u8, @splat("one"));
+    const fat = @as([(max_option_bytes + 1)]u8, @splat('y'));
 
     try testing.expect(check(.{ .text = "which one?" }) == null);
     try testing.expect(check(.{ .text = "" }) != null);
     try testing.expect(check(.{ .text = "  \n\t " }) != null);
-    try testing.expect(check(.{ .text = long }) != null);
+    try testing.expect(check(.{ .text = &long }) != null);
     try testing.expect(check(.{ .text = "pick", .options = &wide }) != null);
-    try testing.expect(check(.{ .text = "pick", .options = &.{fat} }) != null);
+    try testing.expect(check(.{ .text = "pick", .options = &.{&fat} }) != null);
     try testing.expect(check(.{ .text = long[0..max_question_bytes] }) == null);
 }
 
@@ -630,20 +630,20 @@ test "an answer cannot carry a control character or bytes that are not text into
 }
 
 test "an answer permits nothing, and there is no member it could permit through" {
-    inline for (@typeInfo(Answer).@"union".fields) |field| {
-        const ok = field.type == void or field.type == []u8;
+    inline for (@typeInfo(Answer).@"union".field_names, @typeInfo(Answer).@"union".field_types) |field_name, field_type| {
+        const ok = field_type == void or field_type == []u8;
         if (!ok) @compileError(
-            "Answer gained the member \"" ++ field.name ++ "\", which is neither a plain case " ++
+            "Answer gained the member \"" ++ field_name ++ "\", which is neither a plain case " ++
                 "nor the person's own words. An ask grants nothing, and a member that carried a " ++
                 "decision would be the route by which one travelled",
         );
     }
-    try testing.expectEqual(@as(usize, 5), @typeInfo(Answer).@"union".fields.len);
+    try testing.expectEqual(@as(usize, 5), @typeInfo(Answer).@"union".field_names.len);
 
-    inline for (@typeInfo(Question).@"struct".fields) |field| {
-        const ok = field.type == []const u8 or field.type == []const []const u8;
+    inline for (@typeInfo(Question).@"struct".field_names, @typeInfo(Question).@"struct".field_types) |field_name, field_type| {
+        const ok = field_type == []const u8 or field_type == []const []const u8;
         if (!ok) @compileError(
-            "Question gained the member \"" ++ field.name ++ "\", which is not text. An ask names " ++
+            "Question gained the member \"" ++ field_name ++ "\", which is not text. An ask names " ++
                 "no act, and a member that named one would make this an approval by another name",
         );
     }

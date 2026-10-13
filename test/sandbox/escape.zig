@@ -21,7 +21,7 @@ fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
 /// since std.testing.tmpDir gives a relative one.
 fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
     var link_buffer: [64]u8 = undefined;
-    const link = std.fmt.bufPrintZ(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}) catch unreachable;
+    const link = std.fmt.bufPrintSentinel(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}, 0) catch unreachable;
     const rc = linux.readlink(link, buffer.ptr, buffer.len);
     if (linux.errno(rc) != .SUCCESS) return error.ReadlinkFailed;
     const len: usize = @intCast(rc);
@@ -927,7 +927,7 @@ test "a process cannot signal a process outside the sandbox, and does not kill i
     defer {
         // Runs even if an assertion below fails, so no victim outlives the test.
         _ = linux.kill(victim_pid, .KILL);
-        var reap_status: u32 = undefined;
+        var reap_status: i32 = undefined;
         _ = linux.waitpid(victim_pid, &reap_status, 0);
     }
 
@@ -960,7 +960,7 @@ test "a process cannot attach to a System V shared memory segment made outside t
 test "the session keyring join gives the sandbox a keyring the host cannot see into" {
     // CLONE_NEWUSER covers the user keyring but not the session keyring.
     var desc_buffer: [64]u8 = undefined;
-    const description = try std.fmt.bufPrintZ(&desc_buffer, "chock-escape-session-key-{d}", .{linux.getpid()});
+    const description = try std.fmt.bufPrintSentinel(&desc_buffer, "chock-escape-session-key-{d}", .{linux.getpid()}, 0);
 
     const key_id = try createHostSessionKey(description);
     // Removed even if an assertion fails, so no key is left behind.
@@ -1004,7 +1004,7 @@ test "Finding 1: a forged exit code from the old setup-failure range is relayed 
     const term = try runProbeWithRoot("spawn-forge-exit", scratch.path());
 
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const output_path = try std.fmt.bufPrintZ(&path_buffer, "{s}/work/output.txt", .{scratch.path()});
+    const output_path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/work/output.txt", .{scratch.path()}, 0);
 
     // The file is still there, so nothing called removeContentsBestEffort on it.
     try std.testing.expect(fileSize(output_path) != null);
@@ -1043,11 +1043,7 @@ test "Finding 2: signalling the process spawn forked also ends the sandboxed pro
     const middle_pid = try std.fmt.parseInt(linux.pid_t, pid_line_buf[0..pid_line_len], 10);
 
     var heartbeat_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const heartbeat_path = try std.fmt.bufPrintZ(
-        &heartbeat_path_buf,
-        "{s}/work/heartbeat.txt",
-        .{scratch.path()},
-    );
+    const heartbeat_path = try std.fmt.bufPrintSentinel(&heartbeat_path_buf, "{s}/work/heartbeat.txt", .{scratch.path()}, 0);
 
     var waited_ns: u64 = 0;
     var size_before_signal: u64 = 0;
@@ -1109,17 +1105,9 @@ test "a cancelled call takes the processes it started with it, not only the one 
     const middle_pid = try std.fmt.parseInt(linux.pid_t, pid_line_buf[0..pid_line_len], 10);
 
     var forked_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const forked_path = try std.fmt.bufPrintZ(
-        &forked_path_buf,
-        "{s}/work/forked.txt",
-        .{scratch.path()},
-    );
+    const forked_path = try std.fmt.bufPrintSentinel(&forked_path_buf, "{s}/work/forked.txt", .{scratch.path()}, 0);
     var heartbeat_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const heartbeat_path = try std.fmt.bufPrintZ(
-        &heartbeat_path_buf,
-        "{s}/work/heartbeat.txt",
-        .{scratch.path()},
-    );
+    const heartbeat_path = try std.fmt.bufPrintSentinel(&heartbeat_path_buf, "{s}/work/heartbeat.txt", .{scratch.path()}, 0);
 
     var waited_ns: u64 = 0;
     var size_before_signal: u64 = 0;
@@ -1295,19 +1283,11 @@ test "many small files are stopped, the same files with no cap are not, and neit
 
     // The area is a tmpfs, so the directory it sat on must be empty on the real disk.
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const bounded_host = try std.fmt.bufPrintZ(
-        &path_buffer,
-        "{s}/run/chock/scratch",
-        .{bounded_scratch.path()},
-    );
+    const bounded_host = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/run/chock/scratch", .{bounded_scratch.path()}, 0);
     try std.testing.expectEqual(@as(?usize, 0), hostEntryCount(bounded_host));
 
     var unbounded_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const unbounded_host = try std.fmt.bufPrintZ(
-        &unbounded_buffer,
-        "{s}/run/chock/scratch",
-        .{unbounded_scratch.path()},
-    );
+    const unbounded_host = try std.fmt.bufPrintSentinel(&unbounded_buffer, "{s}/run/chock/scratch", .{unbounded_scratch.path()}, 0);
     try std.testing.expectEqual(@as(?usize, 0), hostEntryCount(unbounded_host));
 }
 
@@ -1367,17 +1347,9 @@ test "a process that calls setsid still dies when the sandbox is torn down" {
     const middle_pid = try std.fmt.parseInt(linux.pid_t, pid_line_buf[0..pid_line_len], 10);
 
     var setsid_ok_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const setsid_ok_path = try std.fmt.bufPrintZ(
-        &setsid_ok_path_buf,
-        "{s}/work/setsid-ok",
-        .{scratch.path()},
-    );
+    const setsid_ok_path = try std.fmt.bufPrintSentinel(&setsid_ok_path_buf, "{s}/work/setsid-ok", .{scratch.path()}, 0);
     var heartbeat_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const heartbeat_path = try std.fmt.bufPrintZ(
-        &heartbeat_path_buf,
-        "{s}/work/heartbeat.txt",
-        .{scratch.path()},
-    );
+    const heartbeat_path = try std.fmt.bufPrintSentinel(&heartbeat_path_buf, "{s}/work/heartbeat.txt", .{scratch.path()}, 0);
 
     var waited_ns: u64 = 0;
     var size_before_signal: u64 = 0;

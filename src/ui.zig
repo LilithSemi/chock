@@ -110,7 +110,7 @@ const Compositor = struct {
         const Ignore = struct {
             const Event = @typeInfo(
                 @TypeOf(phantom.window.Session.dispatchEvent),
-            ).@"fn".params[1].type.?;
+            ).@"fn".param_types[1].?;
             fn take(_: *anyopaque, _: Event) void {}
         };
         var nothing: u8 = 0;
@@ -188,7 +188,7 @@ pub fn start(
     const terminal_can_draw = tty.stdoutIsTty() and tty.terminalCanDraw(env.get("TERM"));
     const message_in_hand = asked.message_words.len != 0 or
         !(std.Io.File.stdin().isTty(io) catch false);
-    const can_draw = phantom.backend.prism.builds_here and phantom.backend.prism.canRasterize(gpa);
+    const can_draw = phantom.backend.prism.builds_here and phantom.backend.prism.canRasterize(gpa, io);
     const window = windowPossible(
         can_draw,
         Compositor{ .gpa = gpa, .io = io, .env = env },
@@ -1252,8 +1252,8 @@ test "the character grid measures a row as one reported cell, at any device pixe
         const logical_w = 80 * cell[0] / dpr;
         try testing.expectEqual(@as(u16, 24), measure.rowsIn(logical_h));
         const room = Room{ .measure = measure, .width = logical_w };
-        try testing.expect(room.holds("x" ** 80));
-        try testing.expect(!room.holds("x" ** 81));
+        try testing.expect(room.holds(&@as([80]u8, @splat('x'))));
+        try testing.expect(!room.holds(&@as([81]u8, @splat('x'))));
     }
 }
 
@@ -1274,8 +1274,8 @@ test "a proportional row is measured against its own letters and never divided b
     const across: f32 = 640;
     const room = Room{ .measure = measure, .width = across };
 
-    const words = "the quick brown fox jumps over the lazy dog. " ** 8;
-    const cut = try visibleLine(arena, words, room);
+    const words = repeated("the quick brown fox jumps over the lazy dog. ", 8);
+    const cut = try visibleLine(arena, &words, room);
 
     try testing.expect(measure.widthOf(cut) <= across);
 
@@ -2168,7 +2168,7 @@ test "the transcript stops growing at a readable measure, and the other regions 
     try testing.expectEqual(@as(f32, chock_ui.ui.readable_columns) * cell, h.screen.transcriptRoom().width);
     try testing.expect(h.screen.agentRoom().width < @as(f32, wide) * cell);
 
-    h.screen.observer().onPiece(.{ .text = "word " ** 120 });
+    h.screen.observer().onPiece(.{ .text = &repeated("word ", 120) });
     h.screen.observer().onEvent(1, .{ .message = .{ .role = .assistant, .content = &.{} } });
     try testing.expect(h.screen.paint());
 
@@ -2246,10 +2246,10 @@ test "a wrapped row breaks at a space, and a word with none is broken at the mea
     try testing.expectEqualStrings("the quick", broken[0]);
     try testing.expectEqualStrings("brown fox", broken[1]);
 
-    const solid = try chock_ui.ui.wrapText(arena, "x" ** 25, gridRoom(&font, 10));
+    const solid = try chock_ui.ui.wrapText(arena, &@as([25]u8, @splat('x')), gridRoom(&font, 10));
     try testing.expectEqual(@as(usize, 3), solid.len);
-    try testing.expectEqualStrings("x" ** 10, solid[0]);
-    try testing.expectEqualStrings("x" ** 5, solid[2]);
+    try testing.expectEqualStrings(&@as([10]u8, @splat('x')), solid[0]);
+    try testing.expectEqualStrings(&@as([5]u8, @splat('x')), solid[2]);
 
     const short = try chock_ui.ui.wrapText(arena, "fits", gridRoom(&font, 10));
     try testing.expectEqual(@as(usize, 1), short.len);
@@ -2297,7 +2297,7 @@ test "a row with something in the right hand column is exactly the width and nev
     try testing.expectEqual(@as(f32, 20), columnsOf(short));
     try testing.expect(std.mem.endsWith(u8, short, "18.2s"));
 
-    const long = try spread(arena, "x" ** 200, "18.2s", Room.grid(20));
+    const long = try spread(arena, &@as([200]u8, @splat('x')), "18.2s", Room.grid(20));
     try testing.expectEqual(@as(f32, 20), columnsOf(long));
     try testing.expect(std.mem.endsWith(u8, long, "18.2s"));
 
@@ -3415,7 +3415,7 @@ test "the model's reasoning is folded to its size and is never dropped" {
     defer h.close();
 
     const watcher = h.screen.observer();
-    watcher.onPiece(.{ .reasoning = "the build file names a test step. " ** 64 });
+    watcher.onPiece(.{ .reasoning = &repeated("the build file names a test step. ", 64) });
     watcher.onPiece(.{ .text = "I will run it.\n" });
 
     try testing.expect(std.mem.indexOf(u8, h.screen.lines.items[0].text, "of reasoning") != null);
@@ -3468,7 +3468,7 @@ test "a session at the design width reads as the design draws it" {
 
     const watcher = h.screen.observer();
     watcher.onNotice("Chock copied 12 files from your working tree.");
-    watcher.onPiece(.{ .reasoning = "the build file names a test step. " ** 64 });
+    watcher.onPiece(.{ .reasoning = &repeated("the build file names a test step. ", 64) });
     watcher.onPiece(.{ .text = "The build file names a test step. I will run it.\n" });
     callAndAnswer(h, "exit status: 0\n255/255 passed\n", false, 18_200);
 
@@ -4828,7 +4828,7 @@ fn everyMarkSession(h: *Headless) !void {
         .{ .name = "landlock", .state = .off },
     } });
     h.screen.say(.chock, "\u{2500}\u{2500} 3 rows above. The log keeps them.\n");
-    h.screen.observer().onPiece(.{ .reasoning = "the build file names a test step. " ** 64 });
+    h.screen.observer().onPiece(.{ .reasoning = &repeated("the build file names a test step. ", 64) });
     h.screen.observer().onPiece(.{ .text = "The build file names a test step. I will run it.\n" });
     callAndAnswer(h, "255/255 passed\n", false, 18_200);
 
@@ -5287,7 +5287,7 @@ test "a masked question draws marks and never the bytes" {
     const drawn = try screenText(h);
     try testing.expect(std.mem.indexOf(u8, drawn, password) == null);
     try testing.expect(std.mem.indexOf(u8, drawn, "hunter") == null);
-    try testing.expect(std.mem.indexOf(u8, drawn, "*" ** password.len) != null);
+    try testing.expect(std.mem.indexOf(u8, drawn, &@as([password.len]u8, @splat('*'))) != null);
 
     try testing.expect(std.mem.indexOf(u8, drawn, "git.example.com") != null);
 
@@ -5320,19 +5320,19 @@ test "a masked question never turns a leading digit into an option" {
 }
 
 test "an ask decides nothing, and there is no member of an answer that could" {
-    inline for (@typeInfo(Text).@"union".fields) |field| {
-        const ok = field.type == void or field.type == []const u8;
+    inline for (@typeInfo(Text).@"union".field_names, @typeInfo(Text).@"union".field_types) |field_name, field_type| {
+        const ok = field_type == void or field_type == []const u8;
         if (!ok) @compileError(
-            "Text gained the member \"" ++ field.name ++ "\", which is neither a plain case nor " ++
+            "Text gained the member \"" ++ field_name ++ "\", which is neither a plain case nor " ++
                 "the person's own words. An ask grants nothing, and a member that carried a " ++
                 "decision would be the route by which one travelled",
         );
     }
-    inline for (@typeInfo(Question).@"struct".fields) |field| {
-        const ok = field.type == []const u8 or field.type == []const []const u8 or
-            field.type == i64 or field.type == Question.Echo;
+    inline for (@typeInfo(Question).@"struct".field_names, @typeInfo(Question).@"struct".field_types) |field_name, field_type| {
+        const ok = field_type == []const u8 or field_type == []const []const u8 or
+            field_type == i64 or field_type == Question.Echo;
         if (!ok) @compileError(
-            "Question gained the member \"" ++ field.name ++ "\", which is neither text, the " ++
+            "Question gained the member \"" ++ field_name ++ "\", which is neither text, the " ++
                 "deadline, nor how it is drawn. An ask names no act, and a member that named one " ++
                 "would make this an approval by another name",
         );
@@ -5600,4 +5600,14 @@ test "a long styled line wraps and every row keeps its runs" {
 
     // No row keeps a marker, wrapped or not.
     for (rows) |one| try testing.expect(std.mem.indexOf(u8, one.text, "**") == null);
+}
+
+/// `piece` laid end to end `times` over, at comptime.
+///
+/// Zig 0.17 took the `**` operator away and `@splat` fills an array with ONE
+/// element, so a repeated phrase has no operator of its own any more.
+fn repeated(comptime piece: []const u8, comptime times: usize) [piece.len * times]u8 {
+    var out: [piece.len * times]u8 = undefined;
+    for (0..times) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
+    return out;
 }

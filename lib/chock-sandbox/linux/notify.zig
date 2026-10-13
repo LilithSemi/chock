@@ -8,7 +8,7 @@ const seccomp = @import("seccomp.zig");
 const grants = @import("../grants.zig");
 const SECCOMP = linux.SECCOMP;
 
-pub const call_count = @typeInfo(seccomp.TrapCall).@"enum".fields.len;
+pub const call_count = @typeInfo(seccomp.TrapCall).@"enum".field_names.len;
 
 pub const Counts = [call_count]u64;
 
@@ -316,8 +316,8 @@ fn readAll(fd: i32, bytes: []u8) bool {
 
 test "a histogram has one slot for each call a policy can observe" {
     try std.testing.expectEqual(call_count, empty_counts.len);
-    inline for (@typeInfo(seccomp.TrapCall).@"enum".fields) |field| {
-        try std.testing.expect(field.value < call_count);
+    inline for (@typeInfo(seccomp.TrapCall).@"enum".field_names, @typeInfo(seccomp.TrapCall).@"enum".field_values) |_, field_value| {
+        try std.testing.expect(field_value < call_count);
     }
     for (empty_counts) |count| try std.testing.expectEqual(@as(u64, 0), count);
 }
@@ -560,7 +560,7 @@ test "the reader reads a path out of another process and stops at the clamp" {
     const child: linux.pid_t = @intCast(forked);
     defer {
         _ = linux.close(pair[0]);
-        var status: u32 = 0;
+        var status: i32 = 0;
         _ = linux.wait4(child, &status, 0, null);
     }
     _ = linux.close(pair[1]);

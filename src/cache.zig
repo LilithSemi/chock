@@ -209,7 +209,7 @@ test "clearing a cache that holds something empties it and reports what went" {
     {
         var handle = try std.Io.Dir.createFileAbsolute(testing.io, file, .{});
         defer handle.close(testing.io);
-        try handle.writeStreamingAll(testing.io, "x" ** 32);
+        try handle.writeStreamingAll(testing.io, &@as([32]u8, @splat('x')));
     }
     try testing.expectEqual(@as(u64, 32), cache.measure(arena, testing.io, dir, cache.max_bytes).bytes);
 

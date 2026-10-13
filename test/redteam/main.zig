@@ -833,7 +833,7 @@ test "every root this harness picks for itself leaves a session's sockets room t
     for ([_]scene_mod.Configuration{ .maximum, .realistic }) |configuration| {
         const root = try std.fmt.allocPrint(gpa, "/tmp/ckrt-{s}-{s}", .{
             configuration.tag(),
-            "z" ** scene_suffix_len,
+            @as([scene_suffix_len]u8, @splat('z')),
         });
         defer gpa.free(root);
 
