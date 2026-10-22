@@ -490,13 +490,26 @@ pub const Router = struct {
         self.resolver_fd = -1;
     }
 
-    pub fn pendingBytes(self: *const Router) usize {
-        var total: usize = 0;
+    /// True when everything the sandboxed program sent has left for the host and
+    /// nothing waits to be accepted. What the host sent back does not count: the
+    /// program that would have read it is gone by the time this is asked.
+    ///
+    /// A caller that stops on empty buffers alone stops too early, because a
+    /// connection in the backlog and a connection whose bytes are still in the
+    /// kernel both hold none.
+    pub fn drained(self: *const Router) bool {
         for (&self.links) |*link| {
             if (!link.live) continue;
-            total += link.out_bound.pending() + link.in_bound.pending();
+            if (!link.inside_done or link.out_bound.pending() != 0) return false;
         }
-        return total;
+        return !self.peerWaiting();
+    }
+
+    fn peerWaiting(self: *const Router) bool {
+        if (self.relay_fd < 0) return false;
+        var watched = [1]posix.pollfd{.{ .fd = self.relay_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const ready = posix.poll(&watched, 0) catch return false;
+        return ready > 0 and watched[0].revents & posix.POLL.IN != 0;
     }
 
     pub fn stopListening(self: *Router) void {
@@ -1972,6 +1985,34 @@ test "a connection with the relay gone is refused rather than left waiting" {
     try testing.expect(record.dead_errno != timed_out);
     try testing.expectEqual(@intFromEnum(linux.E.CONNREFUSED), record.dead_errno);
     try testing.expect(record.dead_waited_ms < 1000);
+}
+
+test "a drain waits for the bytes the program sent and not for an answer to them" {
+    var instance: Router = .{
+        .relay_fd = -1,
+        .resolver_fd = -1,
+        .policy = undefined,
+        .host = undefined,
+        .allow_timeout_ms = 0,
+        .answer_ttl_s = 0,
+        .names = .{},
+        .links = @splat(.{}),
+        .counts = .{},
+    };
+    try testing.expect(instance.drained());
+
+    const link = &instance.links[0];
+    link.live = true;
+    try testing.expect(!instance.drained());
+
+    link.inside_done = true;
+    link.out_bound.end = 4;
+    try testing.expect(!instance.drained());
+
+    // The host's half stays open, and holding the drain open for it would wait
+    // on a reply the program that asked for it is no longer there to read.
+    link.out_bound.start = 4;
+    try testing.expect(instance.drained());
 }
 
 test "a descriptor from the host seam is made ready for a loop that polls" {

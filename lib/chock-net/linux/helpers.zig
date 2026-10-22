@@ -3,6 +3,7 @@
 //! and sends its ready byte. What a helper does with the kernel is here.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const palisade = @import("palisade");
 
@@ -55,6 +56,8 @@ pub const Router = struct {
     /// as long as the helper does.
     client: routerlink.Client = undefined,
     instance: router.Router = undefined,
+    /// SIGTERM, as a descriptor. See `watchTermination`.
+    stop_fd: i32 = -1,
     kept: [1]i32 = undefined,
 
     pub fn channel(self: *Router) Channel {
@@ -111,6 +114,7 @@ pub const Router = struct {
             .{ .policy = self.client.policy(), .host = self.client.host() },
             &diag,
         ) catch return false;
+        self.stop_fd = watchTermination();
         return true;
     }
 
@@ -126,7 +130,7 @@ pub const Router = struct {
 
         var last_counts = self.instance.counts;
         sendCounts(self.control_fd, &self.instance.counts);
-        while (!peerHasGone(self.control_fd)) {
+        while (!stopWasAsked(self.stop_fd) and !peerHasGone(self.control_fd)) {
             self.instance.step(monotonicMilliseconds(), idle_step_ms, null) catch return 1;
             if (!std.meta.eql(last_counts, self.instance.counts)) {
                 last_counts = self.instance.counts;
@@ -134,18 +138,54 @@ pub const Router = struct {
             }
         }
 
-        var drained: usize = 0;
-        while (drained < drain_steps) : (drained += 1) {
-            self.instance.step(monotonicMilliseconds(), drain_step_ms, null) catch break;
-            if (self.instance.pendingBytes() == 0) break;
+        // The program is gone, and what it sent can still be in the kernel: in a
+        // connection nobody accepted yet, or in one accepted and not read. The
+        // relay runs on until that is out, inside a budget palisade allows it.
+        const deadline = monotonicMilliseconds() + drain_budget_ms;
+        while (!self.instance.drained()) {
+            const now = monotonicMilliseconds();
+            if (now >= deadline) break;
+            self.instance.step(now, drain_step_ms, null) catch break;
         }
+        sendCounts(self.control_fd, &self.instance.counts);
         return 0;
     }
 };
 
 const idle_step_ms: i32 = 20;
-const drain_steps: usize = 16;
 const drain_step_ms: i32 = 2;
+
+/// Shorter than the time palisade gives a helper to leave before it kills it.
+const drain_budget_ms: i64 = 200;
+
+/// Takes SIGTERM out of the kernel's hands and answers with a descriptor that
+/// carries it. Palisade ends a helper with SIGTERM, and the default action stops
+/// the relay wherever it has reached, which loses bytes the program already sent.
+///
+/// A fault here answers -1 and leaves the signal where it was: a helper that
+/// blocked SIGTERM and could not see it would run until it was killed.
+fn watchTermination() i32 {
+    var wanted = linux.sigemptyset();
+    linux.sigaddset(&wanted, .TERM);
+    const made = linux.signalfd(-1, &wanted, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK);
+    if (linux.errno(made) != .SUCCESS) return -1;
+    const fd: i32 = @intCast(made);
+    if (linux.errno(linux.sigprocmask(linux.SIG.BLOCK, &wanted, null)) != .SUCCESS) {
+        _ = linux.close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/// Whether the helper was asked to end. Nothing reads the descriptor: the signal
+/// stays in it, and the helper leaves on its own once the relay is drained.
+fn stopWasAsked(fd: i32) bool {
+    if (fd < 0) return false;
+    var watched = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    const rc = linux.poll(&watched, watched.len, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    return watched[0].revents & linux.POLL.IN != 0;
+}
 
 const CountsRecord = struct {
     magic: u64 = counts_magic,
@@ -551,6 +591,30 @@ pub const Lowered = struct {
 };
 
 const testing = std.testing;
+
+test "SIGTERM reaches the router helper as a descriptor and not as the end of it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const fd = watchTermination();
+    if (fd < 0) return error.SkipZigTest;
+    defer _ = linux.close(fd);
+
+    try testing.expect(!stopWasAsked(fd));
+    try testing.expectEqual(0, linux.kill(linux.getpid(), .TERM));
+    try testing.expect(stopWasAsked(fd));
+
+    // This process is still here, which is the whole point. The signal comes out
+    // of the descriptor and the mask goes back, or unblocking would end the run.
+    var arrived: linux.signalfd_siginfo = undefined;
+    const bytes = std.mem.asBytes(&arrived);
+    try testing.expectEqual(bytes.len, linux.read(fd, bytes.ptr, bytes.len));
+    try testing.expectEqual(@intFromEnum(linux.SIG.TERM), arrived.signo);
+
+    var wanted = linux.sigemptyset();
+    linux.sigaddset(&wanted, .TERM);
+    try testing.expectEqual(0, linux.sigprocmask(linux.SIG.UNBLOCK, &wanted, null));
+    try testing.expect(!stopWasAsked(fd));
+}
 
 test "buildTarget joins root and path, and refuses what a device helper must never resolve" {
     var buffer: [64]u8 = undefined;
