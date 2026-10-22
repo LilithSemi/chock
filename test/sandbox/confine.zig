@@ -7,7 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
-const sandbox = @import("chock-sandbox");
+const chock_net = @import("chock-net");
 
 const darwin = builtin.os.tag == .macos;
 
@@ -216,7 +216,7 @@ test "a confined VMM cannot run a program, reach a path outside its shares, or w
     var ro_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const ro_share_path = try absoluteDirPath(&ro_buffer, tmp_ro.dir.handle);
 
-    const shares = [_]sandbox.vm_shares.Share{
+    const shares = [_]chock_net.vm_shares.Share{
         .{ .name = "work", .host_path = share_path, .writable = true },
         .{ .name = "readonly", .host_path = ro_share_path, .writable = false },
     };
@@ -232,9 +232,9 @@ test "a confined VMM cannot run a program, reach a path outside its shares, or w
 
     if (child == 0) {
         closeFd(pipes[0]);
-        var which: ?sandbox.vm_confine.Layer = null;
+        var which: ?chock_net.vm_confine.Layer = null;
         const held = quietStderr();
-        sandbox.vm_confine.install(allocator, &shares, &which, null) catch {
+        chock_net.vm_confine.install(allocator, &shares, &which, null) catch {
             restoreStderr(held);
             say(pipes[1], "refused");
             exitNow(2);
@@ -297,7 +297,7 @@ test "a confined VMM can start a thread of its own" {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const share_path = try absoluteDirPath(&buffer, tmp.dir.handle);
 
-    const shares = [_]sandbox.vm_shares.Share{
+    const shares = [_]chock_net.vm_shares.Share{
         .{ .name = "work", .host_path = share_path, .writable = true },
     };
 
@@ -312,9 +312,9 @@ test "a confined VMM can start a thread of its own" {
 
     if (child == 0) {
         closeFd(pipes[0]);
-        var which: ?sandbox.vm_confine.Layer = null;
+        var which: ?chock_net.vm_confine.Layer = null;
         const held = quietStderr();
-        sandbox.vm_confine.install(allocator, &shares, &which, null) catch {
+        chock_net.vm_confine.install(allocator, &shares, &which, null) catch {
             restoreStderr(held);
             say(pipes[1], "refused");
             exitNow(2);

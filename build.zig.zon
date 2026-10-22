@@ -17,8 +17,8 @@
             .hash = "udev-0.1.0-ZWb7H_NaBwBz8odIGbKN2hpRa-3HdrIsuNaml7VzsRTs",
         },
         .fix = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/fix?ref=integration#44e97ffb6a96867f1b7e2b79bb6d131831e2d88f",
-            .hash = "fix-0.3.0-2pqVLBL6VwCNhooXswjysWZdJDKoVs9akuKe8__qrcBk",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/fix?ref=integration#5f668f30e1cba722c5554cdd1c2344e3cd46f09b",
+            .hash = "fix-0.3.0-2pqVLBL6VwCSG9zdNHKoB7JAqKKM08x46Ml8D-BWRTKB",
         },
         .dbus = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/dbus.zig#ac21c343ceee75c0a5ea1793096751ca851abfa1",
@@ -27,6 +27,10 @@
         .mirage = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/mirage#f96e2bd1ff9a159e32cec93dfe665488a2401f2b",
             .hash = "mirage-0.1.0-ORLT6E02FgBblg4Zls7U4mEBHCboH0-NC5rJ_u4t4uOG",
+        },
+        .palisade = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/palisade#3de554f9379e4d9482138a948945285e6d0b28c2",
+            .hash = "palisade-0.1.0-kI7k7zFNCADtMYCkzyeOBldr-xBp8sSJYvDXzhQ4ksBq",
         },
     },
     .paths = .{

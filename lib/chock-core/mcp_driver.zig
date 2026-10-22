@@ -754,7 +754,7 @@ test "a driver that never started answers gone, and says so once" {
     defer process.deinit(testing.io);
 
     var driver = Driver.init(gpa, &process, .{
-        .config = .{ .root = "/nowhere", .mounts = &.{}, .rules = &.{}, .cwd = "/", .env = &.{} },
+        .call = .{ .config = .{ .root = "/nowhere", .mounts = &.{}, .rules = &.{}, .cwd = "/", .env = &.{} } },
         .argv = &.{"/probe"},
     });
     defer driver.deinit();

@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 const self_target = "/probe";
 const git_target = "/probe-git";
@@ -13,7 +13,7 @@ const commit_test_file = "chock-object-store-test.txt";
 
 fn endIfNothingMeasured(err: anyerror) void {
     if (err != error.NamespaceFailed) return;
-    std.process.exit(sandbox.namespace.nothing_measured_exit_status);
+    std.process.exit(palisade.linux.namespace.nothing_measured_exit_status);
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
@@ -73,7 +73,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
 
     mounts.append(arena, .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } }) catch return 3;
-    rules.append(arena, .{ .path = "/nix/store", .access = sandbox.landlock.AccessFs.read_only }) catch return 3;
+    rules.append(arena, .{ .path = "/nix/store", .access = palisade.linux.landlock.AccessFs.read_only }) catch return 3;
 
     var argv: []const []const u8 = undefined;
     var env: []const []const u8 = &.{};
@@ -133,14 +133,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return 2;
     }
 
-    const term = sandbox.spawn(arena, .{
+    const term = palisade.Sandbox.spawn(arena, .{
         .root = root,
         .mounts = mounts.items,
         .rules = rules.items,
         .cwd = cwd,
         .env = env,
         .network = .none,
-    }, argv, null, null) catch |err| {
+    }, argv, .{}) catch |err| {
         endIfNothingMeasured(err);
         std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
         return 3;
@@ -152,8 +152,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 /// Not read only: `markReadOnly` also sets `NODEV`, which then refuses to open the device node at all.
 fn addGitRuntimeMounts(
     arena: std.mem.Allocator,
-    mounts: *std.ArrayList(sandbox.namespace.Mount),
-    rules: *std.ArrayList(sandbox.Config.Rule),
+    mounts: *std.ArrayList(palisade.linux.namespace.Mount),
+    rules: *std.ArrayList(palisade.Sandbox.Rule),
     git_path: []const u8,
 ) std.mem.Allocator.Error!void {
     try mounts.append(arena, .{ .bind = .{ .source = git_path, .target = git_target, .read_only = true } });
@@ -188,8 +188,8 @@ fn runGitStep(
     arena: std.mem.Allocator,
     root: []const u8,
     cwd: []const u8,
-    mounts: []const sandbox.namespace.Mount,
-    rules: []const sandbox.Config.Rule,
+    mounts: []const palisade.linux.namespace.Mount,
+    rules: []const palisade.Sandbox.Rule,
     env: []const []const u8,
     argv_tail: []const []const u8,
 ) ?std.process.Child.Term {
@@ -197,14 +197,14 @@ fn runGitStep(
     argv.append(arena, git_target) catch return null;
     argv.appendSlice(arena, argv_tail) catch return null;
 
-    return sandbox.spawn(arena, .{
+    return palisade.Sandbox.spawn(arena, .{
         .root = root,
         .mounts = mounts,
         .rules = rules,
         .cwd = cwd,
         .env = env,
         .network = .none,
-    }, argv.items, null, null) catch |err| {
+    }, argv.items, .{}) catch |err| {
         endIfNothingMeasured(err);
         std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
         return null;
@@ -217,8 +217,8 @@ fn runGitPushFlow(
     arena: std.mem.Allocator,
     root: []const u8,
     cwd: []const u8,
-    mounts: []const sandbox.namespace.Mount,
-    rules: []const sandbox.Config.Rule,
+    mounts: []const palisade.linux.namespace.Mount,
+    rules: []const palisade.Sandbox.Rule,
     env: []const []const u8,
     url: []const u8,
 ) u8 {
@@ -249,8 +249,8 @@ fn runGitCommitFlow(
     arena: std.mem.Allocator,
     root: []const u8,
     cwd: []const u8,
-    mounts: []const sandbox.namespace.Mount,
-    rules: []const sandbox.Config.Rule,
+    mounts: []const palisade.linux.namespace.Mount,
+    rules: []const palisade.Sandbox.Rule,
     env: []const []const u8,
     tampered_env: ?[]const []const u8,
 ) u8 {
@@ -336,7 +336,7 @@ fn spawnedRead(target: []const u8) u8 {
     }
 
     if (filled == 0) return 4;
-    if (std.mem.eql(u8, buffer[0..filled], sandbox.namespace.deny_notice)) return 1;
+    if (std.mem.eql(u8, buffer[0..filled], palisade.linux.namespace.default_deny_notice)) return 1;
     return 0;
 }
 
@@ -407,8 +407,8 @@ fn selfExePath(arena: std.mem.Allocator) ![]const u8 {
 const ParseError = error{ OutOfMemory, BadBlob };
 
 /// Every field is a slice into `blob`, which is arena owned argv memory.
-fn parseMounts(arena: std.mem.Allocator, blob: []const u8) ParseError!std.ArrayList(sandbox.namespace.Mount) {
-    var list: std.ArrayList(sandbox.namespace.Mount) = .empty;
+fn parseMounts(arena: std.mem.Allocator, blob: []const u8) ParseError!std.ArrayList(palisade.linux.namespace.Mount) {
+    var list: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
     if (blob.len == 0) return list;
 
     var lines = std.mem.splitScalar(u8, blob, '\n');
@@ -449,8 +449,8 @@ fn parseMounts(arena: std.mem.Allocator, blob: []const u8) ParseError!std.ArrayL
     return list;
 }
 
-fn parseRules(arena: std.mem.Allocator, blob: []const u8) ParseError!std.ArrayList(sandbox.Config.Rule) {
-    var list: std.ArrayList(sandbox.Config.Rule) = .empty;
+fn parseRules(arena: std.mem.Allocator, blob: []const u8) ParseError!std.ArrayList(palisade.Sandbox.Rule) {
+    var list: std.ArrayList(palisade.Sandbox.Rule) = .empty;
     if (blob.len == 0) return list;
 
     var lines = std.mem.splitScalar(u8, blob, '\n');

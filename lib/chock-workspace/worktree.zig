@@ -8,7 +8,8 @@ pub const Diagnostic = diagnostic.Diagnostic;
 const git = @import("git.zig");
 const layout_mod = @import("layout.zig");
 pub const Layout = layout_mod.Layout;
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 
 pub const Error = git.Error || error{
     GitFailed,
@@ -23,14 +24,14 @@ pub const Error = git.Error || error{
     WorktreeRegistrationGone,
 };
 
-pub const Mount = sandbox.namespace.Mount;
+pub const Mount = palisade.linux.namespace.Mount;
 
 /// A path no real project uses, under which `mounts` puts the shared parts of `.git`.
 const sandbox_git_root_prefix = chock_runtime_prefix ++ "/git";
 
 /// The kernel takes the last matching mount, not the longest prefix, so a
 /// wide mount at `/run` applied after these would shadow all three at once.
-const chock_runtime_prefix = sandbox.runtime_prefix;
+const chock_runtime_prefix = chock_net.runtime_prefix;
 
 /// Not nested under `sandbox_git_root_prefix`: a new mount point under an
 /// already read only parent gets EROFS.

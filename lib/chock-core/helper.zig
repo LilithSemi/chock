@@ -2,7 +2,8 @@
 //! in both directions, started by Chock and never named by the model.
 
 const std = @import("std");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 const chock_io = @import("chock-io");
 
 pub const Error = error{
@@ -20,7 +21,7 @@ pub const start_wait_ns: u64 = 5 * std.time.ns_per_s;
 const start_step_ns: u64 = std.time.ns_per_ms;
 
 pub const Request = struct {
-    config: sandbox.Config,
+    call: chock_net.Call,
     argv: []const []const u8,
 };
 
@@ -131,8 +132,8 @@ pub const Helper = struct {
         self.started = true;
 
         const allocator = self.arena.allocator();
-        const config_copy = try request.config.copy(allocator);
-        const argv_copy = try sandbox.copyStrings(allocator, request.argv);
+        const config_copy = try request.call.config.copy(allocator);
+        const argv_copy = try palisade.Sandbox.copyStrings(allocator, request.argv);
 
         const requests = driver.pipeCloseOnExec() catch return error.NoPipe;
         const replies = driver.pipeCloseOnExec() catch {
@@ -148,7 +149,12 @@ pub const Helper = struct {
         const null_fd = std.Io.Dir.openFileAbsolute(io, "/dev/null", .{ .mode = .write_only }) catch null;
         if (null_fd) |file| spawn_config.stderr_fd = file.handle;
 
-        self.spawn_state = .{ .allocator = allocator, .config = spawn_config, .argv = argv_copy };
+        self.spawn_state = .{
+            .io = io,
+            .allocator = allocator,
+            .call = .{ .config = spawn_config, .links = request.call.links },
+            .argv = argv_copy,
+        };
         const thread = std.Thread.spawn(.{}, Spawn.run, .{&self.spawn_state}) catch {
             closeRaw(io, requests.read_fd);
             closeRaw(io, requests.write_fd);
@@ -159,13 +165,13 @@ pub const Helper = struct {
         };
 
         var waited: u64 = 0;
-        while (@atomicLoad(std.posix.pid_t, &self.spawn_state.middle.pid, .acquire) == 0 and
+        while (self.spawn_state.middle.pid() == null and
             !self.spawn_state.done.load(.acquire) and waited < start_wait_ns)
         {
             std.Io.sleep(io, .fromNanoseconds(start_step_ns), .awake) catch {};
             waited += start_step_ns;
         }
-        if (@atomicLoad(std.posix.pid_t, &self.spawn_state.middle.pid, .acquire) == 0 and
+        if (self.spawn_state.middle.pid() == null and
             !self.spawn_state.done.load(.acquire))
         {
             self.thread = thread;
@@ -197,13 +203,10 @@ pub const Helper = struct {
             std.Io.File.close(channel.to_helper, io);
         }
 
-        // Pairs with the release store in Spawn.run: a non-zero pid here means the handle beside it is already set.
-        if (@atomicLoad(std.posix.pid_t, &self.spawn_state.middle.pid, .acquire) != 0) {
-            sandbox.signalMiddle(self.spawn_state.middle.fd, std.posix.SIG.KILL) catch {};
-        }
+        self.spawn_state.middle.signal(@intFromEnum(std.os.linux.SIG.KILL)) catch {};
 
         if (self.thread) |one| one.join();
-        sandbox.closeMiddle(&self.spawn_state.middle);
+        self.spawn_state.middle.close();
 
         if (self.channel) |channel| {
             std.Io.File.close(channel.from_helper, io);
@@ -221,16 +224,19 @@ fn closeRaw(io: std.Io, fd: std.posix.fd_t) void {
 }
 
 const Spawn = struct {
+    io: std.Io = undefined,
     allocator: std.mem.Allocator = undefined,
-    config: sandbox.Config = undefined,
+    call: chock_net.Call = undefined,
     argv: []const []const u8 = undefined,
-    middle: sandbox.Middle = .{},
+    middle: palisade.Sandbox.Handle = .{},
     done: std.atomic.Value(bool) = .init(false),
     term: std.process.Child.Term = undefined,
-    spawn_err: ?sandbox.Sandbox.SpawnError = null,
+    spawn_err: ?palisade.Sandbox.SpawnError = null,
 
     fn run(self: *Spawn) void {
-        self.term = sandbox.spawn(self.allocator, self.config, self.argv, null, &self.middle) catch |err| {
+        self.term = chock_net.Driver.native_driver.spawn(self.allocator, self.call, self.argv, .{
+            .handle = &self.middle,
+        }) catch |err| {
             self.spawn_err = err;
             self.done.store(true, .release);
             return;
@@ -355,7 +361,7 @@ test "a start whose pipe cannot be made leaves nothing behind" {
     defer helper.deinit(testing.io);
 
     const result = helper.startWith(testing.io, .{
-        .config = .{ .root = "/nowhere", .mounts = &.{}, .rules = &.{}, .cwd = "/", .env = &.{} },
+        .call = .{ .config = .{ .root = "/nowhere", .mounts = &.{}, .rules = &.{}, .cwd = "/", .env = &.{} } },
         .argv = &.{"/probe"},
     }, chock_io.Fake.driver());
     try testing.expectError(error.NoPipe, result);

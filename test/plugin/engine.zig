@@ -9,7 +9,7 @@ const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
 const core = @import("chock-plugin-core");
 const paths = @import("engine_paths");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 const helper = chock_core.helper;
 const plugin = chock_core.plugin;
@@ -463,7 +463,7 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
         return error.SkipZigTest;
     }
     // Asked in a child, the only way to ask without spending this process's one namespace.
-    if (!sandbox.namespace.probeAvailability().available()) return error.SkipZigTest;
+    if (!palisade.linux.namespace.probeAvailability().available()) return error.SkipZigTest;
 
     const gpa = testing.allocator;
     const io = testing.io;
@@ -498,7 +498,7 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
     const host_here = try std.Io.Dir.cwd().realPathFileAlloc(io, host_path, keep);
     const module_here = try std.Io.Dir.cwd().realPathFileAlloc(io, wasm_path, keep);
 
-    const mounts = try keep.dupe(sandbox.namespace.Mount, &.{
+    const mounts = try keep.dupe(palisade.linux.namespace.Mount, &.{
         .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } },
         .{ .bind = .{ .source = host_here, .target = host_target, .read_only = true } },
         .{ .bind = .{ .source = module_here, .target = module_target, .read_only = true } },
@@ -510,13 +510,13 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
         // A tool call's config carries the workspace writable. The lockdown must
         // drop it.
         .rules = &.{
-            .{ .path = "/", .access = sandbox.landlock.AccessFs.read_write },
+            .{ .path = "/", .access = palisade.linux.landlock.AccessFs.read_write },
         },
         .cwd = "/",
         .env = &.{},
         .network = .host,
     }, &.{
-        .{ .path = "/nix/store", .access = sandbox.landlock.AccessFs.read_only },
+        .{ .path = "/nix/store", .access = palisade.linux.landlock.AccessFs.read_only },
         .{ .path = host_target, .access = .{ .execute = true, .read_file = true } },
         .{ .path = module_target, .access = .{ .read_file = true } },
     });
@@ -529,7 +529,7 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
     defer process.deinit(io);
 
     var driver = plugin_host.Driver.init(gpa, &process, .{
-        .config = config,
+        .call = .{ .config = config },
         .argv = &.{ host_target, plugin_host.verb, module_target },
     });
     defer driver.deinit();

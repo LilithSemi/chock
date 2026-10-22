@@ -5,10 +5,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
-const landlock = @import("../linux/landlock.zig");
-const seccomp = @import("../linux/seccomp.zig");
-const bpf = @import("../linux/bpf.zig");
-const seatbelt = @import("../darwin/seatbelt.zig");
+const landlock = @import("palisade").linux.landlock;
+const seccomp = @import("palisade").linux.seccomp;
+const roles = @import("../linux/roles.zig");
+const bpf = @import("palisade").linux.bpf;
+const seatbelt = @import("palisade").darwin.seatbelt;
 const shares_mod = @import("shares.zig");
 
 pub const Layer = enum { landlock, seccomp, seatbelt, rlimit };
@@ -59,9 +60,9 @@ fn takeLandlockAndSeccomp(
         return err;
     };
 
-    const insns = seccomp.buildVmm(allocator) catch return error.OutOfMemory;
+    const insns = roles.buildVmm(allocator) catch return error.OutOfMemory;
     defer allocator.free(insns);
-    seccomp.install(bpf.Prog.init(insns)) catch {
+    seccomp.install(bpf.Prog.init(insns), null) catch {
         which.* = .seccomp;
         return error.Refused;
     };
@@ -160,7 +161,7 @@ fn takeSeatbelt(
         return error.Refused;
     };
 
-    const support = seatbelt.apply(profile);
+    const support = seatbelt.apply(profile, null);
     if (!support.applied()) {
         which.* = .seatbelt;
         if (diag) |slot| slot.* = .{ .seatbelt = support };

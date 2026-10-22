@@ -6,7 +6,7 @@ const linux = std.os.linux;
 // The default test runner panics on an argv it does not know, so build.zig embeds the probe path.
 const probe_path = @import("probe_path").probe_path;
 
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 /// Skip when the probe answered that this machine would not give it a sandbox.
 fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
@@ -14,7 +14,7 @@ fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
         .exited => |c| c,
         else => return,
     };
-    if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
+    if (code == palisade.linux.namespace.nothing_measured_exit_status) return error.SkipZigTest;
 }
 
 /// Reads the absolute path of an open directory descriptor through /proc/self/fd,

@@ -5,8 +5,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
-const iface = @import("../Sandbox.zig");
-const NetBroker = iface.NetBroker;
+const palisade = @import("palisade");
+const iface = palisade.Sandbox;
+const links = @import("../links.zig");
+const NetBroker = links.NetBroker;
 
 pub const max_host_bytes: usize = 255;
 

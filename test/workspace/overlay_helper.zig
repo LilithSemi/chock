@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 const chock_workspace = @import("chock-workspace");
 const Overlay = chock_workspace.overlay.Overlay;
 
@@ -27,8 +27,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
 
     // `build.zig`'s `failOnTestStderr` fails the build on any byte a test binary writes to standard error.
-    sandbox.namespace.enter(.{}, null) catch {
-        return sandbox.namespace.nothing_measured_exit_status;
+    palisade.linux.namespace.enter(.{}, null) catch {
+        return palisade.linux.namespace.nothing_measured_exit_status;
     };
 
     const described = ov.mounts(arena) catch |err| switch (err) {
@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .bind, .proc, .deny => unreachable,
     };
 
-    sandbox.namespace.mountOverlay(arena, .{
+    palisade.linux.namespace.mountOverlay(arena, .{
         .lower = overlay_mount.lower,
         .upper = overlay_mount.upper,
         .work = overlay_mount.work,

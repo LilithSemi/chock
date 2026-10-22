@@ -358,7 +358,7 @@ fn resolveKind(
 
 const overlay_helper_path = @import("overlay_helper_path").overlay_helper_path;
 
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
     var link_buffer: [64]u8 = undefined;
@@ -459,7 +459,7 @@ fn runOverlayHelper(allocator: std.mem.Allocator, ov: Overlay, ops: []const []co
     const term = try child.wait(std.testing.io);
     allowScratchCleanup(allocator, ov);
     // A boundary that was never reached is not a boundary that held.
-    if (term == .exited and term.exited == sandbox.namespace.nothing_measured_exit_status) {
+    if (term == .exited and term.exited == palisade.linux.namespace.nothing_measured_exit_status) {
         return error.SkipZigTest;
     }
     return term;

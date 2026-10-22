@@ -1,7 +1,7 @@
 # The microVM driver
 
 A way of sandboxing is a driver, and a driver is a value: `Sandbox.Driver` in
-`lib/chock-sandbox/Sandbox.zig` holds a name, what it guarantees, what it can
+`lib/chock-net/links.zig` holds a name, what it guarantees, what it can
 express, and four calls. `native_driver` is the one for the machine Chock was
 built for, and it is what every caller that names none gets.
 
@@ -9,7 +9,7 @@ built for, and it is what every caller that names none gets.
 
 A microVM driver does not replace the Linux driver. It runs it. A guest has a
 kernel of its own, so namespaces, seccomp, Landlock and cgroups all work
-inside it, and `lib/chock-sandbox/linux/driver.zig` runs there unchanged,
+inside it, and palisade's Linux driver runs there unchanged,
 built from the same `Config` by the same code. Mirage treats a guest as root
 inside itself, which is exactly why Chock still sandboxes inside it too.
 
@@ -26,12 +26,12 @@ reason to want this at all.
 ### Three places to get through, and two of them are not independent
 
 Count the places, not the layers. A tool call told to escape has three to
-get through. First, the sandbox inside the guest, `lib/chock-sandbox/linux/driver.zig`,
+get through. First, the sandbox inside the guest, palisade's Linux driver,
 built from the same `Config` a native call uses. Second, the guest itself,
 where escaping gives root in a kernel of its own with nothing of the host
 inside it, needing a fault in the virtio devices Mirage places or in the
 hypervisor under them. Third, the sandbox around the VMM,
-`lib/chock-sandbox/vm/confine.zig`, which confines the process that runs the
+`lib/chock-net/vm/confine.zig`, which confines the process that runs the
 machine to the directories it was granted and the calls it still needs.
 
 The first and third are not independent. On a Linux host both are seccomp and
@@ -209,7 +209,7 @@ was built on.
 
 ### The Seatbelt profile does not need widening
 
-The Darwin arm of `lib/chock-sandbox/vm/confine.zig` closes the network
+The Darwin arm of `lib/chock-net/vm/confine.zig` closes the network
 completely, and `(deny network*)` refuses a unix socket as well as IP, so
 whether the session socket a guest is held on could still be reached was
 worth checking directly.
@@ -262,7 +262,7 @@ that request describes, runs the driver, and answers. That is all it does.
 
 ## What crosses, and what stays
 
-`lib/chock-sandbox/vm/wire.zig` carries a `Config`'s geometry (root, mounts,
+`lib/chock-net/vm/wire.zig` carries a `Config`'s geometry (root, mounts,
 rules, areas, working directory, environment, argv, limits, seccomp options,
 network mode, and whether to audit paths) and the time, as one JSON object a
 line.
@@ -456,7 +456,7 @@ running it in order.
 
 A guest mounts one virtiofs filesystem, and every directory the host offered
 appears as a name inside it. So `/nix/store` on the host is `<root>/store`
-inside the guest, and `lib/chock-sandbox/vm/shares.zig` rewrites one into the
+inside the guest, and `lib/chock-net/vm/shares.zig` rewrites one into the
 other.
 
 The share set is given rather than derived. `Config.mounts` holds one entry
@@ -480,7 +480,7 @@ still open.
 
 ## What the host driver refuses
 
-`lib/chock-sandbox/vm/driver.zig` is one `Sandbox.Driver` over the stream
+`lib/chock-net/vm/driver.zig` is one `Sandbox.Driver` over the stream
 `chock guest` opened. Its `guarantees` is read from the Linux driver rather
 than written again, because that is the code which will run. Besides the two
 share faults above, it refuses two more things:

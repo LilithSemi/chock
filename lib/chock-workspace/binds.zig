@@ -5,10 +5,10 @@
 const std = @import("std");
 
 const policy = @import("chock-policy");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 const worktree_mod = @import("worktree.zig");
 
-pub const Mount = sandbox.namespace.Mount;
+pub const Mount = palisade.linux.namespace.Mount;
 pub const Resolved = policy.workspace.Resolved;
 pub const Mode = policy.workspace.Mode;
 pub const Report = worktree_mod.ImportReport;

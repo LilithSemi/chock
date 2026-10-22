@@ -2,11 +2,14 @@
 
 const std = @import("std");
 
-const iface = @import("../Sandbox.zig");
-const landlock = @import("../linux/landlock.zig");
-const namespace = @import("../linux/namespace.zig");
-const rlimits = @import("../linux/rlimits.zig");
-const seccomp = @import("../linux/seccomp.zig");
+const palisade = @import("palisade");
+const iface = palisade.Sandbox;
+const links = @import("../links.zig");
+const netns = @import("../linux/netns.zig");
+const landlock = @import("palisade").linux.landlock;
+const namespace = @import("palisade").linux.namespace;
+const rlimits = @import("palisade").linux.rlimits;
+const seccomp = @import("palisade").linux.seccomp;
 
 pub const max_message_bytes: usize = 1 << 20;
 
@@ -22,14 +25,14 @@ pub const reaching_v6 = "v6.";
 
 pub const max_reaching_text: usize = reaching_v6.len + 32;
 
-pub fn writeAddress(into: []u8, address: iface.NetRouter.Address) []const u8 {
+pub fn writeAddress(into: []u8, address: links.NetRouter.Address) []const u8 {
     return switch (address) {
         .ipv4 => |bytes| std.fmt.bufPrint(into, reaching_v4 ++ "{x}", .{bytes}) catch unreachable,
         .ipv6 => |bytes| std.fmt.bufPrint(into, reaching_v6 ++ "{x}", .{bytes}) catch unreachable,
     };
 }
 
-pub fn addressIn(text: []const u8) ?iface.NetRouter.Address {
+pub fn addressIn(text: []const u8) ?links.NetRouter.Address {
     if (std.mem.startsWith(u8, text, reaching_v4)) {
         var bytes: [4]u8 = undefined;
         const digits = text[reaching_v4.len..];
@@ -155,7 +158,7 @@ pub const Request = struct {
     argv: []const []const u8,
     limits: rlimits.Limits = .{},
     seccomp_options: Seccomp = .{},
-    network: namespace.Network = .none,
+    network: iface.Network = .none,
     path_audit: bool = false,
     now_ns: i64 = 0,
 };
@@ -183,13 +186,15 @@ const host_only = [_][]const u8{
     "stderr_fd",
     "stdin_fd",
     "containment",
-    "net_broker",
-    "net_router",
-    "device_source",
-    "device_tree",
-    "limits_report",
-    "supervisor_audit",
-    "syscall_audit",
+    // Host side plumbing. A guest builds its own links from what the host
+    // answers over this stream, so a channel or a helper never crosses.
+    "channels",
+    "helpers",
+    // Both follow from the guest's own router link, which the guest sets up
+    // itself, so sending them would say it twice.
+    "substitutions",
+    "owned_directories",
+    "deny_notice",
     "hide_helpers",
 };
 
@@ -199,7 +204,6 @@ pub fn requestFor(
     argv: []const []const u8,
 ) std.mem.Allocator.Error!?Request {
     if (config.containment == .supplied) return null;
-    if (config.device_tree != null) return null;
 
     const mounts = try allocator.alloc(Mount, config.mounts.len);
     for (config.mounts, mounts) |from, *into| into.* = switch (from) {
@@ -276,7 +280,7 @@ pub fn configFor(
         .deny => |one| .{ .deny = .{ .target = one.target } },
     };
 
-    const rules = try allocator.alloc(iface.Config.Rule, request.rules.len);
+    const rules = try allocator.alloc(iface.Rule, request.rules.len);
     for (request.rules, rules) |from, *into| into.* = .{
         .path = from.path,
         .access = @as(landlock.AccessFs, @bitCast(from.access)),
@@ -421,7 +425,7 @@ test "a config's geometry survives the round trip, bit for bit" {
             .block_connect = true,
             .traps = .initMany(&.{ .openat, .connect }),
         },
-        .network = .filtered,
+        .network = .{ .isolated = netns.params },
         .path_audit = true,
     };
 
@@ -430,7 +434,7 @@ test "a config's geometry survives the round trip, bit for bit" {
 
     var as_guest = config;
     as_guest.root = guest_root;
-    try testing.expectEqualSlices(u8, &as_guest.shapeHash(), &back.shapeHash());
+    try testing.expectEqualSlices(u8, &links.shapeHash(as_guest), &links.shapeHash(back));
 
     try testing.expectEqualStrings(guest_root, back.root);
     try testing.expect(!std.mem.eql(u8, config.root, back.root));
@@ -517,19 +521,19 @@ test "a cancel line is read back as the signal it asks for, and nothing else is"
 test "an address goes out as bytes and comes back as the same bytes" {
     var room: [max_reaching_text]u8 = undefined;
 
-    const four: iface.NetRouter.Address = .{ .ipv4 = .{ 127, 0, 0, 1 } };
+    const four: links.NetRouter.Address = .{ .ipv4 = .{ 127, 0, 0, 1 } };
     try testing.expectEqualStrings("v4.7f000001", writeAddress(&room, four));
     try testing.expectEqual(four, addressIn(writeAddress(&room, four)).?);
 
-    const six: iface.NetRouter.Address = .{ .ipv6 = .{
+    const six: links.NetRouter.Address = .{ .ipv6 = .{
         0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
     } };
     try testing.expectEqual(six, addressIn(writeAddress(&room, six)).?);
 
-    try testing.expectEqual(@as(?iface.NetRouter.Address, null), addressIn("127.0.0.1"));
-    try testing.expectEqual(@as(?iface.NetRouter.Address, null), addressIn("v4.7f0000"));
-    try testing.expectEqual(@as(?iface.NetRouter.Address, null), addressIn("v4.zzzzzzzz"));
-    try testing.expectEqual(@as(?iface.NetRouter.Address, null), addressIn(""));
+    try testing.expectEqual(@as(?links.NetRouter.Address, null), addressIn("127.0.0.1"));
+    try testing.expectEqual(@as(?links.NetRouter.Address, null), addressIn("v4.7f0000"));
+    try testing.expectEqual(@as(?links.NetRouter.Address, null), addressIn("v4.zzzzzzzz"));
+    try testing.expectEqual(@as(?links.NetRouter.Address, null), addressIn(""));
 }
 
 test "a cancel is taken from the front, and a request behind it is left alone" {

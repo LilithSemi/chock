@@ -3,7 +3,8 @@
 //! in this process is a filter, and the mount tree is the boundary.
 
 const std = @import("std");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
 const chock_provider = @import("chock-provider");
@@ -181,11 +182,11 @@ pub const default_timeout_ns: u64 = 120 * std.time.ns_per_s;
 
 pub const default_workspace_free_floor_bytes: u64 = 1 << 30;
 
-const tool_bin_dir = sandbox.runtime_prefix ++ "/tool-bin";
+const tool_bin_dir = chock_net.runtime_prefix ++ "/tool-bin";
 
-const tool_in_path = sandbox.runtime_prefix ++ "/tool-in/content";
+const tool_in_path = chock_net.runtime_prefix ++ "/tool-in/content";
 
-pub const Error = sandbox.Sandbox.SpawnError;
+pub const Error = palisade.Sandbox.SpawnError;
 
 pub const Tool = enum {
     read_file,
@@ -497,7 +498,7 @@ pub const Tool = enum {
         };
     }
 
-    const writable_directories_text = if (sandbox.expresses.moved_paths)
+    const writable_directories_text = if (palisade.Sandbox.expresses.moved_paths)
         "Two directories outside the workspace are writable, and they keep " ++
             "different things. " ++ scratchpad.tmp_sandbox_dir ++ " is capped and is " ++
             "emptied when the call ends, so a build's temporary files belong there; it is " ++
@@ -777,7 +778,7 @@ pub const Registry = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         env: *const std.process.Environ.Map,
-        workspace_config: sandbox.Config,
+        workspace_config: chock_net.Call,
         call: ToolCall,
     ) Error!ToolResult {
         return dispatchWith(allocator, io, env, workspace_config, call, .{});
@@ -787,7 +788,7 @@ pub const Registry = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         env: *const std.process.Environ.Map,
-        workspace_config: sandbox.Config,
+        workspace_config: chock_net.Call,
         call: ToolCall,
         timeout_ns: u64,
     ) Error!ToolResult {
@@ -798,7 +799,7 @@ pub const Registry = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         env: *const std.process.Environ.Map,
-        workspace_config: sandbox.Config,
+        workspace_config: chock_net.Call,
         call: ToolCall,
         context: Context,
     ) Error!ToolResult {
@@ -828,13 +829,16 @@ pub const Registry = struct {
             context.store_paths,
             context.read_only_mounts,
         );
-        defer allocator.free(config.mounts);
-        defer allocator.free(config.rules);
+        defer allocator.free(config.config.mounts);
+        defer allocator.free(config.config.rules);
 
         if (context.net) |net| {
-            config.network = .filtered;
-            config.net_router = net.router(call.tool, call.call_id);
+            config.config.network = .{ .isolated = chock_net.netns.params };
+            config.links.net_router = net.router(call.tool, call.call_id);
         }
+
+        config.links.device_source = context.devices;
+        config.links.device_tree = context.device_tree;
 
         return switch (tool) {
             .read_file => readFile(allocator, io, env, config, call, timeout_ns),
@@ -925,22 +929,22 @@ pub const NetSeam = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        router: *const fn (ptr: *anyopaque, tool: []const u8, call_id: []const u8) sandbox.NetRouter,
-        background_router: *const fn (ptr: *anyopaque, tool: []const u8, call_id: []const u8) ?sandbox.NetRouter,
+        router: *const fn (ptr: *anyopaque, tool: []const u8, call_id: []const u8) chock_net.NetRouter,
+        background_router: *const fn (ptr: *anyopaque, tool: []const u8, call_id: []const u8) ?chock_net.NetRouter,
     };
 
-    pub fn router(self: NetSeam, tool: []const u8, call_id: []const u8) sandbox.NetRouter {
+    pub fn router(self: NetSeam, tool: []const u8, call_id: []const u8) chock_net.NetRouter {
         return self.vtable.router(self.ptr, tool, call_id);
     }
 
-    pub fn backgroundRouter(self: NetSeam, tool: []const u8, call_id: []const u8) ?sandbox.NetRouter {
+    pub fn backgroundRouter(self: NetSeam, tool: []const u8, call_id: []const u8) ?chock_net.NetRouter {
         return self.vtable.background_router(self.ptr, tool, call_id);
     }
 };
 
-pub const trust_store_inside = sandbox.trust_store_inside;
+pub const trust_store_inside = chock_net.trust_store_inside;
 
-pub const secret_file_prefix = sandbox.runtime_prefix ++ "/secret-";
+pub const secret_file_prefix = chock_net.runtime_prefix ++ "/secret-";
 
 const host_trust_stores = [_][]const u8{
     "/etc/ssl/certs/ca-certificates.crt",
@@ -996,6 +1000,10 @@ pub const Context = struct {
     read_only_mounts: []const ToolchainMount = &.{},
     provisioning: bool = false,
     role: Role = .worker,
+    devices: ?chock_net.DeviceSource = null,
+    device_tree: ?chock_net.DeviceTree = null,
+    supervisor_audit: ?*palisade.Sandbox.SupervisorAudit = null,
+    syscall_audit: ?*palisade.Sandbox.SyscallAudit = null,
 };
 
 fn propertiesOf(comptime T: type) []const plugin_core.schema.Property {
@@ -1342,7 +1350,7 @@ fn runCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: ToolCall,
     context: Context,
 ) Error!ToolResult {
@@ -1363,25 +1371,23 @@ fn runCommand(
     var config = workspace_config;
 
     if (in_background) {
-        const background: ?sandbox.NetRouter = if (context.net) |net|
+        const background: ?chock_net.NetRouter = if (context.net) |net|
             net.backgroundRouter(call.tool, call.call_id)
         else
             null;
 
         if (background) |router| {
-            config.network = .filtered;
-            config.net_router = router;
-            config.net_broker = null;
+            config.config.network = .{ .isolated = chock_net.netns.params };
+            config.links = .{ .net_router = router };
         } else {
-            config.network = .none;
-            config.net_broker = null;
-            config.net_router = null;
+            config.config.network = .none;
+            config.links = .{};
         }
     }
 
-    var extra_mounts: std.ArrayList(sandbox.namespace.Mount) = .empty;
+    var extra_mounts: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
     defer extra_mounts.deinit(allocator);
-    var extra_rules: std.ArrayList(sandbox.Config.Rule) = .empty;
+    var extra_rules: std.ArrayList(palisade.Sandbox.Rule) = .empty;
     defer extra_rules.deinit(allocator);
     var owned_envs: std.ArrayList([]const []const u8) = .empty;
     defer {
@@ -1398,12 +1404,12 @@ fn runCommand(
         } });
         try extra_rules.append(allocator, .{
             .path = inside,
-            .access = sandbox.landlock.AccessFs.read_write,
+            .access = palisade.linux.landlock.AccessFs.read_write,
         });
 
-        const entries = try cache.environment(allocator, config.env, inside);
+        const entries = try cache.environment(allocator, config.config.env, inside);
         try owned_envs.append(allocator, entries);
-        config.env = entries;
+        config.config.env = entries;
     }
 
     var emptied: ?scratchpad.Size = null;
@@ -1433,7 +1439,7 @@ fn runCommand(
         } });
         try extra_rules.append(allocator, .{
             .path = scratch_inside,
-            .access = sandbox.landlock.AccessFs.read_write,
+            .access = palisade.linux.landlock.AccessFs.read_write,
         });
         try extra_mounts.append(allocator, .{ .bind = .{
             .source = tasks_source.?,
@@ -1442,21 +1448,21 @@ fn runCommand(
         } });
         try extra_rules.append(allocator, .{
             .path = tasks_inside,
-            .access = sandbox.landlock.AccessFs.read_only,
+            .access = palisade.linux.landlock.AccessFs.read_only,
         });
 
-        const area = scratchpad.tempAreaFor(config.limits);
+        const area = scratchpad.tempAreaFor(config.config.limits);
         if (area == .capped) {
-            config.scratch = &.{.{ .target = scratchpad.tmp_sandbox_dir }};
+            config.config.scratch = &.{.{ .target = scratchpad.tmp_sandbox_dir }};
             try extra_rules.append(allocator, .{
                 .path = scratchpad.tmp_sandbox_dir,
-                .access = sandbox.landlock.AccessFs.read_write,
+                .access = palisade.linux.landlock.AccessFs.read_write,
             });
         }
 
-        const entries = try scratchpad.environment(allocator, config.env, area, scratch_inside);
+        const entries = try scratchpad.environment(allocator, config.config.env, area, scratch_inside);
         try owned_envs.append(allocator, entries);
-        config.env = entries;
+        config.config.env = entries;
     }
 
     if (context.net != null) {
@@ -1478,9 +1484,9 @@ fn runCommand(
                         .path = trust_store_inside,
                         .access = .{ .read_file = true },
                     });
-                    const with_trust = try trustEnvironment(allocator, config.env);
+                    const with_trust = try trustEnvironment(allocator, config.config.env);
                     try owned_envs.append(allocator, with_trust);
-                    config.env = with_trust;
+                    config.config.env = with_trust;
                 } else |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.StagingFailed => {},
@@ -1501,11 +1507,11 @@ fn runCommand(
                 armed = try credentials_mod.arm(
                     allocator,
                     granted,
-                    config.env,
+                    config.config.env,
                     &extra_mounts,
                     &extra_rules,
                 );
-                config.env = armed.?.env;
+                config.config.env = armed.?.env;
                 credential_chain.seam = seam;
             }
         }
@@ -1562,7 +1568,7 @@ fn runCommand(
                 }
 
                 if (entries.items.len != 0) {
-                    config.env = try credentials_mod.environment(allocator, config.env, entries.items);
+                    config.config.env = try credentials_mod.environment(allocator, config.config.env, entries.items);
                 }
             }
         }
@@ -1627,7 +1633,7 @@ fn runCommand(
         error.ExecutableNotFound => return toolErrorResult(
             allocator,
             call,
-            try notFoundRefusal(allocator, io, config, parsed.value.argv[0], context.provisioning),
+            try notFoundRefusal(allocator, io, config.config, parsed.value.argv[0], context.provisioning),
         ),
         error.ExecFailed => return toolErrorResult(
             allocator,
@@ -1660,7 +1666,7 @@ fn runCommand(
         size,
         scratchpad.sandboxDirFor(scratch_source.?),
     );
-    if (config.network == .none and result.is_error and namesTheNetwork(result.output)) {
+    if (config.config.network == .none and result.is_error and namesTheNetwork(result.output)) {
         result.note = try allocator.dupe(u8, no_network_note);
     } else if (ran == .captured and ran.captured.waited_for_approval_ns > 0) {
         result.note = try std.fmt.allocPrint(
@@ -1676,7 +1682,7 @@ fn runCommand(
     return result;
 }
 
-fn guestReason(driver: sandbox.Sandbox.Driver, err: anyerror) ?[]const u8 {
+fn guestReason(driver: chock_net.Driver, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.GuestRefused,
         error.GuestCannotPlacePath,
@@ -1706,7 +1712,7 @@ fn backgroundRun(
         allocator,
         io,
         request.driver,
-        request.config,
+        request.call,
         request.argv,
         request.timeout_ns,
         tasks.max_output_bytes,
@@ -1759,7 +1765,7 @@ fn backgroundRun(
 fn withLimitNote(
     allocator: std.mem.Allocator,
     output: []const u8,
-    report: sandbox.Sandbox.LimitsReport,
+    report: palisade.Sandbox.LimitsReport,
 ) []const u8 {
     const notice = (limitNotice(allocator, report) catch return output) orelse return output;
     return std.mem.concat(allocator, u8, &.{ output, notice }) catch output;
@@ -1871,7 +1877,7 @@ fn readFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: ToolCall,
     timeout_ns: u64,
 ) Error!ToolResult {
@@ -1880,7 +1886,7 @@ fn readFile(
     }) catch return parseFailure(allocator, call, .read_file);
     defer parsed.deinit();
 
-    if (deniedMountFor(workspace_config, parsed.value.path)) |denied| {
+    if (deniedMountFor(workspace_config.config, parsed.value.path)) |denied| {
         return deniedPathResult(allocator, call, denied);
     }
 
@@ -1932,7 +1938,7 @@ fn readImage(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: ToolCall,
     timeout_ns: u64,
 ) Error!ToolResult {
@@ -1942,7 +1948,7 @@ fn readImage(
     defer parsed.deinit();
 
     const path = parsed.value.path;
-    if (leavesProject(path, workspace_config.cwd)) {
+    if (leavesProject(path, workspace_config.config.cwd)) {
         return toolErrorResult(allocator, call, try std.fmt.allocPrint(
             allocator,
             "read_image reads a file inside the project, and \"{s}\" is outside it. Give a " ++
@@ -1950,7 +1956,7 @@ fn readImage(
             .{path},
         ));
     }
-    if (deniedMountFor(workspace_config, path)) |denied| {
+    if (deniedMountFor(workspace_config.config, path)) |denied| {
         return deniedPathResult(allocator, call, denied);
     }
 
@@ -2068,7 +2074,7 @@ fn listDirectory(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: ToolCall,
     timeout_ns: u64,
 ) Error!ToolResult {
@@ -2092,7 +2098,7 @@ fn listDirectory(
 
 const glob_find_arguments = [_][]const u8{ "-name", ".git", "-prune", "-o", "-type", "f", "-print" };
 
-fn deniedMountFor(config: sandbox.Config, path: []const u8) ?[]const u8 {
+fn deniedMountFor(config: palisade.Sandbox.Config, path: []const u8) ?[]const u8 {
     for (config.mounts) |mount| {
         const target = switch (mount) {
             .deny => |d| d.target,
@@ -2166,7 +2172,7 @@ fn grepFiles(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: ToolCall,
     timeout_ns: u64,
 ) Error!ToolResult {
@@ -2176,7 +2182,7 @@ fn grepFiles(
     defer parsed.deinit();
 
     const path = parsed.value.path orelse ".";
-    if (leavesProject(path, workspace_config.cwd)) {
+    if (leavesProject(path, workspace_config.config.cwd)) {
         return outsideProjectResult(allocator, call, .grep, path);
     }
     const argv = [_][]const u8{
@@ -2209,7 +2215,7 @@ fn globFiles(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: ToolCall,
     timeout_ns: u64,
 ) Error!ToolResult {
@@ -2219,7 +2225,7 @@ fn globFiles(
     defer parsed.deinit();
 
     const path = parsed.value.path orelse ".";
-    if (leavesProject(path, workspace_config.cwd)) {
+    if (leavesProject(path, workspace_config.config.cwd)) {
         return outsideProjectResult(allocator, call, .glob, path);
     }
     if (path.len != 0 and path[0] == '-') {
@@ -2290,7 +2296,7 @@ fn writeFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: ToolCall,
     timeout_ns: u64,
 ) Error!ToolResult {
@@ -2299,7 +2305,7 @@ fn writeFile(
     }) catch return parseFailure(allocator, call, .write_file);
     defer parsed.deinit();
 
-    if (deniedMountFor(workspace_config, parsed.value.path)) |denied| {
+    if (deniedMountFor(workspace_config.config, parsed.value.path)) |denied| {
         return deniedPathResult(allocator, call, denied);
     }
 
@@ -2334,7 +2340,7 @@ fn editFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: ToolCall,
     timeout_ns: u64,
 ) Error!ToolResult {
@@ -2343,7 +2349,7 @@ fn editFile(
     }) catch return parseFailure(allocator, call, .edit_file);
     defer parsed.deinit();
 
-    if (deniedMountFor(workspace_config, parsed.value.path)) |denied| {
+    if (deniedMountFor(workspace_config.config, parsed.value.path)) |denied| {
         return deniedPathResult(allocator, call, denied);
     }
 
@@ -2459,15 +2465,15 @@ const Put = struct {
     path: []const u8,
     content: []const u8,
     timeout_ns: u64,
-    extra_mounts: []const sandbox.namespace.Mount = &.{},
-    extra_rules: []const sandbox.Config.Rule = &.{},
+    extra_mounts: []const palisade.linux.namespace.Mount = &.{},
+    extra_rules: []const palisade.Sandbox.Rule = &.{},
 };
 
 fn putContent(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: ToolCall,
     put: Put,
     owned_note: []u8,
@@ -2500,9 +2506,9 @@ fn putContent(
         }
     }
 
-    const in_path = if (sandbox.expresses.moved_paths) tool_in_path else staged.host_path;
+    const in_path = if (palisade.Sandbox.expresses.moved_paths) tool_in_path else staged.host_path;
 
-    var copy_mounts: std.ArrayList(sandbox.namespace.Mount) = .empty;
+    var copy_mounts: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
     defer copy_mounts.deinit(allocator);
     try copy_mounts.appendSlice(allocator, put.extra_mounts);
     try copy_mounts.append(allocator, .{ .bind = .{
@@ -2511,7 +2517,7 @@ fn putContent(
         .read_only = true,
     } });
 
-    var copy_rules: std.ArrayList(sandbox.Config.Rule) = .empty;
+    var copy_rules: std.ArrayList(palisade.Sandbox.Rule) = .empty;
     defer copy_rules.deinit(allocator);
     try copy_rules.appendSlice(allocator, put.extra_rules);
     try copy_rules.append(allocator, .{ .path = in_path, .access = .{ .read_file = true } });
@@ -2535,7 +2541,7 @@ fn putContent(
 }
 
 fn memoryDirIn(host_dir: []const u8) []const u8 {
-    return if (sandbox.expresses.moved_paths) memory.sandbox_dir else host_dir;
+    return if (palisade.Sandbox.expresses.moved_paths) memory.sandbox_dir else host_dir;
 }
 
 fn memoryPathIn(
@@ -2613,7 +2619,7 @@ fn readMemory(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: ToolCall,
     context: Context,
 ) Error!ToolResult {
@@ -2638,7 +2644,7 @@ fn readMemory(
             .target = memory_dir,
             .read_only = true,
         } }},
-        .extra_rules = &.{.{ .path = memory_dir, .access = sandbox.landlock.AccessFs.read_only }},
+        .extra_rules = &.{.{ .path = memory_dir, .access = palisade.linux.landlock.AccessFs.read_only }},
         .timeout_ns = context.timeout_ns,
     })) orelse return notFoundResult(allocator, call, "cat");
 
@@ -2687,7 +2693,7 @@ fn writeMemory(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: ToolCall,
     context: Context,
 ) Error!ToolResult {
@@ -2799,7 +2805,7 @@ fn writeMemory(
             } }},
             .extra_rules = &.{.{
                 .path = memory_dir,
-                .access = sandbox.landlock.AccessFs.read_write,
+                .access = palisade.linux.landlock.AccessFs.read_write,
             }},
         },
         if (held == 0)
@@ -2822,7 +2828,7 @@ fn fixedProgram(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     sandbox_call: SandboxCall,
 ) Error!?Captured {
     return runInSandbox(allocator, io, env, workspace_config, sandbox_call) catch |err| switch (err) {
@@ -2928,7 +2934,7 @@ fn buildToolResult(allocator: std.mem.Allocator, call: ToolCall, captured: Captu
 
 fn limitNotice(
     allocator: std.mem.Allocator,
-    report: sandbox.Sandbox.LimitsReport,
+    report: palisade.Sandbox.LimitsReport,
 ) Error!?[]u8 {
     var buffer: [256]u8 = undefined;
     const sentence = report.killedText(&buffer) orelse return null;
@@ -3064,7 +3070,7 @@ fn stageContent(
     content: []const u8,
 ) StageError!Staged {
     var resolved_dir: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = sandbox.resolvedPath(io, env.get("TMPDIR") orelse "/tmp", &resolved_dir);
+    const dir = palisade.Sandbox.resolvedPath(io, env.get("TMPDIR") orelse "/tmp", &resolved_dir);
 
     var attempt: usize = 0;
     while (attempt < stage_attempts) : (attempt += 1) {
@@ -3158,7 +3164,7 @@ fn hostDirHasFile(io: std.Io, host_dir: []const u8, name: []const u8) bool {
     return true;
 }
 
-fn workspaceHasFile(io: std.Io, config: sandbox.Config, name: []const u8) bool {
+fn workspaceHasFile(io: std.Io, config: palisade.Sandbox.Config, name: []const u8) bool {
     for (config.mounts) |mount| switch (mount) {
         .bind => |bind| {
             if (!std.mem.eql(u8, bind.target, config.cwd)) continue;
@@ -3177,7 +3183,7 @@ fn workspaceHasFile(io: std.Io, config: sandbox.Config, name: []const u8) bool {
 fn notFoundRefusal(
     allocator: std.mem.Allocator,
     io: std.Io,
-    config: sandbox.Config,
+    config: palisade.Sandbox.Config,
     name: []const u8,
     provisioning: bool,
 ) std.mem.Allocator.Error![]u8 {
@@ -3263,8 +3269,8 @@ const no_shell_message =
 
 const SandboxCall = struct {
     argv: []const []const u8,
-    extra_mounts: []const sandbox.namespace.Mount = &.{},
-    extra_rules: []const sandbox.Config.Rule = &.{},
+    extra_mounts: []const palisade.linux.namespace.Mount = &.{},
+    extra_rules: []const palisade.Sandbox.Rule = &.{},
     keep_bytes: usize = max_output_bytes,
     timeout_ns: u64,
     background: ?*tasks.Table = null,
@@ -3281,16 +3287,16 @@ const Ran = union(enum) {
 pub fn withStore(
     allocator: std.mem.Allocator,
     io: std.Io,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     store_paths: []const []const u8,
     read_only_mounts: []const ToolchainMount,
-) std.mem.Allocator.Error!sandbox.Config {
+) std.mem.Allocator.Error!chock_net.Call {
     const added = store_paths.len + read_only_mounts.len;
 
-    var mounts = try allocator.alloc(sandbox.namespace.Mount, workspace_config.mounts.len + added);
+    var mounts = try allocator.alloc(palisade.linux.namespace.Mount, workspace_config.config.mounts.len + added);
     errdefer allocator.free(mounts);
-    @memcpy(mounts[0..workspace_config.mounts.len], workspace_config.mounts);
-    var next = workspace_config.mounts.len;
+    @memcpy(mounts[0..workspace_config.config.mounts.len], workspace_config.config.mounts);
+    var next = workspace_config.config.mounts.len;
     for (store_paths) |path| {
         mounts[next] = .{ .bind = .{ .source = path, .target = path, .read_only = true } };
         next += 1;
@@ -3300,10 +3306,10 @@ pub fn withStore(
         next += 1;
     }
 
-    const rules = try allocator.alloc(sandbox.Config.Rule, workspace_config.rules.len + added);
+    const rules = try allocator.alloc(palisade.Sandbox.Rule, workspace_config.config.rules.len + added);
     errdefer allocator.free(rules);
-    @memcpy(rules[0..workspace_config.rules.len], workspace_config.rules);
-    next = workspace_config.rules.len;
+    @memcpy(rules[0..workspace_config.config.rules.len], workspace_config.config.rules);
+    next = workspace_config.config.rules.len;
     for (store_paths) |path| {
         const is_file = if (std.Io.Dir.cwd().statFile(io, path, .{})) |stat|
             stat.kind != .directory
@@ -3312,9 +3318,9 @@ pub fn withStore(
         rules[next] = .{
             .path = path,
             .access = if (is_file)
-                sandbox.landlock.AccessFs.read_only_file
+                palisade.linux.landlock.AccessFs.read_only_file
             else
-                sandbox.landlock.AccessFs.read_only,
+                palisade.linux.landlock.AccessFs.read_only,
         };
         next += 1;
     }
@@ -3322,16 +3328,16 @@ pub fn withStore(
         rules[next] = .{
             .path = one.target,
             .access = switch (one.kind) {
-                .directory => sandbox.landlock.AccessFs.read_only,
-                .file => sandbox.landlock.AccessFs.read_only_file,
+                .directory => palisade.linux.landlock.AccessFs.read_only,
+                .file => palisade.linux.landlock.AccessFs.read_only_file,
             },
         };
         next += 1;
     }
 
     var config = workspace_config;
-    config.mounts = mounts;
-    config.rules = rules;
+    config.config.mounts = mounts;
+    config.config.rules = rules;
     return config;
 }
 
@@ -3339,7 +3345,7 @@ fn runInSandbox(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: SandboxCall,
 ) RunError!Captured {
     std.debug.assert(call.background == null);
@@ -3351,7 +3357,7 @@ fn runInSandboxWith(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     call: SandboxCall,
 ) RunError!Ran {
     var scaffold = std.heap.ArenaAllocator.init(allocator);
@@ -3369,7 +3375,7 @@ fn runInSandboxWith(
 
     if (call.background) |table| {
         const id = try table.start(io, .{
-            .config = prepared.config,
+            .call = prepared.config,
             .argv = prepared.argv,
             .timeout_ns = call.timeout_ns,
             .driver = driverNow(),
@@ -3393,7 +3399,7 @@ fn runInSandboxWith(
 }
 
 pub const Prepared = struct {
-    config: sandbox.Config,
+    config: chock_net.Call,
     argv: []const []const u8,
 };
 
@@ -3401,16 +3407,16 @@ pub fn prepare(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    workspace_config: sandbox.Config,
+    workspace_config: chock_net.Call,
     argv: []const []const u8,
-    extra_mounts: []const sandbox.namespace.Mount,
-    extra_rules: []const sandbox.Config.Rule,
+    extra_mounts: []const palisade.linux.namespace.Mount,
+    extra_rules: []const palisade.Sandbox.Rule,
 ) RunError!Prepared {
     if (argv.len == 0) return error.EmptyArgv;
 
     const workspace_program = std.mem.indexOfScalar(u8, argv[0], '/') != null;
     if (workspace_program) {
-        if (leavesProject(argv[0], workspace_config.cwd)) return error.InvalidExecutableName;
+        if (leavesProject(argv[0], workspace_config.config.cwd)) return error.InvalidExecutableName;
     } else {
         if (isShellName(argv[0])) return error.ShellRefused;
         if (isLauncherName(argv[0])) return error.LauncherRefused;
@@ -3423,7 +3429,7 @@ pub fn prepare(
         try resolveOnPath(allocator, io, env, argv[0]) orelse return error.ExecutableNotFound;
 
     const staged_target: ?[]const u8 = if (resolved) |path|
-        if (sandbox.expresses.moved_paths)
+        if (palisade.Sandbox.expresses.moved_paths)
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_bin_dir, argv[0] })
         else
             path
@@ -3431,7 +3437,7 @@ pub fn prepare(
         null;
 
     const mounted_at: ?[]const u8 = if (resolved) |path|
-        try sandboxPathOf(allocator, workspace_config.mounts, path)
+        try sandboxPathOf(allocator, workspace_config.config.mounts, path)
     else
         null;
     const bind_source: ?[]const u8 = if (mounted_at == null) resolved else null;
@@ -3442,25 +3448,25 @@ pub fn prepare(
     else
         staged_target.?;
 
-    var mounts: std.ArrayList(sandbox.namespace.Mount) = .empty;
+    var mounts: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
     errdefer mounts.deinit(allocator);
-    try mounts.appendSlice(allocator, workspace_config.mounts);
+    try mounts.appendSlice(allocator, workspace_config.config.mounts);
     if (bind_source) |source| {
         try mounts.append(allocator, .{ .bind = .{ .source = source, .target = bin_target, .read_only = true } });
     }
     try mounts.append(allocator, .{ .bind = .{ .source = "/dev/null", .target = "/dev/null", .read_only = false } });
-    if (sandbox.expresses.procfs) try mounts.append(allocator, .{ .proc = .{} });
+    if (palisade.Sandbox.expresses.procfs) try mounts.append(allocator, .{ .proc = .{} });
     try mounts.appendSlice(allocator, extra_mounts);
 
-    var rules: std.ArrayList(sandbox.Config.Rule) = .empty;
+    var rules: std.ArrayList(palisade.Sandbox.Rule) = .empty;
     errdefer rules.deinit(allocator);
-    try rules.appendSlice(allocator, workspace_config.rules);
+    try rules.appendSlice(allocator, workspace_config.config.rules);
     if (resolved != null) {
         try rules.append(allocator, .{ .path = bin_target, .access = .{ .execute = true, .read_file = true } });
     }
     try rules.append(allocator, .{ .path = "/dev/null", .access = .{ .read_file = true, .write_file = true } });
-    if (sandbox.expresses.procfs) {
-        try rules.append(allocator, .{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only });
+    if (palisade.Sandbox.expresses.procfs) {
+        try rules.append(allocator, .{ .path = "/proc", .access = palisade.linux.landlock.AccessFs.read_only });
     }
     try rules.appendSlice(allocator, extra_rules);
 
@@ -3470,15 +3476,15 @@ pub fn prepare(
     try full_argv.appendSlice(allocator, argv[1..]);
 
     var call_config = workspace_config;
-    call_config.mounts = try mounts.toOwnedSlice(allocator);
-    call_config.rules = try rules.toOwnedSlice(allocator);
+    call_config.config.mounts = try mounts.toOwnedSlice(allocator);
+    call_config.config.rules = try rules.toOwnedSlice(allocator);
 
     return .{ .config = call_config, .argv = try full_argv.toOwnedSlice(allocator) };
 }
 
 fn sandboxPathOf(
     allocator: std.mem.Allocator,
-    mounts: []const sandbox.namespace.Mount,
+    mounts: []const palisade.linux.namespace.Mount,
     path: []const u8,
 ) std.mem.Allocator.Error!?[]const u8 {
     var index = mounts.len;
@@ -3564,27 +3570,28 @@ const Captured = struct {
     truncated: bool,
     timed_out: bool,
     timeout_ns: u64,
-    limits: sandbox.Sandbox.LimitsReport = .{},
+    limits: palisade.Sandbox.LimitsReport = .{},
     waited_for_approval_ns: u64 = 0,
 };
 
 const SpawnThread = struct {
+    io: std.Io,
     allocator: std.mem.Allocator,
-    driver: sandbox.Sandbox.Driver,
-    config: sandbox.Config,
+    driver: chock_net.Driver,
+    config: chock_net.Call,
     argv: []const []const u8,
-    middle: sandbox.Middle = .{},
+    middle: palisade.Sandbox.Handle = .{},
+    reports: palisade.Sandbox.Reports = .{},
     done: std.atomic.Value(bool) = .init(false),
     term: std.process.Child.Term = undefined,
-    spawn_err: ?sandbox.Sandbox.SpawnError = null,
+    spawn_err: ?palisade.Sandbox.SpawnError = null,
 
     fn run(self: *SpawnThread) void {
         self.term = self.driver.spawn(
             self.allocator,
             self.config,
             self.argv,
-            null,
-            &self.middle,
+            .{ .handle = &self.middle, .reports = self.reports },
         ) catch |err| {
             self.spawn_err = err;
             self.done.store(true, .release);
@@ -3594,50 +3601,48 @@ const SpawnThread = struct {
     }
 };
 
-var chosen_driver: sandbox.Sandbox.Driver = sandbox.Sandbox.native_driver;
+var chosen_driver: chock_net.Driver = chock_net.Driver.native_driver;
 
-pub fn useDriver(one: sandbox.Sandbox.Driver) void {
+pub fn useDriver(one: chock_net.Driver) void {
     chosen_driver = one;
 }
 
-pub fn driverNow() sandbox.Sandbox.Driver {
+pub fn driverNow() chock_net.Driver {
     return chosen_driver;
 }
 
-var running_tool_handles: [tasks.max_tasks + 1]std.atomic.Value(std.posix.fd_t) = @splat(.init(-1));
+var running_tool_handles: [tasks.max_tasks + 1]std.atomic.Value(?*palisade.Sandbox.Handle) = @splat(.init(null));
 
-fn takeRunningSlot(handle: std.posix.fd_t) ?usize {
-    if (handle < 0) return null;
+fn takeRunningSlot(handle: *palisade.Sandbox.Handle) ?usize {
     for (&running_tool_handles, 0..) |*slot, index| {
-        if (slot.cmpxchgStrong(-1, handle, .acq_rel, .monotonic) == null) return index;
+        if (slot.cmpxchgStrong(null, handle, .acq_rel, .monotonic) == null) return index;
     }
     return null;
 }
 
 fn releaseRunningSlot(slot: ?usize) void {
     const index = slot orelse return;
-    running_tool_handles[index].store(-1, .release);
+    running_tool_handles[index].store(null, .release);
 }
 
 pub fn cancelRunningTool() void {
     for (&running_tool_handles) |*slot| {
-        const handle = slot.load(.monotonic);
-        if (handle < 0) continue;
-        chosen_driver.signalMiddle(handle, std.posix.SIG.KILL) catch {};
+        const handle = slot.load(.monotonic) orelse continue;
+        handle.signal(@intFromEnum(std.os.linux.SIG.KILL)) catch {};
     }
 }
 
 fn spawnCapturing(
     allocator: std.mem.Allocator,
     io: std.Io,
-    driver: sandbox.Sandbox.Driver,
-    config: sandbox.Config,
+    driver: chock_net.Driver,
+    config: chock_net.Call,
     argv: []const []const u8,
     timeout_ns: u64,
     keep_bytes: usize,
     filler: ?idle_mod.Idle,
     approval_wait_ns: ?*const std.atomic.Value(u64),
-) sandbox.Sandbox.SpawnError!Captured {
+) palisade.Sandbox.SpawnError!Captured {
     return spawnCapturingIo(
         allocator,
         io,
@@ -3655,15 +3660,15 @@ fn spawnCapturing(
 fn spawnCapturingIo(
     allocator: std.mem.Allocator,
     io: std.Io,
-    driver: sandbox.Sandbox.Driver,
-    config: sandbox.Config,
+    driver: chock_net.Driver,
+    config: chock_net.Call,
     argv: []const []const u8,
     timeout_ns: u64,
     keep_bytes: usize,
     filler: ?idle_mod.Idle,
     approval_wait_ns: ?*const std.atomic.Value(u64),
     chock_io_driver: chock_io.Io,
-) sandbox.Sandbox.SpawnError!Captured {
+) palisade.Sandbox.SpawnError!Captured {
     const raw_pipe = try chock_io_driver.pipeCloseOnExec();
     const read_fd = raw_pipe.read_fd;
     const write_fd = raw_pipe.write_fd;
@@ -3676,18 +3681,21 @@ fn spawnCapturingIo(
     defer thread_arena_state.deinit();
 
     var thread_config = config;
-    thread_config.stdout_fd = write_fd;
-    thread_config.stderr_fd = write_fd;
+    thread_config.config.stdout_fd = write_fd;
+    thread_config.config.stderr_fd = write_fd;
 
-    var limits_report: sandbox.Sandbox.LimitsReport = .{};
-    thread_config.limits_report = &limits_report;
+    var limits_report: palisade.Sandbox.LimitsReport = .{};
 
     var spawn_thread = SpawnThread{
+        .io = io,
         .allocator = thread_arena_state.allocator(),
         .driver = driver,
         .config = thread_config,
         .argv = argv,
+        .reports = .{ .limits = &limits_report },
     };
+    errdefer chock_net.clearRootAfterFailure(io, config.config.root);
+
     const thread = std.Thread.spawn(.{}, SpawnThread.run, .{&spawn_thread}) catch {
         std.Io.File.close(read_file, io);
         std.Io.File.close(write_file, io);
@@ -3697,20 +3705,20 @@ fn spawnCapturingIo(
     const wait_step: std.Io.Duration = .fromMilliseconds(1);
     const wait_bound: std.Io.Duration = .fromSeconds(5);
     var waited: std.Io.Duration = .zero;
-    while (@atomicLoad(std.posix.pid_t, &spawn_thread.middle.pid, .acquire) == 0 and
+    while (spawn_thread.middle.pid() == null and
         !spawn_thread.done.load(.acquire) and
         waited.toNanoseconds() < wait_bound.toNanoseconds())
     {
         std.Io.sleep(io, wait_step, .awake) catch {};
         waited = .fromNanoseconds(waited.toNanoseconds() + wait_step.toNanoseconds());
     }
-    if (@atomicLoad(std.posix.pid_t, &spawn_thread.middle.pid, .acquire) == 0 and !spawn_thread.done.load(.acquire)) {
+    if (spawn_thread.middle.pid() == null and !spawn_thread.done.load(.acquire)) {
         return error.Unexpected;
     }
 
-    defer driver.closeMiddle(&spawn_thread.middle);
+    defer spawn_thread.middle.close();
 
-    const cancel_slot = takeRunningSlot(spawn_thread.middle.fd);
+    const cancel_slot = takeRunningSlot(&spawn_thread.middle);
     defer releaseRunningSlot(cancel_slot);
 
     std.Io.File.close(write_file, io);
@@ -3763,7 +3771,7 @@ fn drainCapture(
     keep_bytes: usize,
     filler: ?idle_mod.Idle,
     approval_wait_ns: ?*const std.atomic.Value(u64),
-) sandbox.Sandbox.SpawnError!Drained {
+) palisade.Sandbox.SpawnError!Drained {
     var kept = try allocator.alloc(u8, keep_bytes);
     errdefer allocator.free(kept);
     var kept_len: usize = 0;
@@ -3815,8 +3823,8 @@ fn drainCapture(
                     if (std.Io.Clock.Timestamp.now(io, .awake).compare(.lt, fresh)) continue;
                 }
                 timed_out = true;
-                if (@atomicLoad(std.posix.pid_t, &spawn_thread.middle.pid, .acquire) != 0) {
-                    spawn_thread.driver.signalMiddle(spawn_thread.middle.fd, std.posix.SIG.TERM) catch {};
+                if (spawn_thread.middle.pid() != null) {
+                    spawn_thread.middle.signal(@intFromEnum(std.os.linux.SIG.TERM)) catch {};
                     signal_sent = true;
                 }
                 continue;
@@ -3846,30 +3854,25 @@ fn drainCapture(
 }
 
 test "a background task takes a cancel slot of its own and never clears a foreground call's" {
-    const foreground = takeRunningSlot(111).?;
-    const background = takeRunningSlot(222).?;
+    var one: palisade.Sandbox.Handle = .{};
+    one.publish(111, 11);
+    var two: palisade.Sandbox.Handle = .{};
+    two.publish(222, 22);
+    const foreground = takeRunningSlot(&one).?;
+    const background = takeRunningSlot(&two).?;
     try std.testing.expect(foreground != background);
 
     releaseRunningSlot(background);
     try std.testing.expectEqual(
-        @as(std.posix.fd_t, -1),
+        @as(?*palisade.Sandbox.Handle, null),
         running_tool_handles[background].load(.monotonic),
     );
-    try std.testing.expectEqual(
-        @as(std.posix.fd_t, 111),
-        running_tool_handles[foreground].load(.monotonic),
-    );
+    try std.testing.expectEqual(&one, running_tool_handles[foreground].load(.monotonic).?);
     releaseRunningSlot(foreground);
     try std.testing.expectEqual(
-        @as(std.posix.fd_t, -1),
+        @as(?*palisade.Sandbox.Handle, null),
         running_tool_handles[foreground].load(.monotonic),
     );
-
-    try std.testing.expectEqual(@as(?usize, null), takeRunningSlot(-1));
-    const zero = takeRunningSlot(0);
-    try std.testing.expect(zero != null);
-    try std.testing.expectEqual(@as(std.posix.fd_t, 0), running_tool_handles[zero.?].load(.monotonic));
-    releaseRunningSlot(zero);
 
     try std.testing.expectEqual(tasks.max_tasks + 1, running_tool_handles.len);
 }
@@ -3883,7 +3886,7 @@ test "cancelRunningTool signals nothing at all when no tool call is running" {
     });
 
     for (&running_tool_handles) |*slot| {
-        try std.testing.expectEqual(@as(std.posix.fd_t, -1), slot.load(.monotonic));
+        try std.testing.expectEqual(@as(?*palisade.Sandbox.Handle, null), slot.load(.monotonic));
     }
     cancelRunningTool();
 
@@ -3903,19 +3906,19 @@ test "a cancel through a slot whose call has ended reaches nobody" {
     });
 
     const child_pid = child.id.?;
-    var middle: sandbox.Middle = .{ .pid = child_pid };
+    var middle: palisade.Sandbox.Handle = .{ .driver = chosen_driver.asPalisade() };
     const handle = std.os.linux.pidfd_open(child_pid, 0);
     if (std.os.linux.errno(handle) != .SUCCESS) return error.SkipZigTest;
-    middle.fd = @intCast(handle);
-    defer sandbox.closeMiddle(&middle);
+    middle.publish(child_pid, @intCast(handle));
+    defer middle.close();
 
     const term = try child.wait(std.testing.io);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 
-    const slot = takeRunningSlot(middle.fd).?;
+    const slot = takeRunningSlot(&middle).?;
     defer releaseRunningSlot(slot);
 
-    try std.testing.expectError(error.Gone, sandbox.signalMiddle(middle.fd, std.posix.SIG.KILL));
+    try std.testing.expectError(error.Gone, middle.signal(@intFromEnum(std.os.linux.SIG.KILL)));
 
     cancelRunningTool();
 
@@ -3936,13 +3939,13 @@ test "a tool that does not exist is a tool error and not a crash" {
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
 
-    const empty_config = sandbox.Config{
+    const empty_config = chock_net.Call{ .config = .{
         .root = "/does-not-matter-for-this-test",
         .mounts = &.{},
         .rules = &.{},
         .cwd = "/",
         .env = &.{},
-    };
+    } };
 
     const result = try Registry.dispatch(allocator, std.testing.io, &env, empty_config, call);
     defer allocator.free(result.call_id);
@@ -3968,13 +3971,13 @@ test "the network note is offered for the boundary and for nothing else" {
     try std.testing.expect(std.mem.indexOf(u8, no_network_note, "fetch_url") != null);
 }
 
-const unreached_config = sandbox.Config{
+const unreached_config = chock_net.Call{ .config = .{
     .root = "/does-not-matter-for-this-test",
     .mounts = &.{},
     .rules = &.{},
     .cwd = "/home/someone/project",
     .env = &.{},
-};
+} };
 
 test "a shell as argv[0] is refused, and the refusal names the argv array instead" {
     const allocator = std.testing.allocator;
@@ -4836,13 +4839,13 @@ test "a task list dispatched with no session around it is refused, and never rea
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
 
-    const empty_config = sandbox.Config{
+    const empty_config = chock_net.Call{ .config = .{
         .root = "/does-not-matter-for-this-test",
         .mounts = &.{},
         .rules = &.{},
         .cwd = "/",
         .env = &.{},
-    };
+    } };
 
     const result = try Registry.dispatchWith(
         allocator,
@@ -4881,13 +4884,13 @@ const TestNetSeam = struct {
         .background_router = backgroundRouterFn,
     };
 
-    fn backgroundRouterFn(ptr: *anyopaque, name: []const u8, call_id: []const u8) ?sandbox.NetRouter {
+    fn backgroundRouterFn(ptr: *anyopaque, name: []const u8, call_id: []const u8) ?chock_net.NetRouter {
         const self: *TestNetSeam = @ptrCast(@alignCast(ptr));
         self.background_calls += 1;
         return routerFn(ptr, name, call_id);
     }
 
-    fn routerFn(ptr: *anyopaque, name: []const u8, call_id: []const u8) sandbox.NetRouter {
+    fn routerFn(ptr: *anyopaque, name: []const u8, call_id: []const u8) chock_net.NetRouter {
         const self: *TestNetSeam = @ptrCast(@alignCast(ptr));
         self.calls += 1;
         self.last_tool_len = @min(name.len, self.last_tool.len);
@@ -4897,13 +4900,13 @@ const TestNetSeam = struct {
         return .{ .ptr = self, .vtable = &net_vtable };
     }
 
-    const net_vtable = sandbox.NetRouter.VTable{ .resolve = resolveFn, .open = openFn };
+    const net_vtable = chock_net.NetRouter.VTable{ .resolve = resolveFn, .open = openFn };
 
-    fn resolveFn(_: *anyopaque, _: []const u8, _: sandbox.NetRouter.Family) sandbox.NetRouter.Resolution {
+    fn resolveFn(_: *anyopaque, _: []const u8, _: chock_net.NetRouter.Family) chock_net.NetRouter.Resolution {
         return .refused;
     }
 
-    fn openFn(_: *anyopaque, _: sandbox.NetRouter.Address, _: u16) sandbox.NetBroker.Grant {
+    fn openFn(_: *anyopaque, _: chock_net.NetRouter.Address, _: u16) chock_net.NetBroker.Grant {
         return .refused;
     }
 
@@ -4922,13 +4925,13 @@ test "a tool call is given a network router, named after the tool that is runnin
     defer env.deinit();
 
     var seam = TestNetSeam{};
-    const config = sandbox.Config{
+    const config = chock_net.Call{ .config = .{
         .root = "/does-not-matter-for-this-test",
         .mounts = &.{},
         .rules = &.{},
         .cwd = "/",
         .env = &.{},
-    };
+    } };
 
     const result = try Registry.dispatchWith(
         allocator,
@@ -4952,18 +4955,18 @@ test "a tool call is given a network router, named after the tool that is runnin
 
 test "spawnCapturing reports a pipe creation failure without ever reaching the sandbox" {
     const allocator = std.testing.allocator;
-    const empty_config = sandbox.Config{
+    const empty_config = chock_net.Call{ .config = .{
         .root = "/does-not-matter-for-this-test",
         .mounts = &.{},
         .rules = &.{},
         .cwd = "/",
         .env = &.{},
-    };
+    } };
 
     const result = spawnCapturingIo(
         allocator,
         std.testing.io,
-        sandbox.Sandbox.native_driver,
+        chock_net.Driver.native_driver,
         empty_config,
         &.{"true"},
         default_timeout_ns,
@@ -5035,23 +5038,23 @@ test "a long line with no newline is text, and is capped rather than stood in fo
 }
 
 test "the directory a tool binary is bound in is under the one prefix Chock owns" {
-    try std.testing.expect(std.mem.startsWith(u8, tool_bin_dir, sandbox.runtime_prefix ++ "/"));
-    try std.testing.expect(!std.mem.eql(u8, tool_bin_dir, sandbox.runtime_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, tool_bin_dir, chock_net.runtime_prefix ++ "/"));
+    try std.testing.expect(!std.mem.eql(u8, tool_bin_dir, chock_net.runtime_prefix));
     try std.testing.expectEqualStrings("/run/chock/tool-bin", tool_bin_dir);
 }
 
 test "a program the toolchain mount already carries runs where it is, and every other one does not" {
-    const store: sandbox.namespace.Mount = .{ .bind = .{
+    const store: palisade.linux.namespace.Mount = .{ .bind = .{
         .source = "/nix/store",
         .target = "/nix/store",
         .read_only = true,
     } };
-    const workspace: sandbox.namespace.Mount = .{ .bind = .{
+    const workspace: palisade.linux.namespace.Mount = .{ .bind = .{
         .source = "/home/somebody/.local/state/chock/sessions/p/01.work/wt",
         .target = "/home/somebody/work/parser",
         .read_only = false,
     } };
-    const mounts = [_]sandbox.namespace.Mount{ workspace, store };
+    const mounts = [_]palisade.linux.namespace.Mount{ workspace, store };
 
     const allocator = std.testing.allocator;
 
@@ -5082,7 +5085,7 @@ test "a program the toolchain mount already carries runs where it is, and every 
     defer allocator.free(in_worktree);
     try std.testing.expectEqualStrings("/home/somebody/work/parser/tools/helper", in_worktree);
 
-    const overlay = [_]sandbox.namespace.Mount{.{ .overlay = .{
+    const overlay = [_]palisade.linux.namespace.Mount{.{ .overlay = .{
         .lower = "/home/somebody/work/parser",
         .upper = "/tmp/upper",
         .work = "/tmp/work",
@@ -5101,25 +5104,25 @@ test "a toolchain mount is bound at the target the caller named, with the rule i
         .{ .source = "/tree/.dockerenv", .target = "/.dockerenv", .kind = .file },
     };
 
-    const base = sandbox.Config{
+    const base = palisade.Sandbox.Config{
         .root = "/root",
         .mounts = &.{},
         .rules = &.{},
         .cwd = "/",
         .env = &.{},
     };
-    const built = try withStore(allocator, std.testing.io, base, &.{}, &toolchain);
-    defer allocator.free(built.mounts);
-    defer allocator.free(built.rules);
+    const built = try withStore(allocator, std.testing.io, .{ .config = base }, &.{}, &toolchain);
+    defer allocator.free(built.config.mounts);
+    defer allocator.free(built.config.rules);
 
-    try std.testing.expectEqual(@as(usize, 2), built.mounts.len);
-    try std.testing.expectEqualStrings("/tree/usr", built.mounts[0].bind.source);
-    try std.testing.expectEqualStrings("/usr", built.mounts[0].bind.target);
-    try std.testing.expect(built.mounts[0].bind.read_only);
+    try std.testing.expectEqual(@as(usize, 2), built.config.mounts.len);
+    try std.testing.expectEqualStrings("/tree/usr", built.config.mounts[0].bind.source);
+    try std.testing.expectEqualStrings("/usr", built.config.mounts[0].bind.target);
+    try std.testing.expect(built.config.mounts[0].bind.read_only);
 
-    try std.testing.expectEqualStrings("/usr", built.rules[0].path);
-    try std.testing.expectEqual(sandbox.landlock.AccessFs.read_only, built.rules[0].access);
-    try std.testing.expectEqual(sandbox.landlock.AccessFs.read_only_file, built.rules[1].access);
+    try std.testing.expectEqualStrings("/usr", built.config.rules[0].path);
+    try std.testing.expectEqual(palisade.linux.landlock.AccessFs.read_only, built.config.rules[0].access);
+    try std.testing.expectEqual(palisade.linux.landlock.AccessFs.read_only_file, built.config.rules[1].access);
 }
 
 test "a PATH candidate that is a link the host cannot follow is still a program" {
@@ -5155,7 +5158,7 @@ test "a PATH candidate that is a link the host cannot follow is still a program"
 test "a program out of a container image runs at the path the image gives it" {
     const allocator = std.testing.allocator;
     const tree = "/home/somebody/.cache/chock/images/debian-stable-slim/rootfs";
-    const mounts = [_]sandbox.namespace.Mount{
+    const mounts = [_]palisade.linux.namespace.Mount{
         .{ .bind = .{ .source = tree ++ "/usr", .target = "/usr", .read_only = true } },
         .{ .bind = .{ .source = tree ++ "/etc", .target = "/etc", .read_only = true } },
     };
@@ -5172,7 +5175,7 @@ test "a program out of a container image runs at the path the image gives it" {
 
 test "a mount that covers the answer cancels it, so a call never runs a different program" {
     const allocator = std.testing.allocator;
-    const mounts = [_]sandbox.namespace.Mount{
+    const mounts = [_]palisade.linux.namespace.Mount{
         .{ .bind = .{ .source = "/one/usr", .target = "/usr", .read_only = true } },
         .{ .bind = .{ .source = "/two/usr", .target = "/usr", .read_only = true } },
     };
@@ -5387,13 +5390,13 @@ test "edit_file refuses an old_string that is empty or unchanged, before it read
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
 
-    const empty_config = sandbox.Config{
+    const empty_config = chock_net.Call{ .config = .{
         .root = "/does-not-matter-for-this-test",
         .mounts = &.{},
         .rules = &.{},
         .cwd = "/",
         .env = &.{},
-    };
+    } };
 
     {
         const call = ToolCall{
@@ -5426,13 +5429,13 @@ test "a call whose arguments do not parse names the fields the tool actually rea
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
 
-    const empty_config = sandbox.Config{
+    const empty_config = chock_net.Call{ .config = .{
         .root = "/does-not-matter-for-this-test",
         .mounts = &.{},
         .rules = &.{},
         .cwd = "/",
         .env = &.{},
-    };
+    } };
 
     const call = ToolCall{ .call_id = "c1", .tool = "write_file", .arguments = "{\"path\":\"a.zig\"}" };
     const result = try Registry.dispatch(allocator, std.testing.io, &env, empty_config, call);
@@ -5445,8 +5448,8 @@ test "a call whose arguments do not parse names the fields the tool actually rea
 }
 
 test "the directory a write tool stages its bytes in is under the one prefix Chock owns" {
-    try std.testing.expect(std.mem.startsWith(u8, tool_in_path, sandbox.runtime_prefix ++ "/"));
-    try std.testing.expect(!std.mem.eql(u8, tool_in_path, sandbox.runtime_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, tool_in_path, chock_net.runtime_prefix ++ "/"));
+    try std.testing.expect(!std.mem.eql(u8, tool_in_path, chock_net.runtime_prefix));
     try std.testing.expectEqualStrings("/run/chock/tool-in/content", tool_in_path);
     try std.testing.expect(!std.mem.startsWith(u8, tool_in_path, tool_bin_dir));
 }
@@ -5459,34 +5462,34 @@ test "a prepared call asks for nothing this build's own driver refuses" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
 
-    const workspace_config = sandbox.Config{
+    const workspace_config = palisade.Sandbox.Config{
         .root = "/",
         .mounts = &.{.{ .bind = .{
             .source = "/work/checkout",
             .target = "/work/checkout",
             .read_only = false,
         } }},
-        .rules = &.{.{ .path = "/work/checkout", .access = sandbox.landlock.AccessFs.read_write }},
+        .rules = &.{.{ .path = "/work/checkout", .access = palisade.linux.landlock.AccessFs.read_write }},
         .cwd = "/work/checkout",
         .env = &.{},
     };
     const argv = [_][]const u8{"./zig-out/bin/tool"};
-    const prepared = try prepare(arena, std.testing.io, &env, workspace_config, &argv, &.{}, &.{});
+    const prepared = try prepare(arena, std.testing.io, &env, .{ .config = workspace_config }, &argv, &.{}, &.{});
 
     var procs: usize = 0;
-    for (prepared.config.mounts) |mount| switch (mount) {
+    for (prepared.config.config.mounts) |mount| switch (mount) {
         .proc => procs += 1,
-        .bind => |bind| if (!sandbox.expresses.moved_paths) {
+        .bind => |bind| if (!palisade.Sandbox.expresses.moved_paths) {
             try std.testing.expectEqualStrings(bind.source, bind.target);
         },
         .overlay, .deny => {},
     };
-    try std.testing.expectEqual(@as(usize, if (sandbox.expresses.procfs) 1 else 0), procs);
+    try std.testing.expectEqual(@as(usize, if (palisade.Sandbox.expresses.procfs) 1 else 0), procs);
 
-    if (!sandbox.expresses.moved_paths) {
+    if (!palisade.Sandbox.expresses.moved_paths) {
         try std.testing.expectEqual(
-            @as(?sandbox.darwin_driver_for_testing.Inexpressible, null),
-            sandbox.darwin_driver_for_testing.expressibleOn(prepared.config),
+            @as(?palisade.Sandbox.Inexpressible, null),
+            palisade.Sandbox.inexpressibleOnDarwin(prepared.config.config),
         );
     }
 }
@@ -5500,23 +5503,23 @@ test "prepare carries a config's own network through untouched, whatever it was"
     var env = std.process.Environ.Map.init(arena_state_gpa);
     defer env.deinit();
 
-    const workspace_config = sandbox.Config{
+    const workspace_config = palisade.Sandbox.Config{
         .root = "/",
         .mounts = &.{.{ .bind = .{
             .source = "/work/checkout",
             .target = "/work/checkout",
             .read_only = false,
         } }},
-        .rules = &.{.{ .path = "/work/checkout", .access = sandbox.landlock.AccessFs.read_write }},
+        .rules = &.{.{ .path = "/work/checkout", .access = palisade.linux.landlock.AccessFs.read_write }},
         .cwd = "/work/checkout",
         .env = &.{},
         .network = .none,
     };
     const argv = [_][]const u8{"./zig-out/bin/tool"};
-    const prepared = try prepare(arena, std.testing.io, &env, workspace_config, &argv, &.{}, &.{});
+    const prepared = try prepare(arena, std.testing.io, &env, .{ .config = workspace_config }, &argv, &.{}, &.{});
 
-    try std.testing.expectEqual(sandbox.namespace.Network.none, prepared.config.network);
-    try std.testing.expect(prepared.config.net_broker == null);
+    try std.testing.expectEqual(palisade.Sandbox.Network.none, prepared.config.config.network);
+    try std.testing.expect(prepared.config.links.net_broker == null);
 }
 
 test "every landlock rule a tool call is built from names a path its own mount list holds" {
@@ -5552,37 +5555,37 @@ test "every landlock rule a tool call is built from names a path its own mount l
     const scratch_inside = scratchpad.sandboxDirFor(scratch_host);
     const tasks_inside = tasks.sandboxDirFor(tasks_host);
 
-    const extra_mounts = [_]sandbox.namespace.Mount{
+    const extra_mounts = [_]palisade.linux.namespace.Mount{
         .{ .bind = .{ .source = cache_host, .target = cache_inside, .read_only = false } },
         .{ .bind = .{ .source = scratch_host, .target = scratch_inside, .read_only = false } },
         .{ .bind = .{ .source = tasks_host, .target = tasks_inside, .read_only = true } },
     };
-    const extra_rules = [_]sandbox.Config.Rule{
-        .{ .path = cache_inside, .access = sandbox.landlock.AccessFs.read_write },
-        .{ .path = scratch_inside, .access = sandbox.landlock.AccessFs.read_write },
-        .{ .path = tasks_inside, .access = sandbox.landlock.AccessFs.read_only },
-        .{ .path = scratchpad.tmp_sandbox_dir, .access = sandbox.landlock.AccessFs.read_write },
+    const extra_rules = [_]palisade.Sandbox.Rule{
+        .{ .path = cache_inside, .access = palisade.linux.landlock.AccessFs.read_write },
+        .{ .path = scratch_inside, .access = palisade.linux.landlock.AccessFs.read_write },
+        .{ .path = tasks_inside, .access = palisade.linux.landlock.AccessFs.read_only },
+        .{ .path = scratchpad.tmp_sandbox_dir, .access = palisade.linux.landlock.AccessFs.read_write },
     };
 
-    const workspace_config = sandbox.Config{
+    const workspace_config = palisade.Sandbox.Config{
         .root = "/does-not-need-to-exist-for-this-check",
         .mounts = &.{.{ .bind = .{
             .source = "/work/checkout",
             .target = "/work/checkout",
             .read_only = false,
         } }},
-        .rules = &.{.{ .path = "/work/checkout", .access = sandbox.landlock.AccessFs.read_write }},
+        .rules = &.{.{ .path = "/work/checkout", .access = palisade.linux.landlock.AccessFs.read_write }},
         .cwd = "/work/checkout",
         .env = &.{},
         .scratch = &.{.{ .target = scratchpad.tmp_sandbox_dir }},
     };
 
     const store_paths = [_][]const u8{ package, hook };
-    const with_toolchain = try withStore(arena, io, workspace_config, &store_paths, &.{});
+    const with_toolchain = try withStore(arena, io, .{ .config = workspace_config }, &store_paths, &.{});
 
     const in_store_argv = [_][]const u8{"parser"};
     const in_store = try prepare(arena, io, &env, with_toolchain, &in_store_argv, &extra_mounts, &extra_rules);
-    try expectLayersAgree(in_store.config);
+    try expectLayersAgree(in_store.config.config);
 
     const loose_dir = try std.fmt.allocPrint(arena, "{s}/loose", .{tmp_path});
     try std.Io.Dir.createDirAbsolute(io, loose_dir, .default_dir);
@@ -5593,10 +5596,10 @@ test "every landlock rule a tool call is built from names a path its own mount l
 
     const loose_argv = [_][]const u8{"lexer"};
     const bound = try prepare(arena, io, &env, with_toolchain, &loose_argv, &extra_mounts, &extra_rules);
-    try expectLayersAgree(bound.config);
+    try expectLayersAgree(bound.config.config);
 
     var found_program_mount = false;
-    for (bound.config.mounts) |mount| switch (mount) {
+    for (bound.config.config.mounts) |mount| switch (mount) {
         .bind => |bind| if (std.mem.eql(u8, bind.source, loose_program)) {
             found_program_mount = true;
         },
@@ -5605,9 +5608,9 @@ test "every landlock rule a tool call is built from names a path its own mount l
     try std.testing.expect(found_program_mount);
 }
 
-fn expectLayersAgree(config: sandbox.Config) !void {
+fn expectLayersAgree(config: palisade.Sandbox.Config) !void {
     var buffer: [256]u8 = undefined;
-    const said = if (sandbox.firstGap(config)) |gap|
+    const said = if (palisade.Sandbox.firstGap(config)) |gap|
         try std.fmt.bufPrint(&buffer, "{f}", .{gap})
     else
         "";
@@ -5762,24 +5765,24 @@ test "a nix_eval call with no session behind it is refused, and never answers a 
 test "a program that is not there names provide_tool only when this session really has it" {
     const allocator = std.testing.allocator;
 
-    const with = try notFoundRefusal(allocator, std.testing.io, unreached_config, "rg", true);
+    const with = try notFoundRefusal(allocator, std.testing.io, unreached_config.config, "rg", true);
     defer allocator.free(with);
     try std.testing.expect(std.mem.indexOf(u8, with, "provide_tool") != null);
     try std.testing.expect(std.mem.indexOf(u8, with, "apt") != null);
     try std.testing.expect(std.mem.indexOf(u8, with, "npm") != null);
 
-    const without = try notFoundRefusal(allocator, std.testing.io, unreached_config, "rg", false);
+    const without = try notFoundRefusal(allocator, std.testing.io, unreached_config.config, "rg", false);
     defer allocator.free(without);
     try std.testing.expect(std.mem.indexOf(u8, without, "provide_tool") == null);
     try std.testing.expect(std.mem.indexOf(u8, without, "Check the spelling") != null);
 }
 
 test "a denied path is recognised by the name the model uses, absolute or relative" {
-    const mounts = [_]sandbox.namespace.Mount{
+    const mounts = [_]palisade.linux.namespace.Mount{
         .{ .bind = .{ .source = "/work/checkout", .target = "/home/me/project", .read_only = false } },
         .{ .deny = .{ .target = "/home/me/project/secret.env" } },
     };
-    const config = sandbox.Config{
+    const config = palisade.Sandbox.Config{
         .root = "/root",
         .mounts = &mounts,
         .rules = &.{},
@@ -5801,7 +5804,7 @@ test "a denied path is recognised by the name the model uses, absolute or relati
     try std.testing.expectEqual(@as(?[]const u8, null), deniedMountFor(config, "tracked.txt"));
     try std.testing.expectEqual(@as(?[]const u8, null), deniedMountFor(config, "/home/me/project"));
 
-    const plain = sandbox.Config{
+    const plain = palisade.Sandbox.Config{
         .root = "/root",
         .mounts = mounts[0..1],
         .rules = &.{},

@@ -3,7 +3,8 @@
 //! which is a pass for a call in `blocked_calls`.
 
 const std = @import("std");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 const chock_broker = @import("chock-broker");
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
@@ -30,12 +31,12 @@ const reader_pid_in_namespace: linux.pid_t = 3;
 
 fn endIfNothingMeasured(err: anyerror) void {
     if (err != error.NamespaceFailed) return;
-    std.process.exit(sandbox.namespace.nothing_measured_exit_status);
+    std.process.exit(palisade.linux.namespace.nothing_measured_exit_status);
 }
 
-fn enterOrEndUnmeasured(options: sandbox.namespace.Options) void {
-    sandbox.namespace.enter(options, null) catch {
-        std.process.exit(sandbox.namespace.nothing_measured_exit_status);
+fn enterOrEndUnmeasured(options: palisade.linux.namespace.Options) void {
+    palisade.linux.namespace.enter(options, null) catch {
+        std.process.exit(palisade.linux.namespace.nothing_measured_exit_status);
     };
 }
 
@@ -46,13 +47,13 @@ fn enterTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
     const guarded = try std.fs.path.join(arena, &.{ work, "chock.zon" });
     try writeTestFile(arena, guarded, ".{}\n");
 
-    enterOrEndUnmeasured(.{ .network = .none, .mount = true });
-    try sandbox.namespace.buildRoot(arena, root, &.{
+    enterOrEndUnmeasured(.{ .new_net = true, .mount = true });
+    try palisade.linux.namespace.buildRoot(arena, root, &.{
         .{ .bind = .{ .source = work, .target = "/work", .read_only = false } },
         .{ .bind = .{ .source = guarded, .target = "/work/chock.zon", .read_only = true } },
         .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } },
-    }, false, null);
-    try sandbox.namespace.pivotInto(arena, root, null);
+    }, false, palisade.linux.namespace.default_deny_notice, null);
+    try palisade.linux.namespace.pivotInto(arena, root, null);
 }
 
 fn makeTestDir(arena: std.mem.Allocator, path: []const u8) !void {
@@ -128,19 +129,19 @@ fn absentRoot(arena: std.mem.Allocator, root: []const u8) ![]const u8 {
 }
 
 fn baseEscapeConfig(arena: std.mem.Allocator) !struct {
-    mounts: []const sandbox.namespace.Mount,
-    rules: []const sandbox.Config.Rule,
+    mounts: []const palisade.linux.namespace.Mount,
+    rules: []const palisade.Sandbox.Rule,
 } {
     const self_path = try selfExePath(arena);
-    const mounts = try arena.dupe(sandbox.namespace.Mount, &.{
+    const mounts = try arena.dupe(palisade.linux.namespace.Mount, &.{
         .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } },
         .{ .bind = .{ .source = self_path, .target = "/probe", .read_only = true } },
         .{ .proc = .{} },
         // `/dev/null` is also what makes `/dev` exist, which a Landlock rule needs to resolve.
         .{ .bind = .{ .source = "/dev/null", .target = "/dev/null", .read_only = false } },
     });
-    const rules = try arena.dupe(sandbox.Config.Rule, &.{
-        .{ .path = "/nix/store", .access = sandbox.landlock.AccessFs.read_only },
+    const rules = try arena.dupe(palisade.Sandbox.Rule, &.{
+        .{ .path = "/nix/store", .access = palisade.linux.landlock.AccessFs.read_only },
         // /probe is a file, so read_dir would give EINVAL.
         .{ .path = "/probe", .access = .{ .execute = true, .read_file = true } },
     });
@@ -305,7 +306,7 @@ const device_probe_content = "chock device probe content\n";
 const QueuedChange = struct {
     /// Written when `nextFn` hands `change` back, never before, so it arrives as a live hotplug.
     write: ?struct { path: []const u8, content: []const u8 } = null,
-    change: sandbox.DeviceSource.Change,
+    change: chock_net.DeviceSource.Change,
 };
 
 /// The wakeup is a pipe with one byte per change, so `POLLIN` stops when the queue empties.
@@ -332,18 +333,18 @@ const DeviceSourceStub = struct {
         _ = linux.close(self.wakeup_fds[1]);
     }
 
-    fn deviceSource(self: *DeviceSourceStub) sandbox.DeviceSource {
+    fn deviceSource(self: *DeviceSourceStub) chock_net.DeviceSource {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = sandbox.DeviceSource.VTable{ .wakeup = wakeupFn, .next = nextFn };
+    const vtable = chock_net.DeviceSource.VTable{ .wakeup = wakeupFn, .next = nextFn };
 
     fn wakeupFn(ptr: *anyopaque) i32 {
         const self: *DeviceSourceStub = @ptrCast(@alignCast(ptr));
         return self.wakeup_fds[0];
     }
 
-    fn nextFn(ptr: *anyopaque) ?sandbox.DeviceSource.Change {
+    fn nextFn(ptr: *anyopaque) ?chock_net.DeviceSource.Change {
         const self: *DeviceSourceStub = @ptrCast(@alignCast(ptr));
         if (self.served >= self.queue_len) return null;
         const queued = self.queue[self.served];
@@ -377,30 +378,30 @@ fn deviceEscape(
     root: []const u8,
     op: []const u8,
     op_argv: []const []const u8,
-    extra_mounts: []const sandbox.namespace.Mount,
-    extra_rules: []const sandbox.Config.Rule,
-    extra_net_broker: ?sandbox.NetBroker,
+    extra_mounts: []const palisade.linux.namespace.Mount,
+    extra_rules: []const palisade.Sandbox.Rule,
+    extra_net_broker: ?chock_net.NetBroker,
 ) !DeviceRun {
     const base = try baseEscapeConfig(arena);
 
     // `/dev` has to exist as a real directory before `applyLayers` builds the ruleset.
-    const devnull_mount = sandbox.namespace.Mount{
+    const devnull_mount = palisade.linux.namespace.Mount{
         .bind = .{ .source = "/dev/null", .target = "/dev/null", .read_only = false },
     };
     const mounts = try std.mem.concat(
         arena,
-        sandbox.namespace.Mount,
+        palisade.linux.namespace.Mount,
         &.{ base.mounts, &.{devnull_mount}, extra_mounts },
     );
 
     // Landlock walks the hierarchy when a path is opened, so a rule on `/dev` covers a file that appears later.
-    const dev_rule = sandbox.Config.Rule{
+    const dev_rule = palisade.Sandbox.Rule{
         .path = "/dev",
         .access = .{ .read_file = true, .write_file = true },
     };
     const rules = try std.mem.concat(
         arena,
-        sandbox.Config.Rule,
+        palisade.Sandbox.Rule,
         &.{ base.rules, &.{dev_rule}, extra_rules },
     );
 
@@ -419,17 +420,21 @@ fn deviceEscape(
 
     const argv = try std.mem.concat(arena, []const u8, &.{ &.{ "/probe", op }, op_argv });
 
-    const term = try sandbox.spawn(arena, .{
-        .root = root,
-        .mounts = mounts,
-        .rules = rules,
-        .cwd = "/",
-        .env = &.{},
-        .network = if (extra_net_broker != null) .filtered else .none,
-        .net_broker = extra_net_broker,
-        .device_source = stub.deviceSource(),
-        .device_tree = .{ .host = host_dir, .inside = device_tree_inside },
-    }, argv, null, null);
+    const term = try chock_net.Driver.native_driver.spawn(arena, .{
+        .config = .{
+            .root = root,
+            .mounts = mounts,
+            .rules = rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = if (extra_net_broker != null) .{ .isolated = chock_net.netns.params } else .none,
+        },
+        .links = .{
+            .net_broker = extra_net_broker,
+            .device_source = stub.deviceSource(),
+            .device_tree = .{ .host = host_dir, .inside = device_tree_inside },
+        },
+    }, argv, .{});
 
     return .{ .term = term, .served = stub.served };
 }
@@ -456,7 +461,7 @@ const ChildCountContext = struct {
     root: []const u8,
     read_fd: i32,
     device: bool,
-    middle: sandbox.Middle = .{},
+    middle: palisade.Sandbox.Handle = .{},
     term: std.process.Child.Term = undefined,
     err: ?anyerror = null,
 };
@@ -468,10 +473,10 @@ fn runChildCountSpawn(ctx: *ChildCountContext) void {
         return;
     };
 
-    // Declared at function scope: `sandbox.DeviceSource` borrows this address for the whole of the `spawn` call below.
+    // Declared at function scope: `chock_net.DeviceSource` borrows this address for the whole of the `spawn` call below.
     var stub: DeviceSourceStub = undefined;
-    var device_source: ?sandbox.DeviceSource = null;
-    var device_tree: ?sandbox.Config.DeviceTree = null;
+    var device_source: ?chock_net.DeviceSource = null;
+    var device_tree: ?chock_net.DeviceTree = null;
     if (ctx.device) {
         stub = DeviceSourceStub.init(&.{}) catch |err| {
             ctx.err = err;
@@ -491,17 +496,18 @@ fn runChildCountSpawn(ctx: *ChildCountContext) void {
     }
     defer if (ctx.device) stub.deinit();
 
-    ctx.term = sandbox.spawn(ctx.arena, .{
-        .root = ctx.root,
-        .mounts = base.mounts,
-        .rules = base.rules,
-        .cwd = "/",
-        .env = &.{},
-        .network = .none,
-        .stdin_fd = ctx.read_fd,
-        .device_source = device_source,
-        .device_tree = device_tree,
-    }, &.{ "/probe", "spawned-hold-until-closed" }, null, &ctx.middle) catch |err| {
+    ctx.term = chock_net.Driver.native_driver.spawn(ctx.arena, .{
+        .config = .{
+            .root = ctx.root,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .stdin_fd = ctx.read_fd,
+        },
+        .links = .{ .device_source = device_source, .device_tree = device_tree },
+    }, &.{ "/probe", "spawned-hold-until-closed" }, .{ .handle = &ctx.middle }) catch |err| {
         ctx.err = err;
         return;
     };
@@ -512,7 +518,7 @@ const ChildCountRun = struct {
     children: usize,
 };
 
-/// `sandbox.spawn` blocks until the whole call has ended, so counting A's own children needs this background thread.
+/// `palisade.Sandbox.spawn` blocks until the whole call has ended, so counting A's own children needs this background thread.
 fn childCountEscape(arena: std.mem.Allocator, root: []const u8, device: bool) !ChildCountRun {
     var pipe_fds: [2]i32 = undefined;
     if (linux.errno(linux.pipe2(&pipe_fds, .{})) != .SUCCESS) return error.SetupFailed;
@@ -524,11 +530,11 @@ fn childCountEscape(arena: std.mem.Allocator, root: []const u8, device: bool) !C
 
     // Bounded, so a machine that never gives a pid cannot hang the test.
     var tries: usize = 0;
-    while (@atomicLoad(std.posix.pid_t, &ctx.middle.pid, .acquire) == 0 and tries < 500) : (tries += 1) {
+    while (ctx.middle.pid() == null and tries < 500) : (tries += 1) {
         var pause: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
         _ = linux.nanosleep(&pause, null);
     }
-    const a_pid = @atomicLoad(std.posix.pid_t, &ctx.middle.pid, .acquire);
+    const a_pid = (ctx.middle.pid() orelse 0);
 
     var children: usize = 0;
     if (a_pid != 0) {
@@ -574,15 +580,17 @@ fn filteredEscape(
         .transport = transport.transport(),
     };
 
-    const term = try sandbox.spawn(arena, .{
-        .root = root,
-        .mounts = base.mounts,
-        .rules = base.rules,
-        .cwd = "/",
-        .env = &.{},
-        .network = .filtered,
-        .net_broker = network.netBroker(),
-    }, &.{ "/probe", op, ports }, null, null);
+    const term = try chock_net.Driver.native_driver.spawn(arena, .{
+        .config = .{
+            .root = root,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .{ .isolated = chock_net.netns.params },
+        },
+        .links = .{ .net_broker = network.netBroker() },
+    }, &.{ "/probe", op, ports }, .{});
 
     return .{
         .term = term,
@@ -740,15 +748,17 @@ fn askingEscape(
         },
     };
 
-    const term = try sandbox.spawn(arena, .{
-        .root = root,
-        .mounts = base.mounts,
-        .rules = base.rules,
-        .cwd = "/",
-        .env = &.{},
-        .network = .filtered,
-        .net_broker = network.netBroker(),
-    }, &.{ "/probe", op, ports }, null, null);
+    const term = try chock_net.Driver.native_driver.spawn(arena, .{
+        .config = .{
+            .root = root,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .{ .isolated = chock_net.netns.params },
+        },
+        .links = .{ .net_broker = network.netBroker() },
+    }, &.{ "/probe", op, ports }, .{});
 
     const result_id = try locked.append(arena, undefined, .{ .tool_result = .{
         .call_id = "call1",
@@ -839,15 +849,17 @@ fn routedEscape(
         .transport = transport.transport(),
     };
 
-    const term = try sandbox.spawn(arena, .{
-        .root = root,
-        .mounts = base.mounts,
-        .rules = base.rules,
-        .cwd = "/",
-        .env = &.{},
-        .network = .filtered,
-        .net_router = network.netRouter(),
-    }, &.{ "/probe", op, ports }, null, null);
+    const term = try chock_net.Driver.native_driver.spawn(arena, .{
+        .config = .{
+            .root = root,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .{ .isolated = chock_net.netns.params },
+        },
+        .links = .{ .net_router = network.netRouter() },
+    }, &.{ "/probe", op, ports }, .{});
 
     return .{
         .term = term,
@@ -888,7 +900,7 @@ fn askResolver(name: []const u8, kind: u16) Resolved {
 
     const where = linux.sockaddr.in{
         .port = std.mem.nativeToBig(u16, 53),
-        .addr = @bitCast(sandbox.netns.address4),
+        .addr = @bitCast(chock_net.netns.address4),
     };
     const sent = linux.sendto(
         fd,
@@ -1215,7 +1227,7 @@ fn routedGlibc(arena: std.mem.Allocator, root_arg: []const u8, shape: HostileEtc
     };
     defer _ = linux.close(listener.fd);
 
-    var mounts = try std.ArrayList(sandbox.namespace.Mount).initCapacity(arena, base.mounts.len + 3);
+    var mounts = try std.ArrayList(palisade.linux.namespace.Mount).initCapacity(arena, base.mounts.len + 3);
     mounts.appendSliceAssumeCapacity(base.mounts);
     mounts.appendAssumeCapacity(.{ .bind = .{
         .source = try absolutePath(arena, dynamic_probe_path),
@@ -1241,22 +1253,22 @@ fn routedGlibc(arena: std.mem.Allocator, root_arg: []const u8, shape: HostileEtc
         } });
     }
 
-    var rules = try std.ArrayList(sandbox.Config.Rule).initCapacity(arena, base.rules.len + 3);
+    var rules = try std.ArrayList(palisade.Sandbox.Rule).initCapacity(arena, base.rules.len + 3);
     rules.appendSliceAssumeCapacity(base.rules);
     // A file, so `read_only_file`: a directory right over a file is refused.
     rules.appendAssumeCapacity(.{
         .path = "/dynamic",
-        .access = sandbox.landlock.AccessFs.read_only_file,
+        .access = palisade.linux.landlock.AccessFs.read_only_file,
     });
     // Without this rule glibc cannot open the resolver files it was given.
     rules.appendAssumeCapacity(.{
         .path = "/etc",
-        .access = sandbox.landlock.AccessFs.read_only,
+        .access = palisade.linux.landlock.AccessFs.read_only,
     });
     if (pathExists(nscd_directory_z)) {
         rules.appendAssumeCapacity(.{
             .path = nscd_target,
-            .access = sandbox.landlock.AccessFs.read_write,
+            .access = palisade.linux.landlock.AccessFs.read_write,
         });
     }
 
@@ -1277,15 +1289,17 @@ fn routedGlibc(arena: std.mem.Allocator, root_arg: []const u8, shape: HostileEtc
         .transport = transport.transport(),
     };
 
-    const term = try sandbox.spawn(arena, .{
-        .root = root_arg,
-        .mounts = mounts.items,
-        .rules = rules.items,
-        .cwd = "/",
-        .env = &.{},
-        .network = .filtered,
-        .net_router = network.netRouter(),
-    }, &.{ "/dynamic", "resolve", filtered_host, "93.184.216.34" }, null, null);
+    const term = try chock_net.Driver.native_driver.spawn(arena, .{
+        .config = .{
+            .root = root_arg,
+            .mounts = mounts.items,
+            .rules = rules.items,
+            .cwd = "/",
+            .env = &.{},
+            .network = .{ .isolated = chock_net.netns.params },
+        },
+        .links = .{ .net_router = network.netRouter() },
+    }, &.{ "/dynamic", "resolve", filtered_host, "93.184.216.34" }, .{});
 
     if (term != .exited or term.exited != 0) return reportChildTerm(term);
 
@@ -1309,7 +1323,7 @@ fn routedTrustStore(arena: std.mem.Allocator, root_arg: []const u8) !u8 {
         return 3;
     };
 
-    var mounts = try std.ArrayList(sandbox.namespace.Mount).initCapacity(arena, base.mounts.len + 1);
+    var mounts = try std.ArrayList(palisade.linux.namespace.Mount).initCapacity(arena, base.mounts.len + 1);
     mounts.appendSliceAssumeCapacity(base.mounts);
     mounts.appendAssumeCapacity(.{ .bind = .{
         .source = host_etc.path,
@@ -1317,11 +1331,11 @@ fn routedTrustStore(arena: std.mem.Allocator, root_arg: []const u8) !u8 {
         .read_only = true,
     } });
 
-    var rules = try std.ArrayList(sandbox.Config.Rule).initCapacity(arena, base.rules.len + 1);
+    var rules = try std.ArrayList(palisade.Sandbox.Rule).initCapacity(arena, base.rules.len + 1);
     rules.appendSliceAssumeCapacity(base.rules);
     rules.appendAssumeCapacity(.{
         .path = "/etc",
-        .access = sandbox.landlock.AccessFs.read_only,
+        .access = palisade.linux.landlock.AccessFs.read_only,
     });
 
     const policy = try chock_policy.table.Table.parse(arena, filtered_policy, null);
@@ -1343,15 +1357,17 @@ fn routedTrustStore(arena: std.mem.Allocator, root_arg: []const u8) !u8 {
         @intFromBool(host_etc.trust_store.real),
     });
 
-    const term = try sandbox.spawn(arena, .{
-        .root = root_arg,
-        .mounts = mounts.items,
-        .rules = rules.items,
-        .cwd = "/",
-        .env = &.{},
-        .network = .filtered,
-        .net_router = network.netRouter(),
-    }, &.{ "/probe", "routed-trust-store", spec }, null, null);
+    const term = try chock_net.Driver.native_driver.spawn(arena, .{
+        .config = .{
+            .root = root_arg,
+            .mounts = mounts.items,
+            .rules = rules.items,
+            .cwd = "/",
+            .env = &.{},
+            .network = .{ .isolated = chock_net.netns.params },
+        },
+        .links = .{ .net_router = network.netRouter() },
+    }, &.{ "/probe", "routed-trust-store", spec }, .{});
 
     return reportChildTerm(term);
 }
@@ -1411,19 +1427,19 @@ fn openDescriptorCount() usize {
     return count;
 }
 
-const scratch_target = sandbox.runtime_prefix ++ "/scratch";
+const scratch_target = chock_net.runtime_prefix ++ "/scratch";
 
 fn diskEscapeConfig(arena: std.mem.Allocator) !struct {
-    mounts: []const sandbox.namespace.Mount,
-    rules: []const sandbox.Config.Rule,
-    scratch: []const sandbox.namespace.Scratch,
+    mounts: []const palisade.linux.namespace.Mount,
+    rules: []const palisade.Sandbox.Rule,
+    scratch: []const palisade.linux.namespace.Scratch,
 } {
     const base = try baseEscapeConfig(arena);
-    const rules = try arena.alloc(sandbox.Config.Rule, base.rules.len + 1);
+    const rules = try arena.alloc(palisade.Sandbox.Rule, base.rules.len + 1);
     @memcpy(rules[0..base.rules.len], base.rules);
-    rules[base.rules.len] = .{ .path = scratch_target, .access = sandbox.landlock.AccessFs.read_write };
+    rules[base.rules.len] = .{ .path = scratch_target, .access = palisade.linux.landlock.AccessFs.read_write };
 
-    const scratch = try arena.dupe(sandbox.namespace.Scratch, &.{
+    const scratch = try arena.dupe(palisade.linux.namespace.Scratch, &.{
         .{ .target = scratch_target },
     });
     return .{ .mounts = base.mounts, .rules = rules, .scratch = scratch };
@@ -1481,13 +1497,13 @@ fn fileTypeOf(fd: i32) u32 {
 }
 
 const RefusingBroker = struct {
-    fn connectFn(_: *anyopaque, _: []const u8, _: u16) sandbox.NetBroker.Grant {
+    fn connectFn(_: *anyopaque, _: []const u8, _: u16) chock_net.NetBroker.Grant {
         return .refused;
     }
 
-    const vtable = sandbox.NetBroker.VTable{ .connect = connectFn };
+    const vtable = chock_net.NetBroker.VTable{ .connect = connectFn };
 
-    fn broker(self: *RefusingBroker) sandbox.NetBroker {
+    fn broker(self: *RefusingBroker) chock_net.NetBroker {
         return .{ .ptr = self, .vtable = &vtable };
     }
 };
@@ -1610,24 +1626,24 @@ fn waitForPath(path: [:0]const u8) bool {
 const ThreadedSpawn = struct {
     allocator: std.mem.Allocator,
     root: []const u8,
-    mounts: []const sandbox.namespace.Mount,
-    rules: []const sandbox.Config.Rule,
+    mounts: []const palisade.linux.namespace.Mount,
+    rules: []const palisade.Sandbox.Rule,
     argv: []const []const u8,
-    middle: sandbox.Middle = .{},
+    middle: palisade.Sandbox.Handle = .{},
     term: std.process.Child.Term = undefined,
     spawn_err: ?anyerror = null,
     /// Set with `.release` after `term` or `spawn_err` is written, so an `.acquire` load makes a plain read safe.
     done: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *ThreadedSpawn) void {
-        self.term = sandbox.spawn(self.allocator, .{
+        self.term = palisade.Sandbox.spawn(self.allocator, .{
             .root = self.root,
             .mounts = self.mounts,
             .rules = self.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, self.argv, null, &self.middle) catch |err| {
+        }, self.argv, .{ .handle = &self.middle }) catch |err| {
             self.spawn_err = err;
             self.done.store(true, .release);
             return;
@@ -1638,12 +1654,12 @@ const ThreadedSpawn = struct {
     fn waitForMiddlePid(self: *ThreadedSpawn) linux.pid_t {
         var waited: u64 = 0;
         while (waited < probe_wait_bound_ns) : (waited += probe_wait_step_ns) {
-            const pid = @atomicLoad(linux.pid_t, &self.middle.pid, .acquire);
+            const pid = (self.middle.pid() orelse 0);
             if (pid != 0) return pid;
             if (self.done.load(.acquire)) return 0;
             _ = linux.nanosleep(&.{ .sec = 0, .nsec = @intCast(probe_wait_step_ns) }, null);
         }
-        return @atomicLoad(linux.pid_t, &self.middle.pid, .acquire);
+        return (self.middle.pid() orelse 0);
     }
 
     /// False when the bound ran out, which is a real answer: a `spawn` that never returns after a signal is a fault.
@@ -1664,32 +1680,32 @@ const ThreadedSpawn = struct {
 
     /// Through the handle, which reaches the middle process only and still ends the whole call.
     fn killCall(self: *ThreadedSpawn) void {
-        if (@atomicLoad(linux.pid_t, &self.middle.pid, .acquire) == 0) return;
-        sandbox.signalMiddle(self.middle.fd, .KILL) catch {};
+        if (self.middle.pid() == null) return;
+        self.middle.signal(@intFromEnum(linux.SIG.KILL)) catch {};
     }
 
-    /// Only after `spawn` has returned. See `sandbox.Middle`.
+    /// Only after `spawn` has returned. See `palisade.Sandbox.Handle`.
     fn closeHandle(self: *ThreadedSpawn) void {
-        sandbox.closeMiddle(&self.middle);
+        self.middle.close();
     }
 };
 
 /// `baseEscapeConfig` on its own gives no writable path.
 fn workEscapeConfig(arena: std.mem.Allocator, root: []const u8) !struct {
-    mounts: []const sandbox.namespace.Mount,
-    rules: []const sandbox.Config.Rule,
+    mounts: []const palisade.linux.namespace.Mount,
+    rules: []const palisade.Sandbox.Rule,
 } {
     const work = try std.fs.path.join(arena, &.{ root, "work" });
     try makeTestDir(arena, work);
 
     const base = try baseEscapeConfig(arena);
-    const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+    const mounts = try std.mem.concat(arena, palisade.linux.namespace.Mount, &.{
         base.mounts,
         &.{.{ .bind = .{ .source = work, .target = "/work", .read_only = false } }},
     });
-    const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+    const rules = try std.mem.concat(arena, palisade.Sandbox.Rule, &.{
         base.rules,
-        &.{.{ .path = "/work", .access = sandbox.landlock.AccessFs.read_write }},
+        &.{.{ .path = "/work", .access = palisade.linux.landlock.AccessFs.read_write }},
     });
     return .{ .mounts = mounts, .rules = rules };
 }
@@ -1703,11 +1719,11 @@ fn enterFileOverFileTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
     const source = try std.fs.path.join(arena, &.{ root, "source-file" });
     try writeTestFile(arena, source, file_over_file_content);
 
-    enterOrEndUnmeasured(.{ .network = .none, .mount = true });
-    try sandbox.namespace.buildRoot(arena, root, &.{
+    enterOrEndUnmeasured(.{ .new_net = true, .mount = true });
+    try palisade.linux.namespace.buildRoot(arena, root, &.{
         .{ .bind = .{ .source = source, .target = "/marker", .read_only = false } },
-    }, false, null);
-    try sandbox.namespace.pivotInto(arena, root, null);
+    }, false, palisade.linux.namespace.default_deny_notice, null);
+    try palisade.linux.namespace.pivotInto(arena, root, null);
 }
 
 /// The submount has to exist before buildRoot binds "guarded" onto itself: a bind mount carries only existing submounts.
@@ -1716,15 +1732,15 @@ fn enterSubmountTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
     const sub = try std.fs.path.join(arena, &.{ guarded, "sub" });
     try makeTestDir(arena, guarded);
 
-    enterOrEndUnmeasured(.{ .network = .none, .mount = true });
+    enterOrEndUnmeasured(.{ .new_net = true, .mount = true });
 
     try makeTestDir(arena, sub);
     try mountTmpfs(arena, sub);
 
-    try sandbox.namespace.buildRoot(arena, root, &.{
+    try palisade.linux.namespace.buildRoot(arena, root, &.{
         .{ .bind = .{ .source = guarded, .target = "/guarded", .read_only = true } },
-    }, false, null);
-    try sandbox.namespace.pivotInto(arena, root, null);
+    }, false, palisade.linux.namespace.default_deny_notice, null);
+    try palisade.linux.namespace.pivotInto(arena, root, null);
 }
 
 fn mountTmpfs(arena: std.mem.Allocator, path: []const u8) !void {
@@ -1758,9 +1774,9 @@ fn enterLandlockWriteTestRoot(arena: std.mem.Allocator, root: []const u8) ![:0]c
     try makeTestDir(arena, inside);
     try makeTestDir(arena, try outsideDir(arena, root));
 
-    const abi = try sandbox.landlock.probeAbi();
-    var ruleset = try sandbox.landlock.Ruleset.init(abi, null);
-    try ruleset.allowPath(inside, sandbox.landlock.AccessFs.read_write, null);
+    const abi = try palisade.linux.landlock.probeAbi();
+    var ruleset = try palisade.linux.landlock.Ruleset.init(abi, null);
+    try ruleset.allowPath(inside, palisade.linux.landlock.AccessFs.read_write, null);
     try ruleset.restrictSelf(null);
     ruleset.deinit();
     return inside;
@@ -1779,9 +1795,9 @@ fn enterLandlockTruncateTestRoot(arena: std.mem.Allocator, root: []const u8) !st
     try makeTestDir(arena, try outsideDir(arena, root));
     try writeTestFile(arena, outside_file, "chock landlock truncate probe content\n");
 
-    const abi = try sandbox.landlock.probeAbi();
-    var ruleset = try sandbox.landlock.Ruleset.init(abi, null);
-    try ruleset.allowPath(inside, sandbox.landlock.AccessFs.read_write, null);
+    const abi = try palisade.linux.landlock.probeAbi();
+    var ruleset = try palisade.linux.landlock.Ruleset.init(abi, null);
+    try ruleset.allowPath(inside, palisade.linux.landlock.AccessFs.read_write, null);
     try ruleset.restrictSelf(null);
     ruleset.deinit();
     return .{ .inside_file = inside_file, .outside_file = outside_file };
@@ -1798,13 +1814,13 @@ fn ringRefusal(rc: usize) u8 {
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     return runOperation(init) catch |err| {
-        if (err == error.NamespaceFailed) return sandbox.namespace.nothing_measured_exit_status;
+        if (err == error.NamespaceFailed) return palisade.linux.namespace.nothing_measured_exit_status;
         // This host will not give a sandbox its own filtered network, so a routed
         // test measures nothing here. Silent: the driver has already named the
         // missing module on the child's own stderr, and a print on this side
         // would make the test runner show an error beside a test it then marks
         // as passed.
-        if (err == error.NetRouterUnavailable) return sandbox.namespace.nothing_measured_exit_status;
+        if (err == error.NetRouterUnavailable) return palisade.linux.namespace.nothing_measured_exit_status;
         return err;
     };
 }
@@ -1819,7 +1835,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         std.debug.print("usage: probe <operation> [host-id]\n", .{});
         return 2;
     }
-    // A filter installed here is inherited across the fork `sandbox.spawn` does and would kill its unshare.
+    // A filter installed here is inherited across the fork `palisade.Sandbox.spawn` does and would kill its unshare.
     const builds_own_root = std.mem.eql(u8, args[1], "read-home") or
         std.mem.eql(u8, args[1], "write-readonly") or
         std.mem.eql(u8, args[1], "delete-mounted-file") or
@@ -1941,11 +1957,11 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     } else if (!builds_own_root) {
         // The relaxed filter gives up only the write and execute rule.
         const relaxed_wx = std.mem.endsWith(u8, args[1], "-relaxed");
-        const insns = sandbox.seccomp.build(arena, .{ .strict_wx = !relaxed_wx }) catch |err| {
+        const insns = palisade.linux.seccomp.build(arena, .{ .strict_wx = !relaxed_wx }) catch |err| {
             std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
             return 3;
         };
-        sandbox.seccomp.install(sandbox.bpf.Prog.init(insns)) catch |err| {
+        palisade.linux.seccomp.install(palisade.linux.bpf.Prog.init(insns), null) catch |err| {
             std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
             return 3;
         };
@@ -2081,7 +2097,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
     if (std.mem.eql(u8, args[1], "session-keyring-fresh")) {
         // id_arg describes a key escape.zig planted in the session keyring. Finding it means the join failed.
-        sandbox.Sandbox.joinFreshSessionKeyring(std.posix.STDERR_FILENO) catch |err| {
+        palisade.Sandbox.native.joinFreshSessionKeyring(std.posix.STDERR_FILENO) catch |err| {
             std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
             return 3;
         };
@@ -2333,8 +2349,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         }
 
         if (std.mem.eql(u8, args[1], "spawned-filtered-grant")) {
-            const answer = sandbox.net_broker.ask(
-                sandbox.net_broker.fd_number,
+            const answer = chock_net.net_broker.ask(
+                chock_net.net_broker.fd_number,
                 filtered_host,
                 granted_port,
             ) catch |err| {
@@ -2374,8 +2390,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             const read_failed: u8 = 6;
             const wrong_content: u8 = 7;
 
-            const answer = sandbox.net_broker.ask(
-                sandbox.net_broker.fd_number,
+            const answer = chock_net.net_broker.ask(
+                chock_net.net_broker.fd_number,
                 filtered_host,
                 granted_port,
             ) catch |err| {
@@ -2414,8 +2430,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         if (std.mem.eql(u8, args[1], "spawned-filtered-refused")) {
             const before = openDescriptorCount();
-            const answer = sandbox.net_broker.ask(
-                sandbox.net_broker.fd_number,
+            const answer = chock_net.net_broker.ask(
+                chock_net.net_broker.fd_number,
                 filtered_refused_host,
                 granted_port,
             ) catch |err| {
@@ -2435,8 +2451,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             }
 
             // A permitted host on the same socket is still granted.
-            const good = sandbox.net_broker.ask(
-                sandbox.net_broker.fd_number,
+            const good = chock_net.net_broker.ask(
+                chock_net.net_broker.fd_number,
                 filtered_host,
                 granted_port,
             ) catch |err| {
@@ -2459,9 +2475,9 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             // Two asks past the end: the first usually reaches the socket before the close.
             var made: usize = 0;
             var gone_at: ?usize = null;
-            while (made <= sandbox.net_broker.max_requests + 1) : (made += 1) {
-                const answer = sandbox.net_broker.ask(
-                    sandbox.net_broker.fd_number,
+            while (made <= chock_net.net_broker.max_requests + 1) : (made += 1) {
+                const answer = chock_net.net_broker.ask(
+                    chock_net.net_broker.fd_number,
                     filtered_refused_host,
                     granted_port,
                 ) catch |err| {
@@ -2470,7 +2486,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
                         return 5;
                     }
                     if (gone_at == null) {
-                        if (made != sandbox.net_broker.max_requests) {
+                        if (made != chock_net.net_broker.max_requests) {
                             std.debug.print("the far end went at ask {d}\n", .{made});
                             return 5;
                         }
@@ -2498,8 +2514,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         }
 
         if (std.mem.eql(u8, args[1], "spawned-filtered-ask")) {
-            const answer = sandbox.net_broker.ask(
-                sandbox.net_broker.fd_number,
+            const answer = chock_net.net_broker.ask(
+                chock_net.net_broker.fd_number,
                 filtered_host,
                 granted_port,
             ) catch |err| {
@@ -2516,8 +2532,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         }
 
         if (std.mem.eql(u8, args[1], "spawned-filtered-ask-two")) {
-            const first = sandbox.net_broker.ask(
-                sandbox.net_broker.fd_number,
+            const first = chock_net.net_broker.ask(
+                chock_net.net_broker.fd_number,
                 filtered_host,
                 granted_port,
             ) catch |err| {
@@ -2532,8 +2548,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
                 .refused => false,
             };
 
-            const second = sandbox.net_broker.ask(
-                sandbox.net_broker.fd_number,
+            const second = chock_net.net_broker.ask(
+                chock_net.net_broker.fd_number,
                 second_filtered_host,
                 granted_port,
             ) catch |err| {
@@ -2971,7 +2987,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         while (fd < open_fd_set_scan_limit) : (fd += 1) {
             const is_open = linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) == .SUCCESS;
             const belongs = fd <= std.posix.STDERR_FILENO or
-                (filtered and fd == sandbox.net_broker.fd_number);
+                (filtered and fd == chock_net.net_broker.fd_number);
             if (is_open == belongs) continue;
             if (is_open) {
                 std.debug.print("spawned-open-fd-set: descriptor {d} crossed execve\n", .{fd});
@@ -2985,7 +3001,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             std.debug.print("spawned-open-fd-set: descriptor 0 is not a character device\n", .{});
             return 1;
         }
-        if (filtered and fileTypeOf(sandbox.net_broker.fd_number) != linux.S.IFSOCK) {
+        if (filtered and fileTypeOf(chock_net.net_broker.fd_number) != linux.S.IFSOCK) {
             std.debug.print("spawned-open-fd-set: the broker descriptor is not a socket\n", .{});
             return 1;
         }
@@ -2995,7 +3011,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     if (std.mem.eql(u8, args[1], "spawned-proc-mask")) {
         // The list comes from `namespace.masked_proc_entries` itself, so a name added there is covered on the day it is added.
         var checked: usize = 0;
-        for (sandbox.namespace.masked_proc_entries) |name| {
+        for (palisade.linux.namespace.masked_proc_entries) |name| {
             var path_buffer: [64]u8 = undefined;
             const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{s}", .{name}, 0) catch return 5;
 
@@ -3279,14 +3295,14 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const env_z = try arena.dupeSentinel(u8, env_path, 0);
         if (linux.errno(linux.symlink(secret_z.ptr, env_z.ptr)) != .SUCCESS) return 3;
 
-        enterOrEndUnmeasured(.{ .network = .none, .mount = true });
-        const build_result = sandbox.namespace.buildRoot(arena, root_arg, &.{
+        enterOrEndUnmeasured(.{ .new_net = true, .mount = true });
+        const build_result = palisade.linux.namespace.buildRoot(arena, root_arg, &.{
             .{ .bind = .{ .source = work, .target = "/work", .read_only = false } },
             .{ .deny = .{ .target = "/work/.env" } },
-        }, false, null);
+        }, false, palisade.linux.namespace.default_deny_notice, null);
 
         // Still reachable by that name, since `buildRoot` never pivots.
-        var read_buffer: [sandbox.namespace.deny_notice.len]u8 = undefined;
+        var read_buffer: [palisade.linux.namespace.default_deny_notice.len]u8 = undefined;
         var read_content: []const u8 = &.{};
         const read_fd = linux.open(secret_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
         if (linux.errno(read_fd) == .SUCCESS) {
@@ -3295,7 +3311,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             _ = linux.close(handle);
             if (linux.errno(read_rc) == .SUCCESS) read_content = read_buffer[0..read_rc];
         }
-        const escaped = std.mem.eql(u8, read_content, sandbox.namespace.deny_notice);
+        const escaped = std.mem.eql(u8, read_content, palisade.linux.namespace.default_deny_notice);
 
         // Exit 1 is the fault: the bind landed outside.
         if (escaped) return 1;
@@ -3312,10 +3328,10 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const link_z = try arena.dupeSentinel(u8, link_path, 0);
         if (linux.errno(linux.symlink(secret_z.ptr, link_z.ptr)) != .SUCCESS) return 3;
 
-        enterOrEndUnmeasured(.{ .network = .none, .mount = true });
-        const build_result = sandbox.namespace.buildRoot(arena, root_arg, &.{
+        enterOrEndUnmeasured(.{ .new_net = true, .mount = true });
+        const build_result = palisade.linux.namespace.buildRoot(arena, root_arg, &.{
             .{ .bind = .{ .source = link_path, .target = "/work/chock.zon", .read_only = true } },
-        }, false, null);
+        }, false, palisade.linux.namespace.default_deny_notice, null);
 
         // Still reachable by that absolute name, since `buildRoot` never pivots.
         const target_path = try std.fs.path.join(arena, &.{ root_arg, "work/chock.zon" });
@@ -3345,16 +3361,16 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const outside_z = try arena.dupeSentinel(u8, id_arg, 0);
         if (linux.errno(linux.symlink(outside_z.ptr, link_z.ptr)) != .SUCCESS) return 3;
 
-        enterOrEndUnmeasured(.{ .network = .none, .mount = true });
-        const build_result = sandbox.namespace.buildRoot(arena, root_arg, &.{
+        enterOrEndUnmeasured(.{ .new_net = true, .mount = true });
+        const build_result = palisade.linux.namespace.buildRoot(arena, root_arg, &.{
             .{ .bind = .{ .source = work, .target = "/work", .read_only = false } },
             .{ .deny = .{ .target = "/work/link/creds/token" } },
-        }, false, null);
+        }, false, palisade.linux.namespace.default_deny_notice, null);
 
         // Still reachable by that name, since `buildRoot` never pivots.
         const outside_token_path = try std.fs.path.join(arena, &.{ id_arg, "creds/token" });
         const outside_token_z = try arena.dupeSentinel(u8, outside_token_path, 0);
-        var read_buffer: [sandbox.namespace.deny_notice.len]u8 = undefined;
+        var read_buffer: [palisade.linux.namespace.default_deny_notice.len]u8 = undefined;
         var read_content: []const u8 = &.{};
         const read_fd = linux.open(outside_token_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
         if (linux.errno(read_fd) == .SUCCESS) {
@@ -3493,109 +3509,109 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     }
     if (std.mem.eql(u8, args[1], "spawn-ptrace")) {
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-ptrace" }, null, null);
+        }, &.{ "/probe", "spawned-ptrace" }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-vsock")) {
         // `.network = .none` on purpose: the domain check kills the call first.
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-vsock" }, null, null);
+        }, &.{ "/probe", "spawned-vsock" }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-setns-proc1")) {
         // /proc is mounted read only, so the target is really reachable.
         const base = try baseEscapeConfig(arena);
-        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+        const mounts = try std.mem.concat(arena, palisade.linux.namespace.Mount, &.{
             base.mounts,
             &.{.{ .proc = .{} }},
         });
-        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+        const rules = try std.mem.concat(arena, palisade.Sandbox.Rule, &.{
             base.rules,
-            &.{.{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only }},
+            &.{.{ .path = "/proc", .access = palisade.linux.landlock.AccessFs.read_only }},
         });
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = mounts,
             .rules = rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-setns-proc1" }, null, null);
+        }, &.{ "/probe", "spawned-setns-proc1" }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-proc-self-mem-write-landlock")) {
         const base = try baseEscapeConfig(arena);
-        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+        const mounts = try std.mem.concat(arena, palisade.linux.namespace.Mount, &.{
             base.mounts,
             &.{.{ .proc = .{} }},
         });
-        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+        const rules = try std.mem.concat(arena, palisade.Sandbox.Rule, &.{
             base.rules,
-            &.{.{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only }},
+            &.{.{ .path = "/proc", .access = palisade.linux.landlock.AccessFs.read_only }},
         });
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = mounts,
             .rules = rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-proc-self-mem-write-landlock" }, null, null);
+        }, &.{ "/probe", "spawned-proc-self-mem-write-landlock" }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-proc-self-mem-write-mount")) {
         // /proc granted write under Landlock, so only the mount flag is left.
         const base = try baseEscapeConfig(arena);
-        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+        const mounts = try std.mem.concat(arena, palisade.linux.namespace.Mount, &.{
             base.mounts,
             &.{.{ .proc = .{} }},
         });
-        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+        const rules = try std.mem.concat(arena, palisade.Sandbox.Rule, &.{
             base.rules,
             &.{.{
                 .path = "/proc",
                 .access = .{ .execute = true, .write_file = true, .read_file = true, .read_dir = true },
             }},
         });
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = mounts,
             .rules = rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-proc-self-mem-write-mount" }, null, null);
+        }, &.{ "/probe", "spawned-proc-self-mem-write-mount" }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-cgroup-remount")) {
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-cgroup-remount" }, null, null);
+        }, &.{ "/probe", "spawned-cgroup-remount" }, .{});
 
         return reportChildTerm(term);
     }
@@ -3604,25 +3620,25 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const base = try baseEscapeConfig(arena);
         const work = try std.fs.path.join(arena, &.{ root_arg, "work" });
         try makeTestDir(arena, work);
-        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+        const mounts = try std.mem.concat(arena, palisade.linux.namespace.Mount, &.{
             base.mounts,
             &.{.{ .bind = .{ .source = work, .target = "/work", .read_only = false } }},
         });
-        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+        const rules = try std.mem.concat(arena, palisade.Sandbox.Rule, &.{
             base.rules,
             &.{.{
                 .path = "/work",
                 .access = .{ .write_file = true, .read_file = true, .read_dir = true, .make_reg = true },
             }},
         });
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = mounts,
             .rules = rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-memfd-exec" }, null, null);
+        }, &.{ "/probe", "spawned-memfd-exec" }, .{});
 
         return reportChildTerm(term);
     }
@@ -3630,25 +3646,25 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const base = try baseEscapeConfig(arena);
         const work = try std.fs.path.join(arena, &.{ root_arg, "work" });
         try makeTestDir(arena, work);
-        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+        const mounts = try std.mem.concat(arena, palisade.linux.namespace.Mount, &.{
             base.mounts,
             &.{.{ .bind = .{ .source = work, .target = "/work", .read_only = false } }},
         });
-        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+        const rules = try std.mem.concat(arena, palisade.Sandbox.Rule, &.{
             base.rules,
             &.{.{
                 .path = "/work",
                 .access = .{ .write_file = true, .read_file = true, .read_dir = true, .make_reg = true },
             }},
         });
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = mounts,
             .rules = rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-handle-escape" }, null, null);
+        }, &.{ "/probe", "spawned-handle-escape" }, .{});
 
         return reportChildTerm(term);
     }
@@ -3669,8 +3685,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         else
             .files;
 
-        const limits: sandbox.Sandbox.Limits = if (unbounded)
-            sandbox.Sandbox.Limits.none
+        const limits: palisade.Sandbox.Limits = if (unbounded)
+            palisade.Sandbox.Limits.none
         else switch (which) {
             .fork => .{ .processes = fork_bomb_limit },
             // Both fields, since a machine with no cgroup v2 has no ceiling.
@@ -3692,8 +3708,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .files => fd_bomb_cap,
         };
 
-        var report: sandbox.Sandbox.LimitsReport = .{};
-        const term = try sandbox.spawn(arena, .{
+        var report: palisade.Sandbox.LimitsReport = .{};
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
@@ -3701,8 +3717,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .env = &.{},
             .network = .none,
             .limits = limits,
-            .limits_report = &report,
-        }, &.{ "/probe", target }, null, null);
+        }, &.{ "/probe", target }, .{ .reports = .{ .limits = &report } });
 
         // A machine with no cgroup v2 tree is one this project supports, so say so before reading the outcome.
         if (cgroup_only and !report.cgroup.applied()) {
@@ -3718,8 +3733,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const many_files = std.mem.startsWith(u8, args[1], "spawn-disk-files");
         const config = try diskEscapeConfig(arena);
 
-        const limits: sandbox.Sandbox.Limits = if (unbounded)
-            sandbox.Sandbox.Limits.none
+        const limits: palisade.Sandbox.Limits = if (unbounded)
+            palisade.Sandbox.Limits.none
         else if (many_files)
             .{ .scratch_bytes = disk_file_limit }
         else
@@ -3728,8 +3743,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const target = if (many_files) "spawned-disk-file-bomb" else "spawned-disk-one-bomb";
         const cap = if (many_files) disk_file_cap else disk_one_cap;
 
-        var report: sandbox.Sandbox.LimitsReport = .{};
-        const term = try sandbox.spawn(arena, .{
+        var report: palisade.Sandbox.LimitsReport = .{};
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = config.mounts,
             .rules = config.rules,
@@ -3738,8 +3753,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .env = &.{},
             .network = .none,
             .limits = limits,
-            .limits_report = &report,
-        }, &.{ "/probe", target }, null, null);
+        }, &.{ "/probe", target }, .{ .reports = .{ .limits = &report } });
 
         // Nothing in the kernel counts a full filesystem, so `killed_by` is what makes it read as a limit.
         const named = report.killed_by != null;
@@ -3747,14 +3761,14 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     }
     if (std.mem.eql(u8, args[1], "spawn-approval-socket")) {
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-approval-socket", id_arg }, null, null);
+        }, &.{ "/probe", "spawned-approval-socket", id_arg }, .{});
 
         return reportChildTerm(term);
     }
@@ -4097,7 +4111,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
                 granted.port,
             );
             // The far end answered its budget and stopped, and every answer was a refusal.
-            if (run.refused != sandbox.net_broker.max_requests or run.granted != 0) {
+            if (run.refused != chock_net.net_broker.max_requests or run.granted != 0) {
                 std.debug.print("the broker granted {d} and refused {d}\n", .{ run.granted, run.refused });
                 return 5;
             }
@@ -4293,79 +4307,79 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         try writeTestFile(arena, marker, "chock landlock escape probe content\n");
 
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-landlock-read" }, null, null);
+        }, &.{ "/probe", "spawned-landlock-read" }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-network-escape")) {
         // `.network` is left off, so the default on Sandbox.Config decides.
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
-        }, &.{ "/probe", "spawned-connect" }, null, null);
+        }, &.{ "/probe", "spawned-connect" }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-signal-host")) {
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-signal-host", id_arg }, null, null);
+        }, &.{ "/probe", "spawned-signal-host", id_arg }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-shm-attach")) {
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-shm-attach", id_arg }, null, null);
+        }, &.{ "/probe", "spawned-shm-attach", id_arg }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-report-pid")) {
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-report-pid" }, null, null);
+        }, &.{ "/probe", "spawned-report-pid" }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-default-signal")) {
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-default-signal" }, null, null);
+        }, &.{ "/probe", "spawned-default-signal" }, .{});
 
         return switch (term) {
             .signal => |signal| if (signal == .TERM) 0 else 5,
@@ -4374,36 +4388,35 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     }
     if (std.mem.eql(u8, args[1], "spawn-keeper-reaps")) {
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-keeper-reaps" }, null, null);
+        }, &.{ "/probe", "spawned-keeper-reaps" }, .{});
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-supervisor-audit")) {
         // The install is best effort, so this reads the record back rather than trust it.
         const base = try baseEscapeConfig(arena);
-        var audit: sandbox.Sandbox.SupervisorAudit = .{};
-        const term = try sandbox.spawn(arena, .{
+        var audit: palisade.Sandbox.SupervisorAudit = .{};
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-            .supervisor_audit = &audit,
-        }, &.{ "/probe", "spawned-report-pid" }, null, null);
+        }, &.{ "/probe", "spawned-report-pid" }, .{ .reports = .{ .supervisor_audit = &audit } });
 
         switch (term) {
             .exited => |code| if (code != 0) return 4,
             else => return 4,
         }
 
-        const watched = [_]sandbox.Sandbox.LayerName{ .capabilities, .landlock, .seccomp };
+        const watched = [_]palisade.Sandbox.LayerName{ .capabilities, .landlock, .seccomp };
         for (watched, 0..) |layer, index| {
             const base_status: u8 = @intCast(10 + index * 4);
             const counts = audit.counts(layer);
@@ -4417,25 +4430,24 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     if (std.mem.eql(u8, args[1], "spawn-syscall-audit-daemon")) {
         // The program leaves a process behind that still carries the filter, so this call comes back at once.
         const base = try baseEscapeConfig(arena);
-        var audit: sandbox.Sandbox.SyscallAudit = .{};
-        const term = try sandbox.spawn(arena, .{
+        var audit: palisade.Sandbox.SyscallAudit = .{};
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.full },
-            .syscall_audit = &audit,
+            .seccomp_options = .{ .traps = palisade.linux.seccomp.TrapSet.full },
             .path_audit = true,
-        }, &.{ "/probe", "spawned-leave-daemon" }, null, null);
+        }, &.{ "/probe", "spawned-leave-daemon" }, .{ .reports = .{ .syscall_audit = &audit } });
 
         switch (term) {
             .exited => |code| if (code != 0) return 4,
             else => return 4,
         }
         if (audit.paths.readers_absent != 0 or audit.paths.readers_unreported != 0) return 5;
-        const openat_slot = @intFromEnum(sandbox.seccomp.TrapCall.openat);
+        const openat_slot = @intFromEnum(palisade.linux.seccomp.TrapCall.openat);
         if (audit.counts().calls[openat_slot] != 0) return 6;
         return 0;
     }
@@ -4444,25 +4456,24 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     {
         const auditing = std.mem.eql(u8, args[1], "spawn-path-audit");
         const base = try baseEscapeConfig(arena);
-        var audit: sandbox.Sandbox.SyscallAudit = .{};
-        const term = try sandbox.spawn(arena, .{
+        var audit: palisade.Sandbox.SyscallAudit = .{};
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.full },
-            .syscall_audit = &audit,
+            .seccomp_options = .{ .traps = palisade.linux.seccomp.TrapSet.full },
             .path_audit = auditing,
-        }, &.{ "/probe", "spawned-name-paths" }, null, null);
+        }, &.{ "/probe", "spawned-name-paths" }, .{ .reports = .{ .syscall_audit = &audit } });
 
         switch (term) {
             .exited => |code| if (code != 0) return 4,
             else => return 4,
         }
 
-        const slot = @intFromEnum(sandbox.seccomp.TrapCall.openat);
+        const slot = @intFromEnum(palisade.linux.seccomp.TrapCall.openat);
         const seen = &audit.paths.seen;
         if (!auditing) {
             if (seen.kept != 0) return 5;
@@ -4493,40 +4504,39 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     }
     if (std.mem.eql(u8, args[1], "spawn-path-audit-dynamic")) {
         const base = try baseEscapeConfig(arena);
-        const mounts = try arena.alloc(sandbox.namespace.Mount, base.mounts.len + 1);
+        const mounts = try arena.alloc(palisade.linux.namespace.Mount, base.mounts.len + 1);
         @memcpy(mounts[0..base.mounts.len], base.mounts);
         mounts[base.mounts.len] = .{ .bind = .{
             .source = try absolutePath(arena, dynamic_probe_path),
             .target = "/dynamic",
             .read_only = true,
         } };
-        const rules = try arena.alloc(sandbox.Config.Rule, base.rules.len + 1);
+        const rules = try arena.alloc(palisade.Sandbox.Rule, base.rules.len + 1);
         @memcpy(rules[0..base.rules.len], base.rules);
         // A file and not a directory, so `read_only_file`: the kernel refuses a directory right over a file.
         rules[base.rules.len] = .{
             .path = "/dynamic",
-            .access = sandbox.landlock.AccessFs.read_only_file,
+            .access = palisade.linux.landlock.AccessFs.read_only_file,
         };
 
-        var audit: sandbox.Sandbox.SyscallAudit = .{};
-        const term = try sandbox.spawn(arena, .{
+        var audit: palisade.Sandbox.SyscallAudit = .{};
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = mounts,
             .rules = rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.full },
-            .syscall_audit = &audit,
+            .seccomp_options = .{ .traps = palisade.linux.seccomp.TrapSet.full },
             .path_audit = true,
-        }, &.{"/dynamic"}, null, null);
+        }, &.{"/dynamic"}, .{ .reports = .{ .syscall_audit = &audit } });
 
         switch (term) {
             .exited => |code| if (code != 0) return 4,
             else => return 4,
         }
 
-        const slot = @intFromEnum(sandbox.seccomp.TrapCall.openat);
+        const slot = @intFromEnum(palisade.linux.seccomp.TrapCall.openat);
         const seen = &audit.paths.seen;
         if (audit.paths.readers_absent != 0) return 5;
         if (audit.paths.readers_unreported != 0) return 6;
@@ -4541,18 +4551,17 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     }
     if (std.mem.eql(u8, args[1], "spawn-path-audit-killed")) {
         const base = try baseEscapeConfig(arena);
-        var audit: sandbox.Sandbox.SyscallAudit = .{};
-        const term = try sandbox.spawn(arena, .{
+        var audit: palisade.Sandbox.SyscallAudit = .{};
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.full },
-            .syscall_audit = &audit,
+            .seccomp_options = .{ .traps = palisade.linux.seccomp.TrapSet.full },
             .path_audit = true,
-        }, &.{ "/probe", "spawned-kill-the-reader" }, null, null);
+        }, &.{ "/probe", "spawned-kill-the-reader" }, .{ .reports = .{ .syscall_audit = &audit } });
 
         switch (term) {
             .exited => |code| if (code != 0) return 4,
@@ -4579,18 +4588,17 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             return 11;
 
         const base = try baseEscapeConfig(arena);
-        var audit: sandbox.Sandbox.SyscallAudit = .{};
-        const term = try sandbox.spawn(arena, .{
+        var audit: palisade.Sandbox.SyscallAudit = .{};
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.full },
-            .syscall_audit = &audit,
+            .seccomp_options = .{ .traps = palisade.linux.seccomp.TrapSet.full },
             .path_audit = true,
-        }, &.{ "/probe", "spawned-stop-the-reader" }, null, null);
+        }, &.{ "/probe", "spawned-stop-the-reader" }, .{ .reports = .{ .syscall_audit = &audit } });
 
         switch (term) {
             .exited => |code| if (code != 0) return 4,
@@ -4605,8 +4613,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     {
         const watching = std.mem.eql(u8, args[1], "spawn-syscall-audit");
         const base = try baseEscapeConfig(arena);
-        var audit: sandbox.Sandbox.SyscallAudit = .{};
-        const term = try sandbox.spawn(arena, .{
+        var audit: palisade.Sandbox.SyscallAudit = .{};
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
@@ -4615,12 +4623,11 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .network = .none,
             .seccomp_options = .{
                 .traps = if (watching)
-                    sandbox.seccomp.TrapSet.full
+                    palisade.linux.seccomp.TrapSet.full
                 else
-                    sandbox.seccomp.TrapSet.empty,
+                    palisade.linux.seccomp.TrapSet.empty,
             },
-            .syscall_audit = &audit,
-        }, &.{ "/probe", "spawned-count-opens" }, null, null);
+        }, &.{ "/probe", "spawned-count-opens" }, .{ .reports = .{ .syscall_audit = &audit } });
 
         switch (term) {
             .exited => |code| if (code != 0) return 4,
@@ -4628,10 +4635,10 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         }
 
         const counts = audit.counts();
-        const opens = counts.calls[@intFromEnum(sandbox.seccomp.TrapCall.openat)];
-        const execs = counts.calls[@intFromEnum(sandbox.seccomp.TrapCall.execve)];
-        const dirs = counts.calls[@intFromEnum(sandbox.seccomp.TrapCall.getdents64)];
-        const connects = counts.calls[@intFromEnum(sandbox.seccomp.TrapCall.connect)];
+        const opens = counts.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.openat)];
+        const execs = counts.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.execve)];
+        const dirs = counts.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.getdents64)];
+        const connects = counts.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.connect)];
 
         if (!watching) {
             if (counts.observed != 0 or counts.unobserved != 0) return 5;
@@ -4658,45 +4665,47 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         }
 
         var refuser = RefusingBroker{};
-        const term = try sandbox.spawn(arena, .{
-            .root = root_arg,
-            .mounts = base.mounts,
-            .rules = base.rules,
-            .cwd = "/",
-            .env = &.{},
-            .network = if (filtered) .filtered else .none,
-            .net_broker = if (filtered) refuser.broker() else null,
+        const term = try chock_net.Driver.native_driver.spawn(arena, .{
+            .config = .{
+                .root = root_arg,
+                .mounts = base.mounts,
+                .rules = base.rules,
+                .cwd = "/",
+                .env = &.{},
+                .network = if (filtered) .{ .isolated = chock_net.netns.params } else .none,
+            },
+            .links = .{ .net_broker = if (filtered) refuser.broker() else null },
         }, &.{
             "/probe",
             "spawned-open-fd-set",
             if (filtered) "filtered" else "plain",
-        }, null, null);
+        }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-caps-drop")) {
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-caps-drop" }, null, null);
+        }, &.{ "/probe", "spawned-caps-drop" }, .{});
 
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-stdin-devnull")) {
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-stdin-devnull" }, null, null);
+        }, &.{ "/probe", "spawned-stdin-devnull" }, .{});
 
         return reportChildTerm(term);
     }
@@ -4716,7 +4725,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const escape_text = try std.fmt.allocPrint(arena, "{d}", .{escape_fd});
 
         const base = try baseEscapeConfig(arena);
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
@@ -4724,7 +4733,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .env = &.{},
             .network = .none,
             .stdin_fd = read_fd,
-        }, &.{ "/probe", "spawned-stdin-pipe", escape_text }, null, null);
+        }, &.{ "/probe", "spawned-stdin-pipe", escape_text }, .{});
 
         return reportChildTerm(term);
     }
@@ -4735,14 +4744,14 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const write_fd = pipe_fds[1];
 
         const absent = try absentRoot(arena, root_arg);
-        if (sandbox.spawn(arena, .{
+        if (palisade.Sandbox.spawn(arena, .{
             .root = absent,
             .mounts = &.{},
             .rules = &.{},
             .cwd = "/",
             .env = &.{},
             .stderr_fd = write_fd,
-        }, &.{"/probe"}, null, null)) |_| {
+        }, &.{"/probe"}, .{})) |_| {
             return 5;
         } else |err| {
             endIfNothingMeasured(err);
@@ -4765,7 +4774,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         _ = linux.close(pipe_fds[0]);
         const write_fd = pipe_fds[1];
 
-        if (sandbox.spawn(arena, .{
+        if (palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = &.{},
             .rules = &.{},
@@ -4779,7 +4788,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
                 .{ .target = "/run/chock/five" },
             },
             .stderr_fd = write_fd,
-        }, &.{"/probe"}, null, null)) |_| {
+        }, &.{"/probe"}, .{})) |_| {
             return 5;
         } else |err| {
             endIfNothingMeasured(err);
@@ -4790,13 +4799,13 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     }
     if (std.mem.eql(u8, args[1], "spawn-setup-fault-default-stderr")) {
         const absent = try absentRoot(arena, root_arg);
-        if (sandbox.spawn(arena, .{
+        if (palisade.Sandbox.spawn(arena, .{
             .root = absent,
             .mounts = &.{},
             .rules = &.{},
             .cwd = "/",
             .env = &.{},
-        }, &.{"/probe"}, null, null)) |_| {
+        }, &.{"/probe"}, .{})) |_| {
             return 5;
         } else |err| {
             endIfNothingMeasured(err);
@@ -4807,13 +4816,13 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     if (std.mem.eql(u8, args[1], "spawn-proc-mask") or std.mem.eql(u8, args[1], "spawn-proc-live")) {
         // Made by `buildRoot` inside spawn's own child. A procfs mounted anywhere else would be the host's.
         const base = try baseEscapeConfig(arena);
-        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+        const mounts = try std.mem.concat(arena, palisade.linux.namespace.Mount, &.{
             base.mounts,
             &.{.{ .proc = .{} }},
         });
-        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+        const rules = try std.mem.concat(arena, palisade.Sandbox.Rule, &.{
             base.rules,
-            &.{.{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only }},
+            &.{.{ .path = "/proc", .access = palisade.linux.landlock.AccessFs.read_only }},
         });
 
         const inner: []const u8 = if (std.mem.eql(u8, args[1], "spawn-proc-mask"))
@@ -4821,14 +4830,14 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         else
             "spawned-proc-live";
 
-        const term = try sandbox.spawn(arena, .{
+        const term = try palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = mounts,
             .rules = rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", inner }, null, null);
+        }, &.{ "/probe", inner }, .{});
 
         return reportChildTerm(term);
     }
@@ -4837,23 +4846,23 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         try makeTestDir(arena, work);
 
         const base = try baseEscapeConfig(arena);
-        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+        const mounts = try std.mem.concat(arena, palisade.linux.namespace.Mount, &.{
             base.mounts,
             &.{.{ .bind = .{ .source = work, .target = "/work", .read_only = false } }},
         });
-        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+        const rules = try std.mem.concat(arena, palisade.Sandbox.Rule, &.{
             base.rules,
-            &.{.{ .path = "/work", .access = sandbox.landlock.AccessFs.read_write }},
+            &.{.{ .path = "/work", .access = palisade.linux.landlock.AccessFs.read_write }},
         });
 
-        const term = sandbox.spawn(arena, .{
+        const term = palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = mounts,
             .rules = rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-forge-exit" }, null, null) catch |err| {
+        }, &.{ "/probe", "spawned-forge-exit" }, .{}) catch |err| {
             endIfNothingMeasured(err);
             std.debug.print("spawn-forge-exit: spawn reported a setup failure: {s}\n", .{@errorName(err)});
             return 3;
@@ -4876,34 +4885,34 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         try makeTestDir(arena, work);
 
         const base = try baseEscapeConfig(arena);
-        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+        const mounts = try std.mem.concat(arena, palisade.linux.namespace.Mount, &.{
             base.mounts,
             &.{.{ .bind = .{ .source = work, .target = "/work", .read_only = false } }},
         });
-        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+        const rules = try std.mem.concat(arena, palisade.Sandbox.Rule, &.{
             base.rules,
-            &.{.{ .path = "/work", .access = sandbox.landlock.AccessFs.read_write }},
+            &.{.{ .path = "/work", .access = palisade.linux.landlock.AccessFs.read_write }},
         });
 
         const SpawnCtx = struct {
             allocator: std.mem.Allocator,
             root: []const u8,
-            mounts: []const sandbox.namespace.Mount,
-            rules: []const sandbox.Config.Rule,
+            mounts: []const palisade.linux.namespace.Mount,
+            rules: []const palisade.Sandbox.Rule,
             inner: []const u8,
-            middle: sandbox.Middle = .{},
+            middle: palisade.Sandbox.Handle = .{},
             term: std.process.Child.Term = undefined,
             spawn_err: ?anyerror = null,
 
             fn run(self: *@This()) void {
-                self.term = sandbox.spawn(self.allocator, .{
+                self.term = palisade.Sandbox.spawn(self.allocator, .{
                     .root = self.root,
                     .mounts = self.mounts,
                     .rules = self.rules,
                     .cwd = "/",
                     .env = &.{},
                     .network = .none,
-                }, &.{ "/probe", self.inner }, null, &self.middle) catch |err| {
+                }, &.{ "/probe", self.inner }, .{ .handle = &self.middle }) catch |err| {
                     self.spawn_err = err;
                     return;
                 };
@@ -4923,10 +4932,10 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         };
 
         var waited_ns: u64 = 0;
-        while (ctx.middle.pid == 0 and waited_ns < 2_000_000_000) : (waited_ns += 1_000_000) {
+        while (ctx.middle.pid() == null and waited_ns < 2_000_000_000) : (waited_ns += 1_000_000) {
             _ = linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
         }
-        if (ctx.middle.pid == 0) {
+        if (ctx.middle.pid() == null) {
             thread.join();
             if (ctx.spawn_err) |err| endIfNothingMeasured(err);
             std.debug.print("{s}: never learned the middle process\n", .{args[1]});
@@ -4934,11 +4943,11 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         }
 
         var pid_line_buf: [16]u8 = undefined;
-        const pid_line = std.fmt.bufPrint(&pid_line_buf, "{d}\n", .{ctx.middle.pid}) catch unreachable;
+        const pid_line = std.fmt.bufPrint(&pid_line_buf, "{d}\n", .{ctx.middle.pid().?}) catch unreachable;
         _ = linux.write(std.posix.STDOUT_FILENO, pid_line.ptr, pid_line.len);
 
         thread.join();
-        sandbox.closeMiddle(&ctx.middle);
+        ctx.middle.close();
         if (ctx.spawn_err) |err| {
             endIfNothingMeasured(err);
             std.debug.print("{s}: spawn reported a setup failure: {s}\n", .{ args[1], @errorName(err) });
@@ -4967,14 +4976,14 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         caller_signal_seen.store(false, .monotonic);
 
         const base = try baseEscapeConfig(arena);
-        _ = sandbox.spawn(arena, .{
+        _ = palisade.Sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
             .rules = base.rules,
             .cwd = "/",
             .env = &.{},
             .network = .none,
-        }, &.{ "/probe", "spawned-signal-group" }, null, null) catch |err| {
+        }, &.{ "/probe", "spawned-signal-group" }, .{}) catch |err| {
             endIfNothingMeasured(err);
             std.debug.print("spawn-signal-group: spawn reported a setup failure: {s}\n", .{@errorName(err)});
             return 3;
@@ -5095,7 +5104,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             return 3;
         }
 
-        sandbox.signalMiddle(ctx.middle.fd, .TERM) catch |err| {
+        ctx.middle.signal(@intFromEnum(linux.SIG.TERM)) catch |err| {
             std.debug.print("spawn-signal-middle-handled: could not signal the middle process: {s}\n", .{@errorName(err)});
             ctx.killCall();
             return 3;

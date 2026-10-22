@@ -1,12 +1,12 @@
 //! Tests for `lib/chock-core/tools.zig`'s `Registry.dispatch`, against a real
-//! sandbox, a real `Workspace`, and a real `sandbox.Config`. `dispatch` needs a
+//! sandbox, a real `Workspace`, and a real `palisade.Sandbox.Config`. `dispatch` needs a
 //! single threaded caller, which this test binary is not, so every call runs as
 //! a fresh `test/core/tools_probe.zig` process.
 
 const std = @import("std");
 const linux = std.os.linux;
 const chock_workspace = @import("chock-workspace");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 const Workspace = chock_workspace.Workspace;
 const git = chock_workspace.git;
 
@@ -147,7 +147,7 @@ const GitProject = struct {
     }
 };
 
-fn serializeMounts(allocator: std.mem.Allocator, mounts: []const sandbox.namespace.Mount) ![]u8 {
+fn serializeMounts(allocator: std.mem.Allocator, mounts: []const palisade.linux.namespace.Mount) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (mounts) |m| {
@@ -179,7 +179,7 @@ fn serializeMounts(allocator: std.mem.Allocator, mounts: []const sandbox.namespa
     return out.toOwnedSlice(allocator);
 }
 
-fn serializeRules(allocator: std.mem.Allocator, rules: []const sandbox.Config.Rule) ![]u8 {
+fn serializeRules(allocator: std.mem.Allocator, rules: []const palisade.Sandbox.Rule) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (rules) |r| {
@@ -251,7 +251,7 @@ const ProbeOptions = struct {
     cancel_after_ms: ?u64 = null,
     /// Null is a session with no scratchpad, the state that made `make` refuse to run.
     scratch_dir: ?[]const u8 = null,
-    /// Entries added to the `sandbox.Config.env` the workspace built, as `KEY=VALUE`.
+    /// Entries added to the `palisade.Sandbox.Config.env` the workspace built, as `KEY=VALUE`.
     extra_sandbox_env: []const []const u8 = &.{},
     /// The cap on the tmpfs `TMPDIR` names, in bytes.
     scratch_bytes: ?u64 = null,
@@ -375,7 +375,7 @@ fn readAllStdout(allocator: std.mem.Allocator, child: *std.process.Child) ![]u8 
 fn parseProbeOutcome(allocator: std.mem.Allocator, term: std.process.Child.Term, stdout: []u8) !ProbeOutcome {
     defer allocator.free(stdout);
 
-    if (term == .exited and term.exited == sandbox.namespace.nothing_measured_exit_status) {
+    if (term == .exited and term.exited == palisade.linux.namespace.nothing_measured_exit_status) {
         return error.SkipZigTest;
     }
 
@@ -667,7 +667,7 @@ test "run_command runs in the workspace and returns what the program wrote" {
 test "a routed tool call gives the program a resolver it can read" {
     // Every ordinary program finds the router's resolver through `/etc/resolv.conf` and nothing else.
     const allocator = std.testing.allocator;
-    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+    if (!palisade.Sandbox.expresses.moved_paths) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -712,7 +712,7 @@ fn hostHasTrustStore() bool {
 test "a routed tool call can read the trust store it was given" {
     // The host bundle resolves into the store, so the host path binds by its resolved name, not the link.
     const allocator = std.testing.allocator;
-    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+    if (!palisade.Sandbox.expresses.moved_paths) return error.SkipZigTest;
     // A Nix build sandbox holds no `/etc/ssl`, so it has no bundle to place.
     if (!hostHasTrustStore()) return error.SkipZigTest;
 
@@ -4426,7 +4426,7 @@ test "a background command finishes past the bound that stops a foreground one" 
 test "a routed background command keeps its trust store until its own thread builds the sandbox" {
     // The call that stages the bundle under `TMPDIR` deleted the file the moment `start` answered.
     const allocator = std.testing.allocator;
-    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+    if (!palisade.Sandbox.expresses.moved_paths) return error.SkipZigTest;
     if (!hostHasTrustStore()) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
@@ -4554,7 +4554,7 @@ test "no tool call but run_command carries the scratchpad or the task directory"
 
 test "a secret bound as a file is in the sandbox, and the variable names its path" {
     const allocator = std.testing.allocator;
-    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+    if (!palisade.Sandbox.expresses.moved_paths) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4621,7 +4621,7 @@ test "a secret bound as a file is in the sandbox, and the variable names its pat
 
 test "a secret bound as env reaches the program under the name it was given" {
     const allocator = std.testing.allocator;
-    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+    if (!palisade.Sandbox.expresses.moved_paths) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4657,7 +4657,7 @@ test "a secret bound as env reaches the program under the name it was given" {
 
 test "the secret file belongs to one call, and the next call cannot read it" {
     const allocator = std.testing.allocator;
-    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+    if (!palisade.Sandbox.expresses.moved_paths) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

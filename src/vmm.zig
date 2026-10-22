@@ -13,8 +13,8 @@ const session_mod = @import("mirage-session");
 const fs_mod = @import("mirage-fs");
 const attest = @import("mirage-attest");
 const GuestMemory = @import("mirage-memory").GuestMemory;
-const chock_sandbox = @import("chock-sandbox");
-const shares_mod = chock_sandbox.vm_shares;
+const chock_net = @import("chock-net");
+const shares_mod = chock_net.vm_shares;
 
 pub const available = true;
 
@@ -323,14 +323,14 @@ pub fn forkHost(io: std.Io, options: Options, console_fd: std.posix.fd_t) ForkEr
     sys.endWithParent();
 
     // fork copies the whole descriptor table and CLOEXEC does not apply since this child never execs: close everything but these two.
-    chock_sandbox.after_fork.keepOnlyDescriptors(&.{ console_fd, pair[1] });
+    chock_net.after_fork.keepOnlyDescriptors(&.{ console_fd, pair[1] });
 
     for ([_]i32{ 0, 1, 2 }) |slot| {
         if (slot == console_fd or slot == pair[1]) continue;
         sys.dupOnto(console_fd, slot);
     }
 
-    chock_sandbox.after_fork.resetSignalState();
+    chock_net.after_fork.resetSignalState();
 
     sys.ignoreWriteSignals();
 
@@ -351,7 +351,7 @@ fn childMain(io: std.Io, options: Options, console_fd: std.posix.fd_t, control: 
     var mine = options;
     mine.control = control;
 
-    const room = gpa.alloc(u8, chock_sandbox.vm_wire.max_message_bytes) catch {
+    const room = gpa.alloc(u8, chock_net.vm_wire.max_message_bytes) catch {
         sayFault(control, "there was no room to read the share set", "");
         return 1;
     };
@@ -698,9 +698,9 @@ fn host(
         return 1;
     }
 
-    var layer: ?chock_sandbox.vm_confine.Layer = null;
-    var diag: ?chock_sandbox.vm_confine.Diagnostic = null;
-    chock_sandbox.vm_confine.install(gpa, options.shares, &layer, &diag) catch {
+    var layer: ?chock_net.vm_confine.Layer = null;
+    var diag: ?chock_net.vm_confine.Diagnostic = null;
+    chock_net.vm_confine.install(gpa, options.shares, &layer, &diag) catch {
         fault.* = .{
             .said = "the host side of the guest's boundary would not install",
             .detail = refusalText(gpa, layer, diag),
@@ -833,8 +833,8 @@ fn host(
 
 fn refusalText(
     allocator: std.mem.Allocator,
-    layer: ?chock_sandbox.vm_confine.Layer,
-    diag: ?chock_sandbox.vm_confine.Diagnostic,
+    layer: ?chock_net.vm_confine.Layer,
+    diag: ?chock_net.vm_confine.Diagnostic,
 ) []const u8 {
     const named = @tagName(layer orelse .landlock);
     const said = diag orelse return named;
@@ -1545,7 +1545,7 @@ test "a child that says nothing inside the limit is slow and not gone" {
 
 test "a refusal names the layer and what the kernel answered" {
     const allocator = std.testing.allocator;
-    const named = @tagName(chock_sandbox.vm_confine.Layer.landlock);
+    const named = @tagName(chock_net.vm_confine.Layer.landlock);
     const both = refusalText(allocator, .landlock, .{ .landlock = .{ .call = .add_rule, .errno = .NOENT } });
     defer if (both.ptr != named.ptr) allocator.free(both);
     try testing.expect(std.mem.indexOf(u8, both, "landlock") != null);

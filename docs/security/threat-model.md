@@ -25,7 +25,7 @@ statement about what it did is not evidence" in `SECURITY.md`.
 
 This is a real fault, found and fixed in this project, not a hypothetical.
 
-`applyDenyMounts`, in `lib/chock-sandbox/linux/namespace.zig`, is what turns a
+`applyDenyMounts`, in palisade's `namespace.zig`, is what turns a
 project's `deny_read` entry into a mount that hides a path from a tool call. A
 project writes `deny_read: [".env"]` in `chock.zon` because it does not want an
 agent to read that file even inside the throwaway workspace, and Chock answers
@@ -133,7 +133,7 @@ A language server cannot start in a project that permits a host. The language
 server config is built by `lib/chock-core/tools.zig`'s `prepare`, which carries
 the session's network mode through and attaches no router, because only a tool
 call has one. So the config is `filtered` with no seam, and
-`lib/chock-sandbox/linux/driver.zig` refuses it before the fork rather than
+palisade's Linux driver refuses it before the fork rather than
 running a server with a network nothing filters. The refusal is the right
 response to a state that should not exist: a language server needs no socket
 and should be given `Network.none`, which is not what the code does today.

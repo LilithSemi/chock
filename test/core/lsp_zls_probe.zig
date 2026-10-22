@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 const chock_core = @import("chock-core");
 
 /// Every URI is built from this path, inside the sandbox, never from the host side.
@@ -18,7 +18,7 @@ const unicode_source = "const a = \"\u{1F363}\"; const x = 1\n";
 pub fn main(init: std.process.Init.Minimal) !u8 {
     return runOperation(init) catch |err| {
         // build.zig fails the build on any byte a test binary writes to stderr.
-        if (err == error.NamespaceFailed) return sandbox.namespace.nothing_measured_exit_status;
+        if (err == error.NamespaceFailed) return palisade.linux.namespace.nothing_measured_exit_status;
         return err;
     };
 }
@@ -39,8 +39,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 /// `zls` is a path build.zig found on the dev shell's `PATH`.
 fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8, zls: []const u8) !u8 {
     // Asked in a child, the only way to ask without spending this process's own namespace.
-    if (!sandbox.namespace.probeAvailability().available()) {
-        return sandbox.namespace.nothing_measured_exit_status;
+    if (!palisade.linux.namespace.probeAvailability().available()) {
+        return palisade.linux.namespace.nothing_measured_exit_status;
     }
 
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -54,15 +54,15 @@ fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8, zls: []co
     try work_dir.writeFile(io, .{ .sub_path = "src/unicode.zig", .data = unicode_source });
 
     // A dev shell server is a dynamically linked binary, so the store needs an identity bind.
-    const workspace_config = sandbox.Config{
+    const workspace_config = palisade.Sandbox.Config{
         .root = root,
         .mounts = &.{
             .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } },
             .{ .bind = .{ .source = work, .target = sandbox_project, .read_only = true } },
         },
         .rules = &.{
-            .{ .path = "/nix/store", .access = sandbox.landlock.AccessFs.read_only },
-            .{ .path = sandbox_project, .access = sandbox.landlock.AccessFs.read_only },
+            .{ .path = "/nix/store", .access = palisade.linux.landlock.AccessFs.read_only },
+            .{ .path = sandbox_project, .access = palisade.linux.landlock.AccessFs.read_only },
         },
         .cwd = sandbox_project,
         // `zls` reports no global cache directory here and answers anyway.
@@ -81,7 +81,7 @@ fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8, zls: []co
         arena,
         io,
         &env,
-        workspace_config,
+        .{ .config = workspace_config },
         &.{program},
         &.{},
         &.{},
@@ -96,7 +96,7 @@ fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8, zls: []co
     var driver = chock_core.lsp_driver.Driver{
         .gpa = arena,
         .process = &process,
-        .request = .{ .config = prepared.config, .argv = prepared.argv },
+        .request = .{ .call = prepared.config, .argv = prepared.argv },
         .work_root = work,
         .sandbox_root = sandbox_project,
     };

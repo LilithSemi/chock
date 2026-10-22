@@ -5,9 +5,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
-const iface = @import("../Sandbox.zig");
-const NetRouter = iface.NetRouter;
-const NetBroker = iface.NetBroker;
+const palisade = @import("palisade");
+const iface = palisade.Sandbox;
+const links = @import("../links.zig");
+const NetRouter = links.NetRouter;
+const NetBroker = links.NetBroker;
 
 const router = @import("router.zig");
 const nftables = @import("nftables.zig");

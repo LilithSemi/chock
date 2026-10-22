@@ -14,7 +14,8 @@ const worktree_mod = @import("worktree.zig");
 const overlay_mod = @import("overlay.zig");
 const deny_mod = @import("deny.zig");
 const binds_mod = @import("binds.zig");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 
 pub const Error = worktree_mod.Error || overlay_mod.Error || deny_mod.Error || error{
     OverlayCannotBeAdopted,
@@ -331,10 +332,10 @@ pub const Workspace = struct {
         self: *const Workspace,
         allocator: std.mem.Allocator,
         root: []const u8,
-    ) Error!sandbox.Config {
-        var mounts: std.ArrayList(sandbox.namespace.Mount) = .empty;
+    ) Error!palisade.Sandbox.Config {
+        var mounts: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
         errdefer mounts.deinit(allocator);
-        var rules: std.ArrayList(sandbox.Config.Rule) = .empty;
+        var rules: std.ArrayList(palisade.Sandbox.Rule) = .empty;
         errdefer rules.deinit(allocator);
         // The identity comes first for both backings; without it git refuses to commit.
         var env: std.ArrayList([]const u8) = .empty;
@@ -351,20 +352,20 @@ pub const Workspace = struct {
 
                 try rules.append(allocator, .{
                     .path = wt.sandboxRoot(),
-                    .access = sandbox.landlock.AccessFs.read_write,
+                    .access = palisade.linux.landlock.AccessFs.read_write,
                 });
                 try rules.append(allocator, .{
                     .path = wt.sandbox_git_root,
-                    .access = sandbox.landlock.AccessFs.read_only,
+                    .access = palisade.linux.landlock.AccessFs.read_only,
                 });
                 // The scratch object store is not nested under sandbox_git_root, so it needs its own rule.
                 try rules.append(allocator, .{
                     .path = wt.object_store_target,
-                    .access = sandbox.landlock.AccessFs.read_write,
+                    .access = palisade.linux.landlock.AccessFs.read_write,
                 });
                 try rules.append(allocator, .{
                     .path = wt.worktree_meta_target,
-                    .access = sandbox.landlock.AccessFs.read_write,
+                    .access = palisade.linux.landlock.AccessFs.read_write,
                 });
 
                 const backing_env = try wt.gitEnv(allocator);
@@ -378,7 +379,7 @@ pub const Workspace = struct {
 
                 try rules.append(allocator, .{
                     .path = ov.sandboxRoot(),
-                    .access = sandbox.landlock.AccessFs.read_write,
+                    .access = palisade.linux.landlock.AccessFs.read_write,
                 });
             },
         }
@@ -401,6 +402,8 @@ pub const Workspace = struct {
 
         return .{
             // `.in_place` has no root of its own: macOS cannot pivot into one.
+            // Nothing deletes this path: the clear after a failed setup takes
+            // the session's own root and refuses any other name.
             .root = switch (self.sandboxLayout()) {
                 .remapped => root,
                 .in_place => "/",
@@ -409,6 +412,7 @@ pub const Workspace = struct {
             .rules = try rules.toOwnedSlice(allocator),
             .cwd = cwd,
             .env = try env.toOwnedSlice(allocator),
+            .deny_notice = chock_net.deny_notice,
         };
     }
 
@@ -617,7 +621,6 @@ test "open picks the worktree kind for a project that is a git repository" {
 }
 
 test "the in place layout builds a config the darwin driver can express, for both kinds" {
-    const darwin = sandbox.darwin_driver_for_testing;
     const allocator = std.testing.allocator;
 
     for ([_]bool{ true, false }) |with_git| {
@@ -649,7 +652,7 @@ test "the in place layout builds a config the darwin driver can express, for bot
             .deny => {},
             .overlay, .proc => return error.ExpectedABindEntry,
         };
-        try std.testing.expectEqual(@as(?darwin.Inexpressible, null), darwin.expressibleOn(config));
+        try std.testing.expectEqual(@as(?palisade.Sandbox.Inexpressible, null), palisade.Sandbox.inexpressibleOnDarwin(config));
         // The root is the real root, because macOS cannot pivot into one of ours.
         try std.testing.expectEqualStrings("/", config.root);
         try std.testing.expectEqualStrings(workspace.sandboxRoot(), config.cwd);
@@ -660,7 +663,7 @@ test "the in place layout builds a config the darwin driver can express, for bot
 test "a real tool call runs in the workspace on macos, and the boundaries hold" {
     if (builtin.os.tag != .macos) return;
     // Nix on macOS runs every builder under sandbox-exec, which refuses a nested sandbox.
-    if (sandbox.darwin_driver_for_testing.confinedAlready()) return error.SkipZigTest;
+    if (palisade.Sandbox.confinedAlready()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -691,7 +694,7 @@ test "a real tool call runs in the workspace on macos, and the boundaries hold" 
     const written = try std.fmt.bufPrint(&buffer, "{s}/agent-wrote-this.txt", .{workspace.sandboxRoot()});
     try std.testing.expectEqual(
         std.process.Child.Term{ .exited = 0 },
-        try sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", written }, null, null),
+        try palisade.Sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", written }, .{}),
     );
     try std.testing.expect(try existsAsFile(io, written));
     var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -700,21 +703,21 @@ test "a real tool call runs in the workspace on macos, and the boundaries hold" 
 
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tracked = try std.fmt.bufPrint(&tracked_buffer, "{s}/tracked.txt", .{project.root_path});
-    try std.testing.expect(!ranWell(try sandbox.spawn(allocator, run, &.{ "/bin/cat", tracked }, null, null)));
+    try std.testing.expect(!ranWell(try palisade.Sandbox.spawn(allocator, run, &.{ "/bin/cat", tracked }, .{})));
 
     const wt = workspace.kind.worktree;
 
     var objects_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const in_objects = try std.fmt.bufPrint(&objects_buffer, "{s}/objects/agent-wrote-this", .{wt.sandbox_git_root});
-    try std.testing.expect(!ranWell(try sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", in_objects }, null, null)));
+    try std.testing.expect(!ranWell(try palisade.Sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", in_objects }, .{})));
 
     // `commondir` redirects git at a git directory of the agent's own choosing.
-    try std.testing.expect(!ranWell(try sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", wt.worktree_commondir_target }, null, null)));
+    try std.testing.expect(!ranWell(try palisade.Sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", wt.worktree_commondir_target }, .{})));
     var index_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const in_meta = try std.fmt.bufPrint(&index_buffer, "{s}/agent-wrote-this", .{wt.worktree_meta_target});
     try std.testing.expectEqual(
         std.process.Child.Term{ .exited = 0 },
-        try sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", in_meta }, null, null),
+        try palisade.Sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", in_meta }, .{}),
     );
     var real_meta_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const in_real_meta = try std.fmt.bufPrint(&real_meta_buffer, "{s}/agent-wrote-this", .{wt.worktree_meta_source});
@@ -985,9 +988,9 @@ test "every landlock rule sandboxConfig writes names a path its own mount list h
     }
 }
 
-fn expectLayersAgree(config: sandbox.Config) !void {
+fn expectLayersAgree(config: palisade.Sandbox.Config) !void {
     var buffer: [256]u8 = undefined;
-    const said = if (sandbox.firstGap(config)) |gap|
+    const said = if (palisade.Sandbox.firstGap(config)) |gap|
         try std.fmt.bufPrint(&buffer, "{f}", .{gap})
     else
         "";

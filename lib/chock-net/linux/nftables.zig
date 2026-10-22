@@ -5,7 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
-const namespace = @import("namespace.zig");
+const namespace = @import("palisade").linux.namespace;
 
 pub const table_name = "chock";
 pub const set4_name = "allowed4";

@@ -6,7 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const chock_workspace = @import("chock-workspace");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 const Workspace = chock_workspace.Workspace;
 const git = chock_workspace.git;
 
@@ -130,7 +130,7 @@ const TestProject = struct {
     }
 };
 
-fn serializeMounts(allocator: std.mem.Allocator, mounts: []const sandbox.namespace.Mount) ![]u8 {
+fn serializeMounts(allocator: std.mem.Allocator, mounts: []const palisade.linux.namespace.Mount) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (system_paths) |entry| {
@@ -158,7 +158,7 @@ fn serializeMounts(allocator: std.mem.Allocator, mounts: []const sandbox.namespa
     return out.toOwnedSlice(allocator);
 }
 
-fn serializeRules(allocator: std.mem.Allocator, rules: []const sandbox.Config.Rule) ![]u8 {
+fn serializeRules(allocator: std.mem.Allocator, rules: []const palisade.Sandbox.Rule) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (rules) |rule| {
@@ -214,7 +214,7 @@ fn runProbe(
 
 /// A Seatbelt profile cannot be layered, so a process that already carries one skips.
 fn requireOwnProfile() !void {
-    if (sandbox.darwin_driver_for_testing.confinedAlready()) return error.SkipZigTest;
+    if (palisade.Sandbox.confinedAlready()) return error.SkipZigTest;
 }
 
 test "finding 4 on macos: a tool call writes the worktree metadata directory and the user's own repository never sees it" {

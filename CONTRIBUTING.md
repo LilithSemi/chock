@@ -11,10 +11,12 @@ agree to uphold it.
 
 ## Repository layout
 
-- `lib/` - the libraries, one module for each concern. `chock-sandbox` holds the
-  boundary, `chock-proto` the event log, `chock-policy` the rules, `chock-core`
-  the agent loop, `chock-broker` the arbitration, `chock-nix` the toolchain, and
-  `chock-ui` the widget tree the terminal, a window and a browser all draw.
+- `lib/` - the libraries, one module for each concern. The boundary itself is
+  palisade, an outside library. `chock-net` holds what Chock puts around it: the
+  network broker, the device link and the guest wire. `chock-proto` holds the
+  event log, `chock-policy` the rules, `chock-core` the agent loop,
+  `chock-broker` the arbitration, `chock-nix` the toolchain, and `chock-ui` the
+  widget tree the terminal, a window and a browser all draw.
   `chock-acp`, `chock-auth`, `chock-container`, `chock-cost`, `chock-io`,
   `chock-pcsc`, `chock-provider`, `chock-workspace`, `chock-plugin-core` and
   `chock-plugin-sdk` complete the set.

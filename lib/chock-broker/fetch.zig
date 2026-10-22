@@ -4,7 +4,7 @@
 const std = @import("std");
 
 const chock_policy = @import("chock-policy");
-const chock_sandbox = @import("chock-sandbox");
+const chock_net = @import("chock-net");
 
 const actions = @import("actions.zig");
 const diagnostic = @import("diagnostic.zig");
@@ -40,7 +40,7 @@ pub const product_token = actions.product_token;
 pub fn actionInto(buffer: []u8, host: []const u8) ?[]const u8 {
     if (buffer.len < max_action_bytes) return null;
     if (host.len > max_host_bytes) return null;
-    if (!chock_sandbox.net_broker.hostBytesAreUsable(host)) return null;
+    if (!chock_net.net_broker.hostBytesAreUsable(host)) return null;
 
     @memcpy(buffer[0..action_prefix.len], action_prefix);
     var written: usize = action_prefix.len;

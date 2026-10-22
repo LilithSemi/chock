@@ -1,11 +1,12 @@
 //! Runs one `chock_core.tools.Registry.dispatch` call against a real
-//! `sandbox.Config` and prints the result, out of process because `dispatch`
+//! `palisade.Sandbox.Config` and prints the result, out of process because `dispatch`
 //! forks and the zig test runner is not a single threaded caller.
 
 const std = @import("std");
 
 const linux = std.os.linux;
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 const chock_core = @import("chock-core");
 
 /// Half of `struct itimerval`, in microseconds: this syscall reads `setitimer`'s nanosecond field as one.
@@ -133,7 +134,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var env = std.process.Environ.Map.init(arena);
     env.put("PATH", host_path) catch return error.OutOfMemory;
 
-    var config = sandbox.Config{
+    var config = palisade.Sandbox.Config{
         .root = root,
         .mounts = mounts,
         .rules = rules,
@@ -181,9 +182,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     } else null;
     if (table) |*one| context.tasks = one;
 
-    const result = chock_core.tools.Registry.dispatchWith(arena, io, &env, config, call, context) catch |err| switch (err) {
+    const result = chock_core.tools.Registry.dispatchWith(arena, io, &env, .{ .config = config }, call, context) catch |err| switch (err) {
         // Nothing is printed here: the build fails on a byte written to standard error.
-        error.NamespaceFailed => return sandbox.namespace.nothing_measured_exit_status,
+        error.NamespaceFailed => return palisade.linux.namespace.nothing_measured_exit_status,
         else => {
             std.debug.print("dispatch failed: {s}\n", .{@errorName(err)});
             return 3;
@@ -242,8 +243,8 @@ fn writeAll(bytes: []const u8) void {
 const ParseError = error{ OutOfMemory, BadBlob };
 
 /// One line per mount, fields separated by 0x01, the first field the kind.
-fn parseMounts(arena: std.mem.Allocator, blob: []const u8) ParseError![]sandbox.namespace.Mount {
-    var list: std.ArrayList(sandbox.namespace.Mount) = .empty;
+fn parseMounts(arena: std.mem.Allocator, blob: []const u8) ParseError![]palisade.linux.namespace.Mount {
+    var list: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
     if (blob.len == 0) return list.toOwnedSlice(arena) catch return error.OutOfMemory;
 
     var lines = std.mem.splitScalar(u8, blob, '\n');
@@ -281,8 +282,8 @@ fn parseMounts(arena: std.mem.Allocator, blob: []const u8) ParseError![]sandbox.
     return list.toOwnedSlice(arena) catch return error.OutOfMemory;
 }
 
-fn parseRules(arena: std.mem.Allocator, blob: []const u8) ParseError![]sandbox.Config.Rule {
-    var list: std.ArrayList(sandbox.Config.Rule) = .empty;
+fn parseRules(arena: std.mem.Allocator, blob: []const u8) ParseError![]palisade.Sandbox.Rule {
+    var list: std.ArrayList(palisade.Sandbox.Rule) = .empty;
     if (blob.len == 0) return list.toOwnedSlice(arena) catch return error.OutOfMemory;
 
     var lines = std.mem.splitScalar(u8, blob, '\n');
@@ -375,21 +376,21 @@ const RefusingNetwork = struct {
         .background_router = backgroundRouterFn,
     };
 
-    fn routerFn(ptr: *anyopaque, _: []const u8, _: []const u8) sandbox.NetRouter {
+    fn routerFn(ptr: *anyopaque, _: []const u8, _: []const u8) chock_net.NetRouter {
         return .{ .ptr = ptr, .vtable = &router_vtable };
     }
 
-    fn backgroundRouterFn(ptr: *anyopaque, _: []const u8, _: []const u8) ?sandbox.NetRouter {
+    fn backgroundRouterFn(ptr: *anyopaque, _: []const u8, _: []const u8) ?chock_net.NetRouter {
         return .{ .ptr = ptr, .vtable = &router_vtable };
     }
 
-    const router_vtable = sandbox.NetRouter.VTable{ .resolve = resolveFn, .open = openFn };
+    const router_vtable = chock_net.NetRouter.VTable{ .resolve = resolveFn, .open = openFn };
 
-    fn resolveFn(_: *anyopaque, _: []const u8, _: sandbox.NetRouter.Family) sandbox.NetRouter.Resolution {
+    fn resolveFn(_: *anyopaque, _: []const u8, _: chock_net.NetRouter.Family) chock_net.NetRouter.Resolution {
         return .refused;
     }
 
-    fn openFn(_: *anyopaque, _: sandbox.NetRouter.Address, _: u16) sandbox.NetBroker.Grant {
+    fn openFn(_: *anyopaque, _: chock_net.NetRouter.Address, _: u16) chock_net.NetBroker.Grant {
         return .refused;
     }
 };

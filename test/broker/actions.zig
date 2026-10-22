@@ -7,7 +7,6 @@ const chock_broker = @import("chock-broker");
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
 const chock_workspace = @import("chock-workspace");
-const sandbox = @import("chock-sandbox");
 const fake_provider = @import("fake_provider");
 
 const actions = chock_broker.actions;

@@ -4,7 +4,7 @@
 const std = @import("std");
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
-const chock_sandbox = @import("chock-sandbox");
+const chock_net = @import("chock-net");
 
 const diagnostic = @import("diagnostic.zig");
 const secrets = @import("secrets.zig");
@@ -48,7 +48,7 @@ pub const max_frame_bytes: usize = 4096;
 
 pub const action_prefix = "secret.password";
 
-pub const max_host_bytes = chock_sandbox.net_broker.max_host_bytes;
+pub const max_host_bytes = chock_net.net_broker.max_host_bytes;
 
 pub const max_action_bytes = action_prefix.len + 1 + max_host_bytes;
 
@@ -82,7 +82,7 @@ pub fn readPrompt(text: []const u8) ?Prompt {
     const close = std.mem.indexOfScalarPos(u8, rest, 1, '\'') orelse return null;
 
     const host = hostOf(rest[1..close]) orelse return null;
-    if (!chock_sandbox.net_broker.hostBytesAreUsable(host)) return null;
+    if (!chock_net.net_broker.hostBytesAreUsable(host)) return null;
     return .{ .want = want, .host = host };
 }
 
@@ -108,7 +108,7 @@ fn hostOf(url: []const u8) ?[]const u8 {
 pub fn actionInto(buffer: []u8, host: []const u8) ?[]const u8 {
     if (buffer.len < max_action_bytes) return null;
     if (host.len > max_host_bytes) return null;
-    if (!chock_sandbox.net_broker.hostBytesAreUsable(host)) return null;
+    if (!chock_net.net_broker.hostBytesAreUsable(host)) return null;
 
     @memcpy(buffer[0..action_prefix.len], action_prefix);
     var written: usize = action_prefix.len;

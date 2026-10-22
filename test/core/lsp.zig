@@ -10,7 +10,7 @@ const probe_path = @import("lsp_probe_path").lsp_probe_path;
 const zls_probe_path = @import("lsp_probe_path").lsp_zls_probe_path;
 const zls_path: ?[]const u8 = @import("lsp_probe_path").zls_path;
 
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 /// A boundary that was never reached is not a boundary that held, so a machine that refuses a sandbox skips.
 fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
@@ -18,7 +18,7 @@ fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
         .exited => |c| c,
         else => return,
     };
-    if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
+    if (code == palisade.linux.namespace.nothing_measured_exit_status) return error.SkipZigTest;
 }
 
 /// `std.testing.tmpDir` hands back a directory only a relative path reaches.

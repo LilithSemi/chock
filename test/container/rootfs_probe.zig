@@ -4,7 +4,7 @@
 //! runner is not single threaded. Every answer travels as an exit status.
 
 const std = @import("std");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 const bad_usage = 251;
 const probe_fault = 252;
@@ -27,14 +27,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const env_blob = args[4];
     const argv = args[5..];
 
-    var mounts: std.ArrayList(sandbox.namespace.Mount) = .empty;
-    var rules: std.ArrayList(sandbox.Config.Rule) = .empty;
+    var mounts: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
+    var rules: std.ArrayList(palisade.Sandbox.Rule) = .empty;
 
     parseMounts(arena, mounts_blob, &mounts, &rules) catch return probe_fault;
 
     // An image carries no `/proc`, and every real toolchain reads one.
     mounts.append(arena, .{ .proc = .{} }) catch return probe_fault;
-    rules.append(arena, .{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only }) catch
+    rules.append(arena, .{ .path = "/proc", .access = palisade.linux.landlock.AccessFs.read_only }) catch
         return probe_fault;
 
     // Not read only: `markReadOnly` also sets `NODEV`, which refuses to open the device node.
@@ -50,16 +50,16 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     const env = parseEnv(arena, env_blob) catch return probe_fault;
 
-    const term = sandbox.spawn(arena, .{
+    const term = palisade.Sandbox.spawn(arena, .{
         .root = root,
         .mounts = mounts.items,
         .rules = rules.items,
         .cwd = cwd,
         .env = env,
         .network = .none,
-    }, argv, null, null) catch |err| {
+    }, argv, .{}) catch |err| {
         // A sandbox that cannot be built says nothing about the image.
-        if (err == error.NamespaceFailed) return sandbox.namespace.nothing_measured_exit_status;
+        if (err == error.NamespaceFailed) return palisade.linux.namespace.nothing_measured_exit_status;
         return spawn_refused;
     };
 
@@ -72,8 +72,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 fn parseMounts(
     arena: std.mem.Allocator,
     blob: []const u8,
-    mounts: *std.ArrayList(sandbox.namespace.Mount),
-    rules: *std.ArrayList(sandbox.Config.Rule),
+    mounts: *std.ArrayList(palisade.linux.namespace.Mount),
+    rules: *std.ArrayList(palisade.Sandbox.Rule),
 ) !void {
     var lines = std.mem.splitScalar(u8, blob, '\n');
     while (lines.next()) |line| {
@@ -96,8 +96,8 @@ fn parseMounts(
         try rules.append(arena, .{
             .path = target,
             .access = switch (kind[0]) {
-                'd' => sandbox.landlock.AccessFs.read_only,
-                'f' => sandbox.landlock.AccessFs.read_only_file,
+                'd' => palisade.linux.landlock.AccessFs.read_only,
+                'f' => palisade.linux.landlock.AccessFs.read_only_file,
                 else => return error.BadBlob,
             },
         });

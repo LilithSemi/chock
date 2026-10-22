@@ -3,8 +3,10 @@
 
 const std = @import("std");
 
-const iface = @import("../Sandbox.zig");
-const namespace = @import("../linux/namespace.zig");
+const palisade = @import("palisade");
+const iface = palisade.Sandbox;
+const links = @import("../links.zig");
+const namespace = @import("palisade").linux.namespace;
 
 pub const Share = struct {
     name: []const u8,

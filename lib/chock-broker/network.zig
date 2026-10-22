@@ -4,7 +4,7 @@
 const std = @import("std");
 
 const chock_policy = @import("chock-policy");
-const chock_sandbox = @import("chock-sandbox");
+const chock_net = @import("chock-net");
 const chock_proto = @import("chock-proto");
 
 const diagnostic = @import("diagnostic.zig");
@@ -14,8 +14,8 @@ const Broker = @import("Broker.zig");
 const event = chock_proto.event;
 
 const table = chock_policy.table;
-const NetBroker = chock_sandbox.NetBroker;
-const NetRouter = chock_sandbox.NetRouter;
+const NetBroker = chock_net.NetBroker;
+const NetRouter = chock_net.NetRouter;
 
 /// `Locked` is not `pub`; reached through `Storage.lock`'s return type.
 pub const Locked = @typeInfo(
@@ -24,7 +24,7 @@ pub const Locked = @typeInfo(
 
 pub const action_prefix = "net.connect";
 
-pub const max_host_bytes = chock_sandbox.net_broker.max_host_bytes;
+pub const max_host_bytes = chock_net.net_broker.max_host_bytes;
 
 pub const request_source = "the sandbox";
 
@@ -123,7 +123,7 @@ pub fn classActionInto(buffer: []u8, host: []const u8) ?[]const u8 {
 
 fn hostActionInto(buffer: []u8, prefix: []const u8, host: []const u8) ?usize {
     if (buffer.len < max_action_bytes) return null;
-    if (!chock_sandbox.net_broker.hostBytesAreUsable(host)) return null;
+    if (!chock_net.net_broker.hostBytesAreUsable(host)) return null;
 
     var written: usize = 0;
     @memcpy(buffer[0..prefix.len], prefix);

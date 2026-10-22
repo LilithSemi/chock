@@ -50,7 +50,7 @@ There are three modes, and a tool call gets the first:
   after the policy table permits the name and then permits the address and port.
   This is set when the policy permits anything under `net`, which is any rule
   under `net.connect.*` or `net.fetch.*`. A second shape exists in
-  `lib/chock-sandbox/linux/netbroker.zig`, one descriptor to a broker, and
+  `lib/chock-net/linux/netbroker.zig`, one descriptor to a broker, and
   nothing in Chock sets it: that file's own comment says so.
 - `host`. The host's own namespace, with nothing removed. `chock doctor` uses
   this for its own probes.
@@ -295,7 +295,7 @@ given up with a row on the policy table and never with a key in this file. See
 ### A cgroup the caller made
 
 Everything above is for the cgroup Chock makes. A program that embeds
-`chock-sandbox` as a library can hand it a cgroup instead, with
+`chock-net` as a library can hand it a cgroup instead, with
 `Config.containment`, and that is a different promise:
 
 | | who makes the cgroup | who writes the limits | when the process goes in | when it cannot be done |
@@ -373,7 +373,7 @@ exactly four guarantees, and a test on a real Mac tries to break each one, in
 | `ipc_isolated` | yes |
 | `path_restricted` | yes |
 | `syscall_restricted` | no, and it is permanent |
-| `workspace_mounted` | no, and it is permanent |
+| `bind_mounts` | no, and it is permanent |
 | Mach services (`mach-lookup`) | yes, no opt in list needed |
 
 The Mach services row is not one of the four declared guarantees, and it is in
@@ -427,7 +427,7 @@ A config whose every path stays where it is does run. That is what
 `Layout.in_place` builds in `lib/chock-workspace/layout.zig`: the checkout, the
 project's own `.git` and the scratch object store each keep their real path, so
 the workspace becomes a set of rules instead of a set of mounts. This is why
-`workspace_mounted` is absent and a tool call still works.
+`bind_mounts` is absent and a tool call still works.
 
 **This table is the native Darwin driver's limit and not the platform's.** What a
 way of sandboxing can express is a property of the driver, which is why

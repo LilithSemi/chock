@@ -9,7 +9,7 @@ const posix = std.posix;
 const nftables = @import("nftables.zig");
 const netns = @import("netns.zig");
 
-const namespace = @import("namespace.zig");
+const namespace = @import("palisade").linux.namespace;
 
 pub const relay_port: u16 = nftables.relay_port;
 
@@ -1285,7 +1285,7 @@ fn measureInChild(record: *Measurement, pair: [2]posix.fd_t) void {
         return;
     };
     defer net_session.close();
-    _ = net_session.configure(&net_diag) catch {
+    _ = net_session.configure(netns.params, &net_diag) catch {
         recordNetnsFailure(record, net_diag);
         return;
     };

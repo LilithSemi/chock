@@ -1,9 +1,10 @@
 //! The VMM's filesystem allow list, held against the server it answers for.
 //! Reads `Export.zig` out of the dependency the build resolved, and fails naming
-//! any `self.io` call that `seccomp.fs_callers` has no row for.
+//! any `self.io` call that `roles.fs_callers` has no row for.
 
 const std = @import("std");
-const seccomp = @import("chock-sandbox").seccomp;
+const seccomp = @import("palisade").linux.seccomp;
+const roles = @import("chock-net").roles;
 
 const served = @embedFile("mirage-fs-export");
 
@@ -39,8 +40,8 @@ test "every call the guest's filesystem server makes has a row, and the filter p
         if (std.mem.eql(u8, name, "openFileAbsolute")) opened = true;
         if (std.mem.eql(u8, name, "readPositionalAll")) read = true;
 
-        var row: ?seccomp.FilesystemCaller = null;
-        for (seccomp.fs_callers) |each| {
+        var row: ?roles.FilesystemCaller = null;
+        for (roles.fs_callers) |each| {
             for (each.names) |held| {
                 if (std.mem.eql(u8, held, name)) row = each;
             }
@@ -48,7 +49,7 @@ test "every call the guest's filesystem server makes has a row, and the filter p
         const held = row orelse {
             const message = try std.fmt.allocPrint(
                 gpa,
-                "`Export` calls {s} and `seccomp.fs_callers` has no row for it." ++
+                "`Export` calls {s} and `roles.fs_callers` has no row for it." ++
                     " Add one naming the syscall it reaches, and that syscall to" ++
                     " `vmm_calls`, or a row with no syscall if a served filesystem" ++
                     " never reaches it\n",
@@ -61,7 +62,7 @@ test "every call the guest's filesystem server makes has a row, and the filter p
 
         const call = held.call orelse continue;
         var permitted = false;
-        for (seccomp.vmm_calls) |each| {
+        for (roles.vmm_calls) |each| {
             if (each == call) permitted = true;
         }
         if (!permitted) {

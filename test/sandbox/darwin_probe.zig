@@ -3,7 +3,7 @@
 //! kernel's answer as an exit status.
 
 const std = @import("std");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 extern "c" fn sandbox_init(profile: [*:0]const u8, flags: u64, errorbuf: *?[*:0]u8) c_int;
 extern "c" fn shmat(id: c_int, addr: ?*const anyopaque, flags: c_int) ?*anyopaque;
@@ -97,8 +97,8 @@ fn baseMounts(
     arena: std.mem.Allocator,
     work: []const u8,
     self_dir: []const u8,
-) []const sandbox.namespace.Mount {
-    const mounts = arena.alloc(sandbox.namespace.Mount, 2) catch @panic("out of memory");
+) []const palisade.linux.namespace.Mount {
+    const mounts = arena.alloc(palisade.linux.namespace.Mount, 2) catch @panic("out of memory");
     mounts[0] = .{ .bind = .{ .source = work, .target = work, .read_only = false } };
     mounts[1] = .{ .bind = .{ .source = self_dir, .target = self_dir, .read_only = true } };
     return mounts;
@@ -109,16 +109,16 @@ fn runInside(
     work: []const u8,
     self_path: []const u8,
     inner_argv: []const []const u8,
-    extra_mounts: []const sandbox.namespace.Mount,
-    network: sandbox.namespace.Network,
-    limits: sandbox.Sandbox.Limits,
+    extra_mounts: []const palisade.linux.namespace.Mount,
+    network: palisade.Sandbox.Network,
+    limits: palisade.Sandbox.Limits,
 ) u8 {
     const self_dir = std.fs.path.dirname(self_path) orelse "/";
-    var mounts: std.ArrayList(sandbox.namespace.Mount) = .empty;
+    var mounts: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
     mounts.appendSlice(arena, baseMounts(arena, work, self_dir)) catch @panic("out of memory");
     mounts.appendSlice(arena, extra_mounts) catch @panic("out of memory");
 
-    const term = sandbox.spawn(arena, .{
+    const term = palisade.Sandbox.spawn(arena, .{
         .root = "/",
         .mounts = mounts.items,
         .rules = &.{},
@@ -126,7 +126,7 @@ fn runInside(
         .env = &.{},
         .network = network,
         .limits = limits,
-    }, inner_argv, null, null) catch |err| return exitFor(err);
+    }, inner_argv, .{}) catch |err| return exitFor(err);
 
     return switch (term) {
         .exited => |code| code,
@@ -149,7 +149,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const self_path = resolve(arena, args[0]);
     const work = join(arena, root, "work");
     const outside = join(arena, root, "outside");
-    const limits = sandbox.Sandbox.Limits.none;
+    const limits = palisade.Sandbox.Limits.none;
 
     if (std.mem.eql(u8, op, "in-read")) {
         const fd = openRead(args[3]);
@@ -308,7 +308,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     if (std.mem.eql(u8, op, "read-denied-file")) {
         const hidden = join(arena, work, "hidden.env");
-        const deny = arena.alloc(sandbox.namespace.Mount, 1) catch @panic("out of memory");
+        const deny = arena.alloc(palisade.linux.namespace.Mount, 1) catch @panic("out of memory");
         deny[0] = .{ .deny = .{ .target = hidden } };
         return runInside(arena, work, self_path, &.{ self_path, "in-read", root, hidden }, deny, .none, limits);
     }
@@ -316,7 +316,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     if (std.mem.eql(u8, op, "read-beside-denied-file")) {
         const hidden = join(arena, work, "hidden.env");
         const allowed = join(arena, work, "ok.txt");
-        const deny = arena.alloc(sandbox.namespace.Mount, 1) catch @panic("out of memory");
+        const deny = arena.alloc(palisade.linux.namespace.Mount, 1) catch @panic("out of memory");
         deny[0] = .{ .deny = .{ .target = hidden } };
         return runInside(arena, work, self_path, &.{ self_path, "in-read", root, allowed }, deny, .none, limits);
     }
@@ -347,12 +347,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     if (std.mem.eql(u8, op, "mach-lookup-widened-allowed")) {
         // No `runInside`: see `widenedMachLookup`.
-        return widenedMachLookup(sandbox.darwin_driver_for_testing.default_mach_services[0], sandbox.darwin_driver_for_testing.default_mach_services[0]);
+        return widenedMachLookup(palisade.Sandbox.default_mach_services[0], palisade.Sandbox.default_mach_services[0]);
     }
 
     if (std.mem.eql(u8, op, "mach-lookup-widened-lsd")) {
         // A LaunchServices lookup, which `default_mach_services` never carries.
-        return widenedMachLookup(sandbox.darwin_driver_for_testing.default_mach_services[0], "com.apple.lsd.open");
+        return widenedMachLookup(palisade.Sandbox.default_mach_services[0], "com.apple.lsd.open");
     }
 
     if (std.mem.eql(u8, op, "widen")) {
@@ -362,7 +362,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     if (std.mem.eql(u8, op, "file-size")) {
         const target = join(arena, work, "big.txt");
-        var capped = sandbox.Sandbox.Limits.none;
+        var capped = palisade.Sandbox.Limits.none;
         capped.file_size_bytes = 4096;
         return runInside(arena, work, self_path, &.{ self_path, "in-file-size", root, target }, &.{}, .none, capped);
     }
@@ -387,7 +387,7 @@ fn runCancel(arena: std.mem.Allocator, work: []const u8, self_path: []const u8, 
         work: []const u8,
         self_path: []const u8,
         root: []const u8,
-        middle: sandbox.Middle = .{},
+        middle: palisade.Sandbox.Handle = .{},
         term: std.process.Child.Term = undefined,
         failed: bool = false,
         failure: u8 = spawn_refused,
@@ -395,14 +395,14 @@ fn runCancel(arena: std.mem.Allocator, work: []const u8, self_path: []const u8, 
 
         fn run(self: *@This()) void {
             const self_dir = std.fs.path.dirname(self.self_path) orelse "/";
-            self.term = sandbox.spawn(self.arena, .{
+            self.term = palisade.Sandbox.spawn(self.arena, .{
                 .root = "/",
                 .mounts = baseMounts(self.arena, self.work, self_dir),
                 .rules = &.{},
                 .cwd = self.work,
                 .env = &.{},
-                .limits = sandbox.Sandbox.Limits.none,
-            }, &.{ self.self_path, "in-sleep", self.root }, null, &self.middle) catch |err| {
+                .limits = palisade.Sandbox.Limits.none,
+            }, &.{ self.self_path, "in-sleep", self.root }, .{ .handle = &self.middle }) catch |err| {
                 self.failed = true;
                 self.failure = exitFor(err);
                 self.done.store(true, .release);
@@ -417,18 +417,18 @@ fn runCancel(arena: std.mem.Allocator, work: []const u8, self_path: []const u8, 
 
     var waited: u64 = 0;
     while (waited < cancel_bound_ns) : (waited += cancel_step_ns) {
-        if (@atomicLoad(std.c.pid_t, &call.middle.pid, .acquire) != 0) break;
+        if (call.middle.pid() != null) break;
         if (call.done.load(.acquire)) break;
         sleepStep();
     }
-    if (@atomicLoad(std.c.pid_t, &call.middle.pid, .acquire) == 0) {
+    if (call.middle.pid() == null) {
         thread.join();
         return if (call.failed) call.failure else spawn_refused;
     }
 
-    sandbox.signalMiddle(call.middle.fd, .KILL) catch {
+    call.middle.signal(@intFromEnum(std.c.SIG.KILL)) catch {
         thread.join();
-        sandbox.closeMiddle(&call.middle);
+        call.middle.close();
         return not_cancelled;
     };
 
@@ -439,7 +439,7 @@ fn runCancel(arena: std.mem.Allocator, work: []const u8, self_path: []const u8, 
     }
     const finished = call.done.load(.acquire);
     thread.join();
-    sandbox.closeMiddle(&call.middle);
+    call.middle.close();
 
     if (!finished) return not_cancelled;
     if (call.failed) return call.failure;

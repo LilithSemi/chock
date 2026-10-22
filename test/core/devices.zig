@@ -53,5 +53,5 @@ test "HostSource compiles against a real udev.Enumerate and a real signal pipe w
     const fd = device_source.vtable.wakeup(device_source.ptr);
     try testing.expect(fd >= 0);
 
-    try testing.expectEqual(@as(?@import("chock-sandbox").Sandbox.DeviceSource.Change, null), device_source.vtable.next(device_source.ptr));
+    try testing.expectEqual(@as(?@import("chock-net").DeviceSource.Change, null), device_source.vtable.next(device_source.ptr));
 }

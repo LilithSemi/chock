@@ -5,7 +5,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const chock_workspace = @import("chock-workspace");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 const Workspace = chock_workspace.Workspace;
 const git = chock_workspace.git;
 
@@ -172,7 +172,7 @@ const PlainProject = struct {
 };
 
 /// One line per mount, fields separated by 0x01, the first field always the kind.
-fn serializeMounts(allocator: std.mem.Allocator, mounts: []const sandbox.namespace.Mount) ![]u8 {
+fn serializeMounts(allocator: std.mem.Allocator, mounts: []const palisade.linux.namespace.Mount) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (mounts) |m| {
@@ -204,7 +204,7 @@ fn serializeMounts(allocator: std.mem.Allocator, mounts: []const sandbox.namespa
     return out.toOwnedSlice(allocator);
 }
 
-fn serializeRules(allocator: std.mem.Allocator, rules: []const sandbox.Config.Rule) ![]u8 {
+fn serializeRules(allocator: std.mem.Allocator, rules: []const palisade.Sandbox.Rule) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (rules) |r| {
@@ -265,7 +265,7 @@ fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
         .exited => |c| c,
         else => return,
     };
-    if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
+    if (code == palisade.linux.namespace.nothing_measured_exit_status) return error.SkipZigTest;
 }
 
 fn findGitOnPath(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {

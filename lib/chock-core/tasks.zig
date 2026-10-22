@@ -5,13 +5,14 @@ const std = @import("std");
 
 const diagnostic = @import("diagnostic.zig");
 pub const Diagnostic = diagnostic.Diagnostic;
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 const chock_proto = @import("chock-proto");
 
 pub const sandbox_dir = "/run/chock/tasks";
 
 pub fn sandboxDirFor(host_dir: []const u8) []const u8 {
-    return if (sandbox.expresses.moved_paths) sandbox_dir else host_dir;
+    return if (palisade.Sandbox.expresses.moved_paths) sandbox_dir else host_dir;
 }
 
 pub const host_leaf = @import("scratchpad.zig").tasks_leaf;
@@ -50,10 +51,10 @@ pub fn hostPathFor(
 }
 
 pub const Request = struct {
-    config: sandbox.Config,
+    call: chock_net.Call,
     argv: []const []const u8,
     timeout_ns: u64 = default_timeout_ns,
-    driver: sandbox.Sandbox.Driver = sandbox.Sandbox.native_driver,
+    driver: chock_net.Driver = chock_net.Driver.native_driver,
     staged: []const []const u8 = &.{},
 };
 
@@ -344,9 +345,9 @@ fn writeOutput(io: std.Io, path: []const u8, bytes: []const u8) u64 {
 
 fn copyRequest(allocator: std.mem.Allocator, request: Request) std.mem.Allocator.Error!Request {
     var copy = request;
-    copy.config = try request.config.copy(allocator);
-    copy.argv = try sandbox.copyStrings(allocator, request.argv);
-    copy.staged = try sandbox.copyStrings(allocator, request.staged);
+    copy.call.config = try request.call.config.copy(allocator);
+    copy.argv = try palisade.Sandbox.copyStrings(allocator, request.argv);
+    copy.staged = try palisade.Sandbox.copyStrings(allocator, request.staged);
     return copy;
 }
 
@@ -411,7 +412,7 @@ const TestTable = struct {
     }
 };
 
-fn fakeConfig() sandbox.Config {
+fn fakeConfig() palisade.Sandbox.Config {
     return .{ .root = "/root", .mounts = &.{}, .rules = &.{}, .cwd = "/project", .env = &.{} };
 }
 
@@ -422,7 +423,7 @@ test "a finished task writes its output to the host and reports where and how la
     defer harness.deinit(gpa);
 
     const argv = [_][]const u8{ "make", "-j8" };
-    const id = try harness.table.start(testing.io, .{ .config = fakeConfig(), .argv = &argv });
+    const id = try harness.table.start(testing.io, .{ .call = .{ .config = fakeConfig() }, .argv = &argv });
     try testing.expectEqualStrings("task-01", &id);
 
     harness.table.waitAll();
@@ -459,7 +460,7 @@ test "peek reads a finished task without taking it, so the turn still drains it"
     defer harness.deinit(gpa);
 
     const argv = [_][]const u8{"make"};
-    _ = try harness.table.start(testing.io, .{ .config = fakeConfig(), .argv = &argv });
+    _ = try harness.table.start(testing.io, .{ .call = .{ .config = fakeConfig() }, .argv = &argv });
     harness.table.waitAll();
 
     const seen_first = try harness.table.peek(gpa);
@@ -487,7 +488,7 @@ test "a task that has finished stops being a running task, however the record is
     try testing.expectEqual(@as(usize, 0), harness.table.runningCount());
 
     const argv = [_][]const u8{"true"};
-    _ = try harness.table.start(testing.io, .{ .config = fakeConfig(), .argv = &argv });
+    _ = try harness.table.start(testing.io, .{ .call = .{ .config = fakeConfig() }, .argv = &argv });
 
     harness.table.waitAll();
     try testing.expectEqual(@as(usize, 0), harness.table.runningCount());
@@ -507,13 +508,13 @@ test "a task keeps nothing of the tool call that started it" {
     var call_arena = std.heap.ArenaAllocator.init(gpa);
     const call = call_arena.allocator();
 
-    const mounts = try call.alloc(sandbox.namespace.Mount, 1);
+    const mounts = try call.alloc(palisade.linux.namespace.Mount, 1);
     mounts[0] = .{ .bind = .{
         .source = try call.dupe(u8, "/nix/store/aaa"),
         .target = try call.dupe(u8, "/nix/store/aaa"),
         .read_only = true,
     } };
-    const rules = try call.alloc(sandbox.Config.Rule, 1);
+    const rules = try call.alloc(palisade.Sandbox.Rule, 1);
     rules[0] = .{ .path = try call.dupe(u8, "/project"), .access = .{} };
     const env = try call.alloc([]const u8, 1);
     env[0] = try call.dupe(u8, "TMPDIR=/run/chock/scratch");
@@ -521,13 +522,13 @@ test "a task keeps nothing of the tool call that started it" {
     argv[0] = try call.dupe(u8, "make");
 
     const id = try harness.table.start(testing.io, .{
-        .config = .{
+        .call = .{ .config = .{
             .root = try call.dupe(u8, "/root"),
             .mounts = mounts,
             .rules = rules,
             .cwd = try call.dupe(u8, "/project"),
             .env = env,
-        },
+        } },
         .argv = argv,
     });
 
@@ -550,12 +551,12 @@ test "a session may start max_tasks background tasks and no more" {
     const argv = [_][]const u8{"true"};
     var number: usize = 0;
     while (number < max_tasks) : (number += 1) {
-        _ = try harness.table.start(testing.io, .{ .config = fakeConfig(), .argv = &argv });
+        _ = try harness.table.start(testing.io, .{ .call = .{ .config = fakeConfig() }, .argv = &argv });
     }
     try testing.expectEqual(max_tasks, harness.table.startedCount());
     try testing.expectError(
         error.TooManyTasks,
-        harness.table.start(testing.io, .{ .config = fakeConfig(), .argv = &argv }),
+        harness.table.start(testing.io, .{ .call = .{ .config = fakeConfig() }, .argv = &argv }),
     );
 
     harness.table.waitAll();
@@ -564,7 +565,7 @@ test "a session may start max_tasks background tasks and no more" {
     try testing.expectEqual(max_tasks, done.len);
     try testing.expectError(
         error.TooManyTasks,
-        harness.table.start(testing.io, .{ .config = fakeConfig(), .argv = &argv }),
+        harness.table.start(testing.io, .{ .call = .{ .config = fakeConfig() }, .argv = &argv }),
     );
 }
 
@@ -581,7 +582,7 @@ test "the file bound is far above what a model reads, and a capped task says tru
     defer harness.deinit(gpa);
 
     const argv = [_][]const u8{"make"};
-    _ = try harness.table.start(testing.io, .{ .config = fakeConfig(), .argv = &argv });
+    _ = try harness.table.start(testing.io, .{ .call = .{ .config = fakeConfig() }, .argv = &argv });
     harness.table.waitAll();
 
     const done = try harness.table.take(gpa);
@@ -600,7 +601,7 @@ test "a task identifier is short, fixed width, and names its own file" {
     const path = try sandboxPathFor(gpa, host_dir, &idFor(7));
     defer gpa.free(path);
 
-    if (sandbox.expresses.moved_paths) {
+    if (palisade.Sandbox.expresses.moved_paths) {
         try testing.expectEqualStrings("/run/chock/tasks/task-07.out", path);
     } else {
         try testing.expectEqualStrings(host_dir ++ "/task-07.out", path);

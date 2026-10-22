@@ -3,7 +3,7 @@
 //! and reports the kernel's answer as an exit status.
 
 const std = @import("std");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 const succeeded: u8 = 0;
 const refused: u8 = 1;
@@ -60,13 +60,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return bad_arguments;
     }
 
-    const term = sandbox.spawn(allocator, .{
+    const term = palisade.Sandbox.spawn(allocator, .{
         .root = "/",
         .mounts = mounts,
         .rules = rules,
         .cwd = cwd,
         .env = env,
-    }, inner, null, null) catch |err| return exitFor(err);
+    }, inner, .{}) catch |err| return exitFor(err);
 
     return switch (term) {
         .exited => |code| switch (code) {
@@ -110,8 +110,8 @@ fn parseLines(allocator: std.mem.Allocator, blob: []const u8) ![]const []const u
     return lines.toOwnedSlice(allocator);
 }
 
-fn parseMounts(allocator: std.mem.Allocator, blob: []const u8) ![]const sandbox.namespace.Mount {
-    var mounts: std.ArrayList(sandbox.namespace.Mount) = .empty;
+fn parseMounts(allocator: std.mem.Allocator, blob: []const u8) ![]const palisade.linux.namespace.Mount {
+    var mounts: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
     const lines = try parseLines(allocator, blob);
     for (lines) |line| {
         var fields = std.mem.splitScalar(u8, line, 0x01);
@@ -135,8 +135,8 @@ fn parseMounts(allocator: std.mem.Allocator, blob: []const u8) ![]const sandbox.
     return mounts.toOwnedSlice(allocator);
 }
 
-fn parseRules(allocator: std.mem.Allocator, blob: []const u8) ![]const sandbox.Config.Rule {
-    var rules: std.ArrayList(sandbox.Config.Rule) = .empty;
+fn parseRules(allocator: std.mem.Allocator, blob: []const u8) ![]const palisade.Sandbox.Rule {
+    var rules: std.ArrayList(palisade.Sandbox.Rule) = .empty;
     const lines = try parseLines(allocator, blob);
     for (lines) |line| {
         var fields = std.mem.splitScalar(u8, line, 0x01);

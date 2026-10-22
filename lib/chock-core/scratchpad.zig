@@ -3,7 +3,7 @@
 //! output lands.
 
 const std = @import("std");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 const diagnostic = @import("diagnostic.zig");
 pub const Diagnostic = diagnostic.Diagnostic;
@@ -14,7 +14,7 @@ const cache = @import("cache.zig");
 pub const sandbox_dir = "/run/chock/scratch";
 
 pub fn sandboxDirFor(host_dir: []const u8) []const u8 {
-    return if (sandbox.expresses.moved_paths) sandbox_dir else host_dir;
+    return if (palisade.Sandbox.expresses.moved_paths) sandbox_dir else host_dir;
 }
 
 // A tmpfs mounted for one tool call; no host directory answers to this path.
@@ -37,8 +37,8 @@ pub const TempArea = enum {
     scratchpad,
 };
 
-pub fn tempAreaFor(limits: sandbox.Sandbox.Limits) TempArea {
-    if (!sandbox.expresses.scratch_area) return .scratchpad;
+pub fn tempAreaFor(limits: palisade.Sandbox.Limits) TempArea {
+    if (!palisade.Sandbox.expresses.scratch_area) return .scratchpad;
     return if (limits.scratchFitsUnderMemory()) .capped else .scratchpad;
 }
 
@@ -259,7 +259,7 @@ test "a scratchpad appears under the runtime prefix, or at its own path where no
     const allocator = testing.allocator;
     const host_dir = "/somewhere/on/the/host/scratch";
 
-    if (sandbox.expresses.moved_paths) {
+    if (palisade.Sandbox.expresses.moved_paths) {
         try testing.expectEqualStrings(sandbox_dir, sandboxDirFor(host_dir));
     } else {
         try testing.expectEqualStrings(host_dir, sandboxDirFor(host_dir));
@@ -282,11 +282,11 @@ test "a scratchpad appears under the runtime prefix, or at its own path where no
 }
 
 test "a build with no cap mechanism asks for no capped area, and says so rather than pretending" {
-    if (!sandbox.expresses.scratch_area) {
+    if (!palisade.Sandbox.expresses.scratch_area) {
         try testing.expectEqual(TempArea.scratchpad, tempAreaFor(.{}));
         try testing.expectEqual(
             TempArea.scratchpad,
-            tempAreaFor((sandbox.Sandbox.Limits{}).narrow(.{})),
+            tempAreaFor((palisade.Sandbox.Limits{}).narrow(.{})),
         );
         try testing.expectEqualStrings("/a/host/scratch", tempDirFor(.scratchpad, "/a/host/scratch"));
     } else {
@@ -308,11 +308,11 @@ test "TMPDIR names the capped area and CHOCK_SCRATCHPAD names the notes, and the
 test "a call whose limits cannot carry a cap keeps TMPDIR on the scratchpad" {
     const allocator = testing.allocator;
 
-    if (sandbox.expresses.scratch_area) {
+    if (palisade.Sandbox.expresses.scratch_area) {
         try testing.expectEqual(TempArea.capped, tempAreaFor(.{}));
         try testing.expectEqual(
             TempArea.scratchpad,
-            tempAreaFor((sandbox.Sandbox.Limits{}).narrow(.{ .memory_bytes = 1 << 20 })),
+            tempAreaFor((palisade.Sandbox.Limits{}).narrow(.{ .memory_bytes = 1 << 20 })),
         );
     }
 

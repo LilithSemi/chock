@@ -11,7 +11,8 @@ const chock_nix = @import("chock-nix");
 const chock_pcsc = @import("chock-pcsc");
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 
 const session_paths = @import("session.zig");
 const run = @import("run.zig");
@@ -66,9 +67,9 @@ pub const Probe = union(enum) {
     }
 };
 
-pub const CgroupSupport = @FieldType(sandbox.Sandbox.LimitsReport, "cgroup");
+pub const CgroupSupport = @FieldType(palisade.Sandbox.LimitsReport, "cgroup");
 
-pub const CgroupVantage = sandbox.cgroup.Vantage;
+pub const CgroupVantage = palisade.linux.cgroup.Vantage;
 
 pub const DevShellState = union(enum) {
     no_flake,
@@ -123,15 +124,15 @@ pub const LayerFamily = enum {
     namespaces,
     seatbelt,
 
-    pub fn forDriver(given: sandbox.Sandbox.Guarantees) LayerFamily {
+    pub fn forDriver(given: palisade.Sandbox.Guarantees) LayerFamily {
         if (given.count() == 0) return .none;
-        return if (given.contains(.workspace_mounted)) .namespaces else .seatbelt;
+        return if (given.contains(.bind_mounts)) .namespaces else .seatbelt;
     }
 };
 
 pub const Measured = struct {
-    driver: sandbox.Sandbox.Guarantees = sandbox.Sandbox.guarantees,
-    family: LayerFamily = LayerFamily.forDriver(sandbox.Sandbox.guarantees),
+    driver: palisade.Sandbox.Guarantees = palisade.Sandbox.guarantees,
+    family: LayerFamily = LayerFamily.forDriver(palisade.Sandbox.guarantees),
 
     seatbelt: Probe = .{ .absent = layer_not_measured },
     rlimits: Probe = .{ .absent = layer_not_measured },
@@ -155,7 +156,7 @@ pub const Measured = struct {
     pidfd: Probe = .{ .absent = driver_gives_nothing },
     tmpfs: Probe = .{ .absent = driver_gives_nothing },
 
-    device_passthrough: bool = sandbox.Sandbox.expresses.device_passthrough,
+    device_passthrough: bool = palisade.Sandbox.expresses.device_passthrough,
 
     git_program: ?[]const u8 = null,
     nix_program: ?[]const u8 = null,
@@ -467,11 +468,11 @@ fn routerRow(
     };
 }
 
-const router_network_fix = "Load it on the host and run again: modprobe " ++ sandbox.Sandbox.network_modules ++
+const router_network_fix = "Load it on the host and run again: modprobe " ++ chock_net.network_modules ++
     ". A sandbox cannot make the kernel load a module, and every foreground tool call takes a " ++
     "filtered network, so no tool call runs until this is loaded.";
 
-const router_filter_fix = "Load them on the host and run again: modprobe " ++ sandbox.Sandbox.filter_modules ++
+const router_filter_fix = "Load them on the host and run again: modprobe " ++ chock_net.filter_modules ++
     ". A sandbox with a network and no ruleset on it would reach whatever the host can reach, " ++
     "so Chock refuses to start rather than run without the filter.";
 
@@ -1139,7 +1140,7 @@ fn measure(
     project_root: []const u8,
 ) Measured {
     var m = Measured{};
-    switch (comptime LayerFamily.forDriver(sandbox.Sandbox.guarantees)) {
+    switch (comptime LayerFamily.forDriver(palisade.Sandbox.guarantees)) {
         .none => {},
         .namespaces => measureLayers(arena, io, env, project_root, &m),
         .seatbelt => measureSeatbelt(arena, io, env, project_root, &m),
@@ -1199,7 +1200,7 @@ fn measureResolverFiles(io: std.Io, toolchain: ToolchainState, host_root: []cons
         if (pathIsDirectory(io, store)) return .made_inside;
     }
 
-    for (sandbox.Sandbox.resolver_substitutions) |one| {
+    for (chock_net.resolver_substitutions) |one| {
         const target = switch (one) {
             .text => |text| text.target,
             .link => continue,
@@ -1666,7 +1667,7 @@ const Answer = enum(u8) {
 const record_bytes = 3;
 
 const Plan = struct {
-    network: sandbox.namespace.Network,
+    new_net: bool,
     mount: bool,
     filesystems: bool,
     seccomp: bool,
@@ -1730,7 +1731,7 @@ fn measureLayers(
     project_root: []const u8,
     m: *Measured,
 ) void {
-    if (sandbox.landlock.probeAbi()) |abi| {
+    if (palisade.linux.landlock.probeAbi()) |abi| {
         m.landlock = .ok;
         m.landlock_abi = abi;
     } else |err| {
@@ -1741,16 +1742,16 @@ fn measureLayers(
     }
 
     m.pidfd = probePidfd();
-    m.cgroup_vantage = sandbox.cgroup.readVantage();
+    m.cgroup_vantage = palisade.linux.cgroup.readVantage();
     m.cgroup = probeCgroup();
 
     const probe_root = probeRoot(arena, io, env, project_root);
     defer if (probe_root) |root| removeProbeRoot(arena, io, root);
 
-    const filter = sandbox.seccomp.build(arena, .{}) catch null;
+    const filter = palisade.linux.seccomp.build(arena, .{}) catch null;
 
     const whole = runChild(.{
-        .network = .none,
+        .new_net = true,
         .mount = true,
         .filesystems = probe_root != null,
         .seccomp = filter != null,
@@ -1808,14 +1809,14 @@ fn measureSeatbelt(
         file.writeStreamingAll(io, "probe\n") catch {};
     }
 
-    const mounts = [_]sandbox.namespace.Mount{.{ .bind = .{
+    const mounts = [_]palisade.linux.namespace.Mount{.{ .bind = .{
         .source = inside_dir,
         .target = inside_dir,
         .read_only = true,
     } }};
-    const rules = [_]sandbox.Config.Rule{.{
+    const rules = [_]palisade.Sandbox.Rule{.{
         .path = inside_dir,
-        .access = sandbox.landlock.AccessFs.read_only,
+        .access = palisade.linux.landlock.AccessFs.read_only,
     }};
 
     const quiet = std.Io.Dir.openFileAbsolute(io, "/dev/null", .{ .mode = .read_write }) catch {
@@ -1865,14 +1866,14 @@ fn seatbeltProbeRoot(
 
 fn seatbeltProbeRan(
     arena: std.mem.Allocator,
-    mounts: []const sandbox.namespace.Mount,
-    rules: []const sandbox.Config.Rule,
+    mounts: []const palisade.linux.namespace.Mount,
+    rules: []const palisade.Sandbox.Rule,
     cwd: []const u8,
     target: []const u8,
     quiet_fd: std.posix.fd_t,
 ) ?bool {
     const argv = [_][]const u8{ "/bin/cat", target };
-    const term = sandbox.spawn(arena, .{
+    const term = palisade.Sandbox.spawn(arena, .{
         .root = "/",
         .mounts = mounts,
         .rules = rules,
@@ -1880,7 +1881,7 @@ fn seatbeltProbeRan(
         .env = &.{},
         .stdout_fd = quiet_fd,
         .stderr_fd = quiet_fd,
-    }, &argv, null, null) catch return null;
+    }, &argv, .{}) catch return null;
     return switch (term) {
         .exited => |code| code == 0,
         // Killed by a signal says nothing about the boundary, and must never be read as a refusal the sandbox made.
@@ -1895,14 +1896,14 @@ fn seatbeltToolCallRefusal(arena: std.mem.Allocator, root: []const u8) ?[]const 
         chock_core.tasks.sandboxDirFor(root),
     };
     for (also_mounted) |target| {
-        const config = sandbox.Config{
+        const config = palisade.Sandbox.Config{
             .root = "/",
             .mounts = &.{.{ .bind = .{ .source = root, .target = target, .read_only = false } }},
             .rules = &.{},
             .cwd = "/",
             .env = &.{},
         };
-        const why = sandbox.darwin_driver_for_testing.expressibleOn(config) orelse continue;
+        const why = palisade.Sandbox.inexpressibleOnDarwin(config) orelse continue;
         return std.fmt.allocPrint(arena, "a tool call needs {s}, for {s}", .{ why.text(), target }) catch
             "a tool call needs a path to appear somewhere else, and macos has no bind mount";
     }
@@ -1913,11 +1914,11 @@ fn narrowNamespaces(
     arena: std.mem.Allocator,
     m: *Measured,
     whole: ChildReport,
-    filter: ?[]sandbox.bpf.Insn,
+    filter: ?[]palisade.linux.bpf.Insn,
 ) void {
     const failed = whole.namespaces orelse Answer.refused;
     const bare = runChild(.{
-        .network = .host,
+        .new_net = false,
         .mount = false,
         .filesystems = false,
         .seccomp = whole.seccomp == null and filter != null,
@@ -1940,7 +1941,7 @@ fn narrowNamespaces(
     m.ipc_namespace = .ok;
 
     const with_mount = runChild(.{
-        .network = .host,
+        .new_net = false,
         .mount = true,
         .filesystems = false,
         .seccomp = false,
@@ -1955,7 +1956,7 @@ fn narrowNamespaces(
     m.network_namespace = .{ .refused = "the mount namespace beside it was refused, so this was never reached" };
 }
 
-fn applySeccomp(m: *Measured, report: ChildReport, filter: ?[]sandbox.bpf.Insn) void {
+fn applySeccomp(m: *Measured, report: ChildReport, filter: ?[]palisade.linux.bpf.Insn) void {
     if (filter == null) {
         m.seccomp = .{ .refused = "the filter could not be built, which is chock's own fault and not this machine's" };
         return;
@@ -1992,7 +1993,7 @@ fn applyRouter(arena: std.mem.Allocator, m: *Measured, report: ChildReport) void
     m.router_network = routerProbe(
         arena,
         network,
-        routerStepName(sandbox.netns.Step, report.router_network_step),
+        routerStepName(chock_net.netns.Step, report.router_network_step),
     );
 
     const filter = report.router_filter orelse {
@@ -2002,7 +2003,7 @@ fn applyRouter(arena: std.mem.Allocator, m: *Measured, report: ChildReport) void
     m.router_filter = routerProbe(
         arena,
         filter,
-        routerStepName(sandbox.nftables.Step, report.router_filter_step),
+        routerStepName(chock_net.nftables.Step, report.router_filter_step),
     );
 }
 
@@ -2047,7 +2048,7 @@ fn namespaceRefusalText(arena: std.mem.Allocator, answer: Answer) []const u8 {
         .refused_id_map => "the kernel made the user namespace and refused the id map write inside it",
         .ok, .absent, .refused => "the kernel refused a user namespace to this process",
     };
-    const detail = sandbox.namespace.probeAvailability();
+    const detail = palisade.linux.namespace.probeAvailability();
     if (detail != .unavailable) return measured;
     return std.fmt.allocPrint(arena, "{s}, and {f}", .{ measured, detail.unavailable }) catch measured;
 }
@@ -2065,8 +2066,9 @@ fn probePidfd() Probe {
 }
 
 fn probeCgroup() CgroupSupport {
-    const limits = sandbox.Sandbox.Limits{};
-    var made = sandbox.cgroup.Cgroup.create(
+    const limits = palisade.Sandbox.Limits{};
+    var made = palisade.linux.cgroup.Cgroup.create(
+        chock_net.cgroup_name_prefix,
         limits.memory_bytes orelse probe_tmpfs_bytes,
         limits.processes orelse 1,
         0,
@@ -2116,7 +2118,7 @@ fn makeDirAll(io: std.Io, path: []const u8) !void {
     };
 }
 
-fn runChild(plan: Plan, probe_root: ?[]const u8, filter: ?[]sandbox.bpf.Insn) ChildReport {
+fn runChild(plan: Plan, probe_root: ?[]const u8, filter: ?[]palisade.linux.bpf.Insn) ChildReport {
     var fds: [2]i32 = undefined;
     if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return .{};
 
@@ -2184,8 +2186,8 @@ fn readReport(read_fd: i32) ChildReport {
     return report;
 }
 
-fn runProbes(plan: Plan, write_fd: i32, probe_root: ?[]const u8, filter: ?[]sandbox.bpf.Insn) void {
-    const entered = sandbox.namespace.enter(.{ .network = plan.network, .mount = plan.mount }, null);
+fn runProbes(plan: Plan, write_fd: i32, probe_root: ?[]const u8, filter: ?[]palisade.linux.bpf.Insn) void {
+    const entered = palisade.linux.namespace.enter(.{ .new_net = plan.new_net, .mount = plan.mount }, null);
     if (entered) |_| {
         say(write_fd, .namespaces, .ok);
     } else |err| {
@@ -2209,20 +2211,20 @@ fn runProbes(plan: Plan, write_fd: i32, probe_root: ?[]const u8, filter: ?[]sand
 }
 
 fn probeNetwork(write_fd: i32) void {
-    var route_diag: ?sandbox.netns.Diagnostic = null;
-    var route = sandbox.netns.Session.open(&route_diag) catch |err| {
+    var route_diag: ?chock_net.netns.Diagnostic = null;
+    var route = chock_net.netns.Session.open(&route_diag) catch |err| {
         sayDetail(write_fd, .router_network, networkAnswer(err), netnsStepByte(route_diag));
         return;
     };
     defer route.close();
-    _ = route.configure(&route_diag) catch |err| {
+    _ = route.configure(chock_net.netns.params, &route_diag) catch |err| {
         sayDetail(write_fd, .router_network, networkAnswer(err), netnsStepByte(route_diag));
         return;
     };
     say(write_fd, .router_network, .ok);
 
-    var table_diag: ?sandbox.nftables.Diagnostic = null;
-    const table = sandbox.nftables.Session.open(&table_diag) catch |err| {
+    var table_diag: ?chock_net.nftables.Diagnostic = null;
+    const table = chock_net.nftables.Session.open(&table_diag) catch |err| {
         sayDetail(write_fd, .router_filter, filterAnswer(err), nftablesStepByte(table_diag));
         return;
     };
@@ -2234,32 +2236,39 @@ fn probeNetwork(write_fd: i32) void {
     say(write_fd, .router_filter, .ok);
 }
 
-fn networkAnswer(err: sandbox.netns.Error) Answer {
+fn networkAnswer(err: chock_net.netns.Error) Answer {
+    return switch (err) {
+        error.KernelModuleMissing => .absent,
+        error.NotPermitted, error.Refused, error.ExchangeFailed => .refused,
+        // Chock gives the same parameters every time, so a doctor run cannot
+        // reach these: they are a caller mistake, not a host answer.
+        error.DeviceNameEmpty,
+        error.DeviceNameTooLong,
+        error.DeviceNameInvalid,
+        error.PrefixTooLong,
+        => .refused,
+    };
+}
+
+fn filterAnswer(err: chock_net.nftables.Error) Answer {
     return switch (err) {
         error.KernelModuleMissing => .absent,
         error.NotPermitted, error.Refused, error.ExchangeFailed => .refused,
     };
 }
 
-fn filterAnswer(err: sandbox.nftables.Error) Answer {
-    return switch (err) {
-        error.KernelModuleMissing => .absent,
-        error.NotPermitted, error.Refused, error.ExchangeFailed => .refused,
-    };
-}
-
-fn netnsStepByte(diag: ?sandbox.netns.Diagnostic) u8 {
+fn netnsStepByte(diag: ?chock_net.netns.Diagnostic) u8 {
     const one = diag orelse return 0;
     return @intFromEnum(one.step) + 1;
 }
 
-fn nftablesStepByte(diag: ?sandbox.nftables.Diagnostic) u8 {
+fn nftablesStepByte(diag: ?chock_net.nftables.Diagnostic) u8 {
     const one = diag orelse return 0;
     return @intFromEnum(one.step) + 1;
 }
 
 fn probeMounts(write_fd: i32, root: []const u8) void {
-    const scratch = sandbox.namespace.mountScratch(root, "cap", probe_tmpfs_bytes, null);
+    const scratch = palisade.linux.namespace.mountScratch(root, "cap", probe_tmpfs_bytes, null);
     if (scratch) |fd| {
         _ = linux.close(fd);
         say(write_fd, .tmpfs, .ok);
@@ -2279,7 +2288,7 @@ fn probeMounts(write_fd: i32, root: []const u8) void {
     const work = joinLeaf(&work_buffer, root, "work") orelse return;
     const merged = joinLeaf(&merged_buffer, root, "merged") orelse return;
 
-    if (sandbox.namespace.mountOverlay(fba.allocator(), .{
+    if (palisade.linux.namespace.mountOverlay(fba.allocator(), .{
         .lower = lower,
         .upper = upper,
         .work = work,
@@ -2291,7 +2300,7 @@ fn probeMounts(write_fd: i32, root: []const u8) void {
     }
 }
 
-fn mountAnswer(err: sandbox.namespace.MountError) Answer {
+fn mountAnswer(err: palisade.linux.namespace.MountError) Answer {
     return switch (err) {
         error.OverlayNotSupported, error.KernelTooOld => .absent,
         error.NotPermitted,
@@ -2314,9 +2323,9 @@ fn joinLeaf(buffer: []u8, a: []const u8, b: []const u8) ?[]const u8 {
     return buffer[0 .. a.len + 1 + b.len];
 }
 
-fn sayFilter(write_fd: i32, filter: ?[]sandbox.bpf.Insn) void {
+fn sayFilter(write_fd: i32, filter: ?[]palisade.linux.bpf.Insn) void {
     const insns = filter orelse return;
-    if (sandbox.seccomp.install(sandbox.bpf.Prog.init(insns))) {
+    if (palisade.linux.seccomp.install(palisade.linux.bpf.Prog.init(insns), null)) {
         say(write_fd, .seccomp, .ok);
     } else |err| {
         say(write_fd, .seccomp, switch (err) {
@@ -2405,7 +2414,7 @@ const testing = std.testing;
 
 fn healthy() Measured {
     return .{
-        .driver = sandbox.Sandbox.Guarantees.full,
+        .driver = palisade.Sandbox.Guarantees.full,
         .family = .namespaces,
         .user_namespace = .ok,
         .mount_namespace = .ok,
@@ -2669,7 +2678,7 @@ test "the printed report says BLOCKED as many times as its own footer counts" {
     const arena = arena_state.allocator();
 
     var m = Measured{
-        .driver = sandbox.darwin_driver_for_testing.guarantees,
+        .driver = palisade.darwin.guarantees,
         .family = .seatbelt,
         .seatbelt = .ok,
         .rlimits = .ok,
@@ -2767,7 +2776,7 @@ test "a build whose driver applies no layer gets one sentence and no layer rows"
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var m = Measured{ .driver = sandbox.Sandbox.Guarantees.empty, .family = .none };
+    var m = Measured{ .driver = palisade.Sandbox.Guarantees.empty, .family = .none };
     m.credential = .{ .found = "chock login" };
     m.cache = .ok;
     m.free_bytes = 8 * 1024 * 1024 * 1024;
@@ -2803,21 +2812,26 @@ test "a build whose driver applies no layer gets one sentence and no layer rows"
 }
 
 test "the real Darwin driver gives four layers, and still refuses a root of its own" {
-    const darwin = sandbox.darwin_driver_for_testing;
+    const darwin = palisade.darwin;
     try testing.expectEqual(@as(usize, 4), darwin.guarantees.count());
-    for ([_]sandbox.Sandbox.Guarantee{ .network_isolated, .signal_isolated, .ipc_isolated, .path_restricted }) |one| {
+    for ([_]palisade.Sandbox.Guarantee{ .network_isolated, .signal_isolated, .ipc_isolated, .path_restricted }) |one| {
         try testing.expect(darwin.guarantees.contains(one));
     }
     try testing.expect(!darwin.guarantees.contains(.syscall_restricted));
-    try testing.expect(!darwin.guarantees.contains(.workspace_mounted));
+    try testing.expect(!darwin.guarantees.contains(.bind_mounts));
 
-    try testing.expectError(error.NoMountNamespace, darwin.spawn(
-        testing.allocator,
-        .{ .root = "/nonexistent", .mounts = &.{}, .rules = &.{}, .cwd = "/", .env = &.{} },
-        &.{"true"},
-        null,
-        null,
-    ));
+    // The pre-check, not the spawn: what the driver does when it is asked anyway
+    // is palisade's own test, and it needs a Mac to run.
+    try testing.expectEqual(
+        palisade.Sandbox.Inexpressible.root_is_not_the_real_root,
+        palisade.Sandbox.inexpressibleOnDarwin(.{
+            .root = "/nonexistent",
+            .mounts = &.{},
+            .rules = &.{},
+            .cwd = "/",
+            .env = &.{},
+        }).?,
+    );
 
     try testing.expectEqual(LayerFamily.seatbelt, LayerFamily.forDriver(darwin.guarantees));
 }
@@ -2828,7 +2842,7 @@ test "a seatbelt build gets darwin's own rows, and none of the eleven linux ones
     const arena = arena_state.allocator();
 
     var m = Measured{
-        .driver = sandbox.darwin_driver_for_testing.guarantees,
+        .driver = palisade.darwin.guarantees,
         .family = .seatbelt,
         .seatbelt = .ok,
         .rlimits = .ok,
@@ -2873,7 +2887,7 @@ test "the tool call row asks the libraries where they really put their paths" {
     const arena = arena_state.allocator();
 
     const root = "/some/session/scratch";
-    if (sandbox.expresses.moved_paths) {
+    if (palisade.Sandbox.expresses.moved_paths) {
         const why = seatbeltToolCallRefusal(arena, root).?;
         try testing.expect(std.mem.indexOf(u8, why, "bind mount") != null);
         try testing.expect(std.mem.indexOf(u8, why, chock_core.scratchpad.sandbox_dir) != null);
@@ -2887,8 +2901,8 @@ test "the tool call row asks the libraries where they really put their paths" {
     }
 
     try testing.expectEqual(
-        @as(?sandbox.darwin_driver_for_testing.Inexpressible, null),
-        sandbox.darwin_driver_for_testing.expressibleOn(.{
+        @as(?palisade.Sandbox.Inexpressible, null),
+        palisade.Sandbox.inexpressibleOnDarwin(.{
             .root = "/",
             .mounts = &.{.{ .bind = .{ .source = "/x", .target = "/x", .read_only = true } }},
             .rules = &.{},
@@ -2897,8 +2911,8 @@ test "the tool call row asks the libraries where they really put their paths" {
         }),
     );
     try testing.expectEqual(
-        @as(?sandbox.darwin_driver_for_testing.Inexpressible, .bind_moves_a_path),
-        sandbox.darwin_driver_for_testing.expressibleOn(.{
+        @as(?palisade.Sandbox.Inexpressible, .bind_moves_a_path),
+        palisade.Sandbox.inexpressibleOnDarwin(.{
             .root = "/",
             .mounts = &.{.{ .bind = .{ .source = "/x", .target = "/y", .read_only = true } }},
             .rules = &.{},
@@ -3257,7 +3271,7 @@ test "the probe answers map to the three states and never invent a fourth" {
 }
 
 test "the router rows are built by really building a network and really filtering it" {
-    switch (comptime LayerFamily.forDriver(sandbox.Sandbox.guarantees)) {
+    switch (comptime LayerFamily.forDriver(palisade.Sandbox.guarantees)) {
         .none, .seatbelt => return error.SkipZigTest,
         .namespaces => {},
     }
@@ -3267,7 +3281,7 @@ test "the router rows are built by really building a network and really filterin
     const arena = arena_state.allocator();
 
     const report = runChild(.{
-        .network = .none,
+        .new_net = true,
         .mount = true,
         .filesystems = false,
         .seccomp = false,
@@ -3280,13 +3294,13 @@ test "the router rows are built by really building a network and really filterin
 
     const network = report.router_network orelse return error.TestUnexpectedResult;
     if (network != Answer.ok) {
-        try testing.expect(routerStepName(sandbox.netns.Step, report.router_network_step) != null);
+        try testing.expect(routerStepName(chock_net.netns.Step, report.router_network_step) != null);
         return;
     }
 
     const filter = report.router_filter orelse return error.TestUnexpectedResult;
     if (filter != Answer.ok) {
-        try testing.expect(routerStepName(sandbox.nftables.Step, report.router_filter_step) != null);
+        try testing.expect(routerStepName(chock_net.nftables.Step, report.router_filter_step) != null);
         return;
     }
 
@@ -3300,13 +3314,13 @@ test "the router rows are built by really building a network and really filterin
 }
 
 test "a plan that asks for no network builds none, so nothing is ever made on the machine a person is using" {
-    switch (comptime LayerFamily.forDriver(sandbox.Sandbox.guarantees)) {
+    switch (comptime LayerFamily.forDriver(palisade.Sandbox.guarantees)) {
         .none, .seatbelt => return error.SkipZigTest,
         .namespaces => {},
     }
 
     const quiet = runChild(.{
-        .network = .host,
+        .new_net = false,
         .mount = false,
         .filesystems = false,
         .seccomp = false,
@@ -3317,7 +3331,7 @@ test "a plan that asks for no network builds none, so nothing is ever made on th
     try testing.expectEqual(@as(?Answer, null), quiet.router_filter);
 
     const asked = runChild(.{
-        .network = .none,
+        .new_net = true,
         .mount = true,
         .filesystems = false,
         .seccomp = false,
@@ -3335,10 +3349,10 @@ test "a kernel that has no module names the call and the modprobe line, and one 
 
     try testing.expectEqual(Answer.absent, networkAnswer(error.KernelModuleMissing));
     try testing.expectEqual(Answer.absent, filterAnswer(error.KernelModuleMissing));
-    for ([_]sandbox.netns.Error{ error.NotPermitted, error.Refused, error.ExchangeFailed }) |err| {
+    for ([_]chock_net.netns.Error{ error.NotPermitted, error.Refused, error.ExchangeFailed }) |err| {
         try testing.expectEqual(Answer.refused, networkAnswer(err));
     }
-    for ([_]sandbox.nftables.Error{ error.NotPermitted, error.Refused, error.ExchangeFailed }) |err| {
+    for ([_]chock_net.nftables.Error{ error.NotPermitted, error.Refused, error.ExchangeFailed }) |err| {
         try testing.expectEqual(Answer.refused, filterAnswer(err));
     }
 
@@ -3347,7 +3361,7 @@ test "a kernel that has no module names the call and the modprobe line, and one 
         .namespaces = .ok,
         .router_network = .ok,
         .router_filter = .absent,
-        .router_filter_step = @intFromEnum(sandbox.nftables.Step.relay_rule) + 1,
+        .router_filter_step = @intFromEnum(chock_net.nftables.Step.relay_rule) + 1,
     });
     const rows = try rowsFor(arena, m);
 
@@ -3356,9 +3370,9 @@ test "a kernel that has no module names the call and the modprobe line, and one 
     try testing.expectEqualStrings("BLOCKED", wordFor(filter));
     try testing.expect(filter.blocks);
     try testing.expect(std.mem.indexOf(u8, filter.means, "relay_rule") != null);
-    if (sandbox.Sandbox.filter_modules.len != 0) {
+    if (chock_net.filter_modules.len != 0) {
         try testing.expect(std.mem.indexOf(u8, filter.fix, "modprobe") != null);
-        try testing.expect(std.mem.indexOf(u8, filter.fix, sandbox.Sandbox.filter_modules) != null);
+        try testing.expect(std.mem.indexOf(u8, filter.fix, chock_net.filter_modules) != null);
         for ([_][]const u8{
             "nf_tables",
             "nf_nat",
@@ -3376,17 +3390,17 @@ test "a kernel that has no module names the call and the modprobe line, and one 
     applyRouter(arena, &no_dummy, .{
         .namespaces = .ok,
         .router_network = .absent,
-        .router_network_step = @intFromEnum(sandbox.netns.Step.dummy_create) + 1,
+        .router_network_step = @intFromEnum(chock_net.netns.Step.dummy_create) + 1,
     });
     const dummy_rows = try rowsFor(arena, no_dummy);
     const network = rowNamed(dummy_rows, "router network").?;
     try testing.expect(std.mem.indexOf(u8, network.means, "dummy_create") != null);
-    if (sandbox.Sandbox.network_modules.len != 0) {
+    if (chock_net.network_modules.len != 0) {
         try testing.expect(std.mem.indexOf(u8, network.fix, "modprobe") != null);
         try testing.expect(std.mem.indexOf(
             u8,
             network.fix,
-            sandbox.Sandbox.network_modules,
+            chock_net.network_modules,
         ) != null);
         try testing.expect(std.mem.indexOf(u8, network.fix, "nft_redir") == null);
     }
@@ -3398,7 +3412,7 @@ test "a kernel that has no module names the call and the modprobe line, and one 
     applyRouter(arena, &refused, .{
         .namespaces = .ok,
         .router_network = .refused,
-        .router_network_step = @intFromEnum(sandbox.netns.Step.route4_add) + 1,
+        .router_network_step = @intFromEnum(chock_net.netns.Step.route4_add) + 1,
     });
     const refused_rows = try rowsFor(arena, refused);
     const row = rowNamed(refused_rows, "router network").?;
@@ -3419,16 +3433,16 @@ test "a child that never reached the network says so, and is never read as a ker
     try testing.expectEqualStrings(router_not_reached, m.router_filter.why());
     try testing.expect(std.mem.indexOf(u8, router_not_reached, "namespaces") != null);
 
-    try testing.expectEqual(@as(?[]const u8, null), routerStepName(sandbox.netns.Step, 0));
+    try testing.expectEqual(@as(?[]const u8, null), routerStepName(chock_net.netns.Step, 0));
     try testing.expectEqualStrings(
         "open_socket",
-        routerStepName(sandbox.netns.Step, @intFromEnum(sandbox.netns.Step.open_socket) + 1).?,
+        routerStepName(chock_net.netns.Step, @intFromEnum(chock_net.netns.Step.open_socket) + 1).?,
     );
     try testing.expectEqualStrings(
         "open_socket",
-        routerStepName(sandbox.nftables.Step, @intFromEnum(sandbox.nftables.Step.open_socket) + 1).?,
+        routerStepName(chock_net.nftables.Step, @intFromEnum(chock_net.nftables.Step.open_socket) + 1).?,
     );
-    try testing.expectEqual(@as(?[]const u8, null), routerStepName(sandbox.netns.Step, 250));
+    try testing.expectEqual(@as(?[]const u8, null), routerStepName(chock_net.netns.Step, 250));
 
     var unnamed = healthy();
     applyRouter(arena, &unnamed, .{ .namespaces = .ok, .router_network = .absent });
@@ -3458,7 +3472,7 @@ test "a host whose resolv.conf is a link starts a routed sandbox, and the row sa
         .{},
     );
     try testing.expectEqual(
-        if (sandbox.Sandbox.resolver_substitutions.len != 0)
+        if (chock_net.resolver_substitutions.len != 0)
             ResolverFiles.owned
         else
             ResolverFiles.made_inside,
@@ -3475,7 +3489,7 @@ test "a host whose resolv.conf is a link starts a routed sandbox, and the row sa
 
     try tmp.dir.deleteFile(testing.io, "etc/resolv.conf");
     try testing.expectEqual(
-        if (sandbox.Sandbox.resolver_substitutions.len != 0)
+        if (chock_net.resolver_substitutions.len != 0)
             ResolverFiles.owned
         else
             ResolverFiles.made_inside,
@@ -3569,7 +3583,7 @@ test "a machine that cannot route says so in its exit code, because every tool c
         .namespaces = .ok,
         .router_network = .ok,
         .router_filter = .absent,
-        .router_filter_step = @intFromEnum(sandbox.nftables.Step.batch_begin) + 1,
+        .router_filter_step = @intFromEnum(chock_net.nftables.Step.batch_begin) + 1,
     });
     const rows = try rowsFor(arena, no_modules);
     try testing.expectEqual(Verdict.blocked, verdictFor(rows));

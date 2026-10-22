@@ -3,7 +3,7 @@
 //! for the length of that act and gone after it.
 
 const std = @import("std");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 const idle_mod = @import("idle.zig");
 
@@ -12,7 +12,7 @@ pub const sandbox_dir = "/run/chock/credentials";
 pub const helper_dir = "/run/chock/helper";
 
 pub fn sandboxDirFor(host_dir: []const u8) []const u8 {
-    return if (sandbox.expresses.moved_paths) sandbox_dir else host_dir;
+    return if (palisade.Sandbox.expresses.moved_paths) sandbox_dir else host_dir;
 }
 
 pub fn helperPathFor(
@@ -20,7 +20,7 @@ pub fn helperPathFor(
     host_path: []const u8,
     name: []const u8,
 ) std.mem.Allocator.Error![]u8 {
-    if (!sandbox.expresses.moved_paths) return allocator.dupe(u8, host_path);
+    if (!palisade.Sandbox.expresses.moved_paths) return allocator.dupe(u8, host_path);
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ helper_dir, name });
 }
 
@@ -81,8 +81,8 @@ pub fn arm(
     allocator: std.mem.Allocator,
     granted: Grant,
     base_env: []const []const u8,
-    mounts: *std.ArrayList(sandbox.namespace.Mount),
-    rules: *std.ArrayList(sandbox.Config.Rule),
+    mounts: *std.ArrayList(palisade.linux.namespace.Mount),
+    rules: *std.ArrayList(palisade.Sandbox.Rule),
 ) std.mem.Allocator.Error!Armed {
     const inside = sandboxDirFor(granted.host_dir);
     try mounts.append(allocator, .{ .bind = .{
@@ -92,7 +92,7 @@ pub fn arm(
     } });
     try rules.append(allocator, .{
         .path = inside,
-        .access = sandbox.landlock.AccessFs.read_only,
+        .access = palisade.linux.landlock.AccessFs.read_only,
     });
 
     var helper_path: ?[]u8 = null;
@@ -201,9 +201,9 @@ test "an entry of the call's own environment replaces one of the same name" {
 test "a grant becomes two mounts and two rules, and the socket directory is read only" {
     const gpa = testing.allocator;
 
-    var mounts: std.ArrayList(sandbox.namespace.Mount) = .empty;
+    var mounts: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
     defer mounts.deinit(gpa);
-    var rules: std.ArrayList(sandbox.Config.Rule) = .empty;
+    var rules: std.ArrayList(palisade.Sandbox.Rule) = .empty;
     defer rules.deinit(gpa);
 
     var armed = try arm(gpa, .{
@@ -229,7 +229,7 @@ test "a grant becomes two mounts and two rules, and the socket directory is read
     try testing.expectEqual(@as(usize, 2), armed.env.len);
 
     try testing.expectEqualStrings(armed.helper_path.?, mounts.items[1].bind.target);
-    if (sandbox.expresses.moved_paths) {
+    if (palisade.Sandbox.expresses.moved_paths) {
         try testing.expect(std.mem.endsWith(u8, mounts.items[1].bind.target, "/askpass"));
     } else {
         try testing.expectEqualStrings("/usr/bin/chock", mounts.items[1].bind.target);

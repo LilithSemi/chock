@@ -5,7 +5,8 @@ const std = @import("std");
 const chock_main = @import("chock_main");
 const chock_core = @import("chock-core");
 const chock_policy = @import("chock-policy");
-const chock_sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 
 /// From `build.zig`, not the working directory a test binary cannot know.
 const repo_root = @import("repo_root").repo_root;
@@ -625,6 +626,7 @@ test "every name the documentation spells with an underscore is a name the code 
     const docs = try loadDocs(arena, testing.io);
 
     const source = try loadSources(arena, testing.io, &all_code);
+    const dependency = try loadPalisadeSource(arena, testing.io);
     const spans = try allSpans(arena, docs);
 
     var wrong: std.ArrayList(u8) = .empty;
@@ -635,6 +637,8 @@ test "every name the documentation spells with an underscore is a name the code 
         if (std.mem.indexOfScalar(u8, span.text, '_') == null) continue;
         checked += 1;
         if (std.mem.indexOf(u8, source, span.text) != null) continue;
+        if (isSyscallName(span.text)) continue;
+        if (std.mem.indexOf(u8, dependency, span.text) != null) continue;
         try wrong.print(arena, "{s}:{d}: the code has no {s}\n", .{
             span.doc, span.line, span.text,
         });
@@ -642,6 +646,48 @@ test "every name the documentation spells with an underscore is a name the code 
 
     try testing.expect(checked >= 50);
     try testing.expectEqualStrings("", wrong.items);
+}
+
+/// The confinement itself is palisade's, so a name the documentation spells for
+/// a syscall or a kernel control file lives in that library and not here. The
+/// syscall table covers the calls; the fetched source covers the rest.
+fn isSyscallName(name: []const u8) bool {
+    inline for (@typeInfo(std.os.linux.SYS).@"enum".field_names) |field| {
+        if (std.mem.eql(u8, field, name)) return true;
+    }
+    return false;
+}
+
+/// Empty when the dependency has not been fetched, which leaves the check to the
+/// syscall table alone.
+fn loadPalisadeSource(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
+    var root = std.Io.Dir.openDirAbsolute(io, repo_root, .{ .iterate = true }) catch return "";
+    defer root.close(io);
+
+    var packages = root.openDir(io, "zig-pkg", .{ .iterate = true }) catch return "";
+    defer packages.close(io);
+
+    var top = packages.iterate();
+    while (top.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!std.mem.startsWith(u8, entry.name, "palisade-")) continue;
+
+        var dir = packages.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+
+        var out: std.ArrayList(u8) = .empty;
+        var walker = try dir.walk(arena);
+        defer walker.deinit();
+        while (try walker.next(io)) |file| {
+            if (file.kind != .file) continue;
+            if (!std.mem.endsWith(u8, file.path, ".zig")) continue;
+            const text = dir.readFileAlloc(io, file.path, arena, .limited(max_source_bytes)) catch continue;
+            try out.appendSlice(arena, text);
+            try out.append(arena, '\n');
+        }
+        return out.items;
+    }
+    return "";
 }
 
 test "every action a table row names is an action the code has" {
@@ -762,7 +808,7 @@ test "the sandbox page counts the calls it blocks and the proc entries it masks"
         docs,
         "docs/security/sandbox.md",
         "entries",
-        chock_sandbox.namespace.masked_proc_entries.len,
+        palisade.linux.namespace.masked_proc_entries.len,
         &wrong,
     );
     try checkCount(
@@ -770,7 +816,7 @@ test "the sandbox page counts the calls it blocks and the proc entries it masks"
         docs,
         "docs/security/sandbox.md",
         "calls",
-        chock_sandbox.seccomp.blocked_calls.len,
+        palisade.linux.seccomp.blocked_calls.len,
         &wrong,
     );
 
@@ -831,7 +877,7 @@ test "the microVM page counts the roots a guest is granted and the offers it tak
         docs,
         "docs/security/microvm.md",
         "offers",
-        chock_sandbox.vm_shares.max_offers,
+        chock_net.vm_shares.max_offers,
         &wrong,
     );
 

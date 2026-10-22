@@ -8,9 +8,9 @@ pub const Diagnostic = diagnostic.Diagnostic;
 const builtin = @import("builtin");
 const layout_mod = @import("layout.zig");
 pub const Layout = layout_mod.Layout;
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
-pub const Mount = sandbox.namespace.Mount;
+pub const Mount = palisade.linux.namespace.Mount;
 
 pub const Error = error{
     OutOfMemory,

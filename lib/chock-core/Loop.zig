@@ -7,7 +7,8 @@ const chock_cost = @import("chock-cost");
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
 const chock_provider = @import("chock-provider");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 const tools = @import("tools.zig");
 const skills_mod = @import("skills.zig");
 const nix_action = @import("nix.zig");
@@ -59,7 +60,7 @@ pub const ToolRunner = struct {
 
 pub const SandboxToolRunner = struct {
     env: *const std.process.Environ.Map,
-    sandbox_config: sandbox.Config,
+    sandbox_config: chock_net.Call,
     context: tools.Context = .{},
 
     pub fn runner(self: *const SandboxToolRunner) ToolRunner {
@@ -7527,7 +7528,7 @@ test "a finished background task is recorded as an event and delivered as a mess
 
     const argv = [_][]const u8{ "make", "-j8" };
     _ = try table.start(io, .{
-        .config = .{ .root = "/root", .mounts = &.{}, .rules = &.{}, .cwd = "/project", .env = &.{} },
+        .call = .{ .config = .{ .root = "/root", .mounts = &.{}, .rules = &.{}, .cwd = "/project", .env = &.{} } },
         .argv = &argv,
     });
     table.waitAll();

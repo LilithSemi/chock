@@ -5,7 +5,8 @@
 const std = @import("std");
 const udev = @import("udev");
 const chock_policy = @import("chock-policy");
-const chock_sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 const chock_zon = @import("chock-zon");
 
 const linux = std.os.linux;
@@ -495,7 +496,7 @@ pub const HostSource = struct {
     io: std.Io,
     seam: PolicySeam,
     mutex: std.Io.Mutex,
-    queue: std.ArrayList(chock_sandbox.Sandbox.DeviceSource.Change),
+    queue: std.ArrayList(chock_net.DeviceSource.Change),
     index: usize,
     signal: [2]i32,
 
@@ -511,7 +512,7 @@ pub const HostSource = struct {
         };
     }
 
-    pub fn deviceSource(self: *HostSource) chock_sandbox.Sandbox.DeviceSource {
+    pub fn deviceSource(self: *HostSource) chock_net.DeviceSource {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
@@ -537,7 +538,7 @@ pub const HostSource = struct {
         self.queue.clearRetainingCapacity();
     }
 
-    const vtable = chock_sandbox.Sandbox.DeviceSource.VTable{
+    const vtable = chock_net.DeviceSource.VTable{
         .wakeup = wakeupFn,
         .next = nextFn,
     };
@@ -590,7 +591,7 @@ pub const HostSource = struct {
                 self.gpa.free(source);
                 continue;
             };
-            const change: chock_sandbox.Sandbox.DeviceSource.Change = .{
+            const change: chock_net.DeviceSource.Change = .{
                 .place = .{ .kind = 0, .source = source, .target = target },
             };
             self.mutex.lockUncancelable(self.io);
@@ -604,7 +605,7 @@ pub const HostSource = struct {
         }
     }
 
-    fn nextFn(ptr: *anyopaque) ?chock_sandbox.Sandbox.DeviceSource.Change {
+    fn nextFn(ptr: *anyopaque) ?chock_net.DeviceSource.Change {
         const self: *HostSource = @ptrCast(@alignCast(ptr));
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

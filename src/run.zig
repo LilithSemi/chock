@@ -13,7 +13,8 @@ const chock_nix = @import("chock-nix");
 const chock_proto = @import("chock-proto");
 const chock_provider = @import("chock-provider");
 const chock_workspace = @import("chock-workspace");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 const vmm = @import("chock-vmm");
 
 const subagent = chock_core.subagent;
@@ -412,7 +413,7 @@ const Started = struct {
     session_id: []const u8,
     workspace: chock_workspace.Workspace,
     policy: *const chock_policy.table.Table,
-    sandbox_config: sandbox.Config,
+    sandbox_config: palisade.Sandbox.Config,
     dev_shell: ?chock_nix.DevShell,
     image: ?chock_container.Image,
     toolchain: Toolchain,
@@ -439,6 +440,7 @@ const Started = struct {
     apply_mode: ApplyMode,
     language_server: ?chock_core.lsp_driver.Settings,
     device_source: ?*chock_core.devices.HostSource,
+    device_tree: ?chock_net.DeviceTree,
     mcp_servers: ?[]const chock_core.mcp.Settings,
     plugins: ?[]const chock_core.plugin.Settings,
     prompt_project: chock_core.prompt.Project,
@@ -567,7 +569,7 @@ fn sessionConfig(
     policy: *const chock_policy.table.Table,
     dev_shell_name: ?[]const u8,
     context_tokens: ?u64,
-    sandbox_config: sandbox.Config,
+    sandbox_config: palisade.Sandbox.Config,
 ) std.mem.Allocator.Error!chock_proto.event.SessionConfig {
     var rules: std.ArrayList([]const u8) = .empty;
     for (options.policy_rules) |rule| {
@@ -582,7 +584,7 @@ fn sessionConfig(
             try std.fmt.allocPrint(arena, "{x}", .{policy.sourceHash()})
         else
             null,
-        .sandbox_hash = try std.fmt.allocPrint(arena, "{x}", .{sandbox_config.shapeHash()}),
+        .sandbox_hash = try std.fmt.allocPrint(arena, "{x}", .{chock_net.shapeHash(sandbox_config)}),
         .instructions = options.instructions,
         .policy_rules = rules.items,
         .dev_shell = dev_shell_name orelse "",
@@ -1086,7 +1088,7 @@ fn start(
     );
     sandbox_config.seccomp_options.strict_wx = write_execute.rule == .strict;
 
-    sandbox_config.network = if (policy.wantsRouter()) .filtered else .none;
+    sandbox_config.network = if (policy.wantsRouter()) .{ .isolated = chock_net.netns.params } else .none;
 
     if (try resolveLimits(arena, io, project_root, config_dir, org_bundle)) |resolved| {
         applyLimits(&sandbox_config, resolved);
@@ -1130,10 +1132,6 @@ fn start(
     );
     try recordDevices(gpa, io, storage, &attempt, device_wiring.seam);
     const device_source: ?*chock_core.devices.HostSource = device_wiring.host;
-    if (device_wiring.host) |host| {
-        sandbox_config.device_tree = device_wiring.device_tree;
-        sandbox_config.device_source = host.deviceSource();
-    }
 
     const apply_mode = try applyModeFor(
         arena,
@@ -1395,6 +1393,7 @@ fn start(
         .apply_mode = apply_mode,
         .language_server = language_server,
         .device_source = device_source,
+        .device_tree = if (device_source == null) null else device_wiring.device_tree,
         .mcp_servers = mcp_servers,
         .plugins = plugins,
         .prompt_project = prompt_project,
@@ -1740,7 +1739,7 @@ fn recordDevices(
                 .attempt = attempt,
                 .action = one.action,
                 .decision = @tagName(decision),
-                .enforced = decision == .allow and sandbox.expresses.device_passthrough,
+                .enforced = decision == .allow and palisade.Sandbox.expresses.device_passthrough,
             },
         }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| return reportDevicesRecord(err);
 
@@ -1882,7 +1881,7 @@ fn resolveLimits(
     return chock_policy.limits.foldLayers(project, operator, ceiling, machine);
 }
 
-fn applyLimits(config: *sandbox.Config, resolved: chock_policy.limits.Resolved) void {
+fn applyLimits(config: *palisade.Sandbox.Config, resolved: chock_policy.limits.Resolved) void {
     config.limits.processes = resolved.processes;
     config.limits.memory_bytes = resolved.memory_bytes;
 }
@@ -2133,7 +2132,7 @@ test "a limits block that does not parse stops the session rather than sizing it
     try testing.expect(std.mem.indexOf(u8, said.err(), "200%") != null);
 }
 
-fn testConfig() sandbox.Config {
+fn testConfig() palisade.Sandbox.Config {
     return .{
         .root = "/",
         .mounts = &.{},
@@ -2262,7 +2261,7 @@ fn prepareScratchpad(
 fn resolvedForSandbox(arena: std.mem.Allocator, io: std.Io, dir: ?[]const u8) ?[]const u8 {
     const path = dir orelse return null;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const resolved = sandbox.resolvedPath(io, path, &buffer);
+    const resolved = palisade.Sandbox.resolvedPath(io, path, &buffer);
     if (std.mem.eql(u8, resolved, path)) return path;
     return arena.dupe(u8, resolved) catch path;
 }
@@ -2541,7 +2540,7 @@ pub fn chockOwnInProject(
 fn imageToolchainMounts(
     arena: std.mem.Allocator,
     image: *const chock_container.Image,
-    sandbox_mounts: []const sandbox.namespace.Mount,
+    sandbox_mounts: []const palisade.linux.namespace.Mount,
 ) std.mem.Allocator.Error!ImageMounts {
     var kept: std.ArrayList(chock_core.tools.ToolchainMount) = .empty;
     var dropped: std.ArrayList([]const u8) = .empty;
@@ -2572,7 +2571,7 @@ const ImageMounts = struct {
     dropped: []const []const u8,
 };
 
-fn isAboveAMount(target: []const u8, mounts: []const sandbox.namespace.Mount) bool {
+fn isAboveAMount(target: []const u8, mounts: []const palisade.linux.namespace.Mount) bool {
     for (mounts) |mount| {
         const other = switch (mount) {
             .bind => |b| b.target,
@@ -2856,7 +2855,7 @@ test "an image entry above a mount the sandbox makes itself is left out and said
         .in_use = undefined,
     };
 
-    const sandbox_mounts = [_]sandbox.namespace.Mount{.{ .bind = .{
+    const sandbox_mounts = [_]palisade.linux.namespace.Mount{.{ .bind = .{
         .source = "/state/01.work/wt",
         .target = "/home/somebody/project",
         .read_only = false,
@@ -2928,7 +2927,7 @@ fn toolchainFor(
     project_root: []const u8,
     dev_shell: ?chock_nix.DevShell,
     image: ?*const chock_container.Image,
-    sandbox_mounts: []const sandbox.namespace.Mount,
+    sandbox_mounts: []const palisade.linux.namespace.Mount,
 ) !Toolchain {
     if (image) |one| {
         const built = try imageToolchainMounts(arena, one, sandbox_mounts);
@@ -3102,7 +3101,7 @@ const DevicePolicySeam = struct {
 const DeviceWiring = struct {
     seam: ?*DevicePolicySeam = null,
     host: ?*chock_core.devices.HostSource = null,
-    device_tree: ?sandbox.Config.DeviceTree = null,
+    device_tree: ?chock_net.DeviceTree = null,
 };
 
 fn devicesFor(
@@ -3130,7 +3129,7 @@ fn devicesFor(
         .declared = list,
     };
 
-    if (!sandbox.expresses.device_passthrough) return .{ .seam = seam };
+    if (!palisade.Sandbox.expresses.device_passthrough) return .{ .seam = seam };
 
     const host = try arena.create(chock_core.devices.HostSource);
     host.* = chock_core.devices.HostSource.init(gpa, io, seam.seam());
@@ -4390,9 +4389,9 @@ fn chosenLanding(
 }
 
 fn sandboxLayers(
-    given: sandbox.Sandbox.Guarantees,
+    given: palisade.Sandbox.Guarantees,
     witness: LayerWitness,
-    network: sandbox.namespace.Network,
+    network: palisade.Sandbox.Network,
     workspace: []const u8,
 ) [layer_names.len]ui.Layer {
     std.debug.assert(witness.unavailable.subsetOf(witness.probed));
@@ -4400,12 +4399,13 @@ fn sandboxLayers(
     var built: [layer_names.len]ui.Layer = undefined;
     for (layer_names, &built) |named, *slot| {
         const note: []const u8 = switch (named.guarantee) {
+            // Chock's own word for the mode, not palisade's tag for it.
             .network_isolated => switch (network) {
                 .none => "none",
-                .filtered => "filtered",
+                .isolated => "filtered",
                 .host => "host",
             },
-            .workspace_mounted => workspace,
+            .bind_mounts => workspace,
             else => "",
         };
         const state: ui.Layer.State = if (!given.contains(named.guarantee))
@@ -4422,10 +4422,10 @@ fn sandboxLayers(
 }
 
 const LayerWitness = struct {
-    probed: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.empty,
-    unavailable: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.empty,
+    probed: palisade.Sandbox.Guarantees = palisade.Sandbox.Guarantees.empty,
+    unavailable: palisade.Sandbox.Guarantees = palisade.Sandbox.Guarantees.empty,
 
-    fn saw(self: *LayerWitness, guarantee: sandbox.Sandbox.Guarantee, available: bool) void {
+    fn saw(self: *LayerWitness, guarantee: palisade.Sandbox.Guarantee, available: bool) void {
         self.probed.insert(guarantee);
         if (!available) self.unavailable.insert(guarantee);
     }
@@ -4433,22 +4433,22 @@ const LayerWitness = struct {
 
 fn witnessLayers(
     gpa: std.mem.Allocator,
-    given: sandbox.Sandbox.Guarantees,
+    given: palisade.Sandbox.Guarantees,
 ) LayerWitness {
     var out = LayerWitness{};
     if (builtin.target.os.tag != .linux) return out;
 
     if (given.contains(.path_restricted)) {
-        if (sandbox.landlock.probeAbi()) |_| {
+        if (palisade.linux.landlock.probeAbi()) |_| {
             out.saw(.path_restricted, true);
         } else |_| {
             out.saw(.path_restricted, false);
         }
     }
 
-    const namespaces = sandbox.namespace.probeAvailability();
+    const namespaces = palisade.linux.namespace.probeAvailability();
     if (namespaces != .unknown) {
-        for ([_]sandbox.Sandbox.Guarantee{
+        for ([_]palisade.Sandbox.Guarantee{
             .signal_isolated,
             .ipc_isolated,
             .network_isolated,
@@ -4459,9 +4459,9 @@ fn witnessLayers(
 
     if (given.contains(.syscall_restricted)) {
         // No trap set here: a user notification with no listener behind it makes the kernel answer every call with ENOSYS.
-        if (sandbox.seccomp.build(gpa, .{})) |insns| {
+        if (palisade.linux.seccomp.build(gpa, .{})) |insns| {
             defer gpa.free(insns);
-            switch (sandbox.seccomp.probeInstall(sandbox.bpf.Prog.init(insns))) {
+            switch (palisade.linux.seccomp.probeInstall(palisade.linux.bpf.Prog.init(insns))) {
                 .ok => out.saw(.syscall_restricted, true),
                 .refused => out.saw(.syscall_restricted, false),
                 .unknown => {},
@@ -4474,10 +4474,10 @@ fn witnessLayers(
 
 const layer_names = [_]struct {
     name: []const u8,
-    guarantee: sandbox.Sandbox.Guarantee,
+    guarantee: palisade.Sandbox.Guarantee,
 }{
     .{ .name = "net", .guarantee = .network_isolated },
-    .{ .name = "fs", .guarantee = .workspace_mounted },
+    .{ .name = "fs", .guarantee = .bind_mounts },
     .{ .name = "pid", .guarantee = .signal_isolated },
     .{ .name = "ipc", .guarantee = .ipc_isolated },
     .{ .name = "seccomp", .guarantee = .syscall_restricted },
@@ -4485,14 +4485,14 @@ const layer_names = [_]struct {
 };
 
 comptime {
-    var seen = sandbox.Sandbox.Guarantees.empty;
+    var seen = palisade.Sandbox.Guarantees.empty;
     for (layer_names) |named| {
         if (seen.contains(named.guarantee)) @compileError(
             "chock run: two header layers name the same sandbox guarantee",
         );
         seen.insert(named.guarantee);
     }
-    if (seen.count() != @typeInfo(sandbox.Sandbox.Guarantee).@"enum".field_names.len) @compileError(
+    if (seen.count() != @typeInfo(palisade.Sandbox.Guarantee).@"enum".field_names.len) @compileError(
         "chock run: a sandbox guarantee has no layer in the header",
     );
 }
@@ -4854,7 +4854,7 @@ const ToolNetwork = struct {
         id_len: usize = 0,
     };
 
-    fn backgroundRouterFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) ?sandbox.NetRouter {
+    fn backgroundRouterFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) ?chock_net.NetRouter {
         const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
         if (!self.started.policy.wantsBackgroundRouter()) return null;
         if (self.background_used == self.background_nets.len) return null;
@@ -4877,7 +4877,7 @@ const ToolNetwork = struct {
         return slot.network.netRouter();
     }
 
-    fn routerFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) sandbox.NetRouter {
+    fn routerFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) chock_net.NetRouter {
         const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
         self.network.tool = tool;
         self.network.tool_call_id = call_id;
@@ -5015,15 +5015,15 @@ fn logSupervisorAudit(
     gpa: std.mem.Allocator,
     io: std.Io,
     storage: chock_proto.storage.Storage,
-    audit: *const sandbox.Sandbox.SupervisorAudit,
+    audit: *const palisade.Sandbox.SupervisorAudit,
 ) void {
     var locked = storage.lock(io) catch |err| {
         reportSupervisorRecord(err);
         return;
     };
     defer locked.unlock(io) catch {};
-    inline for (comptime std.enums.values(sandbox.Sandbox.LayerName)) |layer| {
-        if (comptime sandbox.Sandbox.failModeFor(.supervisor, layer)) |mode| {
+    inline for (comptime std.enums.values(palisade.Sandbox.LayerName)) |layer| {
+        if (comptime palisade.Sandbox.failModeFor(.supervisor, layer)) |mode| {
             _ = locked.append(
                 gpa,
                 io,
@@ -5044,13 +5044,13 @@ fn reportSupervisorRecord(err: anyerror) void {
 }
 
 fn supervisorEvent(
-    layer: sandbox.Sandbox.LayerName,
-    fail_mode: sandbox.Sandbox.FailMode,
-    counts: sandbox.Sandbox.SupervisorAudit.Counts,
+    layer: palisade.Sandbox.LayerName,
+    fail_mode: palisade.Sandbox.FailMode,
+    counts: palisade.Sandbox.SupervisorAudit.Counts,
 ) chock_proto.event.Event {
     return .{
         .sandbox_supervisor = .{
-            .process = sandbox.Sandbox.SupervisorAudit.process_name,
+            .process = palisade.Sandbox.SupervisorAudit.process_name,
             .layer = layer.wireName(),
             .fail_mode = @tagName(fail_mode),
             .confined = counts.confined,
@@ -5065,7 +5065,7 @@ fn logSyscallAudit(
     gpa: std.mem.Allocator,
     io: std.Io,
     storage: chock_proto.storage.Storage,
-    audit: *sandbox.Sandbox.SyscallAudit,
+    audit: *palisade.Sandbox.SyscallAudit,
 ) void {
     var rows: [syscall_row_count]chock_proto.event.SyscallCount = undefined;
     var path_rows: [syscall_row_count]chock_proto.event.UnverifiedPaths = undefined;
@@ -5100,19 +5100,19 @@ fn reportSyscallRecord(err: anyerror) void {
     );
 }
 
-const syscall_row_count = @typeInfo(sandbox.seccomp.TrapCall).@"enum".field_names.len;
+const syscall_row_count = @typeInfo(palisade.linux.seccomp.TrapCall).@"enum".field_names.len;
 
-const syscall_name_cap = sandbox.Sandbox.SyscallAudit.name_cap;
+const syscall_name_cap = palisade.Sandbox.SyscallAudit.name_cap;
 
 fn syscallEvent(
-    counts: sandbox.Sandbox.SyscallAudit.Counts,
-    paths: sandbox.Sandbox.SyscallAudit.PathCounts,
+    counts: palisade.Sandbox.SyscallAudit.Counts,
+    paths: palisade.Sandbox.SyscallAudit.PathCounts,
     rows: *[syscall_row_count]chock_proto.event.SyscallCount,
     path_rows: *[syscall_row_count]chock_proto.event.UnverifiedPaths,
     names: *[syscall_name_cap][]const u8,
 ) chock_proto.event.Event {
     var filled: usize = 0;
-    inline for (@typeInfo(sandbox.seccomp.TrapCall).@"enum".field_names, @typeInfo(sandbox.seccomp.TrapCall).@"enum".field_values) |field_name, field_value| {
+    inline for (@typeInfo(palisade.linux.seccomp.TrapCall).@"enum".field_names, @typeInfo(palisade.linux.seccomp.TrapCall).@"enum".field_values) |field_name, field_value| {
         const first = filled;
         var kept: u32 = 0;
         while (kept < paths.kept) : (kept += 1) {
@@ -5139,7 +5139,7 @@ fn syscallEvent(
     }
     return .{
         .sandbox_syscalls = .{
-            .mechanism = sandbox.Sandbox.SyscallAudit.mechanism_name,
+            .mechanism = palisade.Sandbox.SyscallAudit.mechanism_name,
             .observed = counts.observed,
             .unobserved = counts.unobserved,
             .calls = rows,
@@ -5180,8 +5180,8 @@ test "the supervisor event names the fault, and the audit question is one field"
 }
 
 test "the event says which way the layer fails, and the answer comes from the sandbox table" {
-    const table = sandbox.Sandbox.failModeFor(.supervisor, .seccomp).?;
-    try std.testing.expectEqual(sandbox.Sandbox.FailMode.open, table);
+    const table = palisade.Sandbox.failModeFor(.supervisor, .seccomp).?;
+    try std.testing.expectEqual(palisade.Sandbox.FailMode.open, table);
     const open = supervisorEvent(.seccomp, table, .{
         .confined = 1,
         .unconfined = 0,
@@ -5198,10 +5198,10 @@ test "the event says which way the layer fails, and the answer comes from the sa
     });
     try std.testing.expectEqualStrings("closed", closed.sandbox_supervisor.fail_mode);
 
-    for (comptime std.enums.values(sandbox.Sandbox.LayerName)) |layer| {
+    for (comptime std.enums.values(palisade.Sandbox.LayerName)) |layer| {
         try std.testing.expectEqual(
-            @as(?sandbox.Sandbox.FailMode, .closed),
-            sandbox.Sandbox.failModeFor(.sandboxed, layer),
+            @as(?palisade.Sandbox.FailMode, .closed),
+            palisade.Sandbox.failModeFor(.sandboxed, layer),
         );
     }
 }
@@ -5214,7 +5214,7 @@ test "every layer the supervisor puts on itself gets a row of its own" {
     const storage = backing.storage();
     defer storage.close(io);
 
-    var audit: sandbox.Sandbox.SupervisorAudit = .{};
+    var audit: palisade.Sandbox.SupervisorAudit = .{};
     audit.record(.capabilities, .on);
     audit.record(.landlock, .{ .off = .rejected });
     audit.record(.seccomp, .on);
@@ -5247,7 +5247,7 @@ test "a session where every supervisor confined itself still writes the event" {
     const storage = backing.storage();
     defer storage.close(io);
 
-    var audit: sandbox.Sandbox.SupervisorAudit = .{};
+    var audit: palisade.Sandbox.SupervisorAudit = .{};
     audit.record(.seccomp, .on);
     audit.record(.seccomp, .on);
     logSupervisorAudit(gpa, io, storage, &audit);
@@ -5276,7 +5276,7 @@ test "the supervisor's own degradation reaches the log, not only the terminal" {
     const storage = backing.storage();
     defer storage.close(io);
 
-    var audit: sandbox.Sandbox.SupervisorAudit = .{};
+    var audit: palisade.Sandbox.SupervisorAudit = .{};
     audit.record(.seccomp, .on);
     audit.record(.seccomp, .{ .off = .not_permitted });
     logSupervisorAudit(gpa, io, storage, &audit);
@@ -5315,20 +5315,20 @@ test "the syscall event names one row for each call the sandbox can watch, and s
     try std.testing.expectEqual(@as(u64, 1), said.unobserved);
     try std.testing.expectEqual(syscall_row_count, said.calls.len);
 
-    inline for (@typeInfo(sandbox.seccomp.TrapCall).@"enum".field_names, @typeInfo(sandbox.seccomp.TrapCall).@"enum".field_values) |field_name, field_value| {
+    inline for (@typeInfo(palisade.linux.seccomp.TrapCall).@"enum".field_names, @typeInfo(palisade.linux.seccomp.TrapCall).@"enum".field_values) |field_name, field_value| {
         try std.testing.expectEqualStrings(field_name, said.calls[field_value].name);
     }
     try std.testing.expectEqual(
         @as(u64, 900),
-        said.calls[@intFromEnum(sandbox.seccomp.TrapCall.openat)].count,
+        said.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.openat)].count,
     );
     try std.testing.expectEqual(
         @as(u64, 0),
-        said.calls[@intFromEnum(sandbox.seccomp.TrapCall.connect)].count,
+        said.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.connect)].count,
     );
     try std.testing.expectEqual(
         @as(?chock_proto.event.UnverifiedPaths, null),
-        said.calls[@intFromEnum(sandbox.seccomp.TrapCall.openat)].unverified_paths,
+        said.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.openat)].unverified_paths,
     );
     try std.testing.expectEqual(false, said.paths_verified);
     try std.testing.expectEqual(@as(u64, 0), said.path_readers_unreported);
@@ -5336,16 +5336,16 @@ test "the syscall event names one row for each call the sandbox can watch, and s
 
 test "a full path record is still one short line of the session log" {
     const gpa = std.testing.allocator;
-    var longest: [sandbox.notify.kept_path_bytes]u8 = @splat('n');
+    var longest: [palisade.linux.notify.kept_path_bytes]u8 = @splat('n');
     longest[0] = '/';
 
     var counted = emptyPathCounts();
     counted.kept = syscall_name_cap;
     for (0..syscall_name_cap) |slot| {
-        counted.name_call[slot] = @intFromEnum(sandbox.seccomp.TrapCall.openat);
+        counted.name_call[slot] = @intFromEnum(palisade.linux.seccomp.TrapCall.openat);
         counted.names[slot] = &longest;
     }
-    for (0..sandbox.notify.call_count) |slot| {
+    for (0..palisade.linux.notify.call_count) |slot| {
         counted.granted[slot] = std.math.maxInt(u32);
         counted.ungranted[slot] = std.math.maxInt(u32);
         counted.ungranted_unnamed[slot] = std.math.maxInt(u32);
@@ -5374,16 +5374,16 @@ test "a full path record is still one short line of the session log" {
     try std.testing.expect(line.len < 2048);
 }
 
-fn emptyPathCounts() sandbox.Sandbox.SyscallAudit.PathCounts {
+fn emptyPathCounts() palisade.Sandbox.SyscallAudit.PathCounts {
     return .{
         .readers_unreported = 0,
         .readers_absent = 0,
-        .granted = sandbox.notify.empty_counts,
-        .ungranted = sandbox.notify.empty_counts,
-        .ungranted_unnamed = sandbox.notify.empty_counts,
-        .relative = sandbox.notify.empty_counts,
-        .unread = sandbox.notify.empty_counts,
-        .truncated = sandbox.notify.empty_counts,
+        .granted = palisade.linux.notify.empty_counts,
+        .ungranted = palisade.linux.notify.empty_counts,
+        .ungranted_unnamed = palisade.linux.notify.empty_counts,
+        .relative = palisade.linux.notify.empty_counts,
+        .unread = palisade.linux.notify.empty_counts,
+        .truncated = palisade.linux.notify.empty_counts,
         .kept = 0,
         .name_call = @splat(0),
         .names = @splat(&.{}),
@@ -5391,8 +5391,8 @@ fn emptyPathCounts() sandbox.Sandbox.SyscallAudit.PathCounts {
 }
 
 test "the syscall event names each call's own paths, and says they are not verified" {
-    const openat = @intFromEnum(sandbox.seccomp.TrapCall.openat);
-    const execve = @intFromEnum(sandbox.seccomp.TrapCall.execve);
+    const openat = @intFromEnum(palisade.linux.seccomp.TrapCall.openat);
+    const execve = @intFromEnum(palisade.linux.seccomp.TrapCall.execve);
 
     var counted = emptyPathCounts();
     counted.readers_unreported = 2;
@@ -5441,7 +5441,7 @@ test "the syscall event names each call's own paths, and says they are not verif
 
     try std.testing.expectEqual(
         @as(?chock_proto.event.UnverifiedPaths, null),
-        said.calls[@intFromEnum(sandbox.seccomp.TrapCall.connect)].unverified_paths,
+        said.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.connect)].unverified_paths,
     );
 }
 
@@ -5453,10 +5453,10 @@ test "what the sandboxed programs asked the kernel for reaches the log, not only
     const storage = backing.storage();
     defer storage.close(io);
 
-    var audit: sandbox.Sandbox.SyscallAudit = .{};
-    var counts = sandbox.notify.empty_counts;
-    counts[@intFromEnum(sandbox.seccomp.TrapCall.openat)] = 31;
-    counts[@intFromEnum(sandbox.seccomp.TrapCall.execve)] = 1;
+    var audit: palisade.Sandbox.SyscallAudit = .{};
+    var counts = palisade.linux.notify.empty_counts;
+    counts[@intFromEnum(palisade.linux.seccomp.TrapCall.openat)] = 31;
+    counts[@intFromEnum(palisade.linux.seccomp.TrapCall.execve)] = 1;
     audit.record(.{ .observed = counts });
     audit.record(.unobserved);
     logSyscallAudit(gpa, io, storage, &audit);
@@ -5489,7 +5489,7 @@ test "a session that watched nothing still writes the event, so an absence is ne
     const storage = backing.storage();
     defer storage.close(io);
 
-    var audit: sandbox.Sandbox.SyscallAudit = .{};
+    var audit: palisade.Sandbox.SyscallAudit = .{};
     logSyscallAudit(gpa, io, storage, &audit);
 
     var replay = try storage.replay(gpa, io, 0);
@@ -7585,7 +7585,7 @@ fn startMcp(
             const with_store = chock_core.tools.withStore(
                 keep,
                 io,
-                started.sandbox_config,
+                .{ .config = started.sandbox_config },
                 context.store_paths,
                 context.read_only_mounts,
             ) catch break :blk null;
@@ -7609,7 +7609,7 @@ fn startMcp(
         } orelse continue;
 
         var config = prepared.config;
-        config.env = try secrets.forServer(keep, &policy, one.name, config.env);
+        config.config.env = try secrets.forServer(keep, &policy, one.name, config.config.env);
         const index = state.count;
 
         state.transports[index] = .{};
@@ -7627,8 +7627,8 @@ fn startMcp(
         var buffer: [chock_core.mcp.max_action_bytes]u8 = undefined;
         const net_action = chock_core.mcp.networkActionInto(&buffer, one.name).?;
         if (policy.answer(one.name, net_action) == .allow) {
-            config.network = .filtered;
-            config.net_router = state.networks[index].netRouter();
+            config.config.network = .{ .isolated = chock_net.netns.params };
+            config.links.net_router = state.networks[index].netRouter();
             tty.detail(
                 "chock: the MCP server {s} may reach the hosts this project's net.connect rules name\n",
                 .{one.name},
@@ -7639,7 +7639,7 @@ fn startMcp(
         state.drivers[index] = chock_core.mcp_driver.Driver.init(
             gpa,
             &state.helpers[index],
-            .{ .config = config, .argv = prepared.argv },
+            .{ .call = config, .argv = prepared.argv },
         );
         state.records[index] = .{ .name = one.name, .host = state.drivers[index].host() };
         state.count += 1;
@@ -7918,7 +7918,7 @@ fn startPlugins(
         state.drivers[index] = chock_core.plugin_host.Driver.init(
             gpa,
             &state.helpers[index],
-            .{ .config = config, .argv = argv },
+            .{ .call = .{ .config = config }, .argv = argv },
         );
         state.records[index] = .{ .name = one.name, .host = state.drivers[index].host() };
         state.count += 1;
@@ -7972,20 +7972,20 @@ fn pluginArgv(
 fn pluginSandbox(
     keep: std.mem.Allocator,
     io: std.Io,
-    workspace_config: sandbox.Config,
+    workspace_config: palisade.Sandbox.Config,
     store_paths: []const []const u8,
     read_only_mounts: []const chock_core.tools.ToolchainMount,
     host_path: []const u8,
     module_path: []const u8,
-) std.mem.Allocator.Error!sandbox.Config {
+) std.mem.Allocator.Error!palisade.Sandbox.Config {
     var base = workspace_config;
     base.cwd = "/";
     base.rules = &.{};
 
-    const with_store = try chock_core.tools.withStore(keep, io, base, store_paths, read_only_mounts);
+    const with_store = try chock_core.tools.withStore(keep, io, .{ .config = base }, store_paths, read_only_mounts);
 
-    var mounts: std.ArrayList(sandbox.namespace.Mount) = .empty;
-    try mounts.appendSlice(keep, with_store.mounts);
+    var mounts: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
+    try mounts.appendSlice(keep, with_store.config.mounts);
     try mounts.append(keep, .{ .bind = .{
         .source = host_path,
         .target = plugin_host_target,
@@ -7997,8 +7997,8 @@ fn pluginSandbox(
         .read_only = true,
     } });
 
-    var reach: std.ArrayList(sandbox.Config.Rule) = .empty;
-    try reach.appendSlice(keep, with_store.rules);
+    var reach: std.ArrayList(palisade.Sandbox.Rule) = .empty;
+    try reach.appendSlice(keep, with_store.config.rules);
     try reach.append(keep, .{
         .path = plugin_host_target,
         .access = .{ .execute = true, .read_file = true },
@@ -8008,7 +8008,7 @@ fn pluginSandbox(
         .access = .{ .read_file = true },
     });
 
-    var config = try chock_core.plugin_host.lockdown(keep, with_store, reach.items);
+    var config = try chock_core.plugin_host.lockdown(keep, with_store.config, reach.items);
     config.mounts = try mounts.toOwnedSlice(keep);
     return config;
 }
@@ -9835,17 +9835,17 @@ fn runSession(
     };
     defer http.deinit();
 
-    var supervisor_audit: sandbox.Sandbox.SupervisorAudit = .{};
-    started.sandbox_config.supervisor_audit = &supervisor_audit;
-    defer started.sandbox_config.supervisor_audit = null;
+    var supervisor_audit: palisade.Sandbox.SupervisorAudit = .{};
     defer logSupervisorAudit(gpa, io, started.storage, &supervisor_audit);
 
-    var syscall_audit: sandbox.Sandbox.SyscallAudit = .{};
-    started.sandbox_config.syscall_audit = &syscall_audit;
-    defer started.sandbox_config.syscall_audit = null;
+    var syscall_audit: palisade.Sandbox.SyscallAudit = .{};
     defer logSyscallAudit(gpa, io, started.storage, &syscall_audit);
 
     var context = chock_core.tools.Context{
+        .devices = if (started.device_source) |host| host.deviceSource() else null,
+        .device_tree = started.device_tree,
+        .supervisor_audit = &supervisor_audit,
+        .syscall_audit = &syscall_audit,
         .memory_dir = started.memory_dir,
         .cache_dir = started.cache_dir,
         .scratch_dir = started.scratch_dir,
@@ -9873,9 +9873,9 @@ fn runSession(
         const room = guest_arena.allocator();
         const shares = try guestShares(room, io, started);
         if (started.own_guest) |one| try readyOwnGuest(room, io, one, shares);
-        const link = try attachGuest(room, io, socket_path, shares);
-        chock_core.tools.useDriver(link.guest.driver());
-        guest_link = link;
+        guest_link = try attachGuest(room, io, socket_path, shares);
+        // The pointer has to name the copy that lives on, not the temporary.
+        chock_core.tools.useDriver(.{ .guest = &guest_link.?.guest });
         tty.print(.plain, "chock: tool calls run in a microVM guest\n", .{});
     }
     defer if (guest_link) |link| link.close(io);
@@ -9893,7 +9893,7 @@ fn runSession(
 
     var tool_runner = chock_core.Loop.SandboxToolRunner{
         .env = started.tool_env,
-        .sandbox_config = started.sandbox_config,
+        .sandbox_config = .{ .config = started.sandbox_config },
         .context = context,
     };
 
@@ -9939,7 +9939,7 @@ fn runSession(
             const with_store = chock_core.tools.withStore(
                 server_arena.allocator(),
                 io,
-                started.sandbox_config,
+                .{ .config = started.sandbox_config },
                 context.store_paths,
                 context.read_only_mounts,
             ) catch break :blk null;
@@ -9966,7 +9966,7 @@ fn runSession(
             server_driver = .{
                 .gpa = gpa,
                 .process = &server_helper,
-                .request = .{ .config = ready.config, .argv = ready.argv },
+                .request = .{ .call = ready.config, .argv = ready.argv },
                 .work_root = started.workspace.workPath(),
                 .sandbox_root = started.sandbox_config.cwd,
             };
@@ -10093,7 +10093,7 @@ fn runSession(
     var screen: ?*ui.Ui = null;
     defer if (screen) |one| one.deinit();
 
-    const layer_witness = witnessLayers(gpa, sandbox.Sandbox.guarantees);
+    const layer_witness = witnessLayers(gpa, palisade.Sandbox.guarantees);
 
     if (options.display) |wanted| {
         screen = ui.startUi(gpa, io, env, wanted.attach) catch |err| open_failed: {
@@ -10107,7 +10107,7 @@ fn runSession(
     }
 
     const layers = sandboxLayers(
-        sandbox.Sandbox.guarantees,
+        palisade.Sandbox.guarantees,
         layer_witness,
         started.sandbox_config.network,
         switch (started.workspace.kind) {
@@ -10191,7 +10191,7 @@ fn runSession(
     tool_network.network.transport = tool_network.transport.transport();
     defer tool_network.deinit();
 
-    if (started.sandbox_config.network == .filtered) {
+    if (std.meta.activeTag(started.sandbox_config.network) == .isolated) {
         tool_runner.context.net = tool_network.seam();
     }
     tool_runner.context.approval_wait_ns = &tool_network.approval_wait_ns;
@@ -11172,7 +11172,7 @@ fn readyOwnGuest(
     arena: std.mem.Allocator,
     io: std.Io,
     one: *OwnGuest,
-    shares: []const sandbox.vm_shares.Share,
+    shares: []const chock_net.vm_shares.Share,
 ) StartError!void {
     one.child.sendShares(arena, try forGuest(arena, shares)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -11211,9 +11211,9 @@ fn readyOwnGuest(
 
 fn forGuest(
     arena: std.mem.Allocator,
-    shares: []const sandbox.vm_shares.Share,
+    shares: []const chock_net.vm_shares.Share,
 ) std.mem.Allocator.Error![]const vmm.Options.Share {
-    if (comptime vmm.Options.Share == sandbox.vm_shares.Share) return shares;
+    if (comptime vmm.Options.Share == chock_net.vm_shares.Share) return shares;
 
     const out = try arena.alloc(vmm.Options.Share, shares.len);
     for (shares, out) |from, *to| to.* = .{
@@ -11321,7 +11321,7 @@ const guest_share_root = "/mnt/shares";
 const GuestLink = struct {
     control: std.posix.fd_t,
     stream: std.posix.fd_t,
-    guest: sandbox.vm_driver.Guest,
+    guest: chock_net.vm_driver.Guest,
 
     reaching: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
@@ -11329,7 +11329,7 @@ const GuestLink = struct {
     fn decide(ptr: *anyopaque, text: []const u8, port: u16) vmm.Reached {
         const self: *GuestLink = @ptrCast(@alignCast(ptr));
         const router = self.guest.routerNow() orelse return .refused;
-        const address = sandbox.vm_wire.addressIn(text) orelse return .refused;
+        const address = chock_net.vm_wire.addressIn(text) orelse return .refused;
         return switch (router.open(address, port)) {
             .granted => |fd| .{ .connected = fd },
             .refused => .refused,
@@ -11355,9 +11355,9 @@ fn attachGuest(
     arena: std.mem.Allocator,
     io: std.Io,
     socket_path: []const u8,
-    shares: []const sandbox.vm_shares.Share,
+    shares: []const chock_net.vm_shares.Share,
 ) StartError!*GuestLink {
-    var refused: ?sandbox.vm_shares.Share = null;
+    var refused: ?chock_net.vm_shares.Share = null;
     const reached = vmm.attach(io, socket_path, shares, guest_port, &refused) catch |err| {
         switch (err) {
             error.NoGuest => tty.print(
@@ -11399,7 +11399,7 @@ fn attachGuest(
             .stream = .{ .handle = reached.stream, .flags = .{ .nonblocking = false } },
             .io = io,
             .shares = .{ .root = guest_share_root, .shares = shares },
-            .read_buffer = try arena.alloc(u8, sandbox.vm_wire.max_message_bytes + 1),
+            .read_buffer = try arena.alloc(u8, chock_net.vm_wire.max_message_bytes + 1),
             .write_buffer = try arena.alloc(u8, 64 * 1024),
         },
     };
@@ -11434,8 +11434,8 @@ fn waitForHello(io: std.Io, link: *GuestLink) bool {
     if (ready == 0) return false;
 
     var reader = link.guest.stream.readerStreaming(io, link.guest.read_buffer);
-    const line = sandbox.vm_wire.readLine(&reader.interface) catch return false;
-    return sandbox.vm_wire.helloIn(line);
+    const line = chock_net.vm_wire.readLine(&reader.interface) catch return false;
+    return chock_net.vm_wire.helloIn(line);
 }
 
 const guest_port: u32 = 1024;
@@ -11444,8 +11444,8 @@ fn guestShares(
     arena: std.mem.Allocator,
     io: std.Io,
     started: *const Started,
-) StartError![]const sandbox.vm_shares.Share {
-    var wanted: std.ArrayList(sandbox.vm_shares.Wanted) = .empty;
+) StartError![]const chock_net.vm_shares.Share {
+    var wanted: std.ArrayList(chock_net.vm_shares.Wanted) = .empty;
 
     for (started.toolchain.mounts) |one| {
         try wanted.append(arena, .{ .host_path = one.source, .writable = false });
@@ -11464,10 +11464,10 @@ fn guestShares(
     }
 
     var resolved: [std.fs.max_path_bytes]u8 = undefined;
-    const staging = sandbox.resolvedPath(io, started.tool_env.get("TMPDIR") orelse "/tmp", &resolved);
+    const staging = palisade.Sandbox.resolvedPath(io, started.tool_env.get("TMPDIR") orelse "/tmp", &resolved);
     try wanted.append(arena, .{ .host_path = try arena.dupe(u8, staging), .writable = true });
 
-    return sandbox.vm_shares.offersFor(
+    return chock_net.vm_shares.offersFor(
         arena,
         io,
         started.sandbox_config,
@@ -11480,7 +11480,7 @@ fn guestShares(
                 .err,
                 "chock run: this session binds more directories than the {d} a guest takes, " ++
                     "so it does not start.\n",
-                .{sandbox.vm_shares.max_offers},
+                .{chock_net.vm_shares.max_offers},
             );
             return error.Reported;
         },
@@ -14736,7 +14736,7 @@ test "a project with no devices block builds no seam, no host, and names no tree
     const wiring = try devicesFor(arena, gpa, std.testing.io, empty, &.{}, "main", "a-model", null);
     try std.testing.expectEqual(@as(?*DevicePolicySeam, null), wiring.seam);
     try std.testing.expectEqual(@as(?*chock_core.devices.HostSource, null), wiring.host);
-    try std.testing.expectEqual(@as(?sandbox.Config.DeviceTree, null), wiring.device_tree);
+    try std.testing.expectEqual(@as(?chock_net.DeviceTree, null), wiring.device_tree);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -14777,13 +14777,13 @@ test "a named device whose rule says allow reaches the sandbox config" {
     try std.testing.expectEqual(chock_policy.table.Decision.allow, seam.decisionFor("device.usb.1d50.6018"));
     try std.testing.expect(seam.seam().permitted("device.usb.1d50.6018"));
 
-    if (sandbox.expresses.device_passthrough) {
+    if (palisade.Sandbox.expresses.device_passthrough) {
         try std.testing.expect(wiring.host != null);
         try std.testing.expectEqualStrings("/dev", wiring.device_tree.?.host);
         try std.testing.expectEqualStrings("/.chock-device-tree", wiring.device_tree.?.inside);
     } else {
         try std.testing.expectEqual(@as(?*chock_core.devices.HostSource, null), wiring.host);
-        try std.testing.expectEqual(@as(?sandbox.Config.DeviceTree, null), wiring.device_tree);
+        try std.testing.expectEqual(@as(?chock_net.DeviceTree, null), wiring.device_tree);
     }
 
     try std.testing.expect(!seam.seam().permitted("device.usb.dead.beef"));
@@ -14899,7 +14899,7 @@ test "the device.exposed event records what was actually enforced, not what was 
     try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"ask\"") != null);
 
     const enforced_true = std.mem.indexOf(u8, text, "\"enforced\":true") != null;
-    try std.testing.expectEqual(sandbox.expresses.device_passthrough, enforced_true);
+    try std.testing.expectEqual(palisade.Sandbox.expresses.device_passthrough, enforced_true);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"enforced\":false") != null);
 }
 
@@ -15857,7 +15857,7 @@ test "a session with a display asks in it, and never at the prompt as well" {
 }
 
 test "the header names every sandbox layer the driver gives, and says the word off for one it does not" {
-    const every = sandbox.Sandbox.Guarantees.full;
+    const every = palisade.Sandbox.Guarantees.full;
     const all_seen = LayerWitness{ .probed = every };
     const on = sandboxLayers(every, all_seen, .none, "worktree");
     try std.testing.expectEqual(@as(usize, 6), on.len);
@@ -15867,7 +15867,7 @@ test "the header names every sandbox layer the driver gives, and says the word o
     try std.testing.expectEqualStrings("fs", on[1].name);
     try std.testing.expectEqualStrings("worktree", on[1].note);
 
-    const none = sandboxLayers(sandbox.Sandbox.Guarantees.empty, all_seen, .none, "worktree");
+    const none = sandboxLayers(palisade.Sandbox.Guarantees.empty, all_seen, .none, "worktree");
     for (none) |one| {
         try std.testing.expectEqual(ui.Layer.State.unsupported, one.state);
         try std.testing.expect(one.state.word().len != 0);
@@ -15886,8 +15886,8 @@ test "the header names every sandbox layer the driver gives, and says the word o
 }
 
 test "a layer the driver gives but this run could not get reads unavailable, not on" {
-    const every = sandbox.Sandbox.Guarantees.full;
-    var landlock_only = sandbox.Sandbox.Guarantees.empty;
+    const every = palisade.Sandbox.Guarantees.full;
+    var landlock_only = palisade.Sandbox.Guarantees.empty;
     landlock_only.insert(.path_restricted);
 
     const blocked = sandboxLayers(every, .{ .probed = every, .unavailable = landlock_only }, .none, "worktree");
@@ -15911,11 +15911,11 @@ test "a layer the driver gives but this run could not get reads unavailable, not
 }
 
 test "a layer nothing probed still reads on, because the driver dies rather than run without it" {
-    const every = sandbox.Sandbox.Guarantees.full;
+    const every = palisade.Sandbox.Guarantees.full;
     const unprobed = sandboxLayers(every, .{}, .none, "worktree");
     for (unprobed) |one| try std.testing.expectEqual(ui.Layer.State.on, one.state);
 
-    var landlock_only = sandbox.Sandbox.Guarantees.empty;
+    var landlock_only = palisade.Sandbox.Guarantees.empty;
     landlock_only.insert(.path_restricted);
     const refused = sandboxLayers(
         every,
@@ -15937,7 +15937,7 @@ test "the header of a normal linux session is six ticks and no other mark" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const layers = sandboxLayers(sandbox.Sandbox.Guarantees.full, .{}, .none, "worktree");
+    const layers = sandboxLayers(palisade.Sandbox.Guarantees.full, .{}, .none, "worktree");
     var said: std.ArrayList(u8) = .empty;
     for (layers) |one| {
         if (said.items.len != 0) try said.appendSlice(arena, "  ");
@@ -15951,7 +15951,7 @@ test "the header of a normal linux session is six ticks and no other mark" {
 }
 
 test "a layer this platform never applies is drawn as missing and never as on" {
-    const darwin = sandbox.Sandbox.Guarantees.initMany(&.{
+    const darwin = palisade.Sandbox.Guarantees.initMany(&.{
         .network_isolated,
         .signal_isolated,
         .ipc_isolated,
@@ -15971,7 +15971,7 @@ test "a layer this platform never applies is drawn as missing and never as on" {
 
 test "this machine really answers for the layers the witness claims to measure" {
     if (builtin.target.os.tag != .linux) return error.SkipZigTest;
-    const given = sandbox.Sandbox.guarantees;
+    const given = palisade.Sandbox.guarantees;
     const seen = witnessLayers(std.testing.allocator, given);
 
     var stray = seen.unavailable;
@@ -15982,7 +15982,7 @@ test "this machine really answers for the layers the witness claims to measure" 
     uninvited = uninvited.differenceWith(given);
     try std.testing.expectEqual(@as(usize, 0), uninvited.count());
 
-    for ([_]sandbox.Sandbox.Guarantee{
+    for ([_]palisade.Sandbox.Guarantee{
         .path_restricted,
         .syscall_restricted,
         .signal_isolated,
@@ -15992,14 +15992,14 @@ test "this machine really answers for the layers the witness claims to measure" 
         try std.testing.expect(seen.probed.contains(guarantee));
     }
 
-    try std.testing.expect(!seen.probed.contains(.workspace_mounted));
+    try std.testing.expect(!seen.probed.contains(.bind_mounts));
 }
 
 test "a session that gave the network layer up says so, and a filtered one does not" {
-    const every = sandbox.Sandbox.Guarantees.full;
+    const every = palisade.Sandbox.Guarantees.full;
 
     const seen = LayerWitness{ .probed = every };
-    const filtered = sandboxLayers(every, seen, .filtered, "overlay");
+    const filtered = sandboxLayers(every, seen, .{ .isolated = chock_net.netns.params }, "overlay");
     try std.testing.expectEqual(ui.Layer.State.on, filtered[0].state);
     try std.testing.expectEqualStrings("filtered", filtered[0].note);
 
@@ -16013,10 +16013,22 @@ test "a session that gave the network layer up says so, and a filtered one does 
 }
 
 test "the word beside the net layer is the name of the mode, for every mode there is" {
-    const every = sandbox.Sandbox.Guarantees.full;
-    for (std.enums.values(sandbox.namespace.Network)) |mode| {
+    const every = palisade.Sandbox.Guarantees.full;
+    const Tag = @typeInfo(palisade.Sandbox.Network).@"union".tag_type.?;
+    // Chock's own words, which are not palisade's tag for every mode.
+    for (std.enums.values(Tag)) |tag| {
+        const mode: palisade.Sandbox.Network = switch (tag) {
+            .none => .none,
+            .host => .host,
+            .isolated => .{ .isolated = chock_net.netns.params },
+        };
+        const want = switch (tag) {
+            .none => "none",
+            .host => "host",
+            .isolated => "filtered",
+        };
         const built = sandboxLayers(every, .{ .probed = every }, mode, "worktree");
-        try std.testing.expectEqualStrings(@tagName(mode), built[0].note);
+        try std.testing.expectEqualStrings(want, built[0].note);
     }
 }
 
@@ -16686,17 +16698,17 @@ test "the sandbox a plugin host gets carries its program, its module and nothing
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
-    const workspace: sandbox.Config = .{
+    const workspace: palisade.Sandbox.Config = .{
         .root = "/tmp/session-root",
         .mounts = &.{
             .{ .bind = .{ .source = "/home/someone/work", .target = "/home/someone/work", .read_only = false } },
         },
         .rules = &.{
-            .{ .path = "/home/someone/work", .access = sandbox.landlock.AccessFs.read_write },
+            .{ .path = "/home/someone/work", .access = palisade.linux.landlock.AccessFs.read_write },
         },
         .cwd = "/home/someone/work",
         .env = &.{"PATH=/bin"},
-        .network = .filtered,
+        .network = .{ .isolated = chock_net.netns.params },
     };
 
     const config = try pluginSandbox(

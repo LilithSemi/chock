@@ -2,7 +2,7 @@
 //! of the project and kept across sessions.
 
 const std = @import("std");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 const diagnostic = @import("diagnostic.zig");
 pub const Diagnostic = diagnostic.Diagnostic;
@@ -12,7 +12,7 @@ pub const sinkOf = diagnostic.sinkOf;
 pub const sandbox_dir = "/run/chock/cache";
 
 pub fn sandboxDirFor(host_dir: []const u8) []const u8 {
-    return if (sandbox.expresses.moved_paths) sandbox_dir else host_dir;
+    return if (palisade.Sandbox.expresses.moved_paths) sandbox_dir else host_dir;
 }
 
 pub const home_dir = sandbox_dir ++ "/home";
@@ -222,7 +222,7 @@ test "a cache appears under the runtime prefix, or at its own path where no path
     const allocator = testing.allocator;
     const host_dir = "/somewhere/on/the/host/cache";
 
-    if (sandbox.expresses.moved_paths) {
+    if (palisade.Sandbox.expresses.moved_paths) {
         try testing.expectEqualStrings(sandbox_dir, sandboxDirFor(host_dir));
     } else {
         try testing.expectEqualStrings(host_dir, sandboxDirFor(host_dir));

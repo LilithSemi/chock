@@ -54,17 +54,25 @@ pub fn build(b: *std.Build) void {
     const chock_zon_tests = b.addTest(.{ .root_module = chock_zon });
     test_step.dependOn(&b.addRunArtifact(chock_zon_tests).step);
 
-    // The sandbox for a tool call. It imports no other chock library. It has no
-    // build.zig of its own, though: this root build script is the only thing that
-    // builds and tests it.
-    const chock_sandbox = b.addModule("chock-sandbox", .{
-        .root_source_file = b.path("lib/chock-sandbox.zig"),
+    // Process confinement: seccomp, Landlock, namespaces, cgroups, rlimits,
+    // capabilities and Seatbelt. It was Chock's own code until it became its
+    // own library for other projects to use. Every module that confines a
+    // process imports it directly.
+    const palisade = b.dependency("palisade", .{ .target = target, .optimize = optimize }).module("palisade");
+
+    // The links a confined call reaches the host through: the network broker,
+    // the network router, the device link and the guest wire. It imports no
+    // other chock library. It has no build.zig of its own, though: this root
+    // build script is the only thing that builds and tests it.
+    const chock_net = b.addModule("chock-net", .{
+        .root_source_file = b.path("lib/chock-net.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "palisade", .module = palisade }},
     });
 
-    const sandbox_tests = b.addTest(.{ .root_module = chock_sandbox });
-    const run_sandbox_tests = b.addRunArtifact(sandbox_tests);
+    const net_tests = b.addTest(.{ .root_module = chock_net });
+    const run_net_tests = b.addRunArtifact(net_tests);
     // Building a test binary for a foreign target already analyses every
     // declaration `std.testing.refAllDecls` reaches, which is how this
     // project checks a Darwin build: `zig build test -Dtarget=aarch64-macos`
@@ -73,17 +81,17 @@ pub fn build(b: *std.Build) void {
     // flag the same command would fail the whole build on the first module,
     // rather than compiling every one of them and reporting every error.
     // See `std.Build.Step.Run.skip_foreign_checks`'s own doc comment.
-    run_sandbox_tests.skip_foreign_checks = true;
-    test_step.dependOn(&run_sandbox_tests.step);
+    run_net_tests.skip_foreign_checks = true;
+    test_step.dependOn(&run_net_tests.step);
     // Kept as a local, and not folded into `module_test_steps.add`, because
     // `test/sandbox/confine.zig` further down adds to this same step: a
     // top-level step can only be created once, and the helper's own call
     // would be the second.
-    const test_sandbox_step = b.step("test-sandbox", "Run the chock-sandbox tests only");
-    test_sandbox_step.dependOn(&run_sandbox_tests.step);
+    const test_net_step = b.step("test-net", "Run the chock-net tests only");
+    test_net_step.dependOn(&run_net_tests.step);
 
     // The layer for the small number of primitives std.Io does not have. Like
-    // chock-sandbox, it imports no other chock library and has no build.zig of
+    // chock-net, it imports no other chock library and has no build.zig of
     // its own.
     const chock_io = b.addModule("chock-io", .{
         .root_source_file = b.path("lib/chock-io.zig"),
@@ -93,7 +101,7 @@ pub fn build(b: *std.Build) void {
 
     const io_tests = b.addTest(.{ .root_module = chock_io });
     const run_io_tests = b.addRunArtifact(io_tests);
-    // Same reasoning as run_sandbox_tests above: a Darwin cross build compiles
+    // Same reasoning as run_net_tests above: a Darwin cross build compiles
     // chock-io/darwin/driver.zig for real, including its std.c calls, and only
     // skips running the resulting binary, which this host cannot execute.
     run_io_tests.skip_foreign_checks = true;
@@ -101,7 +109,7 @@ pub fn build(b: *std.Build) void {
 
     // The event types and the session log. It imports chock-io, for the one pipe
     // lib/chock-proto/log.zig's own short write test needs; besides that it imports
-    // no other chock library, the same rule chock-sandbox follows.
+    // no other chock library, the same rule chock-net follows.
     const chock_proto = b.addModule("chock-proto", .{
         .root_source_file = b.path("lib/chock-proto.zig"),
         .target = target,
@@ -170,7 +178,7 @@ pub fn build(b: *std.Build) void {
     run_control_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_control_tests.step);
 
-    // The policy table the broker evaluates. Like chock-sandbox and chock-io,
+    // The policy table the broker evaluates. Like chock-net and chock-io,
     // it imports no other chock library and has no build.zig of its own: it
     // reads chock.zon and answers a question about one key, and nothing else in
     // Chock has to be present for that.
@@ -182,9 +190,9 @@ pub fn build(b: *std.Build) void {
     });
 
     // The directory the sandbox mounts, and the git and overlay layers that
-    // build it. Only chock-sandbox is forbidden from importing a library above
-    // it. Nothing forbids chock-workspace from importing chock-sandbox, so this
-    // imports chock-sandbox for the one Mount type a worktree's own mount list,
+    // build it. Only chock-net is forbidden from importing a library above
+    // it. Nothing forbids chock-workspace from importing chock-net, so this
+    // imports chock-net for the one Mount type a worktree's own mount list,
     // an overlay's own mount list, and Sandbox.spawn all need to agree on,
     // field for field. chock-policy comes in for the `workspace` block, whose
     // binds this builds the mount list from.
@@ -193,7 +201,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "chock-sandbox", .module = chock_sandbox },
+            .{ .name = "chock-net", .module = chock_net },
+            .{ .name = "palisade", .module = palisade },
             .{ .name = "chock-policy", .module = chock_policy },
             .{ .name = "chock-zon", .module = chock_zon },
         },
@@ -213,7 +222,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "chock-sandbox", .module = chock_sandbox },
+                .{ .name = "chock-net", .module = chock_net },
+                .{ .name = "palisade", .module = palisade },
                 .{ .name = "chock-workspace", .module = chock_workspace },
             },
         }),
@@ -236,7 +246,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "chock-sandbox", .module = chock_sandbox },
+                .{ .name = "chock-net", .module = chock_net },
+                .{ .name = "palisade", .module = palisade },
                 .{ .name = "chock-policy", .module = chock_policy },
                 .{ .name = "chock-zon", .module = chock_zon },
                 .{ .name = "overlay_helper_path", .module = overlay_helper_path_options.createModule() },
@@ -263,7 +274,7 @@ pub fn build(b: *std.Build) void {
     // never disagree about what a sandboxed process is actually allowed to do.
     // Null on a target that is not Linux, where neither suite is built at all.
     const escape_probe_path_module: ?*std.Build.Module = if (linux_only) probe: {
-        // Like chock-sandbox-probe and chock-workspace-overlay-helper, this
+        // Like chock-net-probe and chock-workspace-overlay-helper, this
         // needs a single threaded caller to call Sandbox.spawn, so it cannot
         // run inside the zig test binary itself. See
         // test/workspace/escape_probe.zig's own top comment.
@@ -273,7 +284,10 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("test/workspace/escape_probe.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "chock-sandbox", .module = chock_sandbox }},
+                .imports = &.{
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
+                },
             }),
         });
 
@@ -293,7 +307,8 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "chock-workspace", .module = chock_workspace },
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                     .{ .name = "escape_probe_path", .module = escape_probe_path_module.? },
                 },
             }),
@@ -309,7 +324,7 @@ pub fn build(b: *std.Build) void {
     // the `Cost` and `Usage` types the log already carries, and nothing else:
     // it reads `chock.zon` and does arithmetic, so it needs no sandbox, no
     // workspace, and no session.
-    // The Agent Client Protocol, from the agent's side. Like chock-sandbox,
+    // The Agent Client Protocol, from the agent's side. Like chock-net,
     // chock-io and chock-policy, it imports no other chock library: it is the
     // wire and nothing else, so the command that answers ACP is the only thing
     // that knows both this and a session.
@@ -321,7 +336,7 @@ pub fn build(b: *std.Build) void {
 
     const acp_tests = b.addTest(.{ .root_module = chock_acp });
     const run_acp_tests = b.addRunArtifact(acp_tests);
-    // Same reasoning as run_sandbox_tests above.
+    // Same reasoning as run_net_tests above.
     run_acp_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_acp_tests.step);
 
@@ -337,7 +352,7 @@ pub fn build(b: *std.Build) void {
 
     const cost_tests = b.addTest(.{ .root_module = chock_cost });
     const run_cost_tests = b.addRunArtifact(cost_tests);
-    // Same reasoning as run_sandbox_tests above.
+    // Same reasoning as run_net_tests above.
     run_cost_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_cost_tests.step);
 
@@ -377,7 +392,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_client_tests.step);
 
     // The seal over a session log's chain head, and the smart card that can hold
-    // the key. Like chock-sandbox, chock-io and chock-policy, it imports no other
+    // the key. Like chock-net, chock-io and chock-policy, it imports no other
     // chock library: verification is std.crypto plus a public key, and a module
     // an auditor uses must not need the log reader, the workspace or a
     // credential store to be present. It links no platform library either, which
@@ -391,7 +406,7 @@ pub fn build(b: *std.Build) void {
 
     const pcsc_tests = b.addTest(.{ .root_module = chock_pcsc });
     const run_pcsc_tests = b.addRunArtifact(pcsc_tests);
-    // Same reasoning as run_sandbox_tests above.
+    // Same reasoning as run_net_tests above.
     run_pcsc_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_pcsc_tests.step);
 
@@ -433,7 +448,7 @@ pub fn build(b: *std.Build) void {
 
     const policy_tests = b.addTest(.{ .root_module = chock_policy });
     const run_policy_tests = b.addRunArtifact(policy_tests);
-    // Same reasoning as run_sandbox_tests above.
+    // Same reasoning as run_net_tests above.
     run_policy_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_policy_tests.step);
 
@@ -472,7 +487,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_udev_tests = b.addRunArtifact(udev_tests);
-    // Same reasoning as run_sandbox_tests above.
+    // Same reasoning as run_net_tests above.
     run_udev_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_udev_tests.step);
 
@@ -488,12 +503,12 @@ pub fn build(b: *std.Build) void {
     // does not import chock-core: the loop calls the broker, never the other
     // way round, which is what lets the broker move into its own process later.
     //
-    // It imports chock-sandbox for one type, `Sandbox.NetBroker`: the seam a
+    // It imports chock-net for one type, `Sandbox.NetBroker`: the seam a
     // filtered sandbox asks for a connection through. The decision belongs
     // here, beside the policy table, and the mechanism belongs there, beside
     // the namespaces, so one of the two has to name the other.
-    // chock-workspace already imports chock-sandbox for the same shape of
-    // reason, and chock-sandbox imports no chock library at all, so this makes
+    // chock-workspace already imports chock-net for the same shape of
+    // reason, and chock-net imports no chock library at all, so this makes
     // no cycle. See lib/chock-broker/network.zig's own top comment.
     const chock_broker = b.addModule("chock-broker", .{
         .root_source_file = b.path("lib/chock-broker.zig"),
@@ -503,14 +518,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "chock-proto", .module = chock_proto },
             .{ .name = "chock-policy", .module = chock_policy },
             .{ .name = "chock-workspace", .module = chock_workspace },
-            .{ .name = "chock-sandbox", .module = chock_sandbox },
+            .{ .name = "chock-net", .module = chock_net },
+            .{ .name = "palisade", .module = palisade },
             .{ .name = "chock-version", .module = chock_version_module },
         },
     });
 
     const broker_tests = b.addTest(.{ .root_module = chock_broker });
     const run_broker_tests = b.addRunArtifact(broker_tests);
-    // Same reasoning as run_sandbox_tests above.
+    // Same reasoning as run_net_tests above.
     run_broker_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_broker_tests.step);
 
@@ -518,7 +534,7 @@ pub fn build(b: *std.Build) void {
     // asserts on a Landlock rule, a seccomp filter, a namespace, or a mount.
     // None of those exist on another target.
     //
-    // **This block sits below chock-broker and not beside chock-sandbox, and
+    // **This block sits below chock-broker and not beside chock-net, and
     // that is on purpose.** The filtered network tests need the real
     // `chock_broker.network.Network` over a real `chock_policy` table on the
     // parent side of a real `Sandbox.spawn`. A stand-in broker written inside
@@ -526,17 +542,18 @@ pub fn build(b: *std.Build) void {
     // permissive than the thing that ships, which is one of the two shapes of
     // vacuous test this project has been caught by. The probe is a test
     // program and not a library, so it is free to import whatever a test
-    // needs: test/broker/actions.zig already imports chock-sandbox for the
+    // needs: test/broker/actions.zig already imports chock-net for the
     // same reason in the other direction.
     if (linux_only) {
         const probe = b.addExecutable(.{
-            .name = "chock-sandbox-probe",
+            .name = "chock-net-probe",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("test/sandbox/probe.zig"),
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                     .{ .name = "chock-broker", .module = chock_broker },
                     .{ .name = "chock-policy", .module = chock_policy },
                     // For a real chock_proto.storage.Memory and a real
@@ -556,7 +573,7 @@ pub fn build(b: *std.Build) void {
         // under the toolchain tree, which is a mount every "spawn-" operation
         // declares. See test/sandbox/dynamic_probe.zig.
         const dynamic_probe = b.addExecutable(.{
-            .name = "chock-sandbox-dynamic-probe",
+            .name = "chock-net-dynamic-probe",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("test/sandbox/dynamic_probe.zig"),
                 .target = target,
@@ -591,14 +608,15 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("test/sandbox/escape.zig"),
                 .target = target,
                 .optimize = optimize,
-                // `chock-sandbox` for one question only: the exit status a
+                // `chock-net` for one question only: the exit status a
                 // probe answers with when this machine will not give it a
                 // sandbox at all. See that suite's own `skipIfNothingMeasured`,
                 // and `test/sandbox/darwin_escape.zig`, which takes the same
                 // narrow import for `confinedAlready`.
                 .imports = &.{
                     .{ .name = "probe_path", .module = probe_path_options.createModule() },
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                 },
             }),
         });
@@ -631,13 +649,16 @@ pub fn build(b: *std.Build) void {
                 // `sandbox_init` and `pthread_create` through it. `std.Thread`
                 // has no other way to start a thread on macOS.
                 .link_libc = target.result.os.tag == .macos,
-                .imports = &.{.{ .name = "chock-sandbox", .module = chock_sandbox }},
+                .imports = &.{
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
+                },
             }),
         });
         const run_confine_tests = b.addRunArtifact(confine_tests);
         run_confine_tests.skip_foreign_checks = target.result.os.tag != .macos;
         test_step.dependOn(&run_confine_tests.step);
-        test_sandbox_step.dependOn(&run_confine_tests.step);
+        test_net_step.dependOn(&run_confine_tests.step);
     }
 
     // macOS only, and for the same reason the block above is Linux only: every
@@ -645,7 +666,7 @@ pub fn build(b: *std.Build) void {
     // was really applied by `sandbox_init`, and no other target has one.
     //
     // **It has to run on a real Mac, and a cross build must not look like it
-    // did.** `run_sandbox_tests` and every other test target here set
+    // did.** `run_net_tests` and every other test target here set
     // `skip_foreign_checks`, so a binary the host cannot run is skipped and the
     // step still reports success. That is how a Darwin cross build from Linux
     // once passed while every Linux only suite inside it had been skipped. A
@@ -654,13 +675,16 @@ pub fn build(b: *std.Build) void {
     // rather than passing quietly.
     if (target.result.os.tag == .macos) {
         const darwin_probe = b.addExecutable(.{
-            .name = "chock-sandbox-darwin-probe",
+            .name = "chock-net-darwin-probe",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("test/sandbox/darwin_probe.zig"),
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
-                .imports = &.{.{ .name = "chock-sandbox", .module = chock_sandbox }},
+                .imports = &.{
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
+                },
             }),
         });
 
@@ -673,13 +697,14 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
-                // `chock-sandbox` for one question only: whether this process
+                // `chock-net` for one question only: whether this process
                 // is inside a profile already, which is the one state in which
                 // none of these tests can be answered. See that suite's own
                 // `requireOwnProfile`.
                 .imports = &.{
                     .{ .name = "probe_path", .module = darwin_probe_path.createModule() },
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                 },
             }),
         });
@@ -699,7 +724,10 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
-                .imports = &.{.{ .name = "chock-sandbox", .module = chock_sandbox }},
+                .imports = &.{
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
+                },
             }),
         });
 
@@ -714,7 +742,8 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
                 .imports = &.{
                     .{ .name = "darwin_workspace_probe_path", .module = darwin_workspace_probe_path.createModule() },
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                     .{ .name = "chock-workspace", .module = chock_workspace },
                 },
             }),
@@ -750,7 +779,8 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "chock-policy", .module = chock_policy },
                     .{ .name = "chock-proto", .module = chock_proto },
                     .{ .name = "chock-workspace", .module = chock_workspace },
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                     .{ .name = "fake_provider", .module = fake_provider },
                     .{ .name = "escape_probe_path", .module = escape_probe_path_module.? },
                 },
@@ -776,7 +806,8 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "chock-workspace", .module = chock_workspace },
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                     .{ .name = "escape_probe_path", .module = escape_probe_path_module.? },
                 },
             }),
@@ -812,7 +843,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // The provider instances a user configured, and where a credential for one
-    // of them is found. Like chock-sandbox, chock-io and chock-policy, it
+    // of them is found. Like chock-net, chock-io and chock-policy, it
     // imports no other chock library and has no build.zig of its own: `chock
     // login` runs before a session, a workspace, or a sandbox exists, so it
     // must not need any of them.
@@ -865,7 +896,7 @@ pub fn build(b: *std.Build) void {
 
     const auth_tests = b.addTest(.{ .root_module = chock_auth });
     const run_auth_tests = b.addRunArtifact(auth_tests);
-    // Same reasoning as run_sandbox_tests above.
+    // Same reasoning as run_net_tests above.
     run_auth_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_auth_tests.step);
 
@@ -928,7 +959,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // What a project's Nix dev shell states: the environment a tool call runs
-    // with, and the store paths the sandbox mounts for it. Like chock-sandbox,
+    // with, and the store paths the sandbox mounts for it. Like chock-net,
     // chock-io, chock-policy and chock-auth, it imports no other chock library:
     // a dev shell is evaluated before a session, a workspace, or a sandbox
     // exists, so it must not need any of them.
@@ -958,7 +989,7 @@ pub fn build(b: *std.Build) void {
 
     const nix_tests = b.addTest(.{ .root_module = chock_nix, .use_llvm = evaluator_llvm });
     const run_nix_tests = b.addRunArtifact(nix_tests);
-    // Same reasoning as run_sandbox_tests above.
+    // Same reasoning as run_net_tests above.
     run_nix_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_nix_tests.step);
 
@@ -1015,7 +1046,7 @@ pub fn build(b: *std.Build) void {
 
     const container_tests = b.addTest(.{ .root_module = chock_container });
     const run_container_tests = b.addRunArtifact(container_tests);
-    // Same reasoning as run_sandbox_tests above.
+    // Same reasoning as run_net_tests above.
     run_container_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_container_tests.step);
 
@@ -1031,7 +1062,7 @@ pub fn build(b: *std.Build) void {
     // Every test here skips itself, rather than failing, on a machine with no
     // runtime or no network to fetch the image with. Linux only: the mount set
     // an image produces binds a target that is not its source, which
-    // lib/chock-sandbox/darwin/driver.zig refuses by design.
+    // lib/chock-net/darwin/driver.zig refuses by design.
     if (linux_only) {
         const container_real_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -1059,7 +1090,10 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("test/container/rootfs_probe.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "chock-sandbox", .module = chock_sandbox }},
+                .imports = &.{
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
+                },
             }),
         });
 
@@ -1074,13 +1108,14 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("test/container/sandbox.zig"),
                 .target = target,
                 .optimize = optimize,
-                // `chock-sandbox` for one question only: the exit status the
+                // `chock-net` for one question only: the exit status the
                 // probe answers with when this machine will not give it a
                 // sandbox at all. See that suite's own `runInside`.
                 .imports = &.{
                     .{ .name = "chock-container", .module = chock_container },
                     .{ .name = "rootfs_probe_path", .module = rootfs_probe_path_options.createModule() },
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                 },
             }),
         });
@@ -1124,7 +1159,7 @@ pub fn build(b: *std.Build) void {
 
     // What a plugin host and a plugin guest both need: the types, the magic,
     // and the metadata format as pure functions over bytes. Like
-    // chock-sandbox and chock-policy, it imports no other chock library, and
+    // chock-net and chock-policy, it imports no other chock library, and
     // for a harder reason than they have: `chock-plugin-sdk` builds it into
     // every plugin, so it must compile for `wasm32-freestanding` where there
     // is no file, no socket, and no allocator worth having. That is also why
@@ -1143,14 +1178,14 @@ pub fn build(b: *std.Build) void {
 
     const plugin_core_tests = b.addTest(.{ .root_module = chock_plugin_core });
     const run_plugin_core_tests = b.addRunArtifact(plugin_core_tests);
-    // Same reasoning as run_sandbox_tests above.
+    // Same reasoning as run_net_tests above.
     run_plugin_core_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_plugin_core_tests.step);
 
     // The tool definitions, the dispatch, and the two tools. See the design
     // spec sections 5, part of 10, and 13. This is the first library whose
     // output can change something on the machine, so it imports
-    // chock-sandbox directly, the same way chock-workspace already does,
+    // chock-net directly, the same way chock-workspace already does,
     // for the one Sandbox.Config and Sandbox.spawn every tool call goes
     // through. It also imports chock-proto directly, for the tool.call and
     // tool.result event types dispatch reads and builds, chock-provider,
@@ -1180,7 +1215,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "chock-sandbox", .module = chock_sandbox },
+            .{ .name = "chock-net", .module = chock_net },
+            .{ .name = "palisade", .module = palisade },
             .{ .name = "chock-proto", .module = chock_proto },
             .{ .name = "chock-provider", .module = chock_provider },
             .{ .name = "chock-io", .module = chock_io },
@@ -1221,7 +1257,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "udev", .module = udev.module("udev") },
                 .{ .name = "chock-core", .module = chock_core },
-                .{ .name = "chock-sandbox", .module = chock_sandbox },
+                .{ .name = "chock-net", .module = chock_net },
+                .{ .name = "palisade", .module = palisade },
             },
         }),
     });
@@ -1239,7 +1276,7 @@ pub fn build(b: *std.Build) void {
     // that climbs out with .." and "read_file refuses an absolute path", still
     // reach dispatch, so they are gated with the rest rather than left behind.
     if (linux_only) {
-        // test/core/tools.zig's own probe: like chock-sandbox-probe,
+        // test/core/tools.zig's own probe: like chock-net-probe,
         // chock-workspace-overlay-helper, and chock-workspace-escape-probe, this
         // needs a single threaded caller to call Sandbox.spawn (by way of
         // chock_core.tools.Registry.dispatch), so it cannot run inside the zig
@@ -1251,7 +1288,8 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                     .{ .name = "chock-core", .module = chock_core },
                 },
             }),
@@ -1270,7 +1308,8 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "chock-workspace", .module = chock_workspace },
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                     // For the bounds the searching tools keep. This suite
                     // reads them from the library rather than writing the
                     // numbers out a second time, so a bound that changes
@@ -1304,7 +1343,8 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                     .{ .name = "chock-core", .module = chock_core },
                 },
             }),
@@ -1321,7 +1361,8 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                     .{ .name = "chock-core", .module = chock_core },
                 },
             }),
@@ -1347,12 +1388,13 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("test/core/lsp.zig"),
                 .target = target,
                 .optimize = optimize,
-                // `chock-sandbox` for one question only: the exit status a
+                // `chock-net` for one question only: the exit status a
                 // probe answers with when this machine will not give it a
                 // sandbox at all. See that suite's `skipIfNothingMeasured`.
                 .imports = &.{
                     .{ .name = "lsp_probe_path", .module = lsp_probe_path_options.createModule() },
-                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
                 },
             }),
         });
@@ -1599,7 +1641,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = if (mirage) |dep| &.{
-            .{ .name = "chock-sandbox", .module = chock_sandbox },
+            .{ .name = "chock-net", .module = chock_net },
+            .{ .name = "palisade", .module = palisade },
             .{ .name = "mirage-backend", .module = dep.module("mirage-backend") },
             .{ .name = "mirage-core", .module = dep.module("mirage-core") },
             .{ .name = "mirage-arch", .module = mirage_arch.? },
@@ -1732,7 +1775,8 @@ pub fn build(b: *std.Build) void {
         // What `chock --version` prints. See the block above.
         .{ .name = "chock-version", .module = chock_version_module },
         .{ .name = "vulcan-wasm", .module = vulcan.module("vulcan-wasm") },
-        .{ .name = "chock-sandbox", .module = chock_sandbox },
+        .{ .name = "chock-net", .module = chock_net },
+        .{ .name = "palisade", .module = palisade },
         .{ .name = "chock-io", .module = chock_io },
         .{ .name = "chock-proto", .module = chock_proto },
         // `chock acp` is the one caller. It is the wire and holds no session, so
@@ -1802,14 +1846,17 @@ pub fn build(b: *std.Build) void {
         // console.
         //
         // The file arrives as an import so it can be embedded, and the embed is
-        // why this cannot live in `chock-sandbox` itself: that module is built for
+        // why this cannot live in `chock-net` itself: that module is built for
         // every target, including the ones Mirage is not built for at all.
         const fs_export = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path("test/sandbox/vmm_allowlist.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "chock-sandbox", .module = chock_sandbox }},
+                .imports = &.{
+                    .{ .name = "chock-net", .module = chock_net },
+                    .{ .name = "palisade", .module = palisade },
+                },
             }),
         });
         fs_export.root_module.addAnonymousImport("mirage-fs-export", .{
@@ -1818,10 +1865,10 @@ pub fn build(b: *std.Build) void {
         const run_fs_export = b.addRunArtifact(fs_export);
         run_fs_export.skip_foreign_checks = true;
         test_step.dependOn(&run_fs_export.step);
-        test_sandbox_step.dependOn(&run_fs_export.step);
+        test_net_step.dependOn(&run_fs_export.step);
 
         // Written out rather than through `module_test_steps.add`, for the reason
-        // `test_sandbox_step` is: two runs share this step, and the helper would be
+        // `test_net_step` is: two runs share this step, and the helper would be
         // the second call to create it.
         const test_vmm_step = b.step("test-vmm", "Run the src/vmm.zig tests only");
         test_vmm_step.dependOn(&run_vmm_tests.step);
@@ -1951,7 +1998,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = evaluator_llvm,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
-    // Same reasoning as run_sandbox_tests above.
+    // Same reasoning as run_net_tests above.
     run_exe_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_exe_tests.step);
     module_test_steps.add(b, "test-exe", "Run the src/ program tests only", &run_exe_tests.step);
@@ -2094,7 +2141,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "chock_main", .module = chock_exe_module },
                 .{ .name = "chock-core", .module = chock_core },
                 .{ .name = "chock-policy", .module = chock_policy },
-                .{ .name = "chock-sandbox", .module = chock_sandbox },
+                .{ .name = "chock-net", .module = chock_net },
+                .{ .name = "palisade", .module = palisade },
                 .{ .name = "repo_root", .module = repo_root_options.createModule() },
             },
         }),
@@ -2347,7 +2395,8 @@ pub fn build(b: *std.Build) void {
                 // For the one test that starts a plugin host the way a session
                 // starts it: the mount tree, the Landlock rules and the
                 // lockdown are all sandbox values.
-                .{ .name = "chock-sandbox", .module = chock_sandbox },
+                .{ .name = "chock-net", .module = chock_net },
+                .{ .name = "palisade", .module = palisade },
                 .{ .name = "engine_paths", .module = engine_paths.createModule() },
             },
         }),

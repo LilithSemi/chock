@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 const chock_core = @import("chock-core");
 
 /// No character in it needs JSON escaping, so `serve` needs no decoder.
@@ -16,7 +16,7 @@ const sandbox_project = "/srv/project";
 pub fn main(init: std.process.Init.Minimal) !u8 {
     return runOperation(init) catch |err| {
         // Nothing is printed: build.zig fails the build on a byte a test binary writes to stderr.
-        if (err == error.NamespaceFailed) return sandbox.namespace.nothing_measured_exit_status;
+        if (err == error.NamespaceFailed) return palisade.linux.namespace.nothing_measured_exit_status;
         return err;
     };
 }
@@ -159,8 +159,8 @@ fn writeFramed(body: []const u8) bool {
 /// `work` is the host side of the workspace, which nothing inside ever sees.
 fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8) !u8 {
     // Asked in a child, the only way to ask without spending this process's own namespace.
-    if (!sandbox.namespace.probeAvailability().available()) {
-        return sandbox.namespace.nothing_measured_exit_status;
+    if (!palisade.linux.namespace.probeAvailability().available()) {
+        return palisade.linux.namespace.nothing_measured_exit_status;
     }
 
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -175,13 +175,13 @@ fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8) !u8 {
     const self_path = try selfExePath(arena);
 
     // The program this starts is a dynamically linked binary out of the store.
-    const workspace_config = sandbox.Config{
+    const workspace_config = palisade.Sandbox.Config{
         .root = root,
         .mounts = &.{
             .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } },
         },
         .rules = &.{
-            .{ .path = "/nix/store", .access = sandbox.landlock.AccessFs.read_only },
+            .{ .path = "/nix/store", .access = palisade.linux.landlock.AccessFs.read_only },
         },
         .cwd = "/",
         .env = &.{},
@@ -194,7 +194,7 @@ fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8) !u8 {
         arena,
         io,
         &env,
-        workspace_config,
+        .{ .config = workspace_config },
         &.{ "/probe", "serve" },
         &.{.{ .bind = .{ .source = self_path, .target = "/probe", .read_only = true } }},
         &.{.{ .path = "/probe", .access = .{ .execute = true, .read_file = true } }},
@@ -206,7 +206,7 @@ fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8) !u8 {
     var driver = chock_core.lsp_driver.Driver{
         .gpa = arena,
         .process = &process,
-        .request = .{ .config = prepared.config, .argv = prepared.argv },
+        .request = .{ .call = prepared.config, .argv = prepared.argv },
         .work_root = work,
         .sandbox_root = sandbox_project,
     };

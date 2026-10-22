@@ -3,7 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 const helper = @import("helper.zig");
 const plugin = @import("plugin.zig");
@@ -338,21 +338,19 @@ fn runOne(
 
 pub fn lockdown(
     allocator: std.mem.Allocator,
-    config: sandbox.Config,
-    reach: []const sandbox.Config.Rule,
-) std.mem.Allocator.Error!sandbox.Config {
-    const rules = try allocator.alloc(sandbox.Config.Rule, reach.len);
+    config: palisade.Sandbox.Config,
+    reach: []const palisade.Sandbox.Rule,
+) std.mem.Allocator.Error!palisade.Sandbox.Config {
+    const rules = try allocator.alloc(palisade.Sandbox.Rule, reach.len);
     for (rules, reach) |*slot, one| slot.* = .{ .path = one.path, .access = readOnly(one.access) };
 
     var out = config;
     out.network = .none;
-    out.net_broker = null;
-    out.net_router = null;
     out.rules = rules;
     return out;
 }
 
-pub fn readOnly(access: sandbox.landlock.AccessFs) sandbox.landlock.AccessFs {
+pub fn readOnly(access: palisade.linux.landlock.AccessFs) palisade.linux.landlock.AccessFs {
     return .{
         .execute = access.execute,
         .read_file = access.read_file,
@@ -614,7 +612,7 @@ test "a driver whose process never started answers gone, and says so once" {
     defer process.deinit(testing.io);
 
     var driver = Driver.init(gpa, &process, .{
-        .config = .{ .root = "/nowhere", .mounts = &.{}, .rules = &.{}, .cwd = "/", .env = &.{} },
+        .call = .{ .config = .{ .root = "/nowhere", .mounts = &.{}, .rules = &.{}, .cwd = "/", .env = &.{} } },
         .argv = &.{"/probe"},
     });
     defer driver.deinit();
@@ -645,11 +643,11 @@ test "a driver whose process never started answers gone, and says so once" {
 }
 
 test "the lockdown takes the network and every rule the caller's config carried" {
-    const permissive: sandbox.Config = .{
+    const permissive: palisade.Sandbox.Config = .{
         .root = "/tmp/root",
         .mounts = &.{},
         .rules = &.{
-            .{ .path = "/work", .access = sandbox.landlock.AccessFs.read_write },
+            .{ .path = "/work", .access = palisade.linux.landlock.AccessFs.read_write },
         },
         .cwd = "/work",
         .env = &.{"PATH=/bin"},
@@ -666,7 +664,7 @@ test "the lockdown takes the network and every rule the caller's config carried"
 }
 
 test "a writable path the caller states comes back read only" {
-    const base: sandbox.Config = .{
+    const base: palisade.Sandbox.Config = .{
         .root = "/tmp/root",
         .mounts = &.{},
         .rules = &.{},
@@ -674,7 +672,7 @@ test "a writable path the caller states comes back read only" {
         .env = &.{},
     };
     const locked = try lockdown(testing.allocator, base, &.{
-        .{ .path = "/plugin.wasm", .access = sandbox.landlock.AccessFs.read_write },
+        .{ .path = "/plugin.wasm", .access = palisade.linux.landlock.AccessFs.read_write },
         .{ .path = "/chock", .access = .{ .execute = true, .read_file = true } },
     });
     defer testing.allocator.free(locked.rules);
@@ -692,7 +690,7 @@ test "a writable path the caller states comes back read only" {
 }
 
 test "readOnly keeps only the three rights that read something" {
-    const every = readOnly(sandbox.landlock.AccessFs.all);
+    const every = readOnly(palisade.linux.landlock.AccessFs.all);
     try testing.expect(every.execute);
     try testing.expect(every.read_file);
     try testing.expect(every.read_dir);

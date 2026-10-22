@@ -1,17 +1,17 @@
 //! Tests that try to escape the Darwin sandbox, each driving a real
-//! `chock_sandbox.spawn` on a real Mac. Several want the operation to succeed,
+//! `palisade.Sandbox.spawn` on a real Mac. Several want the operation to succeed,
 //! because a profile that denied everything would pass a refusal-only suite.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-const chock_sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 // The test runner panics on unknown argv, so build.zig embeds the probe path.
 const probe_path = @import("probe_path").probe_path;
 
 /// Read from the real constant, so an edit to the list cannot leave this stale.
-const default_mach_services = chock_sandbox.darwin_driver_for_testing.default_mach_services;
+const default_mach_services = palisade.Sandbox.default_mach_services;
 
 /// 104 on Darwin, not the 108 that `std.Io.net.UnixAddress.max_len` gives on every platform but Windows.
 const sun_path_len = @typeInfo(@FieldType(std.posix.sockaddr.un, "path")).array.len;
@@ -74,7 +74,7 @@ fn runProbe(argv: []const []const u8) !u8 {
 /// Nix on macOS runs every builder under `sandbox-exec`, and macOS refuses to
 /// nest one profile in another, so this skips there instead of failing.
 fn requireOwnProfile() !void {
-    if (chock_sandbox.darwin_driver_for_testing.confinedAlready()) return error.SkipZigTest;
+    if (palisade.Sandbox.confinedAlready()) return error.SkipZigTest;
 }
 
 fn run(op: []const u8, root: []const u8) !u8 {

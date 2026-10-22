@@ -2,7 +2,9 @@
 //! A guest is a layer, not an alternative: this driver builds no boundary of its own and runs the Linux driver inside the guest.
 const std = @import("std");
 
-const iface = @import("../Sandbox.zig");
+const palisade = @import("palisade");
+const iface = palisade.Sandbox;
+const links = @import("../links.zig");
 const shares_mod = @import("shares.zig");
 const wire = @import("wire.zig");
 
@@ -17,7 +19,7 @@ pub const guarantees: iface.Guarantees = iface.Guarantees.initMany(&.{
     .ipc_isolated,
     .path_restricted,
     .syscall_restricted,
-    .workspace_mounted,
+    .bind_mounts,
 });
 
 /// All five, whatever the host is: a Linux guest has its own kernel, so this closes the Darwin gap.
@@ -45,7 +47,7 @@ pub const Guest = struct {
     lock: std.Io.Mutex = .init,
     /// Read from another thread: a guest resolving a name arrives on Mirage's own control socket, polled while `spawn` blocks here.
     router_lock: std.Io.Mutex = .init,
-    net_router: ?iface.NetRouter = null,
+    net_router: ?links.NetRouter = null,
     refusal_buffer: [max_refusal_bytes]u8 = undefined,
 
     pub const Fault = union(enum) {
@@ -87,13 +89,13 @@ pub const Guest = struct {
         };
     }
 
-    pub fn routerNow(self: *Guest) ?iface.NetRouter {
+    pub fn routerNow(self: *Guest) ?links.NetRouter {
         self.router_lock.lockUncancelable(self.io);
         defer self.router_lock.unlock(self.io);
         return self.net_router;
     }
 
-    fn holdRouter(self: *Guest, one: ?iface.NetRouter) void {
+    fn holdRouter(self: *Guest, one: ?links.NetRouter) void {
         self.router_lock.lockUncancelable(self.io);
         defer self.router_lock.unlock(self.io);
         self.net_router = one;
@@ -123,8 +125,8 @@ pub const Guest = struct {
 
     const vtable: iface.Driver.VTable = .{
         .spawn = spawnThunk,
-        .signalMiddle = signalThunk,
-        .closeMiddle = closeThunk,
+        .signal = signalThunk,
+        .close = closeThunk,
         .joinFreshSessionKeyring = keyringThunk,
         .whyLast = whyThunk,
     };
@@ -139,18 +141,17 @@ pub const Guest = struct {
         allocator: std.mem.Allocator,
         config: iface.Config,
         argv: []const []const u8,
-        landlock_report: ?*iface.LandlockReport,
-        middle: ?*iface.Middle,
+        run: iface.Run,
     ) iface.SpawnError!std.process.Child.Term {
         const self: *Guest = @ptrCast(@alignCast(ptr));
-        return self.spawn(allocator, config, argv, landlock_report, middle);
+        return self.spawn(allocator, config, argv, run);
     }
 
     /// One write of a constant, because a caller may be inside a signal handler.
-    fn signalThunk(ptr: *anyopaque, fd: std.posix.fd_t, sig: std.posix.SIG) iface.SignalError!void {
+    fn signalThunk(ptr: *anyopaque, handle: *const iface.Handle, sig: u32) iface.SignalError!void {
         _ = ptr;
-        if (fd < 0) return error.NoHandle;
-        const line = switch (@intFromEnum(sig)) {
+        const fd = handle.fd() orelse return error.NoHandle;
+        const line = switch (sig) {
             @intFromEnum(std.posix.SIG.KILL) => wire.cancel_kill,
             @intFromEnum(std.posix.SIG.TERM) => wire.cancel_terminate,
             else => return error.NoHandle,
@@ -161,13 +162,13 @@ pub const Guest = struct {
     }
 
     /// Closes nothing: the descriptor is the stream itself, which outlives every call on it.
-    fn closeThunk(ptr: *anyopaque, middle: *iface.Middle) void {
+    fn closeThunk(ptr: *anyopaque, middle: *iface.Handle) void {
         _ = ptr;
-        middle.fd = -1;
-        @atomicStore(std.posix.pid_t, &middle.pid, 0, .release);
+        @atomicStore(i32, &middle.raw_fd, -1, .release);
+        @atomicStore(i32, &middle.raw_pid, 0, .release);
     }
 
-    fn keyringThunk(ptr: *anyopaque, stderr_fd: std.posix.fd_t) iface.KeyringError!void {
+    fn keyringThunk(ptr: *anyopaque, stderr_fd: i32) iface.KeyringError!void {
         _ = ptr;
         _ = stderr_fd;
         // The guest joins its own keyring inside; a host side join here would not be the point.
@@ -211,7 +212,7 @@ pub const Guest = struct {
         const router = self.routerNow() orelse
             return wire.write(writer, wire.Resolved{ .refused = true });
 
-        const want: iface.NetRouter.Family = if (asked.ipv6) .ipv6 else .ipv4;
+        const want: links.NetRouter.Family = if (asked.ipv6) .ipv6 else .ipv4;
         switch (router.resolve(asked.resolve, want)) {
             .granted => |address| {
                 var room: [wire.max_reaching_text]u8 = undefined;
@@ -251,33 +252,44 @@ pub const Guest = struct {
         allocator: std.mem.Allocator,
         config: iface.Config,
         argv: []const []const u8,
-        landlock_report: ?*iface.LandlockReport,
-        middle: ?*iface.Middle,
+        run: iface.Run,
     ) iface.SpawnError!std.process.Child.Term {
+        return self.spawnLinked(allocator, config, argv, run, .{});
+    }
+
+    /// The links are taken under the same lock as the call, so a second caller
+    /// cannot swap the router out from under the first.
+    pub fn spawnLinked(
+        self: *Guest,
+        allocator: std.mem.Allocator,
+        config: iface.Config,
+        argv: []const []const u8,
+        run: iface.Run,
+        set: links.Set,
+    ) iface.SpawnError!std.process.Child.Term {
+        const middle = run.handle;
+        const landlock_report = run.reports.landlock;
         // Filled before the lock, not after: a call queued behind another must already have a middle.
         // Copied before the middle is filled and closed at the end, so a closed descriptor number is never reused under us.
         const out_fd = dupOne(config.stdout_fd) orelse {
             self.fault = .{ .gone = "copying the caller's own output descriptor" };
-            return error.GuestGone;
+            return error.RemoteGone;
         };
         defer closeOne(out_fd);
         const err_fd = dupOne(config.stderr_fd) orelse {
             self.fault = .{ .gone = "copying the caller's own error descriptor" };
-            return error.GuestGone;
+            return error.RemoteGone;
         };
         defer closeOne(err_fd);
 
-        if (middle) |slot| {
-            slot.fd = self.stream.handle;
-            @atomicStore(std.posix.pid_t, &slot.pid, iface.Middle.elsewhere, .release);
-        }
+        if (middle) |slot| slot.publish(iface.Handle.elsewhere, self.stream.handle);
 
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
 
         self.fault = null;
 
-        self.holdRouter(config.net_router);
+        self.holdRouter(set.net_router);
         defer self.holdRouter(null);
 
         var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -286,11 +298,11 @@ pub const Guest = struct {
 
         if (config.containment == .supplied) {
             self.fault = .{ .not_expressible = .supplied_cgroup };
-            return error.GuestCannotExpress;
+            return error.RemoteCannotExpress;
         }
-        if (config.device_tree != null) {
+        if (set.device_tree != null or set.device_source != null) {
             self.fault = .{ .not_expressible = .device_tree };
-            return error.GuestCannotExpress;
+            return error.RemoteCannotExpress;
         }
 
         var share_fault: ?shares_mod.Fault = null;
@@ -303,7 +315,7 @@ pub const Guest = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.NotPlaceable => {
                 self.fault = .{ .share = self.keepShareFault(share_fault.?) };
-                return error.GuestCannotPlacePath;
+                return error.RemoteCannotPlacePath;
             },
         };
 
@@ -312,7 +324,7 @@ pub const Guest = struct {
         // requestFor already handled the two checked cases; reaching here with none means a third was added without a check.
         const asked = request orelse {
             self.fault = .{ .not_expressible = .supplied_cgroup };
-            return error.GuestCannotExpress;
+            return error.RemoteCannotExpress;
         };
 
         var timed = asked;
@@ -321,7 +333,7 @@ pub const Guest = struct {
         var writer = self.stream.writerStreaming(self.io, self.write_buffer);
         wire.write(&writer.interface, timed) catch {
             self.fault = .{ .gone = "writing the request" };
-            return error.GuestGone;
+            return error.RemoteGone;
         };
 
         var reader = self.stream.readerStreaming(self.io, self.read_buffer);
@@ -337,7 +349,7 @@ pub const Guest = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.Ended => {
                 self.fault = .{ .gone = "reading what the guest sent back: it closed the stream" };
-                return error.GuestGone;
+                return error.RemoteGone;
             },
             error.Broke => {
                 const named = if (reader.err) |one| @errorName(one) else "no reason kept";
@@ -346,11 +358,11 @@ pub const Guest = struct {
                     "reading what the guest sent back: the read failed with {s}",
                     .{named},
                 ) catch "reading what the guest sent back: the read itself failed" };
-                return error.GuestGone;
+                return error.RemoteGone;
             },
             error.TooLong, error.Unreadable => {
                 self.fault = .{ .refused = "the guest said something this build cannot read" };
-                return error.GuestRefused;
+                return error.RemoteRefused;
             },
         };
         if (parsed.value.landlock) |said| {
@@ -361,7 +373,7 @@ pub const Guest = struct {
         if (parsed.value.ended != null and frames == 0) {
             self.fault = .{ .refused = "the guest is an older build than this host: it ran the " ++
                 "call and sent nothing back. Rebuild the initrd." };
-            return error.GuestRefused;
+            return error.RemoteRefused;
         }
 
         const ended = parsed.value.ended orelse {
@@ -370,7 +382,7 @@ pub const Guest = struct {
             const kept = @min(said.len, self.refusal_buffer.len);
             @memcpy(self.refusal_buffer[0..kept], said[0..kept]);
             self.fault = .{ .refused = self.refusal_buffer[0..kept] };
-            return error.GuestRefused;
+            return error.RemoteRefused;
         };
 
         return switch (ended) {
@@ -404,15 +416,12 @@ test "the driver promises what the driver inside a guest promises, and expresses
         try testing.expect(@field(expresses, field_name));
     }
 
-    const darwin_driver = @import("../darwin/driver.zig");
     inline for (@typeInfo(iface.Expresses).@"struct".field_names, @typeInfo(iface.Expresses).@"struct".field_types) |field_name, _| {
-        try testing.expect(!@field(darwin_driver.expresses, field_name));
+        try testing.expect(!@field(palisade.darwin.expresses, field_name));
     }
 
-    if (@import("builtin").os.tag != .linux) return;
-    const linux_driver = @import("../linux/driver.zig");
-    try testing.expectEqual(linux_driver.guarantees, guarantees);
-    try testing.expectEqual(linux_driver.expresses, expresses);
+    try testing.expectEqual(palisade.linux.guarantees, guarantees);
+    try testing.expectEqual(palisade.linux.expresses, expresses);
 }
 
 test "every reason a guest cannot be asked for something has words of its own" {
@@ -455,8 +464,8 @@ test "a config a guest cannot be asked for never reaches the wire" {
     var supplied = plain;
     supplied.containment = .{ .supplied = .{ .fd = 7 } };
     try testing.expectError(
-        error.GuestCannotExpress,
-        guest.spawn(testing.allocator, supplied, &.{"/bin/true"}, null, null),
+        error.RemoteCannotExpress,
+        guest.spawn(testing.allocator, supplied, &.{"/bin/true"}, .{}),
     );
     try testing.expectEqual(Guest.NotExpressible.supplied_cgroup, guest.fault.?.not_expressible);
 }
@@ -468,8 +477,8 @@ test "a path no share holds is refused before the wire, and names the path" {
     reaching.mounts = &.{.{ .bind = .{ .source = "/home/ross/.ssh", .target = "/keys" } }};
 
     try testing.expectError(
-        error.GuestCannotPlacePath,
-        guest.spawn(testing.allocator, reaching, &.{"/bin/true"}, null, null),
+        error.RemoteCannotPlacePath,
+        guest.spawn(testing.allocator, reaching, &.{"/bin/true"}, .{}),
     );
     try testing.expectEqualStrings("/home/ross/.ssh", guest.fault.?.share.not_offered);
 }
@@ -485,8 +494,8 @@ test "a mount that writes into a read only share is refused before the wire" {
     } }};
 
     try testing.expectError(
-        error.GuestCannotPlacePath,
-        guest.spawn(testing.allocator, writing, &.{"/bin/true"}, null, null),
+        error.RemoteCannotPlacePath,
+        guest.spawn(testing.allocator, writing, &.{"/bin/true"}, .{}),
     );
     try testing.expectEqualStrings("/nix/store/aaa-out", guest.fault.?.share.needs_writing);
 }
@@ -498,7 +507,11 @@ test "a cancel is one line on the stream, and nothing joins a keyring on a guest
     const as_driver = guest.driver();
 
     try testing.expectError(error.Refused, as_driver.joinFreshSessionKeyring(2));
-    try testing.expectError(error.NoHandle, as_driver.signalMiddle(-1, .TERM));
+    var unspawned: iface.Handle = .{};
+    try testing.expectError(
+        error.NoHandle,
+        as_driver.signal(&unspawned, @intFromEnum(std.posix.SIG.TERM)),
+    );
 
     var pair: [2]std.posix.fd_t = undefined;
     const made = std.os.linux.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair);
@@ -506,18 +519,21 @@ test "a cancel is one line on the stream, and nothing joins a keyring on a guest
     const other = std.Io.File{ .handle = pair[1], .flags = .{ .nonblocking = false } };
     defer other.close(testing.io);
 
-    try as_driver.signalMiddle(pair[0], .TERM);
-    try as_driver.signalMiddle(pair[0], .KILL);
-    try testing.expectError(error.NoHandle, as_driver.signalMiddle(pair[0], .HUP));
+    var live: iface.Handle = .{ .driver = as_driver };
+    live.publish(iface.Handle.elsewhere, pair[0]);
+    try live.signal(@intFromEnum(std.posix.SIG.TERM));
+    try live.signal(@intFromEnum(std.posix.SIG.KILL));
+    try testing.expectError(error.NoHandle, live.signal(@intFromEnum(std.posix.SIG.HUP)));
 
     var read_into: [64]u8 = undefined;
     const got = try std.posix.read(pair[1], &read_into);
     try testing.expectEqualStrings(wire.cancel_terminate ++ wire.cancel_kill, read_into[0..got]);
 
-    var middle: iface.Middle = .{ .fd = pair[0], .pid = iface.Middle.elsewhere };
-    as_driver.closeMiddle(&middle);
-    try testing.expectEqual(@as(std.posix.fd_t, -1), middle.fd);
-    try testing.expectEqual(@as(std.posix.pid_t, 0), middle.pid);
+    var middle: iface.Handle = .{ .driver = as_driver };
+    middle.publish(iface.Handle.elsewhere, pair[0]);
+    middle.close();
+    try testing.expectEqual(@as(?i32, null), middle.pid());
+    try testing.expectEqual(@as(?i32, null), middle.fd());
     defer std.Io.File.close(.{ .handle = pair[0], .flags = .{ .nonblocking = false } }, testing.io);
 
     try testing.expectEqualStrings(driver_name, as_driver.name);
@@ -619,8 +635,8 @@ test "a guest that ran the call and sent nothing back is named as an older build
     };
 
     try testing.expectError(
-        error.GuestRefused,
-        guest.spawn(testing.allocator, plain, &.{"/bin/true"}, null, null),
+        error.RemoteRefused,
+        guest.spawn(testing.allocator, plain, &.{"/bin/true"}, .{}),
     );
     try testing.expect(std.mem.indexOf(u8, guest.why().?, "Rebuild the initrd") != null);
 }

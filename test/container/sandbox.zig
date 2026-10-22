@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const chock_container = @import("chock-container");
-const sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
 
 const Image = chock_container.Image;
 const Runtime = chock_container.Runtime;
@@ -141,7 +141,7 @@ fn runInside(arranged: *const Arranged, allocator: std.mem.Allocator, argv: []co
         .exited => |c| c,
         else => 255,
     };
-    if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
+    if (code == palisade.linux.namespace.nothing_measured_exit_status) return error.SkipZigTest;
     return code;
 }
 

@@ -2,7 +2,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const chock_sandbox = @import("chock-sandbox");
+const palisade = @import("palisade");
+const chock_net = @import("chock-net");
 
 const linux = std.os.linux;
 
@@ -10,8 +11,8 @@ const is_linux = builtin.os.tag == .linux;
 
 const tty = @import("tty.zig");
 
-const wire = chock_sandbox.vm_wire;
-const Sandbox = chock_sandbox.Sandbox;
+const wire = chock_net.vm_wire;
+const Sandbox = palisade.Sandbox;
 
 pub const default_port: u32 = 1024;
 
@@ -157,7 +158,7 @@ fn serveOne(
 const Watch = struct {
     fd: std.posix.fd_t,
     io: std.Io,
-    middle: Sandbox.Middle = .{},
+    middle: Sandbox.Handle = .{},
     armed: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     reading: std.Io.Mutex = .init,
@@ -205,18 +206,18 @@ const Watch = struct {
                 if (linux.errno(got) != .SUCCESS or got == 0) break;
                 taken += got;
             }
-            self.deliver(@enumFromInt(cancel.signal));
+            self.deliver(cancel.signal);
         }
     }
 
-    fn deliver(self: *Watch, sig: std.posix.SIG) void {
+    fn deliver(self: *Watch, sig: u32) void {
         var waited: u32 = 0;
         while (waited < wait_for_fork_ms) : (waited += @intCast(poll_ms)) {
             if (!self.armed.load(.acquire)) return;
-            if (@atomicLoad(std.posix.pid_t, &self.middle.pid, .acquire) != 0) break;
+            if (self.middle.pid() != null) break;
             sleepMs(poll_ms);
         }
-        Sandbox.signalMiddle(self.middle.fd, sig) catch {};
+        self.middle.signal(sig) catch {};
     }
 };
 
@@ -348,21 +349,27 @@ fn answer(
         .writer = writer,
         .watch = watch,
     };
-    if (config.network != .none) config.net_router = reaching.router();
+    var set: chock_net.Set = .{};
+    if (config.network != .none) set.net_router = reaching.router();
 
     setClock(io, request.now_ns);
 
     var report: Sandbox.LandlockReport = std.mem.zeroes(Sandbox.LandlockReport);
 
-    var middle: ?*Sandbox.Middle = null;
+    var middle: ?*Sandbox.Handle = null;
     if (watch) |one| {
         one.middle = .{};
         one.armed.store(true, .release);
         middle = &one.middle;
     }
-    defer if (watch) |one| Sandbox.closeMiddle(&one.middle);
+    defer if (watch) |one| one.middle.close();
 
-    const term = Sandbox.spawn(arena, config, request.argv, &report, middle) catch |err| {
+    const term = chock_net.Driver.native_driver.spawn(
+        arena,
+        .{ .config = config, .links = set },
+        request.argv,
+        .{ .handle = middle, .reports = .{ .landlock = &report } },
+    ) catch |err| {
         // Disarmed before the answer goes out, never in a `defer`, or a watcher
         // still armed takes the host's next request for a cancel.
         if (watch) |one| one.armed.store(false, .release);
@@ -405,11 +412,11 @@ const HostNet = struct {
     writer: *std.Io.Writer,
     watch: ?*Watch,
 
-    fn router(self: *HostNet) Sandbox.NetRouter {
+    fn router(self: *HostNet) chock_net.NetRouter {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: Sandbox.NetRouter.VTable = .{
+    const vtable: chock_net.NetRouter.VTable = .{
         .resolve = resolveThunk,
         .open = openThunk,
     };
@@ -417,8 +424,8 @@ const HostNet = struct {
     fn resolveThunk(
         ptr: *anyopaque,
         host: []const u8,
-        want: Sandbox.NetRouter.Family,
-    ) Sandbox.NetRouter.Resolution {
+        want: chock_net.NetRouter.Family,
+    ) chock_net.NetRouter.Resolution {
         const self: *HostNet = @ptrCast(@alignCast(ptr));
 
         noteResolveAsked(self.io, host);
@@ -469,7 +476,7 @@ const HostNet = struct {
         what: []const u8,
         host: []const u8,
         err: anyerror,
-    ) Sandbox.NetRouter.Resolution {
+    ) chock_net.NetRouter.Resolution {
         var room: [256]u8 = undefined;
         const line = std.fmt.bufPrint(
             &room,
@@ -482,9 +489,9 @@ const HostNet = struct {
 
     fn openThunk(
         ptr: *anyopaque,
-        address: Sandbox.NetRouter.Address,
+        address: chock_net.NetRouter.Address,
         port: u16,
-    ) Sandbox.NetBroker.Grant {
+    ) chock_net.NetBroker.Grant {
         const self: *HostNet = @ptrCast(@alignCast(ptr));
         _ = self;
 
@@ -756,7 +763,7 @@ test "the host driver and this program agree, over a real pair of streams" {
 
     var read_buffer: [8192]u8 = undefined;
     var write_buffer: [8192]u8 = undefined;
-    const guest = chock_sandbox.vm_driver.Guest{
+    const guest = chock_net.vm_driver.Guest{
         .stream = host,
         .io = io,
         .shares = .{
@@ -787,8 +794,8 @@ test "the host driver and this program agree, over a real pair of streams" {
 
     var request_buffer: [8192]u8 = undefined;
     var writing = host.writer(io, &request_buffer);
-    var share_fault: ?chock_sandbox.vm_shares.Fault = null;
-    const moved = try chock_sandbox.vm_shares.translate(arena, config, guest.shares, &share_fault);
+    var share_fault: ?chock_net.vm_shares.Fault = null;
+    const moved = try chock_net.vm_shares.translate(arena, config, guest.shares, &share_fault);
     const asked = (try wire.requestFor(arena, moved, &.{})).?;
     try wire.write(&writing.interface, asked);
 

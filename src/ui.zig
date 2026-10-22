@@ -15,7 +15,6 @@ const approval = @import("approval.zig");
 const clock_mod = @import("clock.zig");
 const chock_broker = @import("chock-broker");
 const chock_policy = @import("chock-policy");
-const sandbox = @import("chock-sandbox");
 const chock_ui = @import("chock-ui");
 
 const ui_text = chock_ui.text;
@@ -1775,7 +1774,7 @@ test "a task finished while the field is up is shown once, and not again when th
 
     const argv = [_][]const u8{"make"};
     _ = try table.start(testing.io, .{
-        .config = .{ .root = "/root", .mounts = &.{}, .rules = &.{}, .cwd = "/project", .env = &.{} },
+        .call = .{ .config = .{ .root = "/root", .mounts = &.{}, .rules = &.{}, .cwd = "/project", .env = &.{} } },
         .argv = &argv,
     });
     table.waitAll();
