@@ -7,14 +7,16 @@ the whole directory to home-manager.
 .{
     .providers = .{
         .{ .name = "local", .kind = "openai-compat", .base_url = "http://127.0.0.1:5000/v1" },
+        .{ .name = "chatgpt", .kind = "openai" },
         .{ .name = "work", .kind = "aiand" },
     },
     .defaults = .{ .provider = "local", .model = "glm4.7-flash:A3B" },
 }
 ```
 
-The kinds are `anthropic`, `aiand`, and `openai-compat`. An `openai-compat`
-instance also needs a `base_url`.
+The kinds are `anthropic`, `aiand`, `openai`, and `openai-compat`. The `openai`
+kind uses OpenAI's Responses API and a ChatGPT web login. An `openai-compat`
+instance uses Chat Completions and also needs a `base_url`.
 
 ## The name is the identity
 
@@ -69,10 +71,15 @@ not there" and "the field is there and holds nothing" stay two different
 facts.
 
 The third line above is what a local endpoint needs. `chock run` still refuses
-it for an instance of kind `anthropic` or `aiand` that talks to that kind's
-own address, because those two refuse every request that carries no
+it for an instance of kind `anthropic`, `aiand`, or `openai` that talks to that
+kind's own address, because those addresses refuse every request that carries no
 credential. The refusal comes before anything is built, so no workspace and no
 log are left behind.
+
+Use the third spelling for `openai`, then run `chock login --provider openai`.
+An OpenAI API key is not a credential for this kind. Use `openai-compat` with
+`.token_file` when you want to call an OpenAI-compatible endpoint with an API
+key.
 
 Where a lookup goes, and what `chock login` writes, is in
 [credentials.md](../operate/credentials.md).

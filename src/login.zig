@@ -1,6 +1,7 @@
 //! `chock login`: put one credential in the store.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const chock_auth = @import("chock-auth");
 const chock_policy = @import("chock-policy");
 
@@ -12,7 +13,7 @@ const usage_text =
     \\       chock login --search <name> [options]
     \\       chock login --tool-secret <name> [options]
     \\
-    \\Kinds: anthropic, aiand, openai-compat=<url>
+    \\Kinds: anthropic, aiand, openai, openai-compat=<url>
     \\
     \\Options:
     \\  --search <name>            Store the key of a web search engine under this name,
@@ -137,10 +138,16 @@ pub fn main(
             }
         }
     }
-    const credential = readCredential(gpa, io, method, name) catch |err| switch (err) {
-        error.Reported => return Exit.usage.code(),
-        else => |e| return e,
-    };
+    const credential = if (kind_and_url.kind == .openai)
+        openAiCredential(arena, gpa, io, &env, store, name) catch |err| {
+            tty.print(.err, "chock login: OpenAI web login failed: {t}\n", .{err});
+            return Exit.usage.code();
+        }
+    else
+        readCredential(gpa, io, method, name) catch |err| switch (err) {
+            error.Reported => return Exit.usage.code(),
+            else => |e| return e,
+        };
     defer {
         std.crypto.secureZero(u8, credential);
         gpa.free(credential);
@@ -162,43 +169,46 @@ pub fn main(
         return Exit.usage.code();
     };
 
-    tty.print(.plain, "chock login: asking {s} whether this credential works...\n", .{target.base_url});
-    var outcome = try chock_auth.check.credential(gpa, io, target.kind, target.base_url, credential);
-    defer outcome.deinit(gpa);
-    switch (outcome) {
-        .ok => |ok| {
-            if (ok.model_count) |count| {
+    if (target.kind != .openai) check: {
+        tty.print(.plain, "chock login: asking {s} whether this credential works...\n", .{target.base_url});
+        var outcome = try chock_auth.check.credential(gpa, io, target.kind, target.base_url, credential);
+        defer outcome.deinit(gpa);
+        switch (outcome) {
+            .ok => |ok| {
+                if (ok.model_count) |count| {
+                    tty.print(
+                        .plain,
+                        "chock login: {s} at {s} answered and listed {d} models.\n",
+                        .{ target.kind.wireName(), target.base_url, count },
+                    );
+                } else {
+                    tty.print(
+                        .plain,
+                        "chock login: {s} at {s} answered and accepted the credential.\n",
+                        .{ target.kind.wireName(), target.base_url },
+                    );
+                }
+            },
+            .rejected => |rejected| {
                 tty.print(
-                    .plain,
-                    "chock login: {s} at {s} answered and listed {d} models.\n",
-                    .{ target.kind.wireName(), target.base_url, count },
+                    .warn,
+                    "chock login: {s} refused this credential with status {d}: {s}\n" ++
+                        "Nothing was stored.\n",
+                    .{ target.base_url, @backingInt(rejected.status), std.mem.trim(u8, rejected.body, " \t\r\n") },
                 );
-            } else {
+                return Exit.usage.code();
+            },
+            .not_reached => |reason| {
                 tty.print(
-                    .plain,
-                    "chock login: {s} at {s} answered and accepted the credential.\n",
-                    .{ target.kind.wireName(), target.base_url },
+                    .warn,
+                    "chock login: {s} could not be reached ({s}), so this credential was not checked. " ++
+                        "Nothing was stored.\n",
+                    .{ target.base_url, reason },
                 );
-            }
-        },
-        .rejected => |rejected| {
-            tty.print(
-                .warn,
-                "chock login: {s} refused this credential with status {d}: {s}\n" ++
-                    "Nothing was stored.\n",
-                .{ target.base_url, @intFromEnum(rejected.status), std.mem.trim(u8, rejected.body, " \t\r\n") },
-            );
-            return Exit.usage.code();
-        },
-        .not_reached => |reason| {
-            tty.print(
-                .warn,
-                "chock login: {s} could not be reached ({s}), so this credential was not checked. " ++
-                    "Nothing was stored.\n",
-                .{ target.base_url, reason },
-            );
-            return Exit.usage.code();
-        },
+                return Exit.usage.code();
+            },
+        }
+        break :check;
     }
 
     var put_diag: ?chock_auth.store.Diagnostic = null;
@@ -227,6 +237,123 @@ pub fn main(
 
     reportConfiguration(arena, config_dir, name, target, loaded);
     return Exit.finished.code();
+}
+
+fn openAiCredential(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    store: chock_auth.store.Store,
+    name: []const u8,
+) ![]u8 {
+    const oauth = chock_auth.openai_oauth;
+    var previous: ?chock_auth.store.Stored = try store.get(gpa, io, name, null);
+    defer if (previous) |*held| held.deinit();
+
+    var previous_credential: ?std.json.Parsed(oauth.Credential) = null;
+    defer if (previous_credential) |*held| held.deinit();
+    if (previous) |held| {
+        if (std.mem.eql(u8, held.kind, "openai")) {
+            previous_credential = oauth.Credential.parse(gpa, held.token) catch null;
+        }
+    }
+
+    const host_id = if (previous_credential) |*held|
+        try arena.dupe(u8, held.value.ext_agent_host_id)
+    else
+        try oauth.hostId(arena, io);
+    const registration: oauth.Registration = if (previous_credential) |*held| .{
+        .client_id = held.value.client_id,
+        .host_id = host_id,
+        .login_hint = if (held.value.email.len == 0) null else held.value.email,
+    } else .{ .host_id = host_id };
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    const callback_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/auth/callback", .{port});
+    var attempt = oauth.Attempt.init(io);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&attempt));
+    const url = try oauth.authorizationUrl(arena, callback_url, &attempt, registration);
+
+    tty.print(.plain, "chock login: opening OpenAI in your browser. Waiting for the callback on 127.0.0.1...\n", .{});
+    openBrowser(io, env, url) catch {
+        reportBrowserFailure(url);
+    };
+
+    var stream = try listener.accept(io);
+    defer stream.close(io);
+    var read_buffer: [16 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var write_buffer: [4 * 1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    var server = std.http.Server.init(&reader.interface, &writer.interface);
+    var request = try server.receiveHead();
+    const callback = oauth.parseCallback(arena, request.head.target, &attempt.state) catch |err| {
+        request.respond("OpenAI login was not accepted. You can close this page.\n", .{
+            .status = .bad_request,
+            .keep_alive = false,
+            .extra_headers = &.{.{ .name = "content-type", .value = "text/plain; charset=utf-8" }},
+        }) catch {};
+        return err;
+    };
+    try request.respond("OpenAI returned to Chock. You can close this page and return to the terminal.\n", .{
+        .keep_alive = false,
+        .extra_headers = &.{.{ .name = "content-type", .value = "text/plain; charset=utf-8" }},
+    });
+
+    const client_id = if (registration.isInitial())
+        callback.client_id orelse return error.MissingIssuedClientId
+    else blk: {
+        if (callback.client_id) |given| if (!std.mem.eql(u8, given, registration.client_id)) return error.ClientIdChanged;
+        break :blk registration.client_id;
+    };
+    var token_set = try oauth.exchangeCode(arena, io, callback.code, client_id, &attempt.verifier, callback_url);
+    defer token_set.deinit();
+    const token = token_set.value;
+    const jwks = try oauth.fetchJwks(arena, io);
+    const now = @divTrunc(std.Io.Timestamp.now(io, .real).toMilliseconds(), 1000);
+    const identity = try oauth.verifyIdToken(arena, token.id_token, jwks, client_id, &attempt.nonce, now);
+    const saved = oauth.Credential{
+        .email = identity.email,
+        .issuer = oauth.issuer,
+        .subject = identity.subject,
+        .client_id = client_id,
+        .ext_agent_host_id = host_id,
+        .id_token = token.id_token,
+        .access_token = token.access_token,
+        .refresh_token = token.refresh_token,
+        .token_type = token.token_type,
+        .expires_at = now + token.expires_in,
+        .earliest_refresh_at = token.earliest_refresh_at,
+        .scope = token.scope,
+    };
+    if (!saved.hasInferenceScope()) return error.InferenceScopeNotGranted;
+    return saved.serialize(gpa);
+}
+
+fn openBrowser(io: std.Io, env: *const std.process.Environ.Map, url: []const u8) !void {
+    const command = switch (builtin.os.tag) {
+        .macos => "open",
+        else => "xdg-open",
+    };
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ command, url },
+        .environ_map = env,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    switch (try child.wait(io)) {
+        .exited => |status| if (status != 0) return error.BrowserDidNotOpen,
+        else => return error.BrowserDidNotOpen,
+    }
+}
+
+fn reportBrowserFailure(url: []const u8) void {
+    tty.print(.err, "chock login: the browser did not open. Continue at:\n{s}\n", .{url});
 }
 
 fn searchLogin(
@@ -899,6 +1026,18 @@ fn parseMethod(text: []const u8) ParseError!Method {
 
 const testing = std.testing;
 
+test "a failed browser launch prints the OpenAI authorization link" {
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    const url = "https://auth.openai.com/authorize?client_id=dynamic_agent_client&state=test";
+    reportBrowserFailure(url);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "browser did not open") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), url) != null);
+    try testing.expectEqualStrings("", said.out());
+}
+
 test "a kind with an address of its own gets it, and one without needs a URL" {
     var said: tty.Capture = undefined;
     said.start(testing.io, testing.allocator);
@@ -917,8 +1056,8 @@ test "a kind with an address of its own gets it, and one without needs a URL" {
     try testing.expect(std.mem.indexOf(u8, said.err(), "openai-compat=") != null);
 
     said.clear();
-    try testing.expectError(error.BadArguments, splitProvider("openai"));
-    for ([_][]const u8{ "anthropic", "aiand", "openai-compat" }) |kind| {
+    try testing.expectError(error.BadArguments, splitProvider("mystery"));
+    for ([_][]const u8{ "anthropic", "aiand", "openai", "openai-compat" }) |kind| {
         try testing.expect(std.mem.indexOf(u8, said.err(), kind) != null);
     }
 

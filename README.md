@@ -57,6 +57,7 @@ approval nobody answers is a refusal.
 
 - [ai&](https://aiand.com)
 - Anthropic
+- OpenAI through a ChatGPT account
 - Any OpenAI compatible endpoint
 
 ## Getting started
@@ -64,6 +65,7 @@ approval nobody answers is a refusal.
 ```
 chock doctor                        # can this machine contain a session
 chock login --provider aiand        # store a credential
+chock login --provider openai       # sign in through the browser
 cd ~/some-project
 chock run "add a test for the parser"
 chock -- add a test for the parser  # the same task, with no subcommand

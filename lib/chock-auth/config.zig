@@ -14,12 +14,14 @@ pub const max_file_bytes: usize = 256 * 1024;
 pub const Kind = enum {
     anthropic,
     aiand,
+    openai,
     openai_compat,
 
     pub fn wireName(self: Kind) []const u8 {
         return switch (self) {
             .anthropic => "anthropic",
             .aiand => "aiand",
+            .openai => "openai",
             .openai_compat => "openai-compat",
         };
     }
@@ -32,19 +34,20 @@ pub const Kind = enum {
         return null;
     }
 
-    pub const all_wire_names = "anthropic, aiand, openai-compat";
+    pub const all_wire_names = "anthropic, aiand, openai, openai-compat";
 
     pub fn defaultBaseUrl(self: Kind) []const u8 {
         return switch (self) {
             .anthropic => "https://api.anthropic.com/v1",
             .aiand => "https://api.aiand.com/v1",
+            .openai => "https://api.openai.com/v1",
             .openai_compat => "",
         };
     }
 
     pub fn hostedEndpointNeedsCredential(self: Kind) bool {
         return switch (self) {
-            .anthropic, .aiand => true,
+            .anthropic, .aiand, .openai => true,
             .openai_compat => false,
         };
     }
@@ -825,7 +828,7 @@ test "a field that is present and holds nothing is refused, because absence alre
 test "a kind Chock does not know is refused, and a kind with no address of its own needs one" {
     const gpa = testing.allocator;
     try testing.expectError(error.UnknownProviderKind, parse(gpa,
-        \\.{ .providers = .{ .{ .kind = "openai" } } }
+        \\.{ .providers = .{ .{ .kind = "mystery" } } }
     , null));
     try testing.expectError(error.NoBaseUrl, parse(gpa,
         \\.{ .providers = .{ .{ .kind = "openai-compat" } } }
@@ -984,14 +987,14 @@ test "the provider a refused entry names reaches the caller, and no longer only 
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
     try testing.expectError(error.UnknownProviderKind, parse(gpa,
-        \\.{ .providers = .{ .{ .kind = "openai" } } }
+        \\.{ .providers = .{ .{ .kind = "mystery" } } }
     , &diag));
-    try testing.expectEqualStrings("openai", diag.?.unknown_provider_kind);
+    try testing.expectEqualStrings("mystery", diag.?.unknown_provider_kind);
 
     var buffer: [256]u8 = undefined;
     try testing.expectEqualStrings(
-        "config.zon: the provider kind \"openai\" is not one Chock knows. " ++
-            "The kinds are: anthropic, aiand, openai-compat",
+        "config.zon: the provider kind \"mystery\" is not one Chock knows. " ++
+            "The kinds are: anthropic, aiand, openai, openai-compat",
         try std.fmt.bufPrint(&buffer, "{f}", .{&diag.?}),
     );
 }
@@ -1037,7 +1040,7 @@ test "a typo inside a provider names its block, its line and its column" {
 test "a caller that wants no diagnostic allocates nothing extra for one" {
     const gpa = testing.allocator;
     try testing.expectError(error.UnknownProviderKind, parse(gpa,
-        \\.{ .providers = .{ .{ .kind = "openai" } } }
+        \\.{ .providers = .{ .{ .kind = "mystery" } } }
     , null));
 }
 

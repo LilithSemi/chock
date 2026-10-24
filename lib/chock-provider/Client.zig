@@ -4,16 +4,18 @@ const std = @import("std");
 const message = @import("message.zig");
 const anthropic = @import("anthropic.zig");
 const openai = @import("openai.zig");
+const responses = @import("responses.zig");
 const sse = @import("sse.zig");
 const retry = @import("retry.zig");
 
 pub const Adapter = enum {
     openai_compatible,
+    openai_responses,
     anthropic,
 
     pub fn carries(self: Adapter, capability: message.Capability) bool {
         return switch (self) {
-            .openai_compatible => switch (capability) {
+            .openai_compatible, .openai_responses => switch (capability) {
                 .tool_calls => true,
                 .image_results => true,
             },
@@ -147,6 +149,15 @@ pub const HttpClient = struct {
         return initAdapter(allocator, io, .anthropic, base_url, key);
     }
 
+    pub fn initOpenAi(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        base_url: []const u8,
+        key: []const u8,
+    ) HttpClient {
+        return initAdapter(allocator, io, .openai_responses, base_url, key);
+    }
+
     fn initAdapter(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -238,6 +249,12 @@ pub const HttpClient = struct {
                 .tools = request.tools,
                 .stream = true,
             }),
+            .openai_responses => try responses.buildRequest(allocator, .{
+                .model = request.model,
+                .system = request.system,
+                .messages = request.messages,
+                .tools = request.tools,
+            }),
         };
         defer allocator.free(body);
 
@@ -245,13 +262,14 @@ pub const HttpClient = struct {
             self.base_url,
             switch (self.adapter) {
                 .openai_compatible => openai_path,
+                .openai_responses => responses.path,
                 .anthropic => anthropic.path,
             },
         });
         defer allocator.free(url);
         const uri = std.Uri.parse(url) catch |err| return self.transportFailed(.url, err);
 
-        const auth_value = if (self.key.len == 0 or self.adapter != .openai_compatible)
+        const auth_value = if (self.key.len == 0 or self.adapter == .anthropic)
             try allocator.dupe(u8, "")
         else
             try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.key});
@@ -283,6 +301,7 @@ pub const HttpClient = struct {
                     header_count += 1;
                 }
             },
+            .openai_responses => {},
         }
 
         var req = self.http.request(.POST, uri, .{
@@ -515,6 +534,26 @@ fn streamBody(
                             } });
                         }
                         saw_end = saw_end or decoder.saw_message_stop;
+                    },
+                    .openai_responses => decoded: {
+                        const piece = try responses.decode(allocator, data.body);
+                        defer piece.deinit(allocator);
+                        switch (piece) {
+                            .none => {},
+                            .text => |text| if (text.len != 0) try on_delta(ctx, .{ .text = text }),
+                            .reasoning => |text| if (text.len != 0) try on_delta(ctx, .{ .reasoning = text }),
+                            .tool_call => |fragment| try on_delta(ctx, .{ .tool_call = fragment }),
+                            .usage => |usage| try on_delta(ctx, .{ .usage = usage }),
+                            .completed => |maybe_usage| {
+                                if (maybe_usage) |usage| try on_delta(ctx, .{ .usage = usage });
+                                saw_end = true;
+                            },
+                            .failed => return .{ .status_error = .{
+                                .status = status,
+                                .body = try allocator.dupe(u8, data.body),
+                            } },
+                        }
+                        break :decoded;
                     },
                 },
             }

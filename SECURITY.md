@@ -122,6 +122,13 @@ On Linux a tool call runs in its own user, mount, PID, IPC and network
 namespaces, under a Landlock rule set and a seccomp filter, in a throwaway copy
 of the project. The credential store is never mounted into the sandbox.
 
+An OpenAI web login stores an ID token, an access token, a rotating refresh
+token, and the client and account identity as one credential. The host checks
+the signed ID token before it stores that bundle. It serializes refreshes before
+it replaces a rotating token. Only the short-lived access token goes in a
+provider request. The loopback callback listens on `127.0.0.1`, and a fresh
+state value and PKCE verifier bind each callback to the login that started it.
+
 No tool call writes the real project unless you approved a `workspace` bind in
 write mode, and that sentence is stronger than it used to be. A git worktree keeps its own metadata inside the real
 repository, at `.git/worktrees/<id>`, and git must write the index there for

@@ -809,9 +809,39 @@ fn start(
         .env = env,
     };
     const store = chock_auth.store.Store{ .data_dir = data_dir, .secrets = driver.secrets() };
+
+    // OpenAI rotates the refresh token. Serialize the read, optional refresh,
+    // and replacement so two sessions cannot both spend the same token.
+    var openai_lock: ?chock_auth.lock.Held = null;
+    defer if (openai_lock) |*held| held.release(io);
+    if (instance.kind == .openai) {
+        var lock_diag: ?chock_auth.store.Diagnostic = null;
+        defer if (lock_diag) |*d| d.deinit(arena);
+        chock_auth.store.ensureDir(io, data_dir, &lock_diag) catch |err| {
+            if (lock_diag) |*d| {
+                tty.print(.err, "chock run: the OpenAI renewal lock could not be prepared: {f}\n", .{d});
+            } else {
+                tty.print(.err, "chock run: the OpenAI renewal lock could not be prepared: {t}\n", .{err});
+            }
+            return error.Reported;
+        };
+        openai_lock = switch (chock_auth.lock.take(io, data_dir, "openai-refresh.lock", .{
+            .wait_ns = 30 * std.time.ns_per_s,
+        })) {
+            .held => |held| held,
+            .busy => {
+                tty.print(.err, "chock run: another session is renewing the OpenAI login. Try again.\n", .{});
+                return error.Reported;
+            },
+            .unusable => |err| {
+                tty.print(.err, "chock run: the OpenAI renewal lock could not be used: {t}\n", .{err});
+                return error.Reported;
+            },
+        };
+    }
     var credential_diag: ?chock_auth.lookup.Diagnostic = null;
     defer if (credential_diag) |*d| d.deinit(arena);
-    const credential = chock_auth.lookup.resolve(
+    var credential = chock_auth.lookup.resolve(
         arena,
         io,
         instance,
@@ -854,6 +884,93 @@ fn start(
             .{ config_dir, chock_auth.config.file_name },
         );
         return error.Reported;
+    }
+
+    if (instance.kind == .openai and credential.token.len != 0) {
+        var oauth = chock_auth.openai_oauth.Credential.parse(arena, credential.token) catch {
+            tty.print(
+                .err,
+                "chock run: the credential for {s} is not an OpenAI web-login credential. " ++
+                    "Run: chock login --provider openai --name {s} --replace\n",
+                .{ instance.name, instance.name },
+            );
+            return error.Reported;
+        };
+        defer oauth.deinit();
+        var current = oauth.value;
+        if (!current.hasInferenceScope()) {
+            tty.print(
+                .err,
+                "chock run: the OpenAI login for {s} did not grant ChatGPT plan use. " ++
+                    "Run: chock login --provider openai --name {s} --replace\n",
+                .{ instance.name, instance.name },
+            );
+            return error.Reported;
+        }
+        const now = @divTrunc(std.Io.Timestamp.now(io, .real).toMilliseconds(), 1000);
+        var renewed_set: ?chock_auth.openai_oauth.TokenSet = null;
+        defer if (renewed_set) |*held| held.deinit();
+        if (current.expires_at <= now + 300) {
+            if (credential.source != .login_store) {
+                tty.print(
+                    .err,
+                    "chock run: the OpenAI web credential for {s} needs renewal, but it did not " ++
+                        "come from the login store. Run: chock login --provider openai --name {s} --replace\n",
+                    .{ instance.name, instance.name },
+                );
+                return error.Reported;
+            }
+            renewed_set = chock_auth.openai_oauth.refresh(
+                arena,
+                io,
+                current.client_id,
+                current.refresh_token,
+            ) catch |err| {
+                tty.print(
+                    .err,
+                    "chock run: the OpenAI login for {s} could not be renewed ({t}). " ++
+                        "Run: chock login --provider openai --name {s} --replace\n",
+                    .{ instance.name, err, instance.name },
+                );
+                return error.Reported;
+            };
+            const renewed = renewed_set.?.value;
+            current = .{
+                .email = current.email,
+                .issuer = current.issuer,
+                .subject = current.subject,
+                .client_id = current.client_id,
+                .ext_agent_host_id = current.ext_agent_host_id,
+                .id_token = renewed.id_token,
+                .access_token = renewed.access_token,
+                .refresh_token = renewed.refresh_token,
+                .token_type = renewed.token_type,
+                .expires_at = now + renewed.expires_in,
+                .earliest_refresh_at = renewed.earliest_refresh_at,
+                .scope = renewed.scope,
+            };
+            const serialized = try current.serialize(arena);
+            var refresh_diag: ?chock_auth.store.Diagnostic = null;
+            defer if (refresh_diag) |*d| d.deinit(arena);
+            store.put(arena, io, .{
+                .name = instance.name,
+                .kind = .openai,
+                .base_url = instance.base_url,
+                .token = serialized,
+                .stored_ms = std.Io.Timestamp.now(io, .real).toMilliseconds(),
+            }, &refresh_diag) catch |err| {
+                if (refresh_diag) |*d| {
+                    tty.print(.err, "chock run: the renewed OpenAI login could not be stored: {f}\n", .{d});
+                } else {
+                    tty.print(.err, "chock run: the renewed OpenAI login could not be stored: {t}\n", .{err});
+                }
+                return error.Reported;
+            };
+        }
+        const access_token = try arena.dupe(u8, current.access_token);
+        std.crypto.secureZero(u8, credential.token);
+        arena.free(credential.token);
+        credential.token = access_token;
     }
 
     // Both resolved before the redaction below, because that step must know every value to keep out of the log.
@@ -1211,6 +1328,7 @@ fn start(
 
     const adapter: chock_provider.Client.Adapter = switch (instance.kind) {
         .anthropic => .anthropic,
+        .openai => .openai_responses,
         .aiand, .openai_compat => .openai_compatible,
     };
 
@@ -5320,15 +5438,15 @@ test "the syscall event names one row for each call the sandbox can watch, and s
     }
     try std.testing.expectEqual(
         @as(u64, 900),
-        said.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.openat)].count,
+        said.calls[@backingInt(palisade.linux.seccomp.TrapCall.openat)].count,
     );
     try std.testing.expectEqual(
         @as(u64, 0),
-        said.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.connect)].count,
+        said.calls[@backingInt(palisade.linux.seccomp.TrapCall.connect)].count,
     );
     try std.testing.expectEqual(
         @as(?chock_proto.event.UnverifiedPaths, null),
-        said.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.openat)].unverified_paths,
+        said.calls[@backingInt(palisade.linux.seccomp.TrapCall.openat)].unverified_paths,
     );
     try std.testing.expectEqual(false, said.paths_verified);
     try std.testing.expectEqual(@as(u64, 0), said.path_readers_unreported);
@@ -5342,7 +5460,7 @@ test "a full path record is still one short line of the session log" {
     var counted = emptyPathCounts();
     counted.kept = syscall_name_cap;
     for (0..syscall_name_cap) |slot| {
-        counted.name_call[slot] = @intFromEnum(palisade.linux.seccomp.TrapCall.openat);
+        counted.name_call[slot] = @backingInt(palisade.linux.seccomp.TrapCall.openat);
         counted.names[slot] = &longest;
     }
     for (0..palisade.linux.notify.call_count) |slot| {
@@ -5391,8 +5509,8 @@ fn emptyPathCounts() palisade.Sandbox.SyscallAudit.PathCounts {
 }
 
 test "the syscall event names each call's own paths, and says they are not verified" {
-    const openat = @intFromEnum(palisade.linux.seccomp.TrapCall.openat);
-    const execve = @intFromEnum(palisade.linux.seccomp.TrapCall.execve);
+    const openat = @backingInt(palisade.linux.seccomp.TrapCall.openat);
+    const execve = @backingInt(palisade.linux.seccomp.TrapCall.execve);
 
     var counted = emptyPathCounts();
     counted.readers_unreported = 2;
@@ -5441,7 +5559,7 @@ test "the syscall event names each call's own paths, and says they are not verif
 
     try std.testing.expectEqual(
         @as(?chock_proto.event.UnverifiedPaths, null),
-        said.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.connect)].unverified_paths,
+        said.calls[@backingInt(palisade.linux.seccomp.TrapCall.connect)].unverified_paths,
     );
 }
 
@@ -5455,8 +5573,8 @@ test "what the sandboxed programs asked the kernel for reaches the log, not only
 
     var audit: palisade.Sandbox.SyscallAudit = .{};
     var counts = palisade.linux.notify.empty_counts;
-    counts[@intFromEnum(palisade.linux.seccomp.TrapCall.openat)] = 31;
-    counts[@intFromEnum(palisade.linux.seccomp.TrapCall.execve)] = 1;
+    counts[@backingInt(palisade.linux.seccomp.TrapCall.openat)] = 31;
+    counts[@backingInt(palisade.linux.seccomp.TrapCall.execve)] = 1;
     audit.record(.{ .observed = counts });
     audit.record(.unobserved);
     logSyscallAudit(gpa, io, storage, &audit);
@@ -9831,6 +9949,7 @@ fn runSession(
 ) !Exit {
     var http = switch (started.adapter) {
         .openai_compatible => chock_provider.Client.HttpClient.init(gpa, io, started.base_url, started.credential.token),
+        .openai_responses => chock_provider.Client.HttpClient.initOpenAi(gpa, io, started.base_url, started.credential.token),
         .anthropic => chock_provider.Client.HttpClient.initAnthropic(gpa, io, started.base_url, started.credential.token),
     };
     defer http.deinit();

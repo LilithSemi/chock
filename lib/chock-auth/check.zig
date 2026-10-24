@@ -49,7 +49,7 @@ pub fn credential(
     // Built once and wiped before it is freed: a credential sitting freed but unzeroed in the heap is still readable in a crash dump or a swapped page.
     const header_value = try switch (kind) {
         .anthropic => gpa.dupe(u8, token),
-        .aiand, .openai_compat => std.fmt.allocPrint(gpa, "Bearer {s}", .{token}),
+        .aiand, .openai, .openai_compat => std.fmt.allocPrint(gpa, "Bearer {s}", .{token}),
     };
     defer {
         std.crypto.secureZero(u8, header_value);
@@ -68,7 +68,7 @@ pub fn credential(
                 extra_count = 2;
             }
         },
-        .aiand, .openai_compat => {
+        .aiand, .openai, .openai_compat => {
             if (token.len != 0) authorization = .{ .override = header_value };
         },
     }

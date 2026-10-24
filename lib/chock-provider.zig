@@ -6,6 +6,7 @@ pub const retry = @import("chock-provider/retry.zig");
 pub const message = @import("chock-provider/message.zig");
 pub const anthropic = @import("chock-provider/anthropic.zig");
 pub const openai = @import("chock-provider/openai.zig");
+pub const responses = @import("chock-provider/responses.zig");
 pub const sse = @import("chock-provider/sse.zig");
 pub const Client = @import("chock-provider/Client.zig");
 

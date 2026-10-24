@@ -2,6 +2,7 @@
 
 ```
 chock login --provider aiand
+chock login --provider openai
 chock login --provider anthropic --name work
 chock login --provider openai-compat=http://127.0.0.1:5000/v1 --name local
 printf '%s' "$KEY" | chock login --provider aiand --password-method stdin
@@ -11,6 +12,25 @@ The credential goes to your operating system's own keystore: the secret service
 on Linux, which is what gnome-keyring and kwallet answer, and the Keychain on
 macOS. It is checked against the provider before it is stored, so a mistyped key
 fails at login rather than on your first turn.
+
+## OpenAI web login
+
+`chock login --provider openai` opens the system browser and starts an OAuth
+authorization-code flow with PKCE. OpenAI sends the result to a temporary HTTP
+listener on `127.0.0.1`. Chock checks the callback state, exchanges the code,
+checks the signed OpenAI ID token, and then stores the credential bundle in the
+same keystore as an API key.
+
+The login requests permission to use an eligible ChatGPT plan for Responses
+API calls. It does not read an API key or ChatGPT conversations. The access
+token lasts one hour. Chock renews it with the rotating refresh token before a
+session and writes the complete replacement back to the keystore. Only the
+short-lived access token reaches `api.openai.com`. The ID token, refresh token,
+client ID, and account identity stay in the credential store.
+
+The callback listener binds only to `127.0.0.1`, uses a new random port and
+state for each login, and stops after one request. A returning login reuses the
+client ID and host ID OpenAI issued for that account.
 
 ## Where a credential is kept
 
@@ -139,9 +159,9 @@ reason there is no `none` spelling and no placeholder string pretending to be a
 secret.
 
 `chock run` still refuses one shape of it, before it builds a workspace or
-opens a log: an instance of kind `anthropic` or `aiand` that still talks to
-that kind's own address, with nothing in any of the three sources. Those two
-addresses refuse every request that carries no credential, so the session can
+opens a log: an instance of kind `anthropic`, `aiand`, or `openai` that still
+talks to that kind's own address, with nothing in any of the three sources.
+Those addresses refuse every request that carries no credential, so the session can
 only end in a 401 after the setup is already done. The refusal names the
 instance and the address, never any part of a value. An instance of either
 kind pointed somewhere else keeps running with no credential, because Chock
