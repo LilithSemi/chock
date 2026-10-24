@@ -18,6 +18,7 @@ const cache_cmd = @import("cache.zig");
 const workspace_cmd = @import("workspace.zig");
 const usage_cmd = @import("usage.zig");
 const plan_cmd = @import("plan.zig");
+const skills_cmd = @import("skills.zig");
 const sessions_cmd = @import("sessions.zig");
 const migrate_cmd = @import("migrate.zig");
 const approve_cmd = @import("approve.zig");
@@ -194,6 +195,11 @@ pub const commands = [_]Command{
         .name = "plan",
         .summary = "Show the task list an agent kept while it worked.",
         .run = plan_cmd.main,
+    },
+    .{
+        .name = "skills",
+        .summary = "Check a directory of skills against the format a session reads.",
+        .run = skills_cmd.main,
     },
     .{
         .name = "sessions",

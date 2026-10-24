@@ -65,6 +65,35 @@ Two skills cannot share a name. The layer that comes first keeps it, so your own
 skill wins over a repository's, and the one that lost is reported rather than
 dropped without a word.
 
+## Checking one before a session reads it
+
+`chock skills validate` reads a directory the way a session reads it, and says
+what a session would refuse.
+
+```
+chock skills validate skills/
+chock skills validate skills/review-a-diff
+```
+
+A directory that holds a `SKILL.md` is one skill. Any other directory is read as
+a layer, holding one subdirectory for every skill in it. Each line says one of
+three words:
+
+| Word | Meaning |
+|---|---|
+| ok | the skill loads, and the name after the path is the name a prompt gets |
+| problem | a session refuses this file, and the sentence says why |
+| note | the file loads, and a line of its frontmatter reached nothing |
+
+A problem exits 2, so a check in a pipeline stops on one. Notes alone exit 0,
+because a field this build does not read is not a refusal: a later version of
+the format can name a field, and a skill that carries one still works here. A
+note is how you find the ones that cost you something, such as a description
+written as a YAML block, where the marker becomes the whole value.
+
+A directory with no `SKILL.md` under it anywhere is a problem of its own, so a
+path that points at the wrong place cannot read as clean.
+
 ## What a skill cannot do
 
 A skill is an instruction file, and an instruction file grants nothing. The

@@ -468,6 +468,91 @@ pub fn findIn(skills: []const Skill, name: []const u8) ?Skill {
     return null;
 }
 
+pub const format_fields = [_][]const u8{
+    "name",
+    "description",
+    "license",
+    "compatibility",
+    "metadata",
+    "allowed-tools",
+};
+
+/// What the reader above went past. The skill still loads, and a field the
+/// author wrote reached nothing.
+pub const Note = enum {
+    line_not_read,
+    value_is_a_block_marker,
+    field_not_in_the_format,
+
+    pub fn sentence(self: Note) []const u8 {
+        return switch (self) {
+            .line_not_read => "a frontmatter line is not a `key: value` pair, and nothing was read from it",
+            .value_is_a_block_marker => "a field holds a YAML block marker, and the marker became the value",
+            .field_not_in_the_format => "a field is not one the format names, and nothing was read from it",
+        };
+    }
+};
+
+pub const Noted = struct {
+    note: Note,
+    line: usize,
+    detail: []const u8 = "",
+};
+
+/// Every frontmatter line `parse` passed over, in the order they come. Walks the
+/// frontmatter the way `parse` walks it, so a report and a session agree.
+pub fn notesIn(allocator: std.mem.Allocator, bytes: []const u8) Error![]const Noted {
+    var out: std.ArrayList(Noted) = .empty;
+    errdefer out.deinit(allocator);
+
+    const split = frontmatterOf(bytes) orelse return out.toOwnedSlice(allocator);
+    var at = lineOf(bytes, split.frontmatter);
+
+    var metadata_indent: ?usize = null;
+    var lines = std.mem.splitScalar(u8, split.frontmatter, '\n');
+    while (lines.next()) |raw_line| : (at += 1) {
+        const raw = std.mem.trimEnd(u8, raw_line, "\r");
+        const trimmed = std.mem.trim(u8, raw, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        const indent = indentOf(raw);
+
+        if (metadata_indent) |under| {
+            if (indent > under) continue;
+            metadata_indent = null;
+        }
+
+        const pair = if (indent == 0) splitPair(trimmed) else null;
+        const named = pair orelse {
+            try out.append(allocator, .{
+                .note = .line_not_read,
+                .line = at,
+                .detail = try cut(allocator, trimmed),
+            });
+            continue;
+        };
+
+        if (std.mem.eql(u8, named.key, "metadata")) {
+            if (named.value.len == 0) metadata_indent = indent;
+            continue;
+        }
+        if (!namedByTheFormat(named.key)) {
+            try out.append(allocator, .{
+                .note = .field_not_in_the_format,
+                .line = at,
+                .detail = try cut(allocator, named.key),
+            });
+            continue;
+        }
+        if (isBlockMarker(named.value)) try out.append(allocator, .{
+            .note = .value_is_a_block_marker,
+            .line = at,
+            .detail = try cut(allocator, named.key),
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 const Fields = struct {
     name: ?[]const u8 = null,
     description: ?[]const u8 = null,
@@ -578,6 +663,31 @@ fn dupeMaybe(allocator: std.mem.Allocator, value: ?[]const u8) Error!?[]const u8
 fn cut(allocator: std.mem.Allocator, value: []const u8) Error![]const u8 {
     if (value.len <= max_detail_bytes) return try allocator.dupe(u8, value);
     return try std.fmt.allocPrint(allocator, "{s}...", .{value[0..max_detail_bytes]});
+}
+
+/// The 1 based line in `bytes` that `part` starts on.
+fn lineOf(bytes: []const u8, part: []const u8) usize {
+    const offset = @intFromPtr(part.ptr) - @intFromPtr(bytes.ptr);
+    return 1 + std.mem.count(u8, bytes[0..offset], "\n");
+}
+
+fn namedByTheFormat(key: []const u8) bool {
+    for (format_fields) |one| {
+        if (std.mem.eql(u8, key, one)) return true;
+    }
+    return false;
+}
+
+/// A YAML value that is only `|` or `>` with its indicators. YAML folds the lines
+/// under it into the value, and the reader here keeps the marker instead.
+fn isBlockMarker(value: []const u8) bool {
+    if (value.len == 0) return false;
+    if (value[0] != '|' and value[0] != '>') return false;
+    for (value[1..]) |byte| switch (byte) {
+        '-', '+', '0'...'9' => {},
+        else => return false,
+    };
+    return true;
 }
 
 const testing = std.testing;
@@ -1123,4 +1233,84 @@ test "the answer names who wrote it, and a path only when the agent can open it"
     try testing.expect(std.mem.indexOf(u8, loose, "not in this sandbox") != null);
     try testing.expect(std.mem.indexOf(u8, loose, "/nix/store/aaa-x/deploy") == null);
     try testing.expect(std.mem.endsWith(u8, loose, "Step one.\n"));
+}
+
+test "a frontmatter line the reader goes past is reported with the line it is on" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectEqual(@as(usize, 0), (try notesIn(arena, minimal)).len);
+
+    const document =
+        \\---
+        \\name: a
+        \\description: >-
+        \\  One sentence, then another.
+        \\version: 2
+        \\- allowed-tools
+        \\---
+        \\body
+    ;
+    const notes = try notesIn(arena, document);
+    try testing.expectEqual(@as(usize, 4), notes.len);
+
+    try testing.expectEqual(Note.value_is_a_block_marker, notes[0].note);
+    try testing.expectEqual(@as(usize, 3), notes[0].line);
+    try testing.expectEqualStrings("description", notes[0].detail);
+
+    try testing.expectEqual(Note.line_not_read, notes[1].note);
+    try testing.expectEqual(@as(usize, 4), notes[1].line);
+
+    try testing.expectEqual(Note.field_not_in_the_format, notes[2].note);
+    try testing.expectEqualStrings("version", notes[2].detail);
+
+    try testing.expectEqual(Note.line_not_read, notes[3].note);
+    try testing.expectEqual(@as(usize, 6), notes[3].line);
+}
+
+test "metadata's own lines are reported as nothing, and a key after it is a key again" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const document =
+        \\---
+        \\name: a
+        \\description: d
+        \\metadata:
+        \\  author: somebody
+        \\  version: "1.0"
+        \\license: Apache-2.0
+        \\---
+    ;
+    try testing.expectEqual(@as(usize, 0), (try notesIn(arena, document)).len);
+
+    const no_frontmatter = try notesIn(arena, "# Just markdown\n");
+    try testing.expectEqual(@as(usize, 0), no_frontmatter.len);
+}
+
+test "every field the format names is one the reader keeps" {
+    for (format_fields) |one| {
+        try testing.expect(namedByTheFormat(one));
+        if (std.mem.eql(u8, one, "metadata")) continue;
+
+        var fields = Fields{};
+        fields.put(one, "something");
+        var kept = false;
+        inline for (@typeInfo(Fields).@"struct".field_names) |name| {
+            if (@field(fields, name) != null) kept = true;
+        }
+        try testing.expect(kept);
+    }
+
+    try testing.expect(!namedByTheFormat("version"));
+    try testing.expect(!namedByTheFormat(""));
+
+    try testing.expect(isBlockMarker("|"));
+    try testing.expect(isBlockMarker(">-"));
+    try testing.expect(isBlockMarker("|2+"));
+    try testing.expect(!isBlockMarker("|one"));
+    try testing.expect(!isBlockMarker("a description"));
+    try testing.expect(!isBlockMarker(""));
 }
