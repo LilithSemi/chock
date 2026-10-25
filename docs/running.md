@@ -281,6 +281,10 @@ never removable, and neither is one whose lock could not be tested.
 Work reaches your project only when the agent commits it in the workspace and
 the policy in your `chock.zon` permits the apply. It lands on
 `refs/chock/<session id>`, so `git log` reads it and `git merge` takes it.
+Before taking it, `chock workspace review <session id>` shows the binary-safe
+patch from the base commit recorded by the session to that ref. Repeat
+`--path <file>` to limit the patch to exact project-relative names; the names
+are literal, so Git wildcard and pathspec syntax is not evaluated.
 
 An approved apply merges the work into the branch you have checked out, and the
 prompt names that branch and that merge before you answer. A project can say
@@ -297,6 +301,8 @@ clean run removes its own workspace.
 
 ```
 chock workspace                     # every kept workspace, with its size
+chock workspace review 01K2...      # inspect work parked at the session's ref
+chock workspace review 01K2... --path src/parser.zig
 chock workspace clear
 ```
 

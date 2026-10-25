@@ -1,4 +1,4 @@
-//! `chock workspace`: look at the workspaces sessions left behind, and remove them.
+//! `chock workspace`: inspect, recover, and remove work sessions left behind.
 
 const std = @import("std");
 const chock_core = @import("chock-core");
@@ -14,7 +14,7 @@ const tty = @import("tty.zig");
 const work_suffix = ".work";
 
 const usage_text =
-    \\Usage: chock workspace [list|clear|adopt <session>] [options]
+    \\Usage: chock workspace [list|clear|adopt <session>|review <session>] [options]
     \\
     \\With no subcommand, says which workspaces this project's sessions left behind.
     \\A session that ends cleanly removes its own. A session that errored, was
@@ -32,12 +32,17 @@ const usage_text =
     \\in deleted for you to act on. A git project needs none of this, because its
     \\work is already at refs/chock/<session>.
     \\
+    \\review <session> shows the exact Git patch between the base recorded in the
+    \\session log and refs/chock/<session>. Repeat --path to show only named files.
+    \\Paths are literal: wildcard and pathspec syntax has no special meaning.
+    \\
     \\A workspace whose session is running now is never removed, because that session
     \\is writing into it. Such a row is marked with a * at the start.
     \\
     \\Options:
     \\  --project <dir>   The project. Defaults to the current directory.
     \\  --yes             Do not ask. Only for a caller that has already decided.
+    \\  --path <file>     For review: include this project-relative path. Repeatable.
     \\
 ++ tty.options_text;
 
@@ -46,9 +51,10 @@ const Options = struct {
     action: Action = .list,
     yes: bool = false,
     session: ?[]const u8 = null,
+    paths: []const []const u8 = &.{},
 };
 
-const Action = enum { list, clear, adopt };
+const Action = enum { list, clear, adopt, review };
 
 pub fn main(
     arena: std.mem.Allocator,
@@ -67,7 +73,7 @@ pub fn main(
     var env = try environ.createMap(arena);
     defer env.deinit();
 
-    const options = parseOptions(args) catch |err| switch (err) {
+    const options = parseOptions(arena, args) catch |err| switch (err) {
         error.HelpWanted => {
             tty.out(.plain, "{s}", .{usage_text});
             return Exit.finished.code();
@@ -84,8 +90,11 @@ pub fn main(
         return Exit.usage.code();
     };
 
-    const kept = try list(arena, io, dir);
+    if (options.action == .review) {
+        return reviewWorkspace(arena, io, &env, project_root, dir, options.session, options.paths);
+    }
 
+    const kept = try list(arena, io, dir);
     if (options.action == .list) return listWorkspaces(kept, dir);
     if (options.action == .adopt) {
         return adoptWorkspace(arena, io, kept, project_root, dir, options.session);
@@ -357,8 +366,9 @@ pub fn pruneWorktrees(
 
 const ParseError = error{ HelpWanted, BadArguments };
 
-fn parseOptions(args: []const []const u8) ParseError!Options {
+fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) (ParseError || std.mem.Allocator.Error)!Options {
     var options = Options{};
+    var paths: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
     var saw_action = false;
 
@@ -375,6 +385,12 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             options.yes = true;
             continue;
         }
+        if (std.mem.eql(u8, argument, "--path")) {
+            index += 1;
+            if (index >= args.len) return error.BadArguments;
+            try paths.append(arena, args[index]);
+            continue;
+        }
         if (argument.len != 0 and argument[0] == '-') return error.BadArguments;
 
         if (!saw_action) {
@@ -382,9 +398,11 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             saw_action = true;
             continue;
         }
-        if (options.action != .adopt or options.session != null) return error.BadArguments;
+        if ((options.action != .adopt and options.action != .review) or options.session != null) return error.BadArguments;
         options.session = argument;
     }
+    if (paths.items.len != 0 and options.action != .review) return error.BadArguments;
+    options.paths = try paths.toOwnedSlice(arena);
     return options;
 }
 
@@ -397,6 +415,124 @@ fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]c
         return arena.dupe(u8, buffer[0..len]);
     }
     return std.process.currentPathAlloc(io, arena);
+}
+
+fn reviewWorkspace(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    session_dir: []const u8,
+    wanted: ?[]const u8,
+    paths: []const []const u8,
+) u8 {
+    const session_id = wanted orelse {
+        tty.print(.err, "chock workspace review: name the session whose work you want to review.\n", .{});
+        return Exit.usage.code();
+    };
+    if (!session_paths.isValidId(session_id)) {
+        tty.print(.err, "chock workspace review: {s} is not a session identifier.\n", .{session_id});
+        return Exit.usage.code();
+    }
+
+    const log_path = std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ session_dir, session_id }, 0) catch
+        return Exit.faulted.code();
+    _ = std.Io.Dir.cwd().statFile(io, log_path, .{}) catch {
+        tty.print(.err, "chock workspace review: session {s} has no log in this project.\n", .{session_id});
+        return Exit.usage.code();
+    };
+    const opened = lastWorkspaceOpen(arena, io, log_path, session_id) orelse {
+        tty.print(
+            .err,
+            "chock workspace review: the log of session {s} names no workspace to review.\n",
+            .{session_id},
+        );
+        return Exit.usage.code();
+    };
+    switch (opened.kind) {
+        .worktree => {},
+        .overlay => {
+            tty.print(
+                .err,
+                "chock workspace review: session {s} used an overlay workspace. " ++
+                    "Use `chock workspace adopt {s}` to copy its changes out for review.\n",
+                .{ session_id, session_id },
+            );
+            return Exit.usage.code();
+        },
+        .unknown => |name| {
+            tty.print(
+                .err,
+                "chock workspace review: session {s} used a {s} workspace, which this build cannot review.\n",
+                .{ session_id, name },
+            );
+            return Exit.usage.code();
+        },
+    }
+    if (opened.base_commit.len == 0) {
+        tty.print(.err, "chock workspace review: session {s} recorded no Git base commit.\n", .{session_id});
+        return Exit.usage.code();
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.appendSlice(arena, &.{
+        "diff",
+        "--no-ext-diff",
+        "--binary",
+        "--find-renames",
+        "--find-copies",
+        opened.base_commit,
+        std.fmt.allocPrint(arena, "refs/chock/{s}", .{session_id}) catch return Exit.faulted.code(),
+        "--",
+    }) catch return Exit.faulted.code();
+    for (paths) |path| {
+        if (!reviewPathIsSafe(path)) {
+            tty.print(
+                .err,
+                "chock workspace review: {s} is not a project-relative path.\n",
+                .{path},
+            );
+            return Exit.usage.code();
+        }
+        const literal = std.fmt.allocPrint(arena, ":(top,literal){s}", .{path}) catch return Exit.faulted.code();
+        argv.append(arena, literal) catch return Exit.faulted.code();
+    }
+
+    var output = chock_workspace.git.run(arena, io, env, project_root, argv.items, null) catch |err| {
+        tty.print(.err, "chock workspace review: Git could not read session {s}: {s}.\n", .{ session_id, @errorName(err) });
+        return Exit.faulted.code();
+    };
+    defer output.deinit(arena);
+    const code = switch (output.term) {
+        .exited => |one| one,
+        else => {
+            tty.print(.err, "chock workspace review: Git did not finish normally.\n", .{});
+            return Exit.faulted.code();
+        },
+    };
+    if (code != 0) {
+        tty.print(
+            .err,
+            "chock workspace review: the work of session {s} could not be read: {s}",
+            .{ session_id, output.stderr },
+        );
+        return Exit.usage.code();
+    }
+    if (output.stdout.len == 0) {
+        tty.print(.plain, "chock workspace review: session {s} has no changes in this selection.\n", .{session_id});
+        return Exit.finished.code();
+    }
+    tty.out(.plain, "{s}", .{output.stdout});
+    return Exit.finished.code();
+}
+
+fn reviewPathIsSafe(path: []const u8) bool {
+    if (path.len == 0 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, "..")) return false;
+    }
+    return true;
 }
 
 pub const adopted_dir_name = ".chock-adopted";
@@ -556,6 +692,7 @@ fn findKept(kept: []const Kept, session_id: []const u8) ?Kept {
 const Opened = struct {
     kind: chock_proto.event.WorkspaceKind,
     attempt: []const u8,
+    base_commit: []const u8,
 };
 
 fn lastWorkspaceOpen(
@@ -583,7 +720,11 @@ fn lastWorkspaceOpen(
             .overlay => .overlay,
             .unknown => |name| .{ .unknown = arena.dupe(u8, name) catch return null },
         };
-        found = .{ .kind = kind, .attempt = arena.dupe(u8, opened.attempt) catch return null };
+        found = .{
+            .kind = kind,
+            .attempt = arena.dupe(u8, opened.attempt) catch return null,
+            .base_commit = arena.dupe(u8, opened.base_commit) catch return null,
+        };
     }
     return found;
 }
@@ -639,30 +780,151 @@ fn sayFault(
 const testing = std.testing;
 
 test "the command line names an action and nothing else" {
-    try testing.expectEqual(Action.list, (try parseOptions(&.{})).action);
-    try testing.expectEqual(Action.list, (try parseOptions(&.{"list"})).action);
-    try testing.expectEqual(Action.clear, (try parseOptions(&.{"clear"})).action);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    const with_project = try parseOptions(&.{ "--project", "/somewhere", "clear" });
+    try testing.expectEqual(Action.list, (try parseOptions(arena, &.{})).action);
+    try testing.expectEqual(Action.list, (try parseOptions(arena, &.{"list"})).action);
+    try testing.expectEqual(Action.clear, (try parseOptions(arena, &.{"clear"})).action);
+
+    const with_project = try parseOptions(arena, &.{ "--project", "/somewhere", "clear" });
     try testing.expectEqualStrings("/somewhere", with_project.project.?);
     try testing.expectEqual(Action.clear, with_project.action);
 
-    try testing.expect(!(try parseOptions(&.{"clear"})).yes);
-    try testing.expect((try parseOptions(&.{ "clear", "--yes" })).yes);
-    try testing.expect((try parseOptions(&.{ "--yes", "clear" })).yes);
-    try testing.expectError(error.BadArguments, parseOptions(&.{ "clear", "--force" }));
+    try testing.expect(!(try parseOptions(arena, &.{"clear"})).yes);
+    try testing.expect((try parseOptions(arena, &.{ "clear", "--yes" })).yes);
+    try testing.expect((try parseOptions(arena, &.{ "--yes", "clear" })).yes);
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "clear", "--force" }));
 
-    const taking = try parseOptions(&.{ "adopt", "01JQAAAAAAAAAAAAAAAAAAAAAA" });
+    const taking = try parseOptions(arena, &.{ "adopt", "01JQAAAAAAAAAAAAAAAAAAAAAA" });
     try testing.expectEqual(Action.adopt, taking.action);
     try testing.expectEqualStrings("01JQAAAAAAAAAAAAAAAAAAAAAA", taking.session.?);
-    try testing.expectEqual(@as(?[]const u8, null), (try parseOptions(&.{"adopt"})).session);
-    try testing.expectError(error.BadArguments, parseOptions(&.{ "clear", "01JQAAAAAAAAAAAAAAAAAAAAAA" }));
-    try testing.expectError(error.BadArguments, parseOptions(&.{ "adopt", "one", "two" }));
+    try testing.expectEqual(@as(?[]const u8, null), (try parseOptions(arena, &.{"adopt"})).session);
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "clear", "01JQAAAAAAAAAAAAAAAAAAAAAA" }));
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "adopt", "one", "two" }));
 
-    try testing.expectError(error.BadArguments, parseOptions(&.{"remove-everything"}));
-    try testing.expectError(error.BadArguments, parseOptions(&.{ "clear", "clear" }));
-    try testing.expectError(error.BadArguments, parseOptions(&.{"--project"}));
-    try testing.expectError(error.HelpWanted, parseOptions(&.{"--help"}));
+    const review = try parseOptions(arena, &.{
+        "review",
+        "01JQAAAAAAAAAAAAAAAAAAAAAA",
+        "--path",
+        "src/main.zig",
+        "--path",
+        "docs/read me.md",
+    });
+    try testing.expectEqual(Action.review, review.action);
+    try testing.expectEqual(@as(usize, 2), review.paths.len);
+    try testing.expectEqualStrings("src/main.zig", review.paths[0]);
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "list", "--path", "README.md" }));
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "review", "id", "--path" }));
+
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{"remove-everything"}));
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "clear", "clear" }));
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{"--project"}));
+    try testing.expectError(error.HelpWanted, parseOptions(arena, &.{"--help"}));
+}
+
+test "review paths stay inside the project and are passed as literal pathspecs" {
+    try testing.expect(reviewPathIsSafe("src/main.zig"));
+    try testing.expect(reviewPathIsSafe("docs/read me.md"));
+    try testing.expect(reviewPathIsSafe(":(glob)**"));
+    try testing.expect(!reviewPathIsSafe(""));
+    try testing.expect(!reviewPathIsSafe("/etc/passwd"));
+    try testing.expect(!reviewPathIsSafe("../outside"));
+    try testing.expect(!reviewPathIsSafe("src/../../outside"));
+}
+
+fn gitForTest(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project: []const u8,
+    argv: []const []const u8,
+) ![]const u8 {
+    var output = try chock_workspace.git.run(arena, io, env, project, argv, null);
+    defer output.deinit(arena);
+    const code = switch (output.term) {
+        .exited => |one| one,
+        else => return error.GitDidNotExit,
+    };
+    if (code != 0) return error.GitFailed;
+    return try arena.dupe(u8, std.mem.trimEnd(u8, output.stdout, "\n"));
+}
+
+test "review shows the recorded Git change and literal path filters select exact files" {
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
+    const sessions = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
+    try std.Io.Dir.createDirAbsolute(io, project, .default_dir);
+    try std.Io.Dir.createDirAbsolute(io, sessions, .default_dir);
+    try writeUnder(arena, io, project, "one.txt", "one before\n");
+    try writeUnder(arena, io, project, "two.txt", "two before\n");
+
+    var env = std.process.Environ.Map.init(arena);
+    _ = try gitForTest(arena, io, &env, project, &.{"init"});
+    _ = try gitForTest(arena, io, &env, project, &.{ "add", "--", "one.txt", "two.txt" });
+    _ = try gitForTest(arena, io, &env, project, &.{
+        "-c",
+        "user.name=Chock Test",
+        "-c",
+        "user.email=chock@example.invalid",
+        "commit",
+        "-m",
+        "base",
+    });
+    const base = try gitForTest(arena, io, &env, project, &.{ "rev-parse", "HEAD" });
+
+    try writeUnder(arena, io, project, "one.txt", "one after\n");
+    try writeUnder(arena, io, project, "two.txt", "two after\n");
+    _ = try gitForTest(arena, io, &env, project, &.{ "add", "--", "one.txt", "two.txt" });
+    _ = try gitForTest(arena, io, &env, project, &.{
+        "-c",
+        "user.name=Chock Test",
+        "-c",
+        "user.email=chock@example.invalid",
+        "commit",
+        "-m",
+        "result",
+    });
+    const result = try gitForTest(arena, io, &env, project, &.{ "rev-parse", "HEAD" });
+
+    const id = "01JQ" ++ @as([22]u8, @splat('R'));
+    const ref = try std.fmt.allocPrint(arena, "refs/chock/{s}", .{id});
+    _ = try gitForTest(arena, io, &env, project, &.{ "update-ref", ref, result });
+    _ = try gitForTest(arena, io, &env, project, &.{ "reset", "--hard", base });
+
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ sessions, id }, 0);
+    const log = try chock_proto.log.Log.open(io, log_path, id);
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    _ = try locked.append(arena, io, .{ .workspace_open = .{
+        .kind = .worktree,
+        .attempt = "01JQ" ++ @as([22]u8, @splat('A')),
+        .path = "/gone",
+        .base_commit = base,
+    } }, 1);
+    try locked.unlock(io);
+
+    var said: tty.Capture = undefined;
+    said.start(io, testing.allocator);
+    defer said.stop(io);
+    try testing.expectEqual(
+        Exit.finished.code(),
+        reviewWorkspace(arena, io, &env, project, sessions, id, &.{"one.txt"}),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.out(), "one after") != null);
+    try testing.expect(std.mem.indexOf(u8, said.out(), "two after") == null);
+    try testing.expect(std.mem.indexOf(u8, said.out(), "diff --git a/one.txt b/one.txt") != null);
 }
 
 fn makeSessionDir(arena: std.mem.Allocator, io: std.Io, root: []const u8, ids: []const []const u8) !void {
