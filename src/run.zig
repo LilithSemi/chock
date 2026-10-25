@@ -308,16 +308,15 @@ fn mainWith(
         if (forked.latest and forked.workspace) {
             if (source_snapshot) |from| {
                 const to = try ownGuestSnapshotPath(arena, started.state_dir, &forked.id);
-                std.Io.Dir.renameAbsolute(from, to, teardown_io) catch |err| tty.print(
-                    .warn,
-                    "chock: the microVM checkpoint could not move to the fork: {t}\n",
-                    .{err},
-                );
+                std.Io.Dir.copyFileAbsolute(from, to, teardown_io, .{}) catch |err| {
+                    std.Io.Dir.deleteFileAbsolute(teardown_io, to) catch {};
+                    tty.print(
+                        .warn,
+                        "chock: the microVM checkpoint could not be copied to the fork: {t}\n",
+                        .{err},
+                    );
+                };
             }
-        } else if (source_snapshot) |path| {
-            // A guest checkpoint is only valid when both the transcript and
-            // its mounted workspace are restored at the same turn.
-            std.Io.Dir.deleteFileAbsolute(teardown_io, path) catch {};
         }
         return takeFork(teardown_io, &env, started.exe_path, started.project_root, &forked.id);
     }

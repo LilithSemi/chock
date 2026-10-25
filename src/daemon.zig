@@ -830,7 +830,7 @@ fn beginSession(
                     fail(writer, "the fork's microVM checkpoint path was lost");
                     return;
                 };
-            if (transferForkSnapshot(daemon, &source_id, target_path)) {
+            if (copyForkSnapshot(daemon, &source_id, target_path)) {
                 daemon.noteSnapshot(&id, true);
             }
         }
@@ -1385,10 +1385,9 @@ fn guestSocketPath(
     return path;
 }
 
-/// Move a source session's quiescent checkpoint to a new session. A rename is
-/// deliberate: a checkpoint is large, and two sessions must never both believe
-/// they own the same mutable VM state.
-fn transferForkSnapshot(
+/// Give a fork its own copy of the source session's quiescent checkpoint. The
+/// source retains its copy so either branch can resume independently.
+fn copyForkSnapshot(
     daemon: *Daemon,
     source_id: *const [session_paths.id_length]u8,
     target_path: []const u8,
@@ -1417,17 +1416,18 @@ fn transferForkSnapshot(
             break;
         },
     };
-    std.Io.Dir.renameAbsolute(source_path, target_path, daemon.io) catch |err| {
+    std.Io.Dir.copyFileAbsolute(source_path, target_path, daemon.io, .{}) catch |err| {
+        std.Io.Dir.deleteFileAbsolute(daemon.io, target_path) catch {};
         daemon.finishForkSnapshot(source_id, true);
         tty.print(
             .warn,
-            "chock daemon: session {s}'s microVM checkpoint could not move to its fork: {t}\n",
+            "chock daemon: session {s}'s microVM checkpoint could not be copied to its fork: {t}\n",
             .{ source_id, err },
         );
         return false;
     };
-    daemon.finishForkSnapshot(source_id, false);
-    tty.detail("chock daemon: session {s}'s microVM checkpoint moved to its fork\n", .{source_id});
+    daemon.finishForkSnapshot(source_id, true);
+    tty.detail("chock daemon: session {s}'s microVM checkpoint copied to its fork\n", .{source_id});
     return true;
 }
 
@@ -2183,7 +2183,7 @@ test "adopt refuses a session it may not take, and starts nothing when it does" 
     }
 }
 
-test "a completed checkpoint moves from a source session to its fork" {
+test "a completed checkpoint is copied to a fork and retained by its source" {
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -2225,12 +2225,14 @@ test "a completed checkpoint moves from a source session to its fork" {
     try snapshot.writeStreamingAll(io, "guest state");
     snapshot.close(io);
 
-    try testing.expect(transferForkSnapshot(&daemon, source_id, target_path));
-    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, source_path, .{}));
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, target_path, gpa, .limited(64));
-    defer gpa.free(bytes);
-    try testing.expectEqualStrings("guest state", bytes);
-    try testing.expect(!daemon.takeSnapshot(source_id));
+    try testing.expect(copyForkSnapshot(&daemon, source_id, target_path));
+    const source_bytes = try std.Io.Dir.cwd().readFileAlloc(io, source_path, gpa, .limited(64));
+    defer gpa.free(source_bytes);
+    try testing.expectEqualStrings("guest state", source_bytes);
+    const target_bytes = try std.Io.Dir.cwd().readFileAlloc(io, target_path, gpa, .limited(64));
+    defer gpa.free(target_bytes);
+    try testing.expectEqualStrings("guest state", target_bytes);
+    try testing.expect(daemon.takeSnapshot(source_id));
 }
 
 test "a listing over the wire says what the local fold says" {
