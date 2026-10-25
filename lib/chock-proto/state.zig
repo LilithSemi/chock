@@ -344,8 +344,8 @@ pub const Session = struct {
                 self.children = .empty;
                 self.grants = .{};
                 self.spend = .{};
-                // The source workspace path belongs to the source. `run`
-                // records a fresh workspace before the child starts.
+                // The source workspace path still belongs to the source.
+                // `run` records the child's separately restored workspace.
                 self.workspace = null;
             },
             .session_spawn => |spawn| {

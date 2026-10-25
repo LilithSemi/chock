@@ -7,6 +7,7 @@ const chock_core = @import("chock-core");
 const chock_pcsc = @import("chock-pcsc");
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
+const chock_workspace = @import("chock-workspace");
 
 const approval = @import("approval.zig");
 const session_paths = @import("session.zig");
@@ -67,9 +68,10 @@ const usage_text =
     \\fork makes a new session from an idle session's audited transcript. By default it
     \\forks at the last completed turn; --at names a session.end event byte offset. The
     \\inherited prefix stays byte-for-byte identical and a session.fork event records its
-    \\source and head digest. Running the new session starts a fresh isolated workspace.
-    \\A latest-turn fork may restore the source's quiescent microVM; historical forks
-    \\and unavailable checkpoints start a fresh guest.
+    \\source and head digest. A Git workspace is restored at that exact turn, including
+    \\its commits and staged or unstaged changes. Unsupported or unavailable workspace
+    \\checkpoints start fresh. A latest-turn fork may also restore the source's quiescent
+    \\microVM; historical forks start a fresh guest.
     \\
     \\A session log is the only record of what an agent did, so removing one asks
     \\first. It takes the session's workspace and sandbox root with it.
@@ -1600,6 +1602,7 @@ pub const Forked = struct {
     id: [session_paths.id_length]u8,
     source_event: u64,
     latest: bool,
+    workspace: bool,
 };
 
 pub fn forkSession(
@@ -1748,6 +1751,18 @@ pub fn forkSession(
         .source_head = &chosen.head,
     } }, std.Io.Timestamp.now(io, .real).toMilliseconds());
 
+    const source_paths = try session_paths.pathsFor(arena, env, project_root, source_id);
+    const restored_workspace = chock_workspace.checkpoint.copyForFork(
+        arena,
+        io,
+        source_paths.work,
+        child_paths.work,
+        chosen.event,
+    ) catch |err| {
+        tty.print(.err, "chock sessions fork: the workspace checkpoint could not be copied: {s}\n", .{@errorName(err)});
+        return Exit.faulted.code();
+    };
+
     keep_child = true;
     session_paths.markProject(io, child_paths, project_root);
     if (forked_out) |out| {
@@ -1755,15 +1770,16 @@ pub fn forkSession(
             .id = child_id,
             .source_event = chosen.event,
             .latest = latest_end != null and latest_end.? == chosen.event,
+            .workspace = restored_workspace,
         };
         return Exit.finished.code();
     }
     tty.out(.plain, "{s}\n", .{child_id_text});
     tty.print(
         .plain,
-        "chock sessions fork: forked {s} at event {d}. Continue with:\n" ++
+        "chock sessions fork: forked {s} at event {d}{s}. Continue with:\n" ++
             "  chock run --session {s}\n",
-        .{ source_id, chosen.event, child_id_text },
+        .{ source_id, chosen.event, if (restored_workspace) " with its workspace" else " with a fresh workspace", child_id_text },
     );
     return Exit.finished.code();
 }
@@ -2329,6 +2345,7 @@ test "fork copies an exact completed prefix and records where the child diverged
 
     const child_id = fork_result.id;
     try testing.expect(fork_result.latest);
+    try testing.expect(!fork_result.workspace);
     try testing.expect(!std.mem.eql(u8, &child_id, source_id));
     const child_path = try logPathIn(arena, source_paths.dir, &child_id);
     var child_backing = chock_proto.storage.JsonLines{
@@ -2428,6 +2445,11 @@ test "a historical fork is not reported as the latest checkpoint" {
     replay.deinit();
     store.close(io);
 
+    const checkpoint = try std.fmt.allocPrint(arena, "{s}/checkpoints/{d}", .{ paths.work, first_end.? });
+    try std.Io.Dir.cwd().createDirPath(io, checkpoint);
+    const marker = try std.fs.path.join(arena, &.{ checkpoint, "chosen-turn" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker, .data = "first\n" });
+
     var output: tty.Capture = undefined;
     output.start(io, testing.allocator);
     defer output.stop(io);
@@ -2438,6 +2460,11 @@ test "a historical fork is not reported as the latest checkpoint" {
     );
     try testing.expectEqual(first_end.?, forked.source_event);
     try testing.expect(!forked.latest);
+    try testing.expect(forked.workspace);
+    const child_paths = try session_paths.pathsFor(arena, &env, project, &forked.id);
+    const restored_marker = try std.fs.path.join(arena, &.{ child_paths.work, chock_workspace.checkpoint.restore_leaf, "chosen-turn" });
+    const restored = try std.Io.Dir.readFileAlloc(.cwd(), io, restored_marker, arena, .limited(32));
+    try testing.expectEqualStrings("first\n", restored);
 }
 
 test "a session another process owns reads as live, and the probe leaves its lock alone" {

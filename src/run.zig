@@ -305,7 +305,7 @@ fn mainWith(
             &forked,
         );
         if (code != Exit.finished.code()) return code;
-        if (forked.latest) {
+        if (forked.latest and forked.workspace) {
             if (source_snapshot) |from| {
                 const to = try ownGuestSnapshotPath(arena, started.state_dir, &forked.id);
                 std.Io.Dir.renameAbsolute(from, to, teardown_io) catch |err| tty.print(
@@ -315,8 +315,8 @@ fn mainWith(
                 );
             }
         } else if (source_snapshot) |path| {
-            // A historical transcript cannot correspond to the VM checkpoint,
-            // which always represents the source's latest completed turn.
+            // A guest checkpoint is only valid when both the transcript and
+            // its mounted workspace are restored at the same turn.
             std.Io.Dir.deleteFileAbsolute(teardown_io, path) catch {};
         }
         return takeFork(teardown_io, &env, started.exe_path, started.project_root, &forked.id);
@@ -1178,7 +1178,20 @@ fn start(
         .hand_on => unreachable,
     };
 
-    try attachBinds(arena, io, &workspace, declared_binds, taken == null);
+    const restored_workspace = if (taken == null)
+        chock_workspace.checkpoint.restore(arena, io, &workspace, paths.work) catch |err| {
+            tty.print(
+                .err,
+                "chock run: the forked workspace could not be restored: {s}\n",
+                .{@errorName(err)},
+            );
+            return error.Reported;
+        }
+    else
+        false;
+    if (restored_workspace) tty.print(.plain, "chock: restored the workspace at the fork point\n", .{});
+
+    try attachBinds(arena, io, &workspace, declared_binds, taken == null and !restored_workspace);
 
     var sandbox_config = workspace.sandboxConfig(arena, paths.root) catch |err| {
         tty.print(.err, "chock run: the sandbox could not be described: {s}\n", .{@errorName(err)});
@@ -1213,7 +1226,6 @@ fn start(
         }
         return error.Reported;
     };
-
     const approvals = approvalEndpoint(arena, io, paths.dir, id);
 
     const handovers = handoverEndpoint(arena, io, paths.dir, id);
@@ -1265,7 +1277,7 @@ fn start(
         sandbox_config.mounts,
     );
 
-    if (taken != null and options.allow_dirty) {
+    if ((taken != null or restored_workspace) and options.allow_dirty) {
         tty.print(
             .err,
             "chock run: session {s} carries on in the workspace its last owner left, and " ++
@@ -1275,7 +1287,7 @@ fn start(
         );
         return error.Reported;
     }
-    const uncommitted_files = if (taken != null)
+    const uncommitted_files = if (taken != null or restored_workspace)
         0
     else
         try handleUncommitted(gpa, io, env, &workspace, options);
@@ -1560,7 +1572,7 @@ fn start(
         };
     }
 
-    return .{
+    const started: Started = .{
         .exe_path = exe_path,
         .project_root = project_root,
         .paths = paths,
@@ -1628,6 +1640,8 @@ fn start(
         .redact = redaction,
         .redact_values = try brokerRedaction(arena, redaction),
     };
+    if (restored_workspace) chock_workspace.checkpoint.discardRestore(arena, io, paths.work);
+    return started;
 }
 
 fn redactionFor(
@@ -10614,10 +10628,25 @@ fn runSession(
         }
 
         try chock_core.Loop.run(gpa, io, deps);
+        const ending = try finalEnding(gpa, io, started.storage);
+        _ = chock_workspace.checkpoint.save(
+            gpa,
+            io,
+            &started.workspace,
+            started.paths.work,
+            ending.event,
+        ) catch |err| checkpoint: {
+            tty.print(
+                .warn,
+                "chock: the workspace checkpoint for this turn could not be saved: {s}\n",
+                .{@errorName(err)},
+            );
+            break :checkpoint false;
+        };
         turns += 1;
         if (screen == null) break;
 
-        if (!keepAsking(try finalExit(gpa, io, started.storage), interrupt.requested())) break;
+        if (!keepAsking(ending.exit, interrupt.requested())) break;
     }
 
     if (turns == 0 and fork_request.* == null) return .usage;
@@ -10631,20 +10660,32 @@ fn keepAsking(ending: Exit, interrupted: bool) bool {
 }
 
 fn finalExit(gpa: std.mem.Allocator, io: std.Io, storage: chock_proto.storage.Storage) !Exit {
+    const ending = finalEnding(gpa, io, storage) catch |err| switch (err) {
+        error.MissingSessionEnd => return .faulted,
+        else => return err,
+    };
+    return ending.exit;
+}
+
+const FinalEnding = struct {
+    exit: Exit,
+    event: u64,
+};
+
+fn finalEnding(gpa: std.mem.Allocator, io: std.Io, storage: chock_proto.storage.Storage) !FinalEnding {
     var replay = try storage.replay(gpa, io, 0);
     defer replay.deinit();
 
     var last: Exit = .faulted;
-    var saw_end = false;
+    var event_id: ?u64 = null;
     while (try replay.next(io)) |parsed| {
         defer parsed.deinit();
         if (parsed.value.event != .session_end) continue;
         const ended = parsed.value.event.session_end;
         last = exitFor(ended.reason);
-        saw_end = true;
+        event_id = parsed.value.id;
     }
-    if (!saw_end) return .faulted;
-    return last;
+    return .{ .exit = last, .event = event_id orelse return error.MissingSessionEnd };
 }
 
 const max_sinks: usize = chock_policy.org.max_sinks + 2;

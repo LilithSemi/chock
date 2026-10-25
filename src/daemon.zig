@@ -682,7 +682,7 @@ fn handleFork(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Fork
         writer,
         one.project,
         forked.id,
-        .{ .forked = if (forked.latest) source_id else null },
+        .{ .forked = if (forked.latest and forked.workspace) source_id else null },
     );
 }
 

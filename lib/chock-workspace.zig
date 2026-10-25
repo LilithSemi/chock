@@ -6,6 +6,7 @@ pub const Diagnostic = @import("chock-workspace/diagnostic.zig").Diagnostic;
 pub const binds = @import("chock-workspace/binds.zig");
 pub const deny = @import("chock-workspace/deny.zig");
 pub const git = @import("chock-workspace/git.zig");
+pub const checkpoint = @import("chock-workspace/checkpoint.zig");
 pub const worktree = @import("chock-workspace/worktree.zig");
 pub const overlay = @import("chock-workspace/overlay.zig");
 pub const Workspace = @import("chock-workspace/Workspace.zig").Workspace;
