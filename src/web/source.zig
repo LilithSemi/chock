@@ -87,14 +87,20 @@ pub const Web = struct {
     /// without an arena.
     pub fn eventsProject(self: *Web) []const u8 {
         if (self.watching_project.len == 0) return "";
-        return std.fmt.bufPrint(&self.project_query, "&project={s}", .{self.watching_project}) catch "";
+        return std.fmt.bufPrint(&self.project_query, "&project={f}", .{std.fmt.alt(
+            @as(std.Uri.Component, .{ .raw = self.watching_project }),
+            .formatEscaped,
+        )}) catch "";
     }
 
     /// `&project=...` for a request about the session being followed, or nothing
     /// when serve's own project is the right one.
     fn namedProject(self: *Web, arena: std.mem.Allocator) []const u8 {
         if (self.watching_project.len == 0) return "";
-        return std.fmt.allocPrint(arena, "&project={s}", .{self.watching_project}) catch "";
+        return std.fmt.allocPrint(arena, "&project={f}", .{std.fmt.alt(
+            @as(std.Uri.Component, .{ .raw = self.watching_project }),
+            .formatEscaped,
+        )}) catch "";
     }
 
     pub fn source(self: *Web) Source {
@@ -487,4 +493,20 @@ test "a field this build does not know does not throw the whole event away" {
     ;
     const found = entriesIn(arena, said) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("hello", found[0].ev.message.content[0].text);
+}
+
+test "a cross-project request escapes every query delimiter in its path" {
+    var web = Web{
+        .gpa = testing.allocator,
+        .owner = undefined,
+        .origin = "",
+        .watching_project = try testing.allocator.dupe(u8, "/work/a & b/%23#one?two"),
+    };
+    defer web.deinit();
+
+    var room = std.heap.ArenaAllocator.init(testing.allocator);
+    defer room.deinit();
+    const expected = "&project=%2Fwork%2Fa%20%26%20b%2F%2523%23one%3Ftwo";
+    try testing.expectEqualStrings(expected, web.namedProject(room.allocator()));
+    try testing.expectEqualStrings(expected, web.eventsProject());
 }

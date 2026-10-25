@@ -430,7 +430,8 @@ fn handle(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Req
 /// either one is freed memory.
 fn projectOf(serve: *Serve, arena: std.mem.Allocator, target: []const u8) []const u8 {
     const said = queryValue(target, "project") orelse return serve.project;
-    return arena.dupe(u8, said) catch serve.project;
+    const copy = arena.dupe(u8, said) catch return serve.project;
+    return std.Uri.percentDecodeInPlace(copy);
 }
 
 fn serveSessions(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
@@ -1252,6 +1253,31 @@ test "a query value is read by name and an empty one is no value at all" {
     try testing.expect(queryValue(target, "aft") == null);
     try testing.expect(queryValue(target, "sess") == null);
     try testing.expect(queryValue("/api/sessions", "session") == null);
+}
+
+test "a project query decodes the path the browser escaped" {
+    var room = std.heap.ArenaAllocator.init(testing.allocator);
+    defer room.deinit();
+    var serve = Serve{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .daemon = .{ .unix = "/nowhere" },
+        .project = "/fallback",
+        .owner_uid = 0,
+    };
+
+    try testing.expectEqualStrings(
+        "/work/a & b/%23#one?two",
+        projectOf(
+            &serve,
+            room.allocator(),
+            "/api/fork?session=01JQ&project=%2Fwork%2Fa%20%26%20b%2F%2523%23one%3Ftwo",
+        ),
+    );
+    try testing.expectEqualStrings(
+        "/fallback",
+        projectOf(&serve, room.allocator(), "/api/fork?session=01JQ"),
+    );
 }
 
 test "an event frame carries the log's own identifier and the log's own bytes" {
