@@ -28,6 +28,9 @@ pub const Session = struct {
     id: []const u8,
     /// Milliseconds since the epoch. Zero when nothing has happened yet.
     started_ms: u64 = 0,
+    /// The direct parent and completed event this session branched from.
+    forked_from: []const u8 = "",
+    forked_at: u64 = 0,
     model: []const u8 = "",
     /// What the agent named the session, or empty when it named nothing.
     title: []const u8 = "",

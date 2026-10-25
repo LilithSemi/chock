@@ -435,6 +435,10 @@ pub fn readinessOf(
 pub const Session = struct {
     id: []const u8,
     started_ms: u64,
+    /// The direct parent recorded by the last session.fork event. A fork of a
+    /// fork inherits the older event in its prefix, then records its own.
+    forked_from: []const u8 = "",
+    forked_at: u64 = 0,
     model: []const u8 = "",
     model_count: usize = 0,
     title: []const u8 = "",
@@ -538,11 +542,13 @@ pub fn fold(
                 }
             },
             .session_end => |ended| one.end = try dupeReason(allocator, ended.reason),
-            .session_fork => {
+            .session_fork => |forked| {
                 one.end = null;
                 one.spend = .{};
                 one.model = "";
                 models.clearRetainingCapacity();
+                one.forked_from = try allocator.dupe(u8, forked.source_session);
+                one.forked_at = forked.source_event;
             },
             .session_title => |named| one.title = try allocator.dupe(u8, named.title),
             .usage => |turn| {
@@ -893,6 +899,10 @@ fn listSessions(
             try usage_cmd.costText(arena, one.spend),
         });
         if (one.has_work) tty.out(.plain, "  (holds a workspace)", .{});
+        if (one.forked_from.len != 0) tty.out(.plain, "  (fork of {s} at event {d})", .{
+            one.forked_from,
+            one.forked_at,
+        });
         if (!one.readable) tty.out(.warn, "  (this log could not be read)", .{});
         if (one.readable) {
             if (try chainNote(arena, one.chain)) |note| {
@@ -2394,6 +2404,8 @@ test "fork copies an exact completed prefix and records where the child diverged
     try testing.expect(listed.end == null);
     try testing.expectEqual(@as(u64, 0), listed.spend.turns);
     try testing.expectEqual(@as(usize, 0), listed.model_count);
+    try testing.expectEqualStrings(source_id, listed.forked_from);
+    try testing.expectEqual(source_end_offset.?, listed.forked_at);
 
     const source_bytes = try readLog(arena, io, source_paths.dir, source_id);
     const child_bytes = try readLog(arena, io, source_paths.dir, &child_id);

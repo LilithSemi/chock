@@ -78,10 +78,16 @@ pub const Web = struct {
         var offered: std.ArrayList(chock_ui.model.Resumable) = .empty;
         for (found) |one| {
             if (std.mem.eql(u8, one.id, current)) continue;
-            const note = std.fmt.allocPrint(arena, "{s}  {s}", .{
+            const state_note = std.fmt.allocPrint(arena, "{s}  {s}", .{
                 one.live.text(),
                 one.model,
             }) catch one.live.text();
+            const note = chock_ui.model.resumableNote(
+                arena,
+                one.forked_from,
+                one.forked_at,
+                state_note,
+            ) catch state_note;
             const words = chock_ui.model.resumableWords(arena, one.id, one.title, note) catch one.id;
             offered.append(arena, .{
                 .id = one.id,

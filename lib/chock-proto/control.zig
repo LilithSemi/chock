@@ -599,6 +599,10 @@ pub const ProjectRow = struct {
 pub const SessionRow = struct {
     id: []const u8,
     started_ms: u64 = 0,
+    /// The direct parent and completed event this session branched from. Empty
+    /// for a session that was not forked and for an older daemon.
+    forked_from: []const u8 = "",
+    forked_at: u64 = 0,
     model: []const u8 = "",
     model_count: usize = 0,
     model_alias: []const u8 = "",
@@ -949,6 +953,8 @@ test "a listing row survives a daemon that grew a field and a client that has no
     const row = SessionRow{
         .id = "01JQ" ++ @as([22]u8, @splat('A')),
         .started_ms = 1_700_000_000_000,
+        .forked_from = "01JQ" ++ @as([22]u8, @splat('P')),
+        .forked_at = 42,
         .model = "claude-opus-5",
         .model_alias = "main",
         .live = "live",
@@ -963,6 +969,8 @@ test "a listing row survives a daemon that grew a field and a client that has no
     var parsed = try SessionRow.fromJson(gpa, text);
     defer parsed.deinit();
     try testing.expectEqualStrings(row.id, parsed.value.id);
+    try testing.expectEqualStrings(row.forked_from, parsed.value.forked_from);
+    try testing.expectEqual(row.forked_at, parsed.value.forked_at);
     try testing.expectEqualStrings("live", parsed.value.live);
     try testing.expectEqualStrings("intact", parsed.value.chain);
     try testing.expectEqual(@as(u64, 3), parsed.value.turns);

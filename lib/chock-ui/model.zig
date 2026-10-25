@@ -382,6 +382,23 @@ pub fn resumableWords(
     return std.fmt.allocPrint(arena, "{s}  {s}  {s}", .{ title, id, note });
 }
 
+/// Put branch ancestry first in a session's note so forks with the same
+/// inherited title remain distinguishable even when a narrow view clips the
+/// model or state at the far end of the row.
+pub fn resumableNote(
+    arena: std.mem.Allocator,
+    forked_from: []const u8,
+    forked_at: u64,
+    note: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    if (forked_from.len == 0) return note;
+    return std.fmt.allocPrint(
+        arena,
+        "fork of {s} at {d}  {s}",
+        .{ forked_from, forked_at, note },
+    );
+}
+
 pub const Approval = struct {
     request_id: u64,
     action: []const u8,

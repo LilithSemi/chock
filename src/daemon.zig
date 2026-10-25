@@ -1668,6 +1668,8 @@ pub fn rowOf(session: sessions_cmd.Session) control.SessionRow {
     return .{
         .id = session.id,
         .started_ms = session.started_ms,
+        .forked_from = session.forked_from,
+        .forked_at = session.forked_at,
         .model = session.model,
         .model_count = session.model_count,
         .model_alias = session.model_alias,
@@ -2290,6 +2292,8 @@ test "a listing over the wire says what the local fold says" {
     const wire = parsed.value;
     try testing.expectEqualStrings(local[0].id, wire.id);
     try testing.expectEqual(local[0].started_ms, wire.started_ms);
+    try testing.expectEqualStrings(local[0].forked_from, wire.forked_from);
+    try testing.expectEqual(local[0].forked_at, wire.forked_at);
     try testing.expectEqualStrings(local[0].model, wire.model);
     try testing.expectEqual(local[0].model_count, wire.model_count);
     try testing.expectEqualStrings(local[0].model_alias, wire.model_alias);

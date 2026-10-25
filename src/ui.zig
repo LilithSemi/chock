@@ -686,7 +686,13 @@ const TerminalHost = struct {
             const log_path = sessions_cmd.logPathIn(arena, ui_self.sessions_dir, one.id) catch continue;
             const ready = sessions_cmd.readinessOf(arena, ui_self.io, log_path, one.id);
             const ended = if (one.end) |reason| reason.wireName() else "no end recorded";
-            const words = chock_ui.model.resumableWords(arena, one.id, one.title, ended) catch one.id;
+            const note = chock_ui.model.resumableNote(
+                arena,
+                one.forked_from,
+                one.forked_at,
+                ended,
+            ) catch ended;
+            const words = chock_ui.model.resumableWords(arena, one.id, one.title, note) catch one.id;
             offered.append(arena, .{
                 .id = one.id,
                 .words = words,

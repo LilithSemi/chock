@@ -183,6 +183,8 @@ pub const Web = struct {
             out.append(arena, .{
                 .id = stringAt(object, "id") orelse continue,
                 .started_ms = @intCast(@max(integerAt(object, "started_ms") orelse 0, 0)),
+                .forked_from = stringAt(object, "forked_from") orelse "",
+                .forked_at = @intCast(@max(integerAt(object, "forked_at") orelse 0, 0)),
                 .model = stringAt(object, "model") orelse "",
                 .title = stringAt(object, "title") orelse "",
                 .project = stringAt(object, "project") orelse "",
