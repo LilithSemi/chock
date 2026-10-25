@@ -316,7 +316,7 @@ const Project = struct {
         const config_path = try std.fmt.allocPrint(gpa, "{s}/config.zon", .{config_dir});
         defer gpa.free(config_path);
         // Readable by nobody else, which `chock-auth` insists on for a token.
-        var file = try std.Io.Dir.createFileAbsolute(io, config_path, .{ .permissions = @enumFromInt(0o600) });
+        var file = try std.Io.Dir.createFileAbsolute(io, config_path, .{ .permissions = @fromBackingInt(@intCast(0o600)) });
         defer file.close(io);
         var buffer: [512]u8 = undefined;
         var writer = file.writerStreaming(io, &buffer);
@@ -415,6 +415,68 @@ test "chock run never takes the alternate screen, whatever the colour flags say"
         try testing.expect(std.mem.indexOf(u8, one.out, alt_screen_on) == null);
         try testing.expect(std.mem.indexOf(u8, one.err, alt_screen_on) == null);
     }
+}
+
+test "chock run JSON mode writes one result object and keeps diagnostics on standard error" {
+    if (git_path.len == 0) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var box = try Sandbox.init(gpa, io);
+    defer box.deinit(gpa);
+    var project = try Project.make(gpa, io, &box);
+    defer project.deinit(gpa);
+
+    var run = try runChock(gpa, io, &box.env, &.{
+        "run", "--output", "json", "--project", project.path, "--", "fix", "the", "parser",
+    });
+    defer run.deinit(gpa);
+
+    try testing.expect(run.out.len != 0);
+    try testing.expect(run.out[run.out.len - 1] == '\n');
+    try testing.expect(std.mem.count(u8, run.out, "\n") == 1);
+    try testing.expect(std.mem.indexOf(u8, run.out, "chock:") == null);
+    try testing.expect(std.mem.indexOf(u8, run.err, "model no-such-model via dead") != null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, run.out, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try testing.expectEqualStrings("chock.run-result", object.get("schema").?.string);
+    try testing.expectEqual(@as(i64, 1), object.get("version").?.integer);
+    try testing.expectEqual(@as(i64, run.code), object.get("exit_code").?.integer);
+    try testing.expect(object.get("session_id").? == .string);
+    try testing.expect(object.get("audit_log").? == .string);
+    try testing.expect(object.get("usage").? == .object);
+    try testing.expect(object.get("workspace").? == .object);
+
+    var streamed = try runChock(gpa, io, &box.env, &.{
+        "run", "--output", "jsonl", "--project", project.path, "--", "fix", "the", "parser",
+    });
+    defer streamed.deinit(gpa);
+    try testing.expect(streamed.out[streamed.out.len - 1] == '\n');
+
+    var saw_event = false;
+    var saw_result = false;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, streamed.out, "\n"), '\n');
+    while (lines.next()) |line| {
+        const item = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
+        defer item.deinit();
+        const schema = item.value.object.get("schema").?.string;
+        if (std.mem.eql(u8, schema, "chock.run-event")) {
+            try testing.expect(!saw_result);
+            saw_event = true;
+            try testing.expect(item.value.object.get("event_id").? == .integer);
+            try testing.expect(item.value.object.get("event").? == .object);
+        } else {
+            try testing.expectEqualStrings("chock.run-result", schema);
+            saw_result = true;
+        }
+    }
+    try testing.expect(saw_event);
+    try testing.expect(saw_result);
 }
 
 /// Three files rather than pipes, since `std.process.RunOptions` has no way to give a child its standard input.

@@ -22,7 +22,10 @@ pub const max_answer_bytes: usize = 256;
 pub const max_detail_bytes: usize = 8 * 1024;
 
 pub fn hasTerminal(io: std.Io) bool {
-    return std.Io.File.stdin().isTty(io) catch false;
+    // Machine output is non-interactive even when a caller happens to leave a
+    // terminal attached. An unanswered question must fail closed instead of
+    // putting a prompt beside the promised single JSON result.
+    return tty.humanOut() and (std.Io.File.stdin().isTty(io) catch false);
 }
 
 pub fn timeoutMs(at_terminal: bool) i64 {
