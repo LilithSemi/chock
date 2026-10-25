@@ -17,6 +17,7 @@ const chock_net = @import("chock-net");
 const shares_mod = chock_net.vm_shares;
 
 pub const available = true;
+pub const snapshots = builtin.os.tag == .linux;
 
 const ram_base: u64 = switch (builtin.cpu.arch) {
     .x86_64 => 0,
@@ -89,6 +90,10 @@ const default_tick_ms: u64 = 10;
 
 const file_limit: std.Io.Limit = .limited(512 * 1024 * 1024);
 
+/// A snapshot is mostly guest RAM. Keep the bound finite, but large enough for
+/// every guest Chock currently permits.
+const snapshot_limit: std.Io.Limit = .limited(16 << 30);
+
 const default_cmdline: []const u8 = if (serial_on_port)
     "console=ttyS0 loglevel=7 init=/init"
 else
@@ -104,6 +109,10 @@ pub const Options = struct {
     port: u32 = 1024,
     shares: []const Share = &.{},
     seconds: ?u64 = null,
+    /// Resume a stopped guest instead of booting the kernel and initrd.
+    restore: ?[]const u8 = null,
+    /// Where a snapshot-stop command writes the stopped guest.
+    save: ?[]const u8 = null,
     control: i32,
 
     pub const Share = shares_mod.Share;
@@ -185,6 +194,8 @@ pub const SendError = error{
     Broke,
 };
 
+pub const SnapshotError = error{Broke};
+
 pub const ReadyError = error{
     GuestRefused,
     GuestGone,
@@ -209,6 +220,13 @@ pub const Child = struct {
         defer line.deinit(allocator);
         writeShares(allocator, &line, shares) catch return error.OutOfMemory;
         if (!writeAll(self.control, line.items)) return error.Broke;
+    }
+
+    /// Ask the guest process to stop at its next host exit and write the
+    /// snapshot path supplied in `Options.save`.
+    pub fn snapshotStop(self: *Child) SnapshotError!void {
+        if (self.control < 0) return error.Broke;
+        if (!writeAll(self.control, "S")) return error.Broke;
     }
 
     pub fn waitReady(self: *Child, io: std.Io, limit_ms: u64) ReadyError!void {
@@ -479,13 +497,50 @@ fn host(
 ) anyerror!u8 {
     const cwd: std.Io.Dir = .cwd();
 
-    const kernel = cwd.readFileAlloc(io, options.kernel, gpa, file_limit) catch {
-        fault.* = .{ .said = "the kernel could not be read", .detail = options.kernel };
-        return 1;
-    };
+    const snapshot_bytes: ?[]u8 = if (options.restore) |path|
+        cwd.readFileAlloc(io, path, gpa, snapshot_limit) catch {
+            fault.* = .{ .said = "the guest snapshot could not be read", .detail = path };
+            return 1;
+        }
+    else
+        null;
+    defer if (snapshot_bytes) |bytes| gpa.free(bytes);
+
+    // Open the destination before the VMM installs its filesystem boundary.
+    // The snapshot is daemon state, not a directory the guest may mount.
+    var snapshot_file: ?std.Io.File = if (options.save) |path|
+        std.Io.Dir.createFileAbsolute(io, path, .{
+            .truncate = true,
+            .permissions = .fromMode(0o600),
+        }) catch {
+            fault.* = .{ .said = "the guest snapshot destination could not be opened", .detail = path };
+            return 1;
+        }
+    else
+        null;
+    defer if (snapshot_file) |file| file.close(io);
+
+    var restored_queues: [core.Snapshot.max_queues]core.Snapshot.QueueState = undefined;
+    const restored: ?core.Snapshot.Parts = if (snapshot_bytes) |bytes|
+        core.Snapshot.parse(bytes, &restored_queues) catch {
+            fault.* = .{ .said = "the guest snapshot is not one this build can restore", .detail = options.restore.? };
+            return 1;
+        }
+    else
+        null;
+
+    const kernel = if (restored == null)
+        cwd.readFileAlloc(io, options.kernel, gpa, file_limit) catch {
+            fault.* = .{ .said = "the kernel could not be read", .detail = options.kernel };
+            return 1;
+        }
+    else
+        try gpa.alloc(u8, 0);
     defer gpa.free(kernel);
 
-    const initrd: ?[]u8 = if (options.initrd) |path|
+    const initrd: ?[]u8 = if (restored != null)
+        null
+    else if (options.initrd) |path|
         cwd.readFileAlloc(io, path, gpa, file_limit) catch {
             fault.* = .{ .said = "the initrd could not be read", .detail = path };
             return 1;
@@ -494,7 +549,10 @@ fn host(
         null;
     defer if (initrd) |bytes| gpa.free(bytes);
 
-    var sev_fd: ?i32 = if (comptime sev_possible) backend.kvm.Vm.openSev() else null;
+    var sev_fd: ?i32 = if (comptime sev_possible)
+        if (restored == null) backend.kvm.Vm.openSev() else null
+    else
+        null;
     defer if (sev_fd) |fd| sys.close(fd);
 
     var sev: Sev = .off;
@@ -559,6 +617,14 @@ fn host(
     }
     var memory: GuestMemory = .{ .regions = regions[0..slot_count] };
 
+    if (restored) |parts| {
+        if (parts.ram_base != ram_base or parts.memory.len != ram_size or slot_count != 1) {
+            fault.* = .{ .said = "the guest snapshot does not match this guest's memory" };
+            return 1;
+        }
+        @memcpy((try memory.slice(ram_base, ram_size))[0..parts.memory.len], parts.memory);
+    }
+
     const hv = machine.backend();
 
     const id = try hv.addVcpu();
@@ -571,11 +637,37 @@ fn host(
         for (ids) |*each| each.* = try hv.addVcpu();
     }
 
+    const cpu_ids = try gpa.alloc(backend.Backend.VcpuId, options.cpus);
+    defer gpa.free(cpu_ids);
+    cpu_ids[0] = id;
+    if (!own_cpus) @memcpy(cpu_ids[1..], ids);
+
     var gic = if (own_controller)
         device.Gicv2{ .cpus = options.cpus }
     else
         try backend.platform.createController(&machine.vm, options.cpus);
     defer if (!own_controller) gic.deinit();
+
+    if (restored) |parts| {
+        if (comptime builtin.os.tag != .linux) {
+            fault.* = .{ .said = "guest snapshots are not supported by this host" };
+            return 1;
+        } else {
+            if (parts.cpus != options.cpus) {
+                fault.* = .{ .said = "the guest snapshot does not match this guest's processors" };
+                return 1;
+            }
+            for (cpu_ids, 0..) |which, index| {
+                const cpu = &machine.vcpus[which];
+                _ = try cpu.load(parts.registersFor(@intCast(index)));
+                try cpu.setRunState(if (parts.wasRunning(@intCast(index)))
+                    backend.kvm.Vcpu.runnable
+                else
+                    backend.kvm.Vcpu.stopped);
+            }
+            _ = try gic.load(parts.controller);
+        }
+    }
 
     var seed: [32]u8 = undefined;
     try io.randomSecure(&seed);
@@ -624,7 +716,10 @@ fn host(
         }
     }
 
-    const layout = try core.Launch.prepare(gpa, &memory, &manifest, placing);
+    const layout = if (restored == null)
+        try core.Launch.prepare(gpa, &memory, &manifest, placing)
+    else
+        core.Launch.Layout{ .entry = 0, .device_tree = 0 };
 
     if (comptime sev_possible) {
         if (sev != .off) {
@@ -654,6 +749,26 @@ fn host(
 
     var shared_fs: device.virtio.Fs = undefined;
     shared_fs.init(fs_mod.Export.tag, .{ .ctx = &offered, .answer = answerFs }, share_asked, share_answered);
+
+    if (restored) |parts| {
+        if (parts.queues.len != device.virtio.Fs.queue_count + device.virtio.Vsock.queue_count) {
+            fault.* = .{ .said = "the guest snapshot has a different device layout" };
+            return 1;
+        }
+        var which: usize = 0;
+        for (&shared_fs.queues) |*queue| {
+            parts.queues[which].into(queue);
+            which += 1;
+        }
+        for (&channel.queues) |*queue| {
+            parts.queues[which].into(queue);
+            which += 1;
+        }
+        restoreTransports(snapshot_bytes.?, parts, &shared_fs, &channel) catch {
+            fault.* = .{ .said = "the guest snapshot is missing Chock's device state" };
+            return 1;
+        };
+    }
 
     var held = session_mod.Server.listen(options.session) catch {
         fault.* = .{ .said = "nothing can hold a session there", .detail = options.session };
@@ -708,10 +823,12 @@ fn host(
         return 1;
     };
 
-    if (own_cpus) {
-        try arch.boot.enter(Entering{ .hv = hv, .id = id }, layout);
-    } else {
-        try arch.boot.enter(&machine.vcpus[id], layout);
+    if (restored == null) {
+        if (own_cpus) {
+            try arch.boot.enter(Entering{ .hv = hv, .id = id }, layout);
+        } else {
+            try arch.boot.enter(&machine.vcpus[id], layout);
+        }
     }
 
     sayReady(options.control, sev);
@@ -735,6 +852,7 @@ fn host(
     }
 
     var ending: std.atomic.Value(bool) = .init(false);
+    var snapshot_asked: std.atomic.Value(bool) = .init(false);
 
     var end: Pump = .{
         .io = io,
@@ -748,6 +866,7 @@ fn host(
         .out = out,
         .control = options.control,
         .turns = &turns,
+        .snapshot_asked = &snapshot_asked,
     };
 
     const wanted: []Waiting = if (own_cpus) try gpa.alloc(Waiting, options.cpus) else &.{};
@@ -820,6 +939,38 @@ fn host(
         return 1;
     }
 
+    // Register state cannot be read while another vCPU is inside the
+    // hypervisor. Bring every one out and join it before snapshotting.
+    wakeParked(parked[0..started], &ending);
+    for (others[0..started]) |each| each.join();
+    started = 0;
+
+    if (snapshot_asked.load(.acquire)) {
+        _ = options.save orelse {
+            fault.* = .{ .said = "the guest was asked for a snapshot without a destination" };
+            return 1;
+        };
+        if (sev != .off) {
+            fault.* = .{ .said = "an encrypted guest cannot be snapshotted" };
+            return 1;
+        }
+        saveSnapshot(
+            gpa,
+            io,
+            &snapshot_file.?,
+            &machine,
+            &gic,
+            &memory,
+            ram_size,
+            cpu_ids,
+            &shared_fs,
+            &channel,
+        ) catch |err| {
+            fault.* = .{ .said = "the guest snapshot could not be written", .detail = @errorName(err) };
+            return 1;
+        };
+    }
+
     held.lost(endingOf(reason, end.timed_out));
     held.close(&channel);
     out.flush() catch {};
@@ -879,6 +1030,118 @@ const Devices = struct {
     }
 };
 
+const transport_magic = "chock snapshot devices\x00";
+const transport_state_bytes = 32;
+
+fn writeTransport(mmio: anytype, out: *[transport_state_bytes]u8) void {
+    std.mem.writeInt(u32, out[0..4], mmio.queue_sel, .little);
+    std.mem.writeInt(u32, out[4..8], mmio.status, .little);
+    std.mem.writeInt(u32, out[8..12], mmio.interrupt_status, .little);
+    std.mem.writeInt(u32, out[12..16], mmio.device_features_sel, .little);
+    std.mem.writeInt(u32, out[16..20], mmio.driver_features_sel, .little);
+    std.mem.writeInt(u64, out[20..28], mmio.driver_features, .little);
+    std.mem.writeInt(u32, out[28..32], mmio.notified, .little);
+}
+
+fn readTransport(mmio: anytype, from: *const [transport_state_bytes]u8) void {
+    mmio.queue_sel = std.mem.readInt(u32, from[0..4], .little);
+    mmio.status = std.mem.readInt(u32, from[4..8], .little);
+    mmio.interrupt_status = std.mem.readInt(u32, from[8..12], .little);
+    mmio.device_features_sel = std.mem.readInt(u32, from[12..16], .little);
+    mmio.driver_features_sel = std.mem.readInt(u32, from[16..20], .little);
+    mmio.driver_features = std.mem.readInt(u64, from[20..28], .little);
+    mmio.notified = std.mem.readInt(u32, from[28..32], .little);
+}
+
+fn restoreTransports(
+    bytes: []const u8,
+    parts: core.Snapshot.Parts,
+    fs: *device.virtio.Fs,
+    vsock: *device.virtio.Vsock,
+) !void {
+    const at = core.Snapshot.size(parts);
+    const wanted = transport_magic.len + 2 * transport_state_bytes;
+    if (bytes.len < at + wanted) return error.Truncated;
+    if (!std.mem.eql(u8, bytes[at..][0..transport_magic.len], transport_magic)) return error.BadMagic;
+    var state_at = at + transport_magic.len;
+    readTransport(&fs.mmio, bytes[state_at..][0..transport_state_bytes]);
+    state_at += transport_state_bytes;
+    readTransport(&vsock.mmio, bytes[state_at..][0..transport_state_bytes]);
+}
+
+fn saveSnapshot(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    file: *std.Io.File,
+    machine: *Machine,
+    gic: *backend.platform.Controller,
+    memory: *GuestMemory,
+    ram_size: u64,
+    cpu_ids: []const backend.Backend.VcpuId,
+    fs: *device.virtio.Fs,
+    vsock: *device.virtio.Vsock,
+) !void {
+    if (comptime builtin.os.tag != .linux) return error.SnapshotUnsupported;
+
+    const first = &machine.vcpus[cpu_ids[0]];
+    const count = try first.registerCount();
+    const register_ids = try gpa.alloc(u64, @intCast(count + 1));
+    defer gpa.free(register_ids);
+
+    const each_cpu = try backend.kvm.Vcpu.State.size(first, register_ids);
+    const registers = try gpa.alloc(u8, each_cpu * cpu_ids.len);
+    defer gpa.free(registers);
+    const running = try gpa.alloc(u8, cpu_ids.len);
+    defer gpa.free(running);
+
+    var written: usize = 0;
+    for (cpu_ids, 0..) |which, index| {
+        const cpu = &machine.vcpus[which];
+        const took = try cpu.save(try cpu.registerList(register_ids), registers[index * each_cpu ..]);
+        if (took != each_cpu) return error.RegisterSizeDiffered;
+        written += took;
+        running[index] = @intFromBool(try cpu.runState() == backend.kvm.Vcpu.runnable);
+    }
+
+    const controller = try gpa.alloc(u8, backend.platform.Controller.State.size(cpu_ids.len));
+    defer gpa.free(controller);
+    const controller_bytes = try gic.save(cpu_ids.len, controller);
+
+    var queues: [device.virtio.Fs.queue_count + device.virtio.Vsock.queue_count]core.Snapshot.QueueState = undefined;
+    var which: usize = 0;
+    for (fs.queues) |queue| {
+        queues[which] = .of(queue);
+        which += 1;
+    }
+    for (vsock.queues) |queue| {
+        queues[which] = .of(queue);
+        which += 1;
+    }
+
+    const parts: core.Snapshot.Parts = .{
+        .ram_base = ram_base,
+        .memory = try memory.slice(ram_base, ram_size),
+        .registers = registers[0..written],
+        .cpus = @intCast(cpu_ids.len),
+        .running = running,
+        .controller = controller[0..controller_bytes],
+        .queues = &queues,
+    };
+    const core_size = core.Snapshot.size(parts);
+    const bytes = try gpa.alloc(u8, core_size + transport_magic.len + 2 * transport_state_bytes);
+    defer gpa.free(bytes);
+    _ = try core.Snapshot.write(parts, bytes[0..core_size]);
+    @memcpy(bytes[core_size..][0..transport_magic.len], transport_magic);
+    var at = core_size + transport_magic.len;
+    writeTransport(&fs.mmio, bytes[at..][0..transport_state_bytes]);
+    at += transport_state_bytes;
+    writeTransport(&vsock.mmio, bytes[at..][0..transport_state_bytes]);
+    at += transport_state_bytes;
+
+    try file.writeStreamingAll(io, bytes[0..at]);
+    try file.sync(io);
+}
+
 const Pump = struct {
     io: std.Io,
     deadline: ?i96,
@@ -889,6 +1152,7 @@ const Pump = struct {
     ending: *std.atomic.Value(bool),
     timed_out: bool = false,
     turns: *std.atomic.Value(u64),
+    snapshot_asked: *std.atomic.Value(bool),
 
     fn launchHost(self: *Pump) core.Launch.Host {
         return .{ .ctx = self, .step = Pump.step };
@@ -898,7 +1162,14 @@ const Pump = struct {
         const self: *Pump = @ptrCast(@alignCast(ctx));
 
         if (self.ending.load(.acquire)) return false;
-        if (parentLetGo(self.control)) return false;
+        switch (parentControl(self.control)) {
+            .keep_running => {},
+            .stop => return false,
+            .snapshot => {
+                self.snapshot_asked.store(true, .release);
+                return false;
+            },
+        }
 
         const turn = self.turns.fetchAdd(1, .release) + 1;
         if (turn % 32 == 0) self.out.flush() catch {};
@@ -915,11 +1186,14 @@ const Pump = struct {
     }
 };
 
-fn parentLetGo(control: i32) bool {
+const ParentControl = enum { keep_running, stop, snapshot };
+
+fn parentControl(control: i32) ParentControl {
     var byte: [1]u8 = undefined;
     return switch (sys.read(control, &byte)) {
-        .again, .interrupted, .got => false,
-        .ended, .broke => true,
+        .again, .interrupted => .keep_running,
+        .got => if (byte[0] == 'S') .snapshot else .keep_running,
+        .ended, .broke => .stop,
     };
 }
 
@@ -1425,11 +1699,42 @@ test "a parent that closed its half is the only thing that asks for the end" {
     try testing.expect(sys.channelPair(&pair));
     try testing.expect(dontWaitOn(pair[1]));
 
-    try testing.expect(!parentLetGo(pair[1]));
+    try testing.expectEqual(ParentControl.keep_running, parentControl(pair[1]));
+
+    try testing.expect(writeAll(pair[0], "S"));
+    try testing.expectEqual(ParentControl.snapshot, parentControl(pair[1]));
 
     sys.close(pair[0]);
-    try testing.expect(parentLetGo(pair[1]));
+    try testing.expectEqual(ParentControl.stop, parentControl(pair[1]));
     sys.close(pair[1]);
+}
+
+test "snapshot transport state round trips without host pointers" {
+    const Transport = struct {
+        queue_sel: u32 = 0,
+        status: u32 = 0,
+        interrupt_status: u32 = 0,
+        device_features_sel: u32 = 0,
+        driver_features_sel: u32 = 0,
+        driver_features: u64 = 0,
+        notified: u32 = 0,
+    };
+
+    const before: Transport = .{
+        .queue_sel = 2,
+        .status = 15,
+        .interrupt_status = 1,
+        .device_features_sel = 1,
+        .driver_features_sel = 1,
+        .driver_features = 1 << 32,
+        .notified = 5,
+    };
+    var bytes: [transport_state_bytes]u8 = undefined;
+    writeTransport(&before, &bytes);
+
+    var after: Transport = .{};
+    readTransport(&after, &bytes);
+    try testing.expectEqualDeep(before, after);
 }
 
 test "a signalled child reads as signalled, and one that will not stop is killed" {

@@ -54,9 +54,12 @@ const usage_text =
 const Session = struct {
     id: [session_paths.id_length]u8,
     log_path: [:0]u8,
+    snapshot_path: [:0]u8,
     project: []u8,
     pid: ?std.posix.pid_t = null,
     guest: ?Guest = null,
+    has_snapshot: bool = false,
+    snapshotting: bool = false,
 };
 
 const Guest = struct {
@@ -70,6 +73,9 @@ const Running = struct {
     thread: std.Thread,
     ready: std.atomic.Value(bool) = .init(false),
     stopping: std.atomic.Value(bool) = .init(false),
+    snapshotting: std.atomic.Value(bool) = .init(false),
+    snapshot_saved: std.atomic.Value(bool) = .init(false),
+    snapshot_allowed: std.atomic.Value(bool) = .init(false),
     ended: std.atomic.Value(bool) = .init(false),
 };
 
@@ -95,14 +101,16 @@ const Daemon = struct {
 
     fn deinit(self: *Daemon) void {
         for (self.sessions.items) |entry| {
-            self.gpa.free(entry.log_path);
-            self.gpa.free(entry.project);
             if (entry.guest) |one| {
                 one.running.stopping.store(true, .release);
                 one.running.thread.join();
                 self.gpa.destroy(one.running);
                 self.gpa.free(one.socket);
             }
+            self.gpa.free(entry.log_path);
+            std.Io.Dir.deleteFileAbsolute(self.io, entry.snapshot_path) catch {};
+            self.gpa.free(entry.snapshot_path);
+            self.gpa.free(entry.project);
         }
         self.sessions.deinit(self.gpa);
         self.sandbox.deinit(self.gpa);
@@ -117,6 +125,24 @@ const Daemon = struct {
         return null;
     }
 
+    const GuestState = union(enum) {
+        none,
+        snapshotting,
+        ready: Guest,
+    };
+
+    fn guestState(self: *Daemon, id: []const u8) GuestState {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |entry| {
+            if (!std.mem.eql(u8, &entry.id, id)) continue;
+            if (entry.guest) |one| return .{ .ready = one };
+            if (entry.snapshotting) return .snapshotting;
+            return .none;
+        }
+        return .none;
+    }
+
     fn rememberGuest(self: *Daemon, id: []const u8, one: Guest) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -127,6 +153,38 @@ const Daemon = struct {
             return true;
         }
         return false;
+    }
+
+    fn takeSnapshot(self: *Daemon, id: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |*entry| {
+            if (!std.mem.eql(u8, &entry.id, id)) continue;
+            const had = entry.has_snapshot;
+            entry.has_snapshot = false;
+            return had;
+        }
+        return false;
+    }
+
+    fn noteSnapshot(self: *Daemon, id: []const u8, saved: bool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |*entry| {
+            if (!std.mem.eql(u8, &entry.id, id)) continue;
+            entry.has_snapshot = saved;
+            entry.snapshotting = false;
+            return;
+        }
+    }
+
+    fn snapshotPathFor(self: *Daemon, id: []const u8) ?[]const u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |entry| {
+            if (std.mem.eql(u8, &entry.id, id)) return entry.snapshot_path;
+        }
+        return null;
     }
 
     fn noteTurn(self: *Daemon, id: []const u8) ?u64 {
@@ -149,6 +207,7 @@ const Daemon = struct {
             const one = entry.guest orelse return null;
             if (one.turns != turns) return null;
             entry.guest = null;
+            entry.snapshotting = true;
             return one;
         }
         return null;
@@ -679,8 +738,20 @@ fn beginSession(
         fail(writer, "out of memory");
         return;
     };
-    daemon.remember(.{ .id = id, .log_path = log_path, .project = project_copy }) catch {
+    const snapshot_path = guestSnapshotPath(daemon, &id) orelse {
         daemon.gpa.free(log_path);
+        daemon.gpa.free(project_copy);
+        fail(writer, "out of memory");
+        return;
+    };
+    daemon.remember(.{
+        .id = id,
+        .log_path = log_path,
+        .snapshot_path = snapshot_path,
+        .project = project_copy,
+    }) catch {
+        daemon.gpa.free(log_path);
+        daemon.gpa.free(snapshot_path);
         daemon.gpa.free(project_copy);
         fail(writer, "out of memory");
         return;
@@ -815,7 +886,15 @@ fn startGuest(
     project: []const u8,
 ) ?[:0]const u8 {
     if (daemon.sandbox.chosen() != .microvm) return null;
-    if (daemon.guestFor(id)) |had| return had.socket;
+    while (true) switch (daemon.guestState(id)) {
+        .ready => |had| return had.socket,
+        .snapshotting => std.Io.sleep(
+            daemon.io,
+            .fromNanoseconds(guest_look_ms * std.time.ns_per_ms),
+            .awake,
+        ) catch return null,
+        .none => break,
+    };
 
     if (daemon.guestCount() >= max_guests) {
         tty.print(
@@ -840,6 +919,8 @@ fn startGuest(
     room.* = std.heap.ArenaAllocator.init(daemon.gpa);
 
     const shares = guestShares(room.allocator(), daemon, id, project) orelse return null;
+    const snapshot_path = daemon.snapshotPathFor(id) orelse return null;
+    const restore = if (daemon.takeSnapshot(id)) snapshot_path else null;
 
     const running = daemon.gpa.create(Running) catch return null;
     var running_owned = true;
@@ -862,6 +943,8 @@ fn startGuest(
             .memory_mb = daemon.sandbox.memory(guest_machine, builtin.os.tag),
             .cpus = daemon.sandbox.processors(guest_machine, builtin.os.tag),
             .shares = shares,
+            .restore = restore,
+            .save = snapshot_path,
             .control = vmm.fork_sets_control,
         },
         .shares = room,
@@ -878,11 +961,15 @@ fn startGuest(
     if (!waitForGuest(daemon.io, running)) {
         tty.print(
             .err,
-            "chock daemon: the guest of session {s} did not come up, so the session runs none\n",
-            .{id},
+            "chock daemon: the guest of session {s} did not come up{s}\n",
+            .{ id, if (restore != null) " from its snapshot; trying a cold boot" else ", so the session runs none" },
         );
         running.stopping.store(true, .release);
         running.thread.join();
+        if (restore != null) {
+            std.Io.Dir.deleteFileAbsolute(daemon.io, snapshot_path) catch {};
+            return startGuest(daemon, id, project);
+        }
         return null;
     }
 
@@ -939,6 +1026,9 @@ fn runGuest(work: GuestWork) void {
     defer {
         child.stop();
         const code = child.wait();
+        if (code == 0 and running.snapshotting.load(.acquire)) {
+            running.snapshot_saved.store(true, .release);
+        }
         if (code == 0) {
             tty.detail("chock daemon: a guest's own process ended, answering 0\n", .{});
         } else {
@@ -972,9 +1062,17 @@ fn runGuest(work: GuestWork) void {
     if (child.sev != .off) {
         tty.print(.dim, "chock daemon: a guest's memory is encrypted ({s}).\n", .{child.sev.text()});
     }
+    running.snapshot_allowed.store(vmm.snapshots and child.sev == .off, .release);
     running.ready.store(true, .release);
 
     while (!running.stopping.load(.acquire)) {
+        if (running.snapshotting.load(.acquire)) {
+            child.snapshotStop() catch |err| {
+                running.snapshotting.store(false, .release);
+                tty.print(.err, "chock daemon: a guest could not be asked for a snapshot: {t}\n", .{err});
+            };
+            return;
+        }
         std.Io.sleep(daemon.io, .fromNanoseconds(guest_look_ms * std.time.ns_per_ms), .awake) catch
             return;
     }
@@ -1154,6 +1252,19 @@ fn guestConsolePath(
     ) catch null;
 }
 
+fn guestSnapshotPath(
+    daemon: *Daemon,
+    id: *const [session_paths.id_length]u8,
+) ?[:0]u8 {
+    const tail = id[id.len - guest_name_bytes ..];
+    return std.fmt.allocPrintSentinel(
+        daemon.gpa,
+        "{s}/g-{s}.snapshot",
+        .{ daemon.socket_dir, tail },
+        0,
+    ) catch null;
+}
+
 fn guestSocketPath(
     daemon: *Daemon,
     id: *const [session_paths.id_length]u8,
@@ -1191,9 +1302,19 @@ fn releaseGuestLater(daemon: *Daemon, id: [session_paths.id_length]u8, turn: u64
     defer daemon.gpa.free(one.socket);
     defer daemon.gpa.destroy(one.running);
 
-    one.running.stopping.store(true, .release);
+    if (one.running.snapshot_allowed.load(.acquire)) {
+        one.running.snapshotting.store(true, .release);
+    } else {
+        one.running.stopping.store(true, .release);
+    }
     one.running.thread.join();
-    tty.detail("chock daemon: the guest of session {s} was let go after an idle spell\n", .{id});
+    const saved = one.running.snapshot_saved.load(.acquire);
+    daemon.noteSnapshot(&id, saved);
+    if (saved) {
+        tty.detail("chock daemon: the guest of session {s} was snapshotted after an idle spell\n", .{id});
+    } else {
+        tty.detail("chock daemon: the guest of session {s} was let go after an idle spell\n", .{id});
+    }
 }
 
 fn handleRead(

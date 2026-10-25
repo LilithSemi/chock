@@ -3,6 +3,19 @@
 const std = @import("std");
 
 pub const available = false;
+pub const snapshots = false;
+
+pub const Sev = enum {
+    off,
+    sev,
+
+    pub fn text(self: Sev) []const u8 {
+        return switch (self) {
+            .off => "off",
+            .sev => "sev",
+        };
+    }
+};
 
 pub const Options = struct {
     kernel: []const u8 = "",
@@ -14,6 +27,8 @@ pub const Options = struct {
     port: u32 = 1024,
     shares: []const Share = &.{},
     seconds: ?u64 = null,
+    restore: ?[]const u8 = null,
+    save: ?[]const u8 = null,
     control: i32,
 
     pub const Share = struct {
@@ -77,6 +92,8 @@ pub const ForkError = error{
 
 pub const SendError = error{ OutOfMemory, Broke };
 
+pub const SnapshotError = error{Broke};
+
 pub const ReadyError = error{ GuestRefused, GuestGone, GuestSlow };
 
 pub const Child = struct {
@@ -100,6 +117,11 @@ pub const Child = struct {
         _ = io;
         _ = limit_ms;
         return error.GuestGone;
+    }
+
+    pub fn snapshotStop(self: *Child) SnapshotError!void {
+        _ = self;
+        return error.Broke;
     }
 
     pub fn fault(self: *Child) ?Fault {
