@@ -4,6 +4,7 @@ const std = @import("std");
 const chock_core = @import("chock-core");
 const chock_proto = @import("chock-proto");
 const chock_workspace = @import("chock-workspace");
+const ziggit = @import("ziggit");
 
 const approval = @import("approval.zig");
 const session_paths = @import("session.zig");
@@ -64,7 +65,6 @@ pub fn main(
     exe_path: []const u8,
     args: []const []const u8,
 ) anyerror!u8 {
-    _ = gpa;
     _ = exe_path;
 
     var threaded = std.Io.Threaded.init(arena, .{ .environ = environ });
@@ -92,7 +92,7 @@ pub fn main(
     };
 
     if (options.action == .review) {
-        return reviewWorkspace(arena, io, &env, project_root, dir, options.session, options.paths);
+        return reviewWorkspace(arena, gpa, io, project_root, dir, options.session, options.paths);
     }
 
     const kept = try list(arena, io, dir);
@@ -420,8 +420,8 @@ fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]c
 
 fn reviewWorkspace(
     arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     io: std.Io,
-    env: *const std.process.Environ.Map,
     project_root: []const u8,
     session_dir: []const u8,
     wanted: ?[]const u8,
@@ -496,48 +496,89 @@ fn reviewWorkspace(
         return Exit.usage.code();
     }
 
-    var argv: std.ArrayList([]const u8) = .empty;
-    argv.appendSlice(arena, &.{
-        "diff",
-        "--no-ext-diff",
-        "--binary",
-        "--find-renames",
-        "--find-copies",
-        opened.base_commit,
-        std.fmt.allocPrint(arena, "refs/chock/{s}", .{session_id}) catch return Exit.faulted.code(),
-        "--",
-    }) catch return Exit.faulted.code();
-    for (paths) |path| {
-        const literal = std.fmt.allocPrint(arena, ":(top,literal){s}", .{path}) catch return Exit.faulted.code();
-        argv.append(arena, literal) catch return Exit.faulted.code();
-    }
-
-    var output = chock_workspace.git.run(arena, io, env, project_root, argv.items, null) catch |err| {
-        tty.print(.err, "chock workspace review: Git could not read session {s}: {s}.\n", .{ session_id, @errorName(err) });
+    var project = std.Io.Dir.openDirAbsolute(io, project_root, .{ .iterate = true }) catch |err| {
+        tty.print(.err, "chock workspace review: the project could not be opened: {s}.\n", .{@errorName(err)});
         return Exit.faulted.code();
     };
-    defer output.deinit(arena);
-    const code = switch (output.term) {
-        .exited => |one| one,
-        else => {
-            tty.print(.err, "chock workspace review: Git did not finish normally.\n", .{});
-            return Exit.faulted.code();
-        },
-    };
-    if (code != 0) {
-        tty.print(
-            .err,
-            "chock workspace review: the work of session {s} could not be read: {s}",
-            .{ session_id, output.stderr },
-        );
+    defer project.close(io);
+
+    var diag: ?ziggit.Diagnostic = null;
+    defer if (diag) |*fault| fault.deinit(gpa);
+    var layout = ziggit.discover(gpa, io, project, .{}, &diag) catch |err| {
+        sayGitReviewFault(gpa, session_id, "the Git repository could not be found", err, &diag);
         return Exit.usage.code();
+    };
+    var repo = ziggit.Repository.open(gpa, io, layout, .{}, &diag) catch |err| {
+        layout.deinit(io);
+        sayGitReviewFault(gpa, session_id, "the Git repository could not be opened", err, &diag);
+        return Exit.usage.code();
+    };
+    defer repo.deinit();
+
+    const base = ziggit.resolve(gpa, &repo, opened.base_commit, &diag) catch |err| {
+        sayGitReviewFault(gpa, session_id, "the recorded base commit could not be resolved", err, &diag);
+        return Exit.usage.code();
+    };
+    const ref_name = std.fmt.allocPrint(arena, "refs/chock/{s}", .{session_id}) catch return Exit.faulted.code();
+    const tip = repo.refs.resolve(ref_name, &diag) catch |err| {
+        sayGitReviewFault(gpa, session_id, "the session ref could not be resolved", err, &diag);
+        return Exit.usage.code();
+    };
+    var diff = ziggit.diffCommits(gpa, &repo.odb, base, tip, .{ .detect_copies = true }, &diag) catch |err| {
+        sayGitReviewFault(gpa, session_id, "the session changes could not be read", err, &diag);
+        return Exit.faulted.code();
+    };
+    defer diff.deinit(gpa);
+
+    var rendered: std.Io.Writer.Allocating = .init(gpa);
+    defer rendered.deinit();
+    var shown: usize = 0;
+    for (diff.patches) |patch| {
+        if (!patchSelected(paths, patch)) continue;
+        patch.writeUnified(&rendered.writer) catch {
+            tty.print(.err, "chock workspace review: the patch for session {s} was too large to render.\n", .{session_id});
+            return Exit.faulted.code();
+        };
+        shown += 1;
     }
-    if (output.stdout.len == 0) {
+    if (shown == 0) {
         tty.print(.plain, "chock workspace review: session {s} has no changes in this selection.\n", .{session_id});
         return Exit.finished.code();
     }
-    tty.out(.plain, "{s}", .{output.stdout});
+    tty.out(.plain, "{s}", .{rendered.written()});
     return Exit.finished.code();
+}
+
+fn patchSelected(paths: []const []const u8, patch: ziggit.Patch) bool {
+    return pathSelected(paths, patch.old_path) or pathSelected(paths, patch.new_path);
+}
+
+test "review path selection recognizes either side of a rename" {
+    const patch = ziggit.Patch{
+        .old_path = "before.txt",
+        .new_path = "after.txt",
+        .status = .renamed,
+    };
+    try testing.expect(patchSelected(&.{"before.txt"}, patch));
+    try testing.expect(patchSelected(&.{"after.txt"}, patch));
+    try testing.expect(!patchSelected(&.{"another.txt"}, patch));
+}
+
+fn sayGitReviewFault(
+    gpa: std.mem.Allocator,
+    session_id: []const u8,
+    doing: []const u8,
+    err: anyerror,
+    diag: *?ziggit.Diagnostic,
+) void {
+    tty.print(.err, "chock workspace review: {s} for session {s}: {s}", .{ doing, session_id, @errorName(err) });
+    if (diag.*) |*fault| {
+        if (fault.path) |path| tty.print(.err, ": {s}", .{path});
+        if (fault.detail) |detail| tty.print(.err, ": {s}", .{detail});
+        fault.deinit(gpa);
+        diag.* = null;
+    }
+    tty.print(.err, ".\n", .{});
 }
 
 fn reviewOverlay(
@@ -1007,7 +1048,7 @@ test "review shows the recorded Git change and literal path filters select exact
     defer said.stop(io);
     try testing.expectEqual(
         Exit.finished.code(),
-        reviewWorkspace(arena, io, &env, project, sessions, id, &.{"one.txt"}),
+        reviewWorkspace(arena, testing.allocator, io, project, sessions, id, &.{"one.txt"}),
     );
     try testing.expect(std.mem.indexOf(u8, said.out(), "one after") != null);
     try testing.expect(std.mem.indexOf(u8, said.out(), "two after") == null);
@@ -1503,13 +1544,12 @@ test "review lists an overlay's changes without adopting or modifying the projec
     try writeUnder(arena, testing.io, upper, "tracked.txt", "changed\n");
     try writeUnder(arena, testing.io, upper, "notes/new.md", "new\n");
 
-    var env = std.process.Environ.Map.init(arena);
     var said: tty.Capture = undefined;
     said.start(testing.io, testing.allocator);
     defer said.stop(testing.io);
     try testing.expectEqual(
         Exit.finished.code(),
-        reviewWorkspace(arena, testing.io, &env, project, root, id, &.{"notes/new.md"}),
+        reviewWorkspace(arena, testing.allocator, testing.io, project, root, id, &.{"notes/new.md"}),
     );
     try testing.expect(std.mem.indexOf(u8, said.out(), "A notes/new.md") != null);
     try testing.expect(std.mem.indexOf(u8, said.out(), "tracked.txt") == null);

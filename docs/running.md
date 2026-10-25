@@ -281,7 +281,7 @@ never removable, and neither is one whose lock could not be tested.
 Work reaches your project only when the agent commits it in the workspace and
 the policy in your `chock.zon` permits the apply. It lands on
 `refs/chock/<session id>`, so `git log` reads it and `git merge` takes it.
-Before taking it, `chock workspace review <session id>` shows the binary-safe
+Before taking it, `chock workspace review <session id>` shows the binary-aware
 patch from the base commit recorded by the session to that ref. Repeat
 `--path <file>` to limit the patch to exact project-relative names; the names
 are literal, so Git wildcard and pathspec syntax is not evaluated.

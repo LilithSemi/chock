@@ -32,6 +32,10 @@
             .url = "git+https://git.lilithsemi.com/LilithSemi/palisade#3de554f9379e4d9482138a948945285e6d0b28c2",
             .hash = "palisade-0.1.0-kI7k7zFNCADtMYCkzyeOBldr-xBp8sSJYvDXzhQ4ksBq",
         },
+        .ziggit = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/ziggit#52a7deaf438c677b670e8f2af0d208bd29bfb92b",
+            .hash = "ziggit-0.1.0-KYLpgYHNFADuTovcF0_Zr68pzPsJi57KekNX3OHtW0GR",
+        },
     },
     .paths = .{
         "build.zig",

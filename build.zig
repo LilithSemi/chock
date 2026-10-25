@@ -1767,6 +1767,11 @@ pub fn build(b: *std.Build) void {
         run_web_bundle.addFileArg2(web_dist.dir.path(b, name), .{});
     }
 
+    // Structured Git diffs for workspace review and selective application.
+    // Keeping this as a direct dependency makes that API explicit instead of
+    // reaching through fix's private dependency graph.
+    const ziggit = b.dependency("ziggit", .{ .target = target, .optimize = optimize });
+
     const exe_imports = [_]std.Build.Module.Import{
         .{ .name = "chock-vmm", .module = vmm_module },
         .{ .name = "phantom", .module = phantom.module("phantom") },
@@ -1800,6 +1805,7 @@ pub fn build(b: *std.Build) void {
         // again. It is the other answer to where a tool call's files come from,
         // for a machine with no Nix: see lib/chock-container.zig.
         .{ .name = "chock-container", .module = chock_container },
+        .{ .name = "ziggit", .module = ziggit.module("ziggit") },
     };
 
     const chock_exe_module = b.createModule(.{
