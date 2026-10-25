@@ -2,6 +2,7 @@
 //! exports, forks, removes, or prunes a session's log.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const chock_auth = @import("chock-auth");
 const chock_core = @import("chock-core");
 const chock_pcsc = @import("chock-pcsc");
@@ -1718,6 +1719,15 @@ pub fn forkSession(
     const child_id = session_paths.newId(io);
     const child_id_text: []const u8 = &child_id;
     const child_paths = try session_paths.pathsFor(arena, env, project_root, child_id_text);
+    var keep_child = false;
+    defer if (!keep_child) {
+        // A failed fork owns none of these, including paths `create` may have
+        // made before a later path failed. Do not leave an invisible partial
+        // session behind.
+        std.Io.Dir.deleteFileAbsolute(io, child_paths.log) catch {};
+        std.Io.Dir.cwd().deleteTree(io, child_paths.work) catch {};
+        std.Io.Dir.cwd().deleteTree(io, child_paths.root) catch {};
+    };
     session_paths.create(io, child_paths) catch |err| {
         tty.print(.err, "chock sessions fork: the child session directory could not be made: {s}\n", .{@errorName(err)});
         return Exit.faulted.code();
@@ -1727,11 +1737,7 @@ pub fn forkSession(
         tty.print(.err, "chock sessions fork: the child log could not be made: {s}\n", .{@errorName(err)});
         return Exit.faulted.code();
     };
-    var keep_child = false;
-    defer {
-        if (child_file.handle != -1) child_file.close(io);
-        if (!keep_child) std.Io.Dir.cwd().deleteFile(io, child_paths.log) catch {};
-    }
+    defer if (child_file.handle != -1) child_file.close(io);
 
     var source_file = try std.Io.Dir.openFileAbsolute(io, source_path, .{});
     defer source_file.close(io);
@@ -2415,6 +2421,73 @@ test "fork copies an exact completed prefix and records where the child diverged
 
     const end_line = try readLogLineAt(arena, io, source_paths.log, source_end_offset.?);
     try testing.expectEqualStrings(&chain.of(end_line), &fork_head.?);
+}
+
+test "a failed fork removes every path made for its child" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state_home = try scratchDir(arena, &tmp, "state");
+    const project = try scratchDir(arena, &tmp, "project");
+    try std.Io.Dir.createDirAbsolute(io, project, .default_dir);
+
+    var env = std.process.Environ.Map.init(arena);
+    try env.put("XDG_STATE_HOME", state_home);
+
+    const source_id = "01JQ" ++ @as([22]u8, @splat('F'));
+    const source_paths = try session_paths.pathsFor(arena, &env, project, source_id);
+    try session_paths.create(io, source_paths);
+    try makeLog(arena, io, source_paths.dir, source_id, &.{
+        .{ .message = .{ .role = .user, .content = &.{.{ .text = "fork this" }} } },
+        .{ .session_end = .{ .reason = .finished, .detail = "" } },
+    });
+
+    var source_backing = chock_proto.storage.JsonLines{
+        .log = try chock_proto.log.Log.open(io, source_paths.log, source_id),
+    };
+    const source = source_backing.storage();
+    defer source.close(io);
+    var replay = try source.replay(arena, io, 0);
+    defer replay.deinit();
+    var end_at: ?u64 = null;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event == .session_end) end_at = parsed.value.id;
+    }
+
+    const checkpoint = try std.fmt.allocPrint(
+        arena,
+        "{s}/checkpoints/{d}",
+        .{ source_paths.work, end_at.? },
+    );
+    try std.Io.Dir.cwd().createDirPath(io, checkpoint);
+    const unsupported = try std.fmt.allocPrintSentinel(arena, "{s}/named-pipe", .{checkpoint}, 0);
+    const made = std.os.linux.mknod(unsupported.ptr, std.os.linux.S.IFIFO | 0o600, 0);
+    try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(made));
+
+    var output: tty.Capture = undefined;
+    output.start(io, testing.allocator);
+    defer output.stop(io);
+    try testing.expectEqual(
+        Exit.faulted.code(),
+        try forkSession(arena, io, &env, source_paths.dir, project, source_id, null, null),
+    );
+
+    var dir = try std.Io.Dir.openDirAbsolute(io, source_paths.dir, .{ .iterate = true });
+    defer dir.close(io);
+    var entries = dir.iterate();
+    var count: usize = 0;
+    while (try entries.next(io)) |entry| {
+        count += 1;
+        try testing.expect(std.mem.startsWith(u8, entry.name, source_id));
+    }
+    try testing.expectEqual(@as(usize, 3), count);
 }
 
 test "a historical fork is not reported as the latest checkpoint" {
