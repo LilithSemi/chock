@@ -100,6 +100,7 @@ leaves a log written a moment ago and no process at all.
 
 ```
 chock sessions                          # every session, oldest first
+chock sessions show <session>           # conversation and tool timeline
 chock sessions verify [<session>]       # read the hash chain, and the seal
 chock sessions seal [<session>]         # sign the head of a log's chain
 chock sessions seal --require-card      # sign on a card, or write nothing
@@ -114,6 +115,19 @@ fork control for its exact turn. The child keeps an audited copy of the chosen
 transcript prefix and restores that turn's Git workspace when one was saved.
 [forks.md](using/forks.md) covers lineage, historical turns, microVM snapshots,
 and the cases that deliberately cold boot.
+
+`chock sessions show` reads only the JSONL log and puts every event's byte
+offset beside it, so an audit finding can name the exact record. Its default
+human view previews large tool results and diffs; add `--full` to expand them,
+or choose `--format compact` for one line per event. `--format json` writes one
+complete JSON event per line with the real offset in its `id` field.
+
+Use `--only` with a comma-separated set of `lifecycle`, `messages`, `tools`,
+`approvals`, `policy`, `diffs`, `subagents`, `usage`, `workspace`, `sandbox`,
+and `network` to narrow the view. Unknown event kinds are still shown and make
+the command return the audit-gap exit status; a filter never hides something
+this Chock does not understand. Torn records, undecodable records, and broken
+hash chains are likewise printed at their byte offset and return an audit gap.
 
 Every run writes a `session.config` event, holding what a person put on the
 command line and the SHA-256 of the `chock.zon` the policy came from:

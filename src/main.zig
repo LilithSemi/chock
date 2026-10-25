@@ -203,7 +203,7 @@ pub const commands = [_]Command{
     },
     .{
         .name = "sessions",
-        .summary = "List, fork, verify, or remove this project's sessions.",
+        .summary = "List, inspect, fork, verify, export, or remove this project's sessions.",
         .run = sessions_cmd.main,
     },
     .{

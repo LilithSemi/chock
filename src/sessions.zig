@@ -12,6 +12,7 @@ const chock_workspace = @import("chock-workspace");
 
 const approval = @import("approval.zig");
 const session_paths = @import("session.zig");
+const show_cmd = @import("session_show.zig");
 const usage_cmd = @import("usage.zig");
 const workspace_cmd = @import("workspace.zig");
 const Exit = @import("main.zig").Exit;
@@ -32,7 +33,7 @@ pub const answer_timeout_ms: u64 = 5 * 60 * 1000;
 pub const day_ms: u64 = 24 * 60 * 60 * 1000;
 
 const usage_text =
-    \\Usage: chock sessions [list|verify [<session>]|seal [<session>]|
+    \\Usage: chock sessions [list|show <session>|verify [<session>]|seal [<session>]|
     \\                       export [<session>] --to <dir>|fork <session>|remove <session>|prune] [options]
     \\
     \\With no subcommand, says what every session of this project was, oldest first,
@@ -40,8 +41,10 @@ const usage_text =
     \\session is running when its log's lock is held, which is the same fact that
     \\decides who owns the session.
     \\
-    \\To read one session rather than the list: chock usage show <session> says what
-    \\it cost, and chock plan show <session> says what task list it kept.
+    \\show walks one session as a conversation and tool timeline. Every row names
+    \\the event's byte offset in the audit log. Human output previews large bodies;
+    \\--full expands them. Compact output keeps one event to a line. JSON output is
+    \\JSON Lines, one complete event per line, with its real byte offset.
     \\
     \\verify reads the hash chain each log carries: every event holds the hash of the
     \\line before it, so an event changed after the fact is found and named. A hash
@@ -86,6 +89,11 @@ const usage_text =
     \\  --to <dir>           For export: where the copies go. Made if it is not there.
     \\  --at <event>         For fork: a session.end event byte offset. Defaults to the last.
     \\  --older-than <days>  For prune: remove sessions that started before this.
+    \\  --format <kind>       For show: human (default), compact, or json.
+    \\  --only <groups>       For show: comma-separated lifecycle, messages, tools,
+    \\                        approvals, policy, diffs, subagents, usage, workspace,
+    \\                        sandbox, or network. Unknown events are always shown.
+    \\  --full                For human show: do not shorten large recorded bodies.
     \\  --require-card       For seal: sign on a card or write nothing. Refuses every
     \\                       software seal, including the one a machine with no reader
     \\                       would otherwise write.
@@ -105,10 +113,15 @@ const Options = struct {
     to: ?[]const u8 = null,
     require_card: bool = false,
     at: ?u64 = null,
+    show_format: show_cmd.Format = .human,
+    show_filters: show_cmd.Filters = .{},
+    show_full: bool = false,
+    show_options_named: bool = false,
 };
 
 const Action = enum {
     list,
+    show,
     verify,
     seal,
     @"export",
@@ -118,7 +131,7 @@ const Action = enum {
 
     fn takesSession(self: Action) bool {
         return switch (self) {
-            .verify, .seal, .@"export", .fork, .remove => true,
+            .show, .verify, .seal, .@"export", .fork, .remove => true,
             .list, .prune => false,
         };
     }
@@ -158,6 +171,25 @@ pub fn main(
     };
 
     if (options.action == .list) return listSessions(arena, io, dir, project_root);
+
+    if (options.action == .show) {
+        if (!session_paths.isValidId(options.session)) {
+            tty.print(.err, "chock sessions show: \"{s}\" is not a session identifier\n", .{options.session});
+            return Exit.usage.code();
+        }
+        return switch (try show_cmd.show(arena, gpa, io, dir, options.session, .{
+            .format = options.show_format,
+            .filters = options.show_filters,
+            .full = options.show_full,
+        })) {
+            .shown => Exit.finished.code(),
+            .invalid => Exit.audit_gap.code(),
+            .not_found => {
+                tty.print(.err, "chock sessions show: there is no session {s} in this project\n", .{options.session});
+                return Exit.usage.code();
+            },
+        };
+    }
 
     if (options.action == .verify) {
         if (options.session.len != 0 and !session_paths.isValidId(options.session)) {
@@ -241,7 +273,7 @@ pub fn main(
     const action = switch (options.action) {
         .remove => remove_action,
         .prune => prune_action,
-        .list, .verify, .seal, .@"export", .fork => unreachable,
+        .list, .show, .verify, .seal, .@"export", .fork => unreachable,
     };
     if (try retentionRefusal(arena, org_rules, action)) |why| {
         tty.print(.warn, "chock sessions {s}: {s}\n", .{ @tagName(options.action), why });
@@ -262,7 +294,7 @@ pub fn main(
     const console = stdin.console();
 
     return switch (options.action) {
-        .list, .verify, .seal, .@"export", .fork => unreachable,
+        .list, .show, .verify, .seal, .@"export", .fork => unreachable,
         .remove => removeSession(
             arena,
             io,
@@ -2248,6 +2280,25 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             options.require_card = true;
             continue;
         }
+        if (std.mem.eql(u8, argument, "--format")) {
+            index += 1;
+            if (index >= args.len) return error.BadArguments;
+            options.show_format = show_cmd.Format.parse(args[index]) orelse return error.BadArguments;
+            options.show_options_named = true;
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "--only")) {
+            index += 1;
+            if (index >= args.len) return error.BadArguments;
+            options.show_filters = show_cmd.Filters.parse(args[index]) orelse return error.BadArguments;
+            options.show_options_named = true;
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "--full")) {
+            options.show_full = true;
+            options.show_options_named = true;
+            continue;
+        }
         if (std.mem.eql(u8, argument, "--yes")) {
             options.yes = true;
             continue;
@@ -2263,7 +2314,7 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
         options.session = argument;
     }
 
-    if ((options.action == .remove or options.action == .fork) and options.session.len == 0)
+    if ((options.action == .remove or options.action == .fork or options.action == .show) and options.session.len == 0)
         return error.BadArguments;
     if (!options.action.takesSession() and options.session.len != 0) return error.BadArguments;
     if (options.action == .prune and options.older_than_days == null) return error.BadArguments;
@@ -2272,6 +2323,8 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
     if (options.action != .@"export" and options.to != null) return error.BadArguments;
     if (options.action != .fork and options.at != null) return error.BadArguments;
     if (options.action != .seal and options.require_card) return error.BadArguments;
+    if (options.action != .show and options.show_options_named) return error.BadArguments;
+    if (options.show_full and options.show_format != .human) return error.BadArguments;
     return options;
 }
 
@@ -2674,6 +2727,32 @@ test "a historical fork is not reported as the latest checkpoint" {
     const restored_marker = try std.fs.path.join(arena, &.{ child_paths.work, chock_workspace.checkpoint.restore_leaf, "chosen-turn" });
     const restored = try std.Io.Dir.readFileAlloc(.cwd(), io, restored_marker, arena, .limited(32));
     try testing.expectEqualStrings("first\n", restored);
+}
+
+test "show takes one session and keeps its rendering options to itself" {
+    const id = "01JQ" ++ @as([22]u8, @splat('S'));
+    const showing = try parseOptions(&.{ "show", id, "--only", "messages,tools", "--full" });
+    try testing.expectEqual(Action.show, showing.action);
+    try testing.expectEqualStrings(id, showing.session);
+    try testing.expectEqual(show_cmd.Format.human, showing.show_format);
+    try testing.expect(showing.show_filters.messages);
+    try testing.expect(showing.show_filters.tools);
+    try testing.expect(!showing.show_filters.approvals);
+    try testing.expect(showing.show_full);
+
+    try testing.expectEqual(
+        show_cmd.Format.compact,
+        (try parseOptions(&.{ "show", id, "--format", "compact" })).show_format,
+    );
+
+    try testing.expectError(error.BadArguments, parseOptions(&.{"show"}));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "show", id, "another" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "show", id, "--format", "xml" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "show", id, "--only", "messages,unknown-group" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "show", id, "--format", "compact", "--full" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "list", "--format", "human" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "verify", "--only", "all" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "seal", "--full" }));
 }
 
 test "a session another process owns reads as live, and the probe leaves its lock alone" {
