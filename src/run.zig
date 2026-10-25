@@ -369,7 +369,6 @@ fn takeFork(
 ) !u8 {
     const argv = [_][]const u8{
         exe_path,
-        "run",
         "--project",
         project_root,
         "--session",
@@ -384,7 +383,7 @@ fn takeFork(
         tty.print(
             .err,
             "chock: forked session {s}, but it could not be started ({s}). Continue with " ++
-                "`chock run --session {s} --adopt`.\n",
+                "`chock --session {s} --adopt`.\n",
             .{ id, @errorName(err), id },
         );
         return Exit.faulted.code();

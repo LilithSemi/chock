@@ -261,10 +261,16 @@ const Daemon = struct {
         return count;
     }
 
-    fn remember(self: *Daemon, entry: Session) !void {
+    /// Register a session once. Requests for later turns reuse that entry
+    /// instead of growing the daemon's table once per prompt.
+    fn remember(self: *Daemon, entry: Session) !bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |known| {
+            if (std.mem.eql(u8, &known.id, &entry.id)) return false;
+        }
         try self.sessions.append(self.gpa, entry);
+        return true;
     }
 
     fn notePid(self: *Daemon, id: []const u8, pid: ?std.posix.pid_t) void {
@@ -758,6 +764,13 @@ const Begin = union(enum) {
     /// the one an idle guest can represent.
     forked: ?[session_paths.id_length]u8,
     nothing,
+
+    fn startsChild(self: Begin) bool {
+        return switch (self) {
+            .say, .carry_on => true,
+            .forked, .nothing => false,
+        };
+    }
 };
 
 fn beginSession(
@@ -790,7 +803,7 @@ fn beginSession(
         fail(writer, "out of memory");
         return;
     };
-    daemon.remember(.{
+    const remembered = daemon.remember(.{
         .id = id,
         .log_path = log_path,
         .snapshot_path = snapshot_path,
@@ -802,40 +815,63 @@ fn beginSession(
         fail(writer, "out of memory");
         return;
     };
+    if (!remembered) {
+        daemon.gpa.free(log_path);
+        daemon.gpa.free(snapshot_path);
+        daemon.gpa.free(project_copy);
+    }
 
     if (begin == .forked) {
         if (begin.forked) |source_id| {
-            if (transferForkSnapshot(daemon, &source_id, snapshot_path)) {
+            const target_path = if (remembered)
+                snapshot_path
+            else
+                daemon.snapshotPathFor(&id) orelse {
+                    fail(writer, "the fork's microVM checkpoint path was lost");
+                    return;
+                };
+            if (transferForkSnapshot(daemon, &source_id, target_path)) {
                 daemon.noteSnapshot(&id, true);
             }
         }
     }
 
     if (begin == .nothing) {
-        var opened = openLog(daemon, writer, log_path, &id) orelse return;
+        var opened = openLog(daemon, writer, paths.log, &id) orelse return;
         opened.backing.log.close(daemon.io);
     }
 
-    if (begin != .nothing) {
+    // A fork is already a complete, open child session. It stays idle until a
+    // person sends the first divergent prompt; starting an adopted run here
+    // would answer the inherited source prompt a second time.
+    if (begin.startsChild()) {
+        const child_project = daemon.gpa.dupe(u8, project) catch {
+            fail(writer, "out of memory");
+            return;
+        };
         const owned_message: ?[]u8 = switch (begin) {
             .say => |text| daemon.gpa.dupe(u8, text) catch {
+                daemon.gpa.free(child_project);
                 fail(writer, "out of memory");
                 return;
             },
-            .carry_on, .forked, .nothing => null,
+            .carry_on => null,
+            .forked, .nothing => unreachable,
         };
 
         const child = Child{
             .daemon = daemon,
             .id = id,
-            .project = project_copy,
+            .project = child_project,
             .message = owned_message,
             .adopt = switch (begin) {
-                .carry_on, .forked => true,
-                .say, .nothing => false,
+                .carry_on => true,
+                .say => false,
+                .forked, .nothing => unreachable,
             },
         };
         const thread = std.Thread.spawn(.{}, runChild, .{child}) catch {
+            daemon.gpa.free(child_project);
             if (owned_message) |text| daemon.gpa.free(text);
             fail(writer, "the session could not be started");
             return;
@@ -844,7 +880,7 @@ fn beginSession(
     }
 
     var text_buffer: [std.fs.max_path_bytes + session_paths.id_length + 8]u8 = undefined;
-    const text = std.fmt.bufPrint(&text_buffer, "{s}\t{s}", .{ id, log_path }) catch {
+    const text = std.fmt.bufPrint(&text_buffer, "{s}\t{s}", .{ id, paths.log }) catch {
         fail(writer, "the answer was longer than this daemon can write");
         return;
     };
@@ -879,13 +915,14 @@ fn refuseChockOwn(daemon: *Daemon, writer: *std.Io.Writer, project: []const u8) 
 const Child = struct {
     daemon: *Daemon,
     id: [session_paths.id_length]u8,
-    project: []const u8,
+    project: []u8,
     message: ?[]u8,
     adopt: bool,
 };
 
 fn runChild(child: Child) void {
     const daemon = child.daemon;
+    defer daemon.gpa.free(child.project);
     defer if (child.message) |text| daemon.gpa.free(text);
 
     const guest = startGuest(daemon, &child.id, child.project);
@@ -2022,6 +2059,46 @@ fn probeRequest(
     return .{ .answer = writer.buffered(), .remembered = daemon.sessions.items.len };
 }
 
+test "a daemon fork stays idle until its first divergent prompt" {
+    const id = "01JQ" ++ @as([22]u8, @splat('F'));
+    try testing.expect(!((Begin{ .forked = id.* }).startsChild()));
+    try testing.expect(!((Begin{ .forked = null }).startsChild()));
+    try testing.expect(!((Begin{ .nothing = {} }).startsChild()));
+    try testing.expect((Begin{ .carry_on = {} }).startsChild());
+    try testing.expect((Begin{ .say = "new prompt" }).startsChild());
+}
+
+test "remembering another turn does not duplicate a daemon session" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var daemon = Daemon{ .gpa = gpa, .io = io, .exe_path = "/nowhere/chock", .env = &env };
+    defer daemon.deinit();
+
+    const id = "01JQ" ++ @as([22]u8, @splat('R'));
+    try testing.expect(try daemon.remember(.{
+        .id = id.*,
+        .log_path = try gpa.dupeSentinel(u8, "/nowhere/session.jsonl", 0),
+        .snapshot_path = try gpa.dupeSentinel(u8, "/nowhere/session.snapshot", 0),
+        .project = try gpa.dupe(u8, "/project"),
+    }));
+
+    const duplicate_log = try gpa.dupeSentinel(u8, "/nowhere/session.jsonl", 0);
+    defer gpa.free(duplicate_log);
+    const duplicate_snapshot = try gpa.dupeSentinel(u8, "/nowhere/session.snapshot", 0);
+    defer gpa.free(duplicate_snapshot);
+    const duplicate_project = try gpa.dupe(u8, "/project");
+    defer gpa.free(duplicate_project);
+    try testing.expect(!(try daemon.remember(.{
+        .id = id.*,
+        .log_path = duplicate_log,
+        .snapshot_path = duplicate_snapshot,
+        .project = duplicate_project,
+    })));
+    try testing.expectEqual(@as(usize, 1), daemon.sessions.items.len);
+}
+
 test "adopt refuses a session it may not take, and starts nothing when it does" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -2136,7 +2213,7 @@ test "a completed checkpoint moves from a source session to its fork" {
 
     const log_path = try gpa.dupeSentinel(u8, "/nowhere/source.jsonl", 0);
     const project = try gpa.dupe(u8, "/project");
-    try daemon.remember(.{
+    _ = try daemon.remember(.{
         .id = source_id.*,
         .log_path = log_path,
         .snapshot_path = source_path,
