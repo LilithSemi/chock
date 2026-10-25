@@ -105,6 +105,7 @@ const Daemon = struct {
     live: std.atomic.Value(usize) = .init(0),
     sandbox: chock_policy.sandbox.Block = .{},
     socket_dir: []const u8 = "",
+    snapshot_dir: []const u8 = "",
 
     fn deinit(self: *Daemon) void {
         for (self.sessions.items) |entry| {
@@ -351,17 +352,18 @@ pub fn main(
         tty.print(.plain, "chock daemon: tool calls run in a microVM guest, one a session\n", .{});
     }
 
-    const socket_path = options.socket orelse path: {
-        const state = chock_auth.paths.stateDir(arena, &env) catch |err| {
-            tty.print(.err, "chock daemon: the state directory could not be found: {t}\n", .{err});
-            return Exit.usage.code();
-        };
-        makeDirAll(io, state) catch |err| {
-            tty.print(.err, "chock daemon: {s} could not be made: {t}\n", .{ state, err });
-            return Exit.usage.code();
-        };
-        break :path control.socketPathIn(arena, state) catch return Exit.faulted.code();
+    const state_dir = chock_auth.paths.stateDir(arena, &env) catch |err| {
+        tty.print(.err, "chock daemon: the state directory could not be found: {t}\n", .{err});
+        return Exit.usage.code();
     };
+    makeDirAll(io, state_dir) catch |err| {
+        tty.print(.err, "chock daemon: {s} could not be made: {t}\n", .{ state_dir, err });
+        return Exit.usage.code();
+    };
+    daemon.snapshot_dir = state_dir;
+
+    const socket_path = options.socket orelse
+        (control.socketPathIn(arena, state_dir) catch return Exit.faulted.code());
 
     daemon.socket_dir = std.fs.path.dirname(socket_path) orelse ".";
 
@@ -1343,7 +1345,7 @@ fn waitForGuest(io: std.Io, running: *Running) bool {
     return false;
 }
 
-const guest_name_bytes: usize = 12;
+const guest_name_bytes = session_paths.guest_name_bytes;
 
 /// Where a guest's console is written, beside its socket and named the same.
 fn guestConsolePath(
@@ -1363,13 +1365,8 @@ fn guestSnapshotPath(
     daemon: *Daemon,
     id: *const [session_paths.id_length]u8,
 ) ?[:0]u8 {
-    const tail = id[id.len - guest_name_bytes ..];
-    return std.fmt.allocPrintSentinel(
-        daemon.gpa,
-        "{s}/g-{s}.snapshot",
-        .{ daemon.socket_dir, tail },
-        0,
-    ) catch null;
+    const dir = if (daemon.snapshot_dir.len != 0) daemon.snapshot_dir else daemon.socket_dir;
+    return session_paths.guestSnapshotPath(daemon.gpa, dir, id) catch null;
 }
 
 fn snapshotOnDisk(io: std.Io, path: []const u8) bool {

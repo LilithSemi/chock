@@ -1804,6 +1804,9 @@ pub const Removal = struct {
     id: []const u8,
     log_path: []const u8,
     log_bytes: u64 = 0,
+    snapshot_path: []const u8 = "",
+    snapshot_bytes: u64 = 0,
+    has_snapshot: bool = false,
     work_path: []const u8,
     work: chock_core.cache.Size = .{},
     has_work: bool = false,
@@ -1812,7 +1815,7 @@ pub const Removal = struct {
     has_root: bool = false,
 
     pub fn totalBytes(self: Removal) u64 {
-        return self.log_bytes + self.work.bytes + self.root.bytes;
+        return self.log_bytes + self.snapshot_bytes + self.work.bytes + self.root.bytes;
     }
 };
 
@@ -1820,6 +1823,16 @@ pub fn planRemoval(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: []const u8,
+    id: []const u8,
+) std.mem.Allocator.Error!?Removal {
+    return planRemovalWithSnapshots(allocator, io, dir, null, id);
+}
+
+fn planRemovalWithSnapshots(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    state_dir: ?[]const u8,
     id: []const u8,
 ) std.mem.Allocator.Error!?Removal {
     std.debug.assert(session_paths.isValidId(id));
@@ -1834,6 +1847,16 @@ pub fn planRemoval(
         .work_path = try std.fmt.allocPrint(allocator, "{s}/{s}" ++ work_suffix, .{ dir, id }),
         .root_path = try std.fmt.allocPrint(allocator, "{s}/{s}" ++ root_suffix, .{ dir, id }),
     };
+
+    if (state_dir) |state_path| {
+        plan.snapshot_path = try session_paths.guestSnapshotPath(allocator, state_path, id);
+        if (std.Io.Dir.cwd().statFile(io, plan.snapshot_path, .{})) |snapshot| {
+            if (snapshot.kind == .file) {
+                plan.has_snapshot = true;
+                plan.snapshot_bytes = snapshot.size;
+            }
+        } else |_| {}
+    }
 
     plan.has_work = chock_core.cache.exists(io, plan.work_path);
     if (plan.has_work) {
@@ -1867,6 +1890,12 @@ pub fn removalText(
     });
 
     try text.print(allocator, "\n  the log             {s}  {d} bytes\n", .{ plan.log_path, plan.log_bytes });
+    if (plan.has_snapshot) {
+        try text.print(allocator, "  its VM checkpoint   {s}  {d} bytes\n", .{
+            plan.snapshot_path,
+            plan.snapshot_bytes,
+        });
+    }
     if (plan.has_work) {
         try text.print(allocator, "  its workspace       {s}  {d} bytes in {d} files\n", .{
             plan.work_path,
@@ -1898,12 +1927,16 @@ pub fn removalText(
 }
 
 pub const RemoveError = error{
+    CheckpointKept,
     WorkspaceKept,
     SandboxRootKept,
     LogKept,
 };
 
 pub fn remove(io: std.Io, plan: Removal) RemoveError!void {
+    if (plan.has_snapshot) {
+        std.Io.Dir.deleteFileAbsolute(io, plan.snapshot_path) catch return error.CheckpointKept;
+    }
     if (plan.has_work) {
         std.Io.Dir.cwd().deleteTree(io, plan.work_path) catch return error.WorkspaceKept;
     }
@@ -1958,7 +1991,8 @@ fn removeSession(
         return Exit.usage.code();
     }
 
-    const plan = try planRemoval(arena, io, dir, id) orelse {
+    const state_dir: ?[]const u8 = chock_auth.paths.stateDir(arena, env) catch null;
+    const plan = try planRemovalWithSnapshots(arena, io, dir, state_dir, id) orelse {
         tty.print(.err, "chock sessions remove: this project has no session {s} ({s})\n", .{ id, dir });
         return Exit.usage.code();
     };
@@ -2058,6 +2092,7 @@ fn pruneSessions(
 ) !u8 {
     const sessions = try list(arena, io, dir);
     const going = try prunable(arena, sessions, now_ms, older_than_days);
+    const state_dir: ?[]const u8 = chock_auth.paths.stateDir(arena, env) catch null;
 
     if (going.len == 0) {
         tty.print(
@@ -2079,7 +2114,7 @@ fn pruneSessions(
     var plans: std.ArrayList(Removal) = .empty;
     var total: u64 = 0;
     for (going) |one| {
-        const plan = try planRemoval(arena, io, dir, one.id) orelse continue;
+        const plan = try planRemovalWithSnapshots(arena, io, dir, state_dir, one.id) orelse continue;
         total += plan.totalBytes();
         try plans.append(arena, plan);
 
@@ -2916,14 +2951,21 @@ test "removing a session takes its workspace and its sandbox root, and takes the
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try scratchDir(arena, &tmp, "sessions");
+    const state_dir = try scratchDir(arena, &tmp, "state");
+    try std.Io.Dir.createDirAbsolute(testing.io, state_dir, .default_dir);
 
     const id = "01JQ" ++ @as([22]u8, @splat('A'));
     try makeLog(arena, testing.io, dir, id, &.{});
     const wrote = try makeWorkspace(arena, testing.io, dir, id);
     const root = try std.fmt.allocPrint(arena, "{s}/{s}" ++ root_suffix, .{ dir, id });
     try std.Io.Dir.createDirAbsolute(testing.io, root, .default_dir);
+    const snapshot = try session_paths.guestSnapshotPath(arena, state_dir, id);
+    var snapshot_file = try std.Io.Dir.createFileAbsolute(testing.io, snapshot, .{});
+    try snapshot_file.writeStreamingAll(testing.io, "saved guest");
+    snapshot_file.close(testing.io);
 
-    const plan = (try planRemoval(arena, testing.io, dir, id)).?;
+    const plan = (try planRemovalWithSnapshots(arena, testing.io, dir, state_dir, id)).?;
+    try testing.expect(plan.has_snapshot);
     try testing.expect(plan.has_work);
     try testing.expect(plan.has_root);
     try testing.expectEqual(@as(u64, 10), plan.work.bytes);
@@ -2935,6 +2977,7 @@ test "removing a session takes its workspace and its sandbox root, and takes the
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, wrote, .{}));
     try testing.expect(!chock_core.cache.exists(testing.io, plan.work_path));
     try testing.expect(!chock_core.cache.exists(testing.io, plan.root_path));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, snapshot, .{}));
     try testing.expectError(
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(testing.io, plan.log_path, .{}),

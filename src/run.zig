@@ -11325,12 +11325,7 @@ fn ownGuestSnapshotPath(
     state_dir: []const u8,
     session_id: []const u8,
 ) std.mem.Allocator.Error![:0]const u8 {
-    return std.fmt.allocPrintSentinel(
-        arena,
-        "{s}/g-{s}.snapshot",
-        .{ state_dir, session_id[session_id.len - 12 ..] },
-        0,
-    );
+    return session_paths.guestSnapshotPath(arena, state_dir, session_id);
 }
 
 fn refuseGuestOverChockOwn(

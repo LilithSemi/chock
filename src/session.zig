@@ -9,6 +9,8 @@ const tty = @import("tty.zig");
 
 pub const id_length = 26;
 
+pub const guest_name_bytes = 12;
+
 const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 pub fn newId(io: std.Io) [id_length]u8 {
@@ -47,6 +49,20 @@ pub fn isValidId(text: []const u8) bool {
         if (std.mem.indexOfScalar(u8, crockford, character) == null) return false;
     }
     return true;
+}
+
+pub fn guestSnapshotPath(
+    allocator: std.mem.Allocator,
+    state_dir: []const u8,
+    id: []const u8,
+) std.mem.Allocator.Error![:0]u8 {
+    std.debug.assert(isValidId(id));
+    return std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/g-{s}.snapshot",
+        .{ state_dir, id[id.len - guest_name_bytes ..] },
+        0,
+    );
 }
 
 pub const Error = std.mem.Allocator.Error || chock_auth.paths.DirError;
