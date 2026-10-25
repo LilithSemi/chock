@@ -204,7 +204,27 @@ pub fn main(
             );
             return Exit.usage.code();
         }
-        return forkSession(arena, io, &env, dir, project_root, options.session, options.at, null);
+        var forked: Forked = undefined;
+        const code = try forkSession(
+            arena,
+            io,
+            &env,
+            dir,
+            project_root,
+            options.session,
+            options.at,
+            &forked,
+        );
+        if (code != Exit.finished.code()) return code;
+        const guest = forked.latest and forked.workspace and copyStoredGuestSnapshotForFork(
+            arena,
+            io,
+            &env,
+            options.session,
+            &forked.id,
+        );
+        reportFork(options.session, forked, guest);
+        return code;
     }
 
     if (options.action == .remove and !session_paths.isValidId(options.session)) {
@@ -1616,6 +1636,51 @@ pub const Forked = struct {
     workspace: bool,
 };
 
+/// Copy a guest that is already quiescent on disk. The CLI cannot stop a warm
+/// daemon-owned guest, but it can preserve a checkpoint left by a prior run or
+/// daemon shutdown. Failure is a cold-boot fallback and never damages the
+/// source checkpoint.
+fn copyStoredGuestSnapshotForFork(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    source_id: []const u8,
+    child_id: []const u8,
+) bool {
+    const state_dir = chock_auth.paths.stateDir(arena, env) catch return false;
+    const source = session_paths.guestSnapshotPath(arena, state_dir, source_id) catch return false;
+    const stat = std.Io.Dir.cwd().statFile(io, source, .{}) catch return false;
+    if (stat.kind != .file or stat.size == 0) return false;
+
+    const child = session_paths.guestSnapshotPath(arena, state_dir, child_id) catch return false;
+    std.Io.Dir.copyFileAbsolute(source, child, io, .{}) catch |err| {
+        std.Io.Dir.deleteFileAbsolute(io, child) catch {};
+        tty.print(
+            .warn,
+            "chock sessions fork: the stored microVM checkpoint could not be copied: {t}\n",
+            .{err},
+        );
+        return false;
+    };
+    return true;
+}
+
+fn reportFork(source_id: []const u8, forked: Forked, guest: bool) void {
+    tty.out(.plain, "{s}\n", .{&forked.id});
+    tty.print(
+        .plain,
+        "chock sessions fork: forked {s} at event {d}{s}{s}. Continue with:\n" ++
+            "  chock run --session {s}\n",
+        .{
+            source_id,
+            forked.source_event,
+            if (forked.workspace) " with its workspace" else " with a fresh workspace",
+            if (guest) " and quiescent microVM" else "",
+            &forked.id,
+        },
+    );
+}
+
 pub fn forkSession(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -1781,22 +1846,17 @@ pub fn forkSession(
 
     keep_child = true;
     session_paths.markProject(io, child_paths, project_root);
+    const result = Forked{
+        .id = child_id,
+        .source_event = chosen.event,
+        .latest = latest_end != null and latest_end.? == chosen.event,
+        .workspace = restored_workspace,
+    };
     if (forked_out) |out| {
-        out.* = .{
-            .id = child_id,
-            .source_event = chosen.event,
-            .latest = latest_end != null and latest_end.? == chosen.event,
-            .workspace = restored_workspace,
-        };
+        out.* = result;
         return Exit.finished.code();
     }
-    tty.out(.plain, "{s}\n", .{child_id_text});
-    tty.print(
-        .plain,
-        "chock sessions fork: forked {s} at event {d}{s}. Continue with:\n" ++
-            "  chock run --session {s}\n",
-        .{ source_id, chosen.event, if (restored_workspace) " with its workspace" else " with a fresh workspace", child_id_text },
-    );
+    reportFork(source_id, result, false);
     return Exit.finished.code();
 }
 
@@ -2456,6 +2516,35 @@ test "fork copies an exact completed prefix and records where the child diverged
 
     const end_line = try readLogLineAt(arena, io, source_paths.log, source_end_offset.?);
     try testing.expectEqualStrings(&chain.of(end_line), &fork_head.?);
+}
+
+test "a CLI fork copies a stored guest checkpoint without consuming its source" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state_home = try scratchDir(arena, &tmp, "state");
+    var env = std.process.Environ.Map.init(arena);
+    try env.put("XDG_STATE_HOME", state_home);
+
+    const state_dir = try chock_auth.paths.stateDir(arena, &env);
+    try std.Io.Dir.cwd().createDirPath(io, state_dir);
+    const source_id = "01JQ" ++ @as([22]u8, @splat('C'));
+    const child_id = "01JQ" ++ @as([22]u8, @splat('D'));
+    const source = try session_paths.guestSnapshotPath(arena, state_dir, source_id);
+    const child = try session_paths.guestSnapshotPath(arena, state_dir, child_id);
+    var snapshot = try std.Io.Dir.createFileAbsolute(io, source, .{ .exclusive = true });
+    try snapshot.writeStreamingAll(io, "quiescent guest");
+    snapshot.close(io);
+
+    try testing.expect(copyStoredGuestSnapshotForFork(arena, io, &env, source_id, child_id));
+    const source_bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, source, arena, .limited(64));
+    const child_bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, child, arena, .limited(64));
+    try testing.expectEqualStrings("quiescent guest", source_bytes);
+    try testing.expectEqualStrings(source_bytes, child_bytes);
 }
 
 test "a failed fork removes every path made for its child" {
