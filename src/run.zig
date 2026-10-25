@@ -90,6 +90,9 @@ const usage_text =
     \\                      reach does not stop the session; it is said at the start
     \\                      and again at the end, and a gap that is still open when
     \\                      the session ends exits 9.
+    \\  --output <format>   Write human output (the default), one versioned JSON
+    \\                      result, or live JSONL events followed by that result.
+    \\                      JSON modes never prompt and fail closed.
     \\
 ++ tty.options_text;
 
@@ -113,6 +116,7 @@ const Options = struct {
     guest: ?[]const u8 = null,
     allow_dirty: bool = false,
     no_notices: bool = false,
+    output: Output = .human,
     export_dir: ?[]const u8 = null,
     export_syslog: ?[]const u8 = null,
     parent_session: []const u8 = "",
@@ -124,6 +128,8 @@ const Options = struct {
     display: ?Display = null,
     help_wanted: bool = false,
 };
+
+const Output = enum { human, json, jsonl };
 
 pub const Display = struct {
     attach: ui.Attach,
@@ -181,6 +187,9 @@ fn mainWith(
     var options = (try readOptions(arena, args)) orelse return Exit.usage.code();
     if (options.help_wanted) return Exit.finished.code();
     options.display = display;
+    const machine = options.output != .human;
+    if (machine) tty.setHumanOut(false);
+    defer if (machine) tty.setHumanOut(true);
 
     if (options.display) |*wanted| {
         if (options.message_words.len != 0) {
@@ -196,6 +205,7 @@ fn mainWith(
     var started = start(arena, gpa, setup_io, &env, exe_path, options) catch |err| switch (err) {
         error.Reported => {
             setup_threaded.deinit();
+            if (machine) writeRunResult(arena, gpa, null, null, .usage, .failed, options.output, null);
             return Exit.usage.code();
         },
         else => |e| {
@@ -209,6 +219,7 @@ fn mainWith(
     var take_up: ?[]const u8 = null;
     var fork_request: ?ForkRequest = null;
     var shipped: ShippingReport = .{};
+    var streamed_event: ?u64 = null;
 
     const outcome = phase: {
         var session_threaded = std.Io.Threaded.init(std.mem.Allocator.failing, .{ .environ = environ });
@@ -223,6 +234,7 @@ fn mainWith(
             &take_up,
             &fork_request,
             &shipped,
+            &streamed_event,
         );
     };
 
@@ -276,15 +288,35 @@ fn mainWith(
         // `Busy` means another process already holds the log's lock, not a fault here.
         if (err == error.Busy) {
             tty.print(.err, "chock run: {s}\n", .{busy_detail});
+            if (machine) writeRunResult(
+                arena,
+                gpa,
+                teardown_io,
+                &started,
+                .usage,
+                applied,
+                options.output,
+                streamed_event,
+            );
             return Exit.usage.code();
         }
         tty.print(.err, "chock run: the session failed: {s}\n", .{@errorName(err)});
+        if (machine) writeRunResult(
+            arena,
+            gpa,
+            teardown_io,
+            &started,
+            .faulted,
+            applied,
+            options.output,
+            streamed_event,
+        );
         return Exit.faulted.code();
     };
 
     if (take_up) |id| {
         defer gpa.free(id);
-        return takeUp(teardown_io, &env, started.exe_path, started.project_root, id);
+        return takeUp(teardown_io, &env, started.exe_path, started.project_root, id, options.output);
     }
 
     if (fork_request) |request| {
@@ -304,7 +336,19 @@ fn mainWith(
             request.at,
             &forked,
         );
-        if (code != Exit.finished.code()) return code;
+        if (code != Exit.finished.code()) {
+            if (machine) writeRunResult(
+                arena,
+                gpa,
+                teardown_io,
+                &started,
+                .faulted,
+                applied,
+                options.output,
+                streamed_event,
+            );
+            return code;
+        }
         if (forked.latest and forked.workspace) {
             if (source_snapshot) |from| {
                 const to = try ownGuestSnapshotPath(arena, started.state_dir, &forked.id);
@@ -318,10 +362,21 @@ fn mainWith(
                 };
             }
         }
-        return takeFork(teardown_io, &env, started.exe_path, started.project_root, &forked.id);
+        return takeFork(teardown_io, &env, started.exe_path, started.project_root, &forked.id, options.output);
     }
 
-    return exitWithApply(result, applied, &shipped).code();
+    const final_exit = exitWithApply(result, applied, &shipped);
+    if (machine) writeRunResult(
+        arena,
+        gpa,
+        teardown_io,
+        &started,
+        final_exit,
+        applied,
+        options.output,
+        streamed_event,
+    );
+    return final_exit.code();
 }
 
 fn takeUp(
@@ -330,8 +385,9 @@ fn takeUp(
     exe_path: []const u8,
     project_root: []const u8,
     id: []const u8,
+    output: Output,
 ) !u8 {
-    const argv = [_][]const u8{
+    const human_argv = [_][]const u8{
         exe_path,
         "run",
         "--project",
@@ -340,9 +396,10 @@ fn takeUp(
         id,
         "--adopt",
     };
+    const machine_argv = human_argv ++ [_][]const u8{ "--output", @tagName(output) };
 
     var child = std.process.spawn(io, .{
-        .argv = &argv,
+        .argv = if (output != .human) &machine_argv else &human_argv,
         .environ_map = env,
     }) catch |err| {
         tty.print(
@@ -365,8 +422,9 @@ fn takeFork(
     exe_path: []const u8,
     project_root: []const u8,
     id: []const u8,
+    output: Output,
 ) !u8 {
-    const argv = [_][]const u8{
+    const human_argv = [_][]const u8{
         exe_path,
         "--project",
         project_root,
@@ -374,9 +432,20 @@ fn takeFork(
         id,
         "--adopt",
     };
+    const machine_argv = [_][]const u8{
+        exe_path,
+        "run",
+        "--project",
+        project_root,
+        "--session",
+        id,
+        "--adopt",
+        "--output",
+        @tagName(output),
+    };
 
     var child = std.process.spawn(io, .{
-        .argv = &argv,
+        .argv = if (output != .human) &machine_argv else &human_argv,
         .environ_map = env,
     }) catch |err| {
         tty.print(
@@ -400,6 +469,171 @@ const Applied = enum {
     refused,
     failed,
 };
+
+const RunResultUsage = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    cache_creation_input_tokens: u64 = 0,
+    cache_read_input_tokens: u64 = 0,
+    turns: u64 = 0,
+    cost: ?f64 = null,
+    currency: ?[]const u8 = null,
+};
+
+const RunResultWorkspace = struct {
+    outcome: []const u8,
+    changed_files: []const []const u8 = &.{},
+};
+
+const RunResultApprovals = struct {
+    requested: u64 = 0,
+    approved: u64 = 0,
+    refused: u64 = 0,
+    unanswered: u64 = 0,
+};
+
+const RunResult = struct {
+    schema: []const u8 = "chock.run-result",
+    version: u32 = 1,
+    session_id: ?[]const u8,
+    status: []const u8,
+    exit_code: u8,
+    final_answer: ?[]const u8,
+    usage: RunResultUsage = .{},
+    approvals: RunResultApprovals = .{},
+    workspace: RunResultWorkspace,
+    audit_log: ?[]const u8,
+};
+
+const RunResultFold = struct {
+    answer: ?[]const u8 = null,
+    usage: RunResultUsage = .{},
+    approvals: RunResultApprovals = .{},
+    changed_files: []const []const u8 = &.{},
+};
+
+fn writeRunResult(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: ?std.Io,
+    started: ?*const Started,
+    exit: Exit,
+    applied: Applied,
+    output: Output,
+    streamed_event: ?u64,
+) void {
+    if (output == .jsonl and io != null and started != null) {
+        finishRunEvents(gpa, io.?, started.?, streamed_event);
+    }
+    const folded = if (io != null and started != null)
+        foldRunResult(arena, gpa, io.?, started.?.paths.log, started.?.session_id) catch RunResultFold{}
+    else
+        RunResultFold{};
+    const result = RunResult{
+        .session_id = if (started) |one| one.session_id else null,
+        .status = @tagName(exit),
+        .exit_code = exit.code(),
+        .final_answer = folded.answer,
+        .usage = folded.usage,
+        .approvals = folded.approvals,
+        .workspace = .{
+            .outcome = @tagName(applied),
+            .changed_files = folded.changed_files,
+        },
+        .audit_log = if (started) |one| one.paths.log else null,
+    };
+    const encoded = std.json.Stringify.valueAlloc(arena, result, .{}) catch return;
+    _ = tty.writeMachineOut(encoded);
+    _ = tty.writeMachineOut("\n");
+}
+
+fn foldRunResult(
+    arena: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    io: std.Io,
+    log_path: [:0]const u8,
+    session_id: []const u8,
+) !RunResultFold {
+    var log = try chock_proto.log.Log.open(io, log_path, session_id);
+    defer log.close(io);
+    var replay = try log.replayFrom(scratch, io, 0);
+    defer replay.deinit();
+
+    var answer: ?[]const u8 = null;
+    var spend = chock_proto.state.Spend{};
+    var approvals = RunResultApprovals{};
+    var files: std.ArrayList([]const u8) = .empty;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .message => |message| if (message.role == .assistant) {
+                var text: std.ArrayList(u8) = .empty;
+                for (message.content) |part| switch (part) {
+                    .text => |one| try text.appendSlice(arena, one),
+                    else => {},
+                };
+                if (text.items.len != 0) answer = try arena.dupe(u8, text.items);
+            },
+            .usage => |usage| {
+                var owned = usage;
+                if (usage.cost == .known) owned.cost = .{ .known = .{
+                    .value = usage.cost.known.value,
+                    .currency = try arena.dupe(u8, usage.cost.known.currency),
+                } };
+                spend.add(owned);
+            },
+            .approval_request => approvals.requested += 1,
+            .approval_response => |response| {
+                switch (response.decision) {
+                    .allowed_by_policy,
+                    .approved_by_user,
+                    .approved_by_user_for_session,
+                    .approved_by_review,
+                    => approvals.approved += 1,
+                    .denied_by_policy,
+                    .refused_by_user,
+                    .expired,
+                    .refused_by_review,
+                    .review_unavailable,
+                    .unknown,
+                    => approvals.refused += 1,
+                }
+            },
+            .diff => |diff| {
+                var seen = false;
+                for (files.items) |path| {
+                    if (std.mem.eql(u8, path, diff.path)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) try files.append(arena, try arena.dupe(u8, diff.path));
+            },
+            else => {},
+        }
+    }
+    std.mem.sort([]const u8, files.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.lessThan);
+    const answered = approvals.approved + approvals.refused;
+    approvals.unanswered = approvals.requested -| answered;
+    return .{
+        .answer = answer,
+        .usage = .{
+            .input_tokens = spend.input_tokens,
+            .output_tokens = spend.output_tokens,
+            .cache_creation_input_tokens = spend.cache_creation_input_tokens,
+            .cache_read_input_tokens = spend.cache_read_input_tokens,
+            .turns = spend.turns,
+            .cost = if (spend.enforceable()) spend.amount else null,
+            .currency = if (spend.enforceable() and spend.currency.len != 0) spend.currency else null,
+        },
+        .approvals = approvals,
+        .changed_files = try files.toOwnedSlice(arena),
+    };
+}
 
 const Cleanup = enum {
     remove,
@@ -10043,6 +10277,7 @@ fn runSession(
     take_up: *?[]const u8,
     fork_request: *?ForkRequest,
     shipped: *ShippingReport,
+    streamed_event: *?u64,
 ) !Exit {
     var http = switch (started.adapter) {
         .openai_compatible => chock_provider.Client.HttpClient.init(gpa, io, started.base_url, started.credential.token),
@@ -10305,6 +10540,13 @@ fn runSession(
     var printer = Printer.init(gpa, io);
     printer.paint = tty.stdoutPainter();
     defer printer.deinit();
+    var json_lines = JsonLineObserver{
+        .gpa = gpa,
+        .io = io,
+        .storage = started.storage,
+        .session_id = started.session_id,
+        .last_event_id = streamed_event,
+    };
 
     var screen: ?*ui.Ui = null;
     defer if (screen) |one| one.deinit();
@@ -10540,7 +10782,12 @@ fn runSession(
         .gpa = gpa,
         .io = io,
         .storage = started.storage,
-        .inner = if (screen) |one| one.observer() else printer.observer(),
+        .inner = if (screen) |one|
+            one.observer()
+        else if (options.output == .jsonl)
+            json_lines.observer()
+        else
+            printer.observer(),
         .sinks = sinks.slice(),
     };
     defer if (sinks.count != 0) exporter.finish(shipped);
@@ -10888,6 +11135,96 @@ const Exporter = struct {
         }
     }
 };
+
+const JsonLineObserver = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    session_id: []const u8,
+    last_event_id: *?u64,
+    next_offset: u64 = 0,
+
+    fn observer(self: *JsonLineObserver) chock_core.Loop.Observer {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.Loop.Observer.VTable{
+        .onEvent = onEventFn,
+        .onPiece = onPieceFn,
+        .onNotice = onNoticeFn,
+    };
+
+    fn onEventFn(ptr: *anyopaque, _: u64, _: chock_proto.event.Event) void {
+        const self: *JsonLineObserver = @ptrCast(@alignCast(ptr));
+        self.push();
+    }
+
+    fn onPieceFn(_: *anyopaque, _: chock_core.Loop.Piece) void {}
+
+    fn onNoticeFn(_: *anyopaque, _: []const u8) void {}
+
+    fn push(self: *JsonLineObserver) void {
+        var replay = self.storage.replay(self.gpa, self.io, self.next_offset) catch return;
+        defer replay.deinit();
+        while (replay.next(self.io) catch return) |parsed| {
+            defer parsed.deinit();
+            if (!writeRunEvent(
+                self.gpa,
+                self.session_id,
+                parsed.value.id,
+                parsed.value.event,
+            )) return;
+            self.last_event_id.* = parsed.value.id;
+            self.next_offset = replay.at();
+        }
+    }
+};
+
+const RunStreamEvent = struct {
+    schema: []const u8 = "chock.run-event",
+    version: u32 = 1,
+    session_id: []const u8,
+    event_id: u64,
+    event: chock_proto.event.Event,
+};
+
+fn writeRunEvent(
+    gpa: std.mem.Allocator,
+    session_id: []const u8,
+    id: u64,
+    ev: chock_proto.event.Event,
+) bool {
+    const encoded = std.json.Stringify.valueAlloc(gpa, RunStreamEvent{
+        .session_id = session_id,
+        .event_id = id,
+        .event = ev,
+    }, .{}) catch return false;
+    defer gpa.free(encoded);
+    if (!tty.writeMachineOut(encoded)) return false;
+    return tty.writeMachineOut("\n");
+}
+
+/// Some audit events are written by teardown code rather than the model loop.
+/// Complete the stream from the log before its terminal result, without
+/// repeating events the live observer already delivered.
+fn finishRunEvents(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    started: *const Started,
+    after: ?u64,
+) void {
+    var log = chock_proto.log.Log.open(io, started.paths.log, started.session_id) catch return;
+    defer log.close(io);
+    var replay = log.replayFrom(gpa, io, 0) catch return;
+    defer replay.deinit();
+    while (replay.next(io) catch return) |parsed| {
+        defer parsed.deinit();
+        if (after) |last| {
+            if (parsed.value.id <= last) continue;
+        }
+        if (!writeRunEvent(gpa, started.session_id, parsed.value.id, parsed.value.event)) return;
+    }
+}
 
 const Printer = struct {
     io: std.Io,
@@ -11819,6 +12156,7 @@ const value_options = [_][]const u8{
     "--max-turns",
     "--export-dir",
     "--export-syslog",
+    "--output",
     subagent.flag.parent_session,
     subagent.flag.parent_kind,
     subagent.flag.spawn_reason,
@@ -11919,6 +12257,11 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
             options.export_dir = value;
         } else if (std.mem.eql(u8, argument, "--export-syslog")) {
             options.export_syslog = value;
+        } else if (std.mem.eql(u8, argument, "--output")) {
+            options.output = std.meta.stringToEnum(Output, value) orelse {
+                tty.print(.err, "chock run: --output takes human, json, or jsonl, and \"{s}\" is none of them.\n", .{value});
+                return error.BadArguments;
+            };
         } else if (std.mem.eql(u8, argument, subagent.flag.parent_session)) {
             options.parent_session = value;
         } else if (std.mem.eql(u8, argument, subagent.flag.parent_kind)) {
@@ -12318,6 +12661,121 @@ test "no message on the command line leaves the words empty, which is what makes
     try testing.expectEqualStrings("local", options.provider.?);
 }
 
+test "--output json selects the versioned non-interactive result" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = try parseOptions(arena, &.{ "--output", "json", "do it" });
+    try testing.expectEqual(Output.json, parsed.output);
+    try testing.expectEqual(@as(usize, 1), parsed.message_words.len);
+    try testing.expectEqual(
+        Output.jsonl,
+        (try parseOptions(arena, &.{ "--output", "jsonl", "do it" })).output,
+    );
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, std.testing.allocator);
+    defer said.stop(testing.io);
+    try testing.expectError(
+        error.BadArguments,
+        parseOptions(arena, &.{ "--output", "xml", "do it" }),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), "human, json, or jsonl") != null);
+}
+
+test "the machine result folds the last answer, usage, and sorted changed paths from the audit log" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root);
+    const id = "01JQ" ++ @as([22]u8, @splat('R'));
+    const path = try std.fmt.allocPrintSentinel(arena, "{s}/result.jsonl", .{root[0..root_len]}, 0);
+
+    {
+        var log = try chock_proto.log.Log.open(io, path, id);
+        defer log.close(io);
+        var locked = try log.lock(io);
+        defer locked.unlock(io) catch {};
+        _ = try locked.append(gpa, io, .{ .message = .{
+            .role = .assistant,
+            .content = &.{ .{ .text = "done" }, .{ .text = " now" } },
+        } }, 1);
+        _ = try locked.append(gpa, io, .{ .usage = .{
+            .input_tokens = 10,
+            .output_tokens = 4,
+            .cost = .{ .known = .{ .value = 0.25, .currency = "USD" } },
+        } }, 2);
+        _ = try locked.append(gpa, io, .{ .approval_request = .{
+            .action = "workspace.apply",
+            .summary = "apply the work",
+            .detail = "",
+            .reason = "",
+            .agent_kind = "",
+            .spawn_chain = &.{},
+            .timeout_at_ms = 10,
+            .tool_call_id = "call_1",
+        } }, 3);
+        _ = try locked.append(gpa, io, .{ .approval_response = .{
+            .request_id = 3,
+            .decision = .denied_by_policy,
+            .responder = "policy",
+        } }, 4);
+        _ = try locked.append(gpa, io, .{ .approval_request = .{
+            .action = "net.fetch",
+            .summary = "fetch a URL",
+            .detail = "",
+            .reason = "",
+            .agent_kind = "",
+            .spawn_chain = &.{},
+            .timeout_at_ms = 10,
+            .tool_call_id = "call_2",
+        } }, 5);
+        for ([_][]const u8{ "z.zig", "a.zig", "z.zig" }) |changed| {
+            _ = try locked.append(gpa, io, .{ .diff = .{
+                .path = changed,
+                .patch = "",
+                .change_set_id = "one",
+                .review = .none,
+                .review_note = "",
+            } }, 3);
+        }
+    }
+
+    const folded = try foldRunResult(arena, gpa, io, path, id);
+    try testing.expectEqualStrings("done now", folded.answer.?);
+    try testing.expectEqual(@as(u64, 10), folded.usage.input_tokens);
+    try testing.expectEqual(@as(u64, 4), folded.usage.output_tokens);
+    try testing.expectEqual(@as(u64, 1), folded.usage.turns);
+    try testing.expectEqual(@as(f64, 0.25), folded.usage.cost.?);
+    try testing.expectEqualStrings("USD", folded.usage.currency.?);
+    try testing.expectEqual(@as(u64, 2), folded.approvals.requested);
+    try testing.expectEqual(@as(u64, 0), folded.approvals.approved);
+    try testing.expectEqual(@as(u64, 1), folded.approvals.refused);
+    try testing.expectEqual(@as(u64, 1), folded.approvals.unanswered);
+    try testing.expectEqual(@as(usize, 2), folded.changed_files.len);
+    try testing.expectEqualStrings("a.zig", folded.changed_files[0]);
+    try testing.expectEqualStrings("z.zig", folded.changed_files[1]);
+
+    const encoded = try std.json.Stringify.valueAlloc(arena, RunResult{
+        .session_id = id,
+        .status = "finished",
+        .exit_code = 0,
+        .final_answer = folded.answer,
+        .usage = folded.usage,
+        .approvals = folded.approvals,
+        .workspace = .{ .outcome = "landed", .changed_files = folded.changed_files },
+        .audit_log = path,
+    }, .{});
+    try testing.expect(std.mem.indexOf(u8, encoded, "\"schema\":\"chock.run-result\"") != null);
+    try testing.expect(std.mem.indexOf(u8, encoded, "\"version\":1") != null);
+}
+
 test "a message that starts with a dash is a message after --, and an option otherwise" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -12645,6 +13103,7 @@ test "a budget slice narrows what chock.zon allows and can never widen it" {
 
 fn valueFor(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "--max-turns")) return "3";
+    if (std.mem.eql(u8, name, "--output")) return "json";
     if (std.mem.eql(u8, name, subagent.flag.max_cost)) return "1.25";
     if (std.mem.eql(u8, name, "--session")) return "01JQ" ++ @as([22]u8, @splat('A'));
     if (std.mem.eql(u8, name, "--policy-rule")) return "git.push=allow";

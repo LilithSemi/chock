@@ -37,6 +37,67 @@ project is never written by a tool call, and
 By default the agent sees the committed state of the project. `--allow-dirty`
 copies your uncommitted work into the workspace as well.
 
+## Structured runs
+
+`chock run --output json "fix the parser"` reserves standard output for one
+JSON object. Progress and diagnostics stay on standard error. JSON mode never
+reads an approval or another answer from the terminal, even when one is
+attached; an action without a policy, reviewer, or remote approval answer is
+refused. The process exit code and the object's `exit_code` are always the
+same.
+
+The contract is named `chock.run-result`, version `1`:
+
+```json
+{
+  "schema": "chock.run-result",
+  "version": 1,
+  "session_id": "01M...",
+  "status": "finished",
+  "exit_code": 0,
+  "final_answer": "The parser now rejects an empty field.",
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 180,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 800,
+    "turns": 2,
+    "cost": 0.0042,
+    "currency": "USD"
+  },
+  "approvals": {
+    "requested": 1,
+    "approved": 0,
+    "refused": 1,
+    "unanswered": 0
+  },
+  "workspace": {
+    "outcome": "landed",
+    "changed_files": ["src/parser.zig", "test/parser.zig"]
+  },
+  "audit_log": "/home/you/.local/state/chock/sessions/.../01M....jsonl"
+}
+```
+
+`status` uses the exit-code names in the table below. `final_answer` is null
+when the model produced no textual answer. Cost and currency are null when
+any turn was unpriced or currencies were mixed. `changed_files` is the sorted
+set of paths represented by diff events in the audit log. Approval counts
+include policy, reviewer, remote, and terminal answers; an expired, unknown,
+or unavailable answer is refused, while a request with no response is
+unanswered. The workspace outcome says whether work landed, was refused,
+remained uncommitted, failed, or had nothing to apply. A setup failure after
+machine-output options have been accepted still emits the same schema with
+null session, answer, and audit-log fields.
+
+`--output jsonl` writes live `chock.run-event` version `1` objects as the
+session records them, then writes the `chock.run-result` object as the final
+line. Each event line carries `session_id`, the byte-offset `event_id` used by
+the audit log, and the typed event payload. Provider text fragments and
+human-facing notices are not separate records: the completed, redacted message
+and every policy/tool event come from the authoritative log instead. A consumer
+can distinguish the final line by its `schema` field.
+
 ## The tools
 
 Every tool the agent has, what each one asks for, and how a call is gated are

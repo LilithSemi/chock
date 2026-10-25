@@ -93,6 +93,7 @@ var state: struct {
     err: Painter = .off,
     verbose: bool = false,
     stdout_is_tty: bool = false,
+    human_out: bool = true,
 } = .{};
 
 pub fn configure(settings: Settings) void {
@@ -113,7 +114,19 @@ pub fn configure(settings: Settings) void {
         }) },
         .verbose = settings.verbose,
         .stdout_is_tty = settings.stdout_is_tty,
+        .human_out = true,
     };
+}
+
+/// Machine-output commands reserve stdout for their final record. Existing
+/// human progress still uses the ordinary output functions, so one switch
+/// keeps provider pieces, prompts, and summaries off that wire.
+pub fn setHumanOut(enabled: bool) void {
+    state.human_out = enabled;
+}
+
+pub fn humanOut() bool {
+    return state.human_out;
 }
 
 pub fn stdoutIsTty() bool {
@@ -200,8 +213,18 @@ fn release() void {
 pub fn writeOut(bytes: []const u8) bool {
     take();
     defer release();
+    if (!state.human_out) return true;
     const stream = streams.out orelse return false;
     stream.writeAll(bytes) catch {};
+    return true;
+}
+
+/// Writes the one machine record even while ordinary stdout is suppressed.
+pub fn writeMachineOut(bytes: []const u8) bool {
+    take();
+    defer release();
+    const stream = streams.out orelse return false;
+    stream.writeAll(bytes) catch return false;
     return true;
 }
 
@@ -219,6 +242,7 @@ fn flushOutHoldingLock() void {
 pub fn out(rank: Rank, comptime fmt: []const u8, args: anytype) void {
     take();
     defer release();
+    if (!state.human_out) return;
     const paint = stdoutPainter();
     const stream = streams.out orelse return printThroughDebug(paint, rank, fmt, args);
     write(stream, paint, rank, fmt, args);
