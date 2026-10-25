@@ -2068,6 +2068,8 @@ fn probeRequest(
     };
     switch (request) {
         .adopt => |one| handleAdopt(daemon, &writer, one),
+        .fork => |one| handleFork(daemon, &writer, one),
+        .prompt => |one| handlePrompt(daemon, &writer, one),
         .list => |one| handleList(daemon, arena, &writer, one),
         .answer => |one| handleAnswer(daemon, arena, &writer, one),
         .read => |one| handleRead(daemon, arena, &writer, one),
@@ -2083,6 +2085,81 @@ test "a daemon fork stays idle until its first divergent prompt" {
     try testing.expect(!((Begin{ .nothing = {} }).startsChild()));
     try testing.expect((Begin{ .carry_on = {} }).startsChild());
     try testing.expect((Begin{ .say = "new prompt" }).startsChild());
+}
+
+test "the daemon fork request creates an idle child at the requested turn" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const home_len = try tmp.dir.realPath(io, &home_buffer);
+    const home = home_buffer[0..home_len];
+    const project = try std.fmt.allocPrint(arena, "{s}/project", .{home});
+    try std.Io.Dir.createDirAbsolute(io, project, .default_dir);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("HOME", home);
+
+    var daemon = Daemon{ .gpa = gpa, .io = io, .exe_path = "/nowhere/chock", .env = &env };
+    defer daemon.deinit();
+
+    const source_id = "01JQ" ++ @as([22]u8, @splat('F'));
+    var source_paths = try session_paths.pathsFor(gpa, &env, project, source_id);
+    defer source_paths.deinit();
+    try session_paths.create(io, source_paths);
+
+    var end_at: u64 = 0;
+    {
+        const log = try chock_proto.log.Log.open(io, source_paths.log, source_id);
+        var backing = chock_proto.storage.JsonLines{ .log = log };
+        const store = backing.storage();
+        defer store.close(io);
+        var locked = try store.lock(io);
+        const content = [_]chock_proto.event.ContentPart{.{ .text = "branch here" }};
+        _ = try locked.append(gpa, io, .{ .message = .{ .role = .user, .content = &content } }, 1);
+        end_at = try locked.append(gpa, io, .{ .session_end = .{ .reason = .finished, .detail = "" } }, 2);
+        try locked.unlock(io);
+    }
+
+    var request_buffer: [std.fs.max_path_bytes + 128]u8 = undefined;
+    const request = try std.fmt.bufPrint(
+        &request_buffer,
+        "fork {s}\t{s}\t{d}",
+        .{ project, source_id, end_at },
+    );
+    var answer_buffer: [64 * 1024]u8 = undefined;
+    const got = probeRequest(&daemon, arena, &answer_buffer, request);
+    try testing.expectEqual(@as(usize, 1), got.remembered);
+
+    const reply = try control.Reply.parse(std.mem.trimEnd(u8, got.answer, "\n"));
+    const answer = switch (reply) {
+        .ok => |text| text,
+        else => return error.TestUnexpectedResult,
+    };
+    const separator = std.mem.indexOfScalar(u8, answer, '\t') orelse return error.TestUnexpectedResult;
+    const child_id = answer[0..separator];
+    try testing.expect(session_paths.isValidId(child_id));
+    try testing.expect(!std.mem.eql(u8, source_id, child_id));
+
+    const remembered = daemon.sessions.items[0];
+    try testing.expectEqualStrings(child_id, &remembered.id);
+    try testing.expect(remembered.pid == null);
+    try testing.expect(remembered.guest == null);
+
+    const sessions_dir = try session_paths.projectDir(arena, &env, project);
+    const child = (try sessions_cmd.fold(arena, io, sessions_dir, child_id)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(source_id, child.forked_from);
+    try testing.expectEqual(end_at, child.forked_at);
+    try testing.expect(child.end == null);
+    try testing.expectEqual(@as(u64, 0), child.spend.turns);
 }
 
 test "remembering another turn does not duplicate a daemon session" {

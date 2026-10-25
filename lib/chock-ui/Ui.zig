@@ -3131,3 +3131,27 @@ pub const Ui = struct {
         return phantom.StatefulWidget(Screen, ctx.new(Screen{ .ui = self }));
     }
 };
+
+test "the fork command requests the latest completed turn" {
+    const ui = try Ui.init(std.testing.allocator, std.testing.io, host_mod.quiet);
+    defer ui.deinit();
+
+    ui.runCommand(.fork);
+    const requested = ui.takeForkRequest();
+    try std.testing.expect(requested != null);
+    try std.testing.expect(requested.? == null);
+    try std.testing.expect(ui.takeForkRequest() == null);
+}
+
+test "a message tap requests its exact completed turn" {
+    const ui = try Ui.init(std.testing.allocator, std.testing.io, host_mod.quiet);
+    defer ui.deinit();
+
+    var tapped = Ui.MessageTap{ .ui = ui, .at = 2945995 };
+    Ui.onMessageTap(&tapped);
+
+    try std.testing.expect(ui.submitted);
+    const requested = ui.takeForkRequest();
+    try std.testing.expect(requested != null);
+    try std.testing.expectEqual(@as(u64, 2945995), requested.?.?);
+}
