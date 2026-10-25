@@ -29,6 +29,8 @@ const max_connections: usize = 64;
 
 const watch_idle_ms: u64 = 250;
 
+const max_child_error_bytes: usize = 64 * 1024;
+
 const usage_text =
     \\Usage: chock daemon [options]
     \\
@@ -796,6 +798,11 @@ fn beginSession(
     };
     defer paths.deinit();
 
+    makeDirAll(daemon.io, paths.dir) catch {
+        fail(writer, "the session directory could not be made");
+        return;
+    };
+
     const log_path = daemon.gpa.dupeSentinel(u8, paths.log, 0) catch {
         fail(writer, "out of memory");
         return;
@@ -858,9 +865,19 @@ fn beginSession(
             fail(writer, "out of memory");
             return;
         };
+        const child_log_path = (daemon.logPathFor(&id) catch {
+            daemon.gpa.free(child_project);
+            fail(writer, "out of memory");
+            return;
+        }) orelse {
+            daemon.gpa.free(child_project);
+            fail(writer, "the session log path was lost");
+            return;
+        };
         const owned_message: ?[]u8 = switch (begin) {
             .say => |text| daemon.gpa.dupe(u8, text) catch {
                 daemon.gpa.free(child_project);
+                daemon.gpa.free(child_log_path);
                 fail(writer, "out of memory");
                 return;
             },
@@ -872,6 +889,7 @@ fn beginSession(
             .daemon = daemon,
             .id = id,
             .project = child_project,
+            .log_path = child_log_path,
             .message = owned_message,
             .adopt = switch (begin) {
                 .carry_on => true,
@@ -881,6 +899,7 @@ fn beginSession(
         };
         const thread = std.Thread.spawn(.{}, runChild, .{child}) catch {
             daemon.gpa.free(child_project);
+            daemon.gpa.free(child_log_path);
             if (owned_message) |text| daemon.gpa.free(text);
             fail(writer, "the session could not be started");
             return;
@@ -925,6 +944,7 @@ const Child = struct {
     daemon: *Daemon,
     id: [session_paths.id_length]u8,
     project: []u8,
+    log_path: [:0]u8,
     message: ?[]u8,
     adopt: bool,
 };
@@ -932,7 +952,17 @@ const Child = struct {
 fn runChild(child: Child) void {
     const daemon = child.daemon;
     defer daemon.gpa.free(child.project);
+    defer daemon.gpa.free(child.log_path);
     defer if (child.message) |text| daemon.gpa.free(text);
+
+    const before = logEnd(daemon.io, child.log_path, &child.id) catch |err| {
+        tty.print(
+            .err,
+            "chock daemon: session {s} log could not be read before starting it: {t}\n",
+            .{ child.id, err },
+        );
+        return;
+    };
 
     const guest = startGuest(daemon, &child.id, child.project);
     const turn = daemon.noteTurn(&child.id);
@@ -964,23 +994,170 @@ fn runChild(child: Child) void {
         .environ_map = daemon.env,
         .stdin = .ignore,
         .stdout = .ignore,
-        .stderr = .inherit,
+        .stderr = .pipe,
     }) catch |err| {
         tty.print(.err, "chock daemon: session {s} could not be started: {t}\n", .{ child.id, err });
+        publishChildFailure(child, before, "the session process could not be started", @errorName(err));
         return;
     };
 
     if (process.id) |pid| daemon.notePid(&child.id, pid);
     defer daemon.notePid(&child.id, null);
 
-    const term = process.wait(daemon.io) catch |err| {
-        tty.print(.err, "chock daemon: session {s} could not be waited for: {t}\n", .{ child.id, err });
+    var errors_future = daemon.io.concurrent(captureChildErrors, .{
+        daemon.gpa,
+        daemon.io,
+        process.stderr.?,
+    }) catch {
+        tty.print(.err, "chock daemon: session {s} standard error could not be captured\n", .{child.id});
+        process.kill(daemon.io);
+        publishChildFailure(child, before, "the session process's errors could not be captured", "");
         return;
     };
+
+    const term = process.wait(daemon.io) catch |err| {
+        tty.print(.err, "chock daemon: session {s} could not be waited for: {t}\n", .{ child.id, err });
+        const captured = errors_future.await(daemon.io);
+        defer captured.deinit(daemon.gpa);
+        printChildErrors(captured);
+        publishChildFailure(child, before, "the session process could not be waited for", @errorName(err));
+        return;
+    };
+
+    const captured = errors_future.await(daemon.io);
+    defer captured.deinit(daemon.gpa);
+    printChildErrors(captured);
+
     switch (term) {
-        .exited => |status| tty.print(.plain, "chock daemon: session {s} exited {d}\n", .{ child.id, status }),
-        else => tty.print(.warn, "chock daemon: session {s} did not exit normally\n", .{child.id}),
+        .exited => |status| {
+            tty.print(.plain, "chock daemon: session {s} exited {d}\n", .{ child.id, status });
+            if (status != 0) {
+                var fallback_buffer: [96]u8 = undefined;
+                const fallback = std.fmt.bufPrint(
+                    &fallback_buffer,
+                    "the session process exited with status {d}",
+                    .{status},
+                ) catch "the session process failed";
+                publishCapturedFailure(child, before, captured, fallback);
+            }
+        },
+        else => {
+            tty.print(.warn, "chock daemon: session {s} did not exit normally\n", .{child.id});
+            publishCapturedFailure(child, before, captured, "the session process did not exit normally");
+        },
     }
+}
+
+const ChildErrors = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    truncated: bool = false,
+    unreadable: bool = false,
+
+    fn deinit(self: ChildErrors, gpa: std.mem.Allocator) void {
+        var bytes = self.bytes;
+        bytes.deinit(gpa);
+    }
+};
+
+fn captureChildErrors(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) ChildErrors {
+    var captured: ChildErrors = .{};
+    var file_reader: std.Io.File.Reader = .initStreaming(file, io, &.{});
+    var buffer: [4096]u8 = undefined;
+
+    while (true) {
+        const read = file_reader.interface.readSliceShort(&buffer) catch {
+            captured.unreadable = true;
+            return captured;
+        };
+        if (read == 0) return captured;
+
+        const room = max_child_error_bytes - captured.bytes.items.len;
+        const keep = @min(room, read);
+        captured.bytes.appendSlice(gpa, buffer[0..keep]) catch {
+            captured.unreadable = true;
+            captured.bytes.clearAndFree(gpa);
+        };
+        if (keep != read) captured.truncated = true;
+    }
+}
+
+fn printChildErrors(captured: ChildErrors) void {
+    if (captured.bytes.items.len != 0) tty.print(.err, "{s}", .{captured.bytes.items});
+    if (captured.truncated) tty.print(.warn, "chock daemon: session error output was truncated\n", .{});
+    if (captured.unreadable) tty.print(.warn, "chock daemon: session error output could not be read completely\n", .{});
+}
+
+fn publishCapturedFailure(
+    child: Child,
+    before: u64,
+    captured: ChildErrors,
+    fallback: []const u8,
+) void {
+    const detail = std.mem.trim(u8, captured.bytes.items, " \t\r\n");
+    publishChildFailure(child, before, if (detail.len != 0) detail else fallback, "");
+}
+
+fn publishChildFailure(child: Child, before: u64, message: []const u8, suffix: []const u8) void {
+    var detail_buffer: [512]u8 = undefined;
+    const detail = if (suffix.len == 0)
+        message
+    else
+        std.fmt.bufPrint(&detail_buffer, "{s}: {s}", .{ message, suffix }) catch message;
+
+    const appended = appendChildFailure(
+        child.daemon.gpa,
+        child.daemon.io,
+        child.log_path,
+        &child.id,
+        before,
+        detail,
+    ) catch |err| {
+        tty.print(
+            .err,
+            "chock daemon: session {s} error could not be written to its log: {t}\n",
+            .{ child.id, err },
+        );
+        return;
+    };
+    _ = appended;
+}
+
+fn logEnd(io: std.Io, log_path: [:0]const u8, id: []const u8) !u64 {
+    var log = try chock_proto.log.Log.open(io, log_path, id);
+    defer log.close(io);
+    return log.file.length(io);
+}
+
+/// Adds the ending the child could not add itself. An ending written at or after `before`
+/// wins, even when the process later returns a non-zero cleanup status.
+fn appendChildFailure(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    log_path: [:0]const u8,
+    id: []const u8,
+    before: u64,
+    detail: []const u8,
+) !bool {
+    var log = try chock_proto.log.Log.open(io, log_path, id);
+    defer log.close(io);
+
+    var locked = try log.lock(io);
+    defer locked.unlock(io) catch {};
+
+    const end = try log.file.length(io);
+    if (end > before) {
+        var replay = try log.replayFrom(gpa, io, before);
+        defer replay.deinit();
+        while (try replay.next(io)) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value.event == .session_end) return false;
+        }
+    }
+
+    _ = try locked.append(gpa, io, .{
+        .session_end = .{ .reason = .errored, .detail = detail },
+    }, std.Io.Timestamp.now(io, .real).toMilliseconds());
+    return true;
 }
 
 fn startGuest(
@@ -1856,6 +2033,82 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
 }
 
 const testing = std.testing;
+
+test "a child failure ends its attempted turn without duplicating the child's ending" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const path = try std.fs.path.joinZ(arena, &.{ root_buffer[0..root_len], "session.jsonl" });
+    const id = "01JQ" ++ @as([22]u8, @splat('F'));
+
+    {
+        var log = try chock_proto.log.Log.open(io, path, id);
+        defer log.close(io);
+        var locked = try log.lock(io);
+        defer locked.unlock(io) catch {};
+        _ = try locked.append(gpa, io, .{
+            .session_end = .{ .reason = .finished, .detail = "an older turn" },
+        }, 1);
+    }
+
+    const before_failed_turn = try logEnd(io, path, id);
+    try testing.expect(try appendChildFailure(
+        gpa,
+        io,
+        path,
+        id,
+        before_failed_turn,
+        "the credential collection is locked",
+    ));
+
+    const before_ended_turn = try logEnd(io, path, id);
+    {
+        var log = try chock_proto.log.Log.open(io, path, id);
+        defer log.close(io);
+        var locked = try log.lock(io);
+        defer locked.unlock(io) catch {};
+        _ = try locked.append(gpa, io, .{
+            .session_end = .{ .reason = .finished, .detail = "the child handled this turn" },
+        }, 2);
+    }
+    try testing.expect(!try appendChildFailure(
+        gpa,
+        io,
+        path,
+        id,
+        before_ended_turn,
+        "this must not be appended",
+    ));
+
+    var log = try chock_proto.log.Log.open(io, path, id);
+    defer log.close(io);
+    var replay = try log.replayFrom(gpa, io, 0);
+    defer replay.deinit();
+    var endings: usize = 0;
+    var saw_daemon_error = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event == .session_end) {
+            endings += 1;
+            const ended = parsed.value.event.session_end;
+            if (ended.reason == .errored) {
+                try testing.expectEqualStrings("the credential collection is locked", ended.detail);
+                saw_daemon_error = true;
+            }
+            try testing.expect(!std.mem.eql(u8, ended.detail, "this must not be appended"));
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), endings);
+    try testing.expect(saw_daemon_error);
+}
 
 test "nothing but the unix socket is listened on until --host says so" {
     var said: tty.Capture = undefined;
