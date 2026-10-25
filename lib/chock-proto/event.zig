@@ -98,6 +98,7 @@ pub const Kind = enum {
     session_start,
     session_config,
     session_end,
+    session_fork,
     session_spawn,
     session_title,
     session_imported,
@@ -132,7 +133,7 @@ pub const Kind = enum {
 
     pub fn fromWireName(name: []const u8) ?Kind {
         inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |_, field_value| {
-            const kind: Kind = @enumFromInt(field_value);
+            const kind: Kind = @fromBackingInt(@intCast(field_value));
             if (kind == .unknown) continue;
             if (std.mem.eql(u8, wire_names.get(kind), name)) return kind;
         }
@@ -144,6 +145,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .session_start = "session.start",
     .session_config = "session.config",
     .session_end = "session.end",
+    .session_fork = "session.fork",
     .session_spawn = "session.spawn",
     .session_title = "session.title",
     .session_imported = "session.imported",
@@ -306,6 +308,20 @@ pub const SessionEndReason = union(enum) {
 pub const SessionEnd = struct {
     reason: SessionEndReason,
     detail: []const u8,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
+/// The point at which this log stopped being the source session and became a
+/// new one. The source prefix is copied byte for byte, so `source_head` hashes
+/// the exact last inherited line rather than a re-encoding of its event.
+pub const SessionFork = struct {
+    source_session: []const u8,
+    source_event: u64,
+    source_head: []const u8,
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
@@ -1095,6 +1111,7 @@ pub const Event = union(Kind) {
     session_start: SessionStart,
     session_config: SessionConfig,
     session_end: SessionEnd,
+    session_fork: SessionFork,
     session_spawn: SessionSpawn,
     session_title: SessionTitle,
     session_imported: SessionImported,
@@ -1205,7 +1222,7 @@ pub fn fromJson(allocator: std.mem.Allocator, text: []const u8) DecodeError!std.
 
 test "every Kind has a wire name, and every wire name is a Kind" {
     inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |_, field_value| {
-        const kind: Kind = @enumFromInt(field_value);
+        const kind: Kind = @fromBackingInt(@intCast(field_value));
         if (kind == .unknown) continue;
         const name = kind.wireName();
         try std.testing.expectEqual(kind, Kind.fromWireName(name).?);
@@ -2358,7 +2375,7 @@ test "a secret use records what reached which tool and never the value" {
 test "every event kind has a wire name and reads back as itself" {
     // Catches a kind added to the enum and forgotten in the name table.
     inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |_, field_value| {
-        const kind: Kind = @enumFromInt(field_value);
+        const kind: Kind = @fromBackingInt(@intCast(field_value));
         if (kind == .unknown) continue;
         const name = kind.wireName();
         try std.testing.expect(name.len != 0);

@@ -372,6 +372,7 @@ pub const Verb = enum {
     start,
     adopt,
     create,
+    fork,
     prompt,
     cancel,
     read,
@@ -386,6 +387,7 @@ pub const Request = union(Verb) {
     start: Start,
     adopt: Adopt,
     create: Create,
+    fork: Fork,
     prompt: Prompt,
     cancel: Cancel,
     read: Read,
@@ -400,6 +402,8 @@ pub const Request = union(Verb) {
     pub const Adopt = struct { project: []const u8, session: []const u8 };
     /// A session with a log and nothing running, named before there is anything to say.
     pub const Create = struct { project: []const u8 };
+    /// Copy a completed prefix into a new session. Null means its latest turn.
+    pub const Fork = struct { project: []const u8, session: []const u8, at: ?u64 };
     /// Stops the running turn; a no-op if there is none.
     pub const Cancel = struct { project: []const u8, session: []const u8 };
     /// A message in a session that already exists; `start` both creates and speaks.
@@ -436,6 +440,14 @@ pub const Request = union(Verb) {
                 .session = try field(asked.rest, 1, 2),
             } },
             .create => .{ .create = .{ .project = try field(asked.rest, 0, 1) } },
+            .fork => fork: {
+                const at = try field(asked.rest, 2, 3);
+                break :fork .{ .fork = .{
+                    .project = try field(asked.rest, 0, 3),
+                    .session = try field(asked.rest, 1, 3),
+                    .at = if (std.mem.eql(u8, at, "latest")) null else std.fmt.parseInt(u64, at, 10) catch return error.BadArguments,
+                } };
+            },
             .cancel => .{ .cancel = .{
                 .project = try field(asked.rest, 0, 2),
                 .session = try field(asked.rest, 1, 2),
@@ -483,6 +495,10 @@ pub const Request = union(Verb) {
             .start => |one| try writer.print("start {s}\t{s}\n", .{ one.project, one.message }),
             .adopt => |one| try writer.print("adopt {s}\t{s}\n", .{ one.project, one.session }),
             .create => |one| try writer.print("create {s}\n", .{one.project}),
+            .fork => |one| if (one.at) |at|
+                try writer.print("fork {s}\t{s}\t{d}\n", .{ one.project, one.session, at })
+            else
+                try writer.print("fork {s}\t{s}\tlatest\n", .{ one.project, one.session }),
             .cancel => |one| try writer.print("cancel {s}\t{s}\n", .{ one.project, one.session }),
             .prompt => |one| try writer.print(
                 "prompt {s}\t{s}\t{s}\n",
@@ -718,7 +734,11 @@ pub const Feed = struct {
             self.sent += 1;
             this_call += 1;
             any = true;
-            if (parsed.value.event == .session_end) self.ended = true;
+            switch (parsed.value.event) {
+                .session_end => self.ended = true,
+                .session_fork => self.ended = false,
+                else => {},
+            }
             if (limit != 0 and this_call >= limit) break;
         }
         return any;
@@ -830,6 +850,8 @@ test "every verb round trips from a request to a line and back" {
         .{ .start = .{ .project = "/home/ross/chock", .message = "fix the parser please" } },
         .{ .adopt = .{ .project = "/home/ross/chock", .session = id } },
         .{ .create = .{ .project = "/home/ross/chock" } },
+        .{ .fork = .{ .project = "/home/ross/chock", .session = id, .at = null } },
+        .{ .fork = .{ .project = "/home/ross/chock", .session = id, .at = 4096 } },
         .{ .cancel = .{ .project = "/home/ross/chock", .session = id } },
         .{ .prompt = .{
             .project = "/home/ross/chock",
@@ -874,6 +896,7 @@ test "a message with a tab in it cannot smuggle a field into a request" {
         Request.parse("answer /p\t01\t1\tyes\textra"),
     );
     try testing.expectError(error.BadArguments, Request.parse("watch /p\t01"));
+    try testing.expectError(error.BadArguments, Request.parse("fork /p\t01\tnot-an-offset"));
     try testing.expectError(error.BadArguments, Request.parse("answer /p\t01\t1"));
 }
 

@@ -461,6 +461,7 @@ fn serve(daemon: *Daemon, arena: std.mem.Allocator, stream: *std.Io.net.Stream) 
         .start => |one| handleStart(daemon, writer, one),
         .adopt => |one| handleAdopt(daemon, writer, one),
         .create => |one| handleCreate(daemon, writer, one),
+        .fork => |one| handleFork(daemon, writer, one),
         .prompt => |one| handlePrompt(daemon, writer, one),
         .cancel => |one| handleCancel(daemon, writer, one),
         .read => |one| handleRead(daemon, arena, writer, one),
@@ -549,6 +550,39 @@ fn handleCreate(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Cr
     beginSession(daemon, writer, one.project, session_paths.newId(daemon.io), .nothing);
 }
 
+fn handleFork(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Fork) void {
+    const source_id = checkedSession(writer, one.project, one.session) orelse return;
+
+    var room = std.heap.ArenaAllocator.init(daemon.gpa);
+    defer room.deinit();
+    const arena = room.allocator();
+
+    const dir = session_paths.projectDir(arena, daemon.env, one.project) catch {
+        fail(writer, "the session directory could not be built");
+        return;
+    };
+    var child_id: [session_paths.id_length]u8 = undefined;
+    const code = sessions_cmd.forkSession(
+        arena,
+        daemon.io,
+        daemon.env,
+        dir,
+        one.project,
+        &source_id,
+        one.at,
+        &child_id,
+    ) catch {
+        fail(writer, "that session could not be forked");
+        return;
+    };
+    if (code != Exit.finished.code()) {
+        fail(writer, "that session could not be forked at the requested completed turn");
+        return;
+    }
+
+    beginSession(daemon, writer, one.project, child_id, .forked);
+}
+
 fn handlePrompt(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Prompt) void {
     const id = checkedSession(writer, one.project, one.session) orelse return;
     if (one.message.len == 0) {
@@ -617,6 +651,7 @@ fn checkedSession(
 const Begin = union(enum) {
     say: []const u8,
     carry_on,
+    forked,
     nothing,
 };
 
@@ -662,7 +697,7 @@ fn beginSession(
                 fail(writer, "out of memory");
                 return;
             },
-            .carry_on, .nothing => null,
+            .carry_on, .forked, .nothing => null,
         };
 
         const child = Child{
@@ -670,6 +705,7 @@ fn beginSession(
             .id = id,
             .project = project_copy,
             .message = owned_message,
+            .adopt = begin == .carry_on or begin == .forked,
         };
         const thread = std.Thread.spawn(.{}, runChild, .{child}) catch {
             if (owned_message) |text| daemon.gpa.free(text);
@@ -717,6 +753,7 @@ const Child = struct {
     id: [session_paths.id_length]u8,
     project: []const u8,
     message: ?[]u8,
+    adopt: bool,
 };
 
 fn runChild(child: Child) void {
@@ -742,7 +779,7 @@ fn runChild(child: Child) void {
         argv_buffer[argv_len] = "--";
         argv_buffer[argv_len + 1] = text;
         argv_len += 2;
-    } else {
+    } else if (child.adopt) {
         argv_buffer[argv_len] = "--adopt";
         argv_len += 1;
     }

@@ -3525,6 +3525,7 @@ test "a line whose first word is not a command exactly is a message, paths inclu
     try testing.expectEqual(Command.plan, commandOf("/plan").?);
     try testing.expectEqual(Command.plan, commandOf("  /plan  ").?);
     try testing.expectEqual(Command.help, commandOf("/help").?);
+    try testing.expectEqual(Command.fork, commandOf("/fork").?);
     try testing.expectEqual(Command.usage, commandOf("/usage").?);
 }
 
@@ -3748,6 +3749,7 @@ test "the pane takes the arrows and the two keys that close it, and refuses the 
 
 test "a command is never read as a message, and a message that looks like one still is" {
     try testing.expectEqual(Command.plan, chock_ui.ui.answerFor("/plan").command);
+    try testing.expectEqual(Command.fork, chock_ui.ui.answerFor("/fork").command);
     try testing.expectEqual(Command.help, chock_ui.ui.answerFor("  /help  ").command);
     try testing.expectEqual(Command.usage, chock_ui.ui.answerFor("/usage").command);
 
@@ -5079,6 +5081,54 @@ test "a session that ended leaves Chock's own row newest, with nothing drawn und
         };
         try testing.expect(top <= ended or top >= input_top);
     }
+}
+
+test "messages become forkable at their completed turn and keep that exact boundary" {
+    const gpa = testing.allocator;
+    const h = try Headless.open(gpa);
+    defer h.close();
+
+    h.screen.saidByUser("first question");
+    const watching = h.screen.observer();
+    watching.onPiece(.{ .text = "first answer" });
+    watching.onEvent(40, .{ .message = .{ .role = .assistant, .content = &.{} } });
+
+    for (h.screen.lines.items) |line| {
+        if (line.message) try testing.expect(line.fork_at == null);
+    }
+
+    watching.onEvent(41, .{ .session_end = .{ .reason = .finished, .detail = "" } });
+    var first_messages: usize = 0;
+    for (h.screen.lines.items) |line| {
+        if (!line.message) continue;
+        first_messages += 1;
+        try testing.expectEqual(@as(u64, 41), line.fork_at.?);
+    }
+    try testing.expect(first_messages >= 2);
+
+    h.screen.saidByUser("second question");
+    watching.onPiece(.{ .text = "second answer" });
+    watching.onEvent(50, .{ .message = .{ .role = .assistant, .content = &.{} } });
+    watching.onEvent(51, .{ .session_end = .{ .reason = .finished, .detail = "" } });
+
+    var at_first: usize = 0;
+    var at_second: usize = 0;
+    for (h.screen.lines.items) |line| {
+        if (!line.message) continue;
+        if (line.fork_at.? == 41) at_first += 1;
+        if (line.fork_at.? == 51) at_second += 1;
+    }
+    try testing.expect(at_first >= 2);
+    try testing.expect(at_second >= 2);
+
+    try testing.expect(h.screen.paint());
+    var fork_buttons: usize = 0;
+    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |primitive| {
+        if (primitive != .rrect) continue;
+        if (primitive.rrect.hover_color != null and primitive.rrect.active_color != null)
+            fork_buttons += 1;
+    }
+    try testing.expect(fork_buttons >= 2);
 }
 
 fn drawnTopOf(h: *Headless, words: []const u8) ?f32 {

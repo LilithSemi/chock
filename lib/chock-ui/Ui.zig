@@ -215,6 +215,7 @@ pub const Ask = union(enum) {
     done,
     message: []const u8,
     take_up: []const u8,
+    fork: ?u64,
 };
 
 const Mark = struct {
@@ -276,6 +277,8 @@ const Shown = struct {
     fold_at: ?usize = null,
     open: bool = false,
     gap: bool = false,
+    fork_at: ?u64 = null,
+    show_fork: bool = false,
 };
 
 const Screen = struct {
@@ -324,6 +327,8 @@ pub const Ui = struct {
     sessions_dir: []const u8 = "",
     current_session: []const u8 = "",
     taken: ?[]const u8 = null,
+    fork_requested: ?ForkRequest = null,
+    message_taps: [max_message_taps]MessageTap = @splat(.{}),
 
     tasks: ?*chock_core.tasks.Table = null,
     tasks_shown_early: usize = 0,
@@ -354,12 +359,16 @@ pub const Ui = struct {
     lines: std.ArrayList(model.Line) = .empty,
     pending: std.ArrayList(u8) = .empty,
     pending_voice: model.Voice = .chock,
+    pending_is_message: bool = false,
 
     cursor: ?usize = null,
 
     pane: ?model.Pane = null,
 
     sidebar: model.Sidebar = .none,
+    /// The session list follows the available width: beside the transcript on
+    /// a wide view, and in the transcript picker on a narrow one.
+    sessions_open: bool = false,
 
     fixed_size: bool = false,
 
@@ -399,6 +408,22 @@ pub const Ui = struct {
     /// The most picker rows a tap can reach. A longer list still draws and still
     /// answers the arrow keys; only the rows past this are keyboard only.
     const max_picker_taps = 256;
+    const max_message_taps = 256;
+
+    const ForkRequest = struct { at: ?u64 };
+
+    const MessageTap = struct {
+        ui: ?*Ui = null,
+        at: u64 = 0,
+    };
+
+    fn onMessageTap(ctx: *anyopaque) void {
+        const tap: *MessageTap = @ptrCast(@alignCast(ctx));
+        const self = tap.ui orelse return;
+        self.fork_requested = .{ .at = tap.at };
+        self.submitted = true;
+        self.host.invalidate();
+    }
 
     const Tap = struct {
         ui: ?*Ui = null,
@@ -439,6 +464,10 @@ pub const Ui = struct {
         }
 
         while (true) {
+            if (self.fork_requested) |request| {
+                self.fork_requested = null;
+                return .{ .fork = request.at };
+            }
             self.beginInput();
 
             while (!self.submitted) {
@@ -455,6 +484,11 @@ pub const Ui = struct {
                 return .{ .take_up = try arena.dupe(u8, id) };
             }
 
+            if (self.fork_requested) |request| {
+                self.fork_requested = null;
+                return .{ .fork = request.at };
+            }
+
             switch (answerFor(self.typed.items)) {
                 .nothing => return .done,
                 .message => |words| {
@@ -463,6 +497,10 @@ pub const Ui = struct {
                 },
                 .command => |command| {
                     self.runCommand(command);
+                    if (self.fork_requested) |request| {
+                        self.fork_requested = null;
+                        return .{ .fork = request.at };
+                    }
                     self.phase = .session;
                     _ = self.paint();
                     continue;
@@ -500,13 +538,14 @@ pub const Ui = struct {
         const at = text_mod.clockText(arena, self.clock.now(), self.clock.utc_offset_minutes) catch "";
         self.sayPinned(.chock, said_by_user, at);
 
-        self.say(.chock, text);
+        self.sayMessage(.chock, text);
         self.endLine();
         self.draw();
     }
 
     pub fn runCommand(self: *Ui, command: model.Command) void {
         switch (command) {
+            .fork => self.fork_requested = .{ .at = null },
             .help => self.openHelp(),
             .plan => self.togglePlan(),
             .usage => self.sayUsage(),
@@ -591,6 +630,7 @@ pub const Ui = struct {
             self.sayPlan();
             return;
         }
+        self.sessions_open = false;
         self.sidebar = .plan;
     }
 
@@ -599,15 +639,25 @@ pub const Ui = struct {
     /// The same list the picker shows, in the band instead of the middle, so a
     /// person reads one session and still sees the rest.
     pub fn toggleSessions(self: *Ui) void {
-        if (self.sidebar == .sessions) {
+        if (self.sessions_open) {
+            self.sessions_open = false;
             self.sidebar = .none;
             self.picker = null;
             return;
         }
+        self.sessions_open = true;
         if (!self.fitsSidebar()) {
             self.openPicker();
             return;
         }
+        self.sidebar = .sessions;
+        self.refreshSessions();
+    }
+
+    /// Open the responsive session list before the first layout has measured
+    /// the view. `resize` chooses its wide or narrow presentation.
+    pub fn showSessions(self: *Ui) void {
+        self.sessions_open = true;
         self.sidebar = .sessions;
         self.refreshSessions();
     }
@@ -743,7 +793,7 @@ pub const Ui = struct {
         self.taken = chosen.id;
         // The band keeps the list: a person reading one session still sees the
         // rest. A picker drawn over the transcript goes away once it is used.
-        if (self.sidebar != .sessions) self.picker = null;
+        if (!self.sessions_open) self.picker = null;
         self.submitted = true;
     }
 
@@ -764,6 +814,45 @@ pub const Ui = struct {
         self.typed.clearRetainingCapacity();
         self.submitted = false;
         self.phase = .message;
+    }
+
+    /// Take a fork gesture without entering the native session loop. The outer
+    /// optional says whether one was requested; the inner one is the optional
+    /// exact turn (`null` means the latest completed turn).
+    pub fn takeForkRequest(self: *Ui) ??u64 {
+        const request = self.fork_requested orelse return null;
+        self.fork_requested = null;
+        return request.at;
+    }
+
+    /// Empty session-specific presentation before another log is replayed into
+    /// this same interface. Picker storage stays: it belongs to navigation.
+    pub fn clearTranscript(self: *Ui) void {
+        self.pending.clearRetainingCapacity();
+        self.pending_is_message = false;
+        self.reasoning.clearRetainingCapacity();
+        self.transcript.clearRetainingCapacity();
+        self.dropRunning();
+        for (self.lines.items) |line| self.freeLine(line);
+        self.lines.clearRetainingCapacity();
+        self.markdown = .{};
+        self.turn_open = false;
+        self.scroll_back = 0;
+        self.cursor = null;
+        self.tokens_in = 0;
+        self.tokens_out = 0;
+        self.spent = 0;
+        self.spent_currency = "";
+        self.plan = .{};
+        self.facts = .{};
+        self.approval = null;
+        self.approval_answer = null;
+        _ = self.approval_arena.reset(.retain_capacity);
+        self.question = null;
+        self.question_said = null;
+        self.question_filled = 0;
+        _ = self.question_arena.reset(.retain_capacity);
+        self.message_taps = @splat(.{});
     }
 
     pub fn endInput(self: *Ui) void {
@@ -1063,7 +1152,6 @@ pub const Ui = struct {
     }
 
     fn foldEvent(self: *Ui, id: u64, ev: chock_proto.event.Event) void {
-        _ = id;
         switch (ev) {
             .plan_update => |update| self.foldPlan(update),
             .message => |m| switch (m.role) {
@@ -1095,6 +1183,11 @@ pub const Ui = struct {
                 }) catch "started a subagent";
                 self.sayFolded(.chock, said, .subagent, spawn.reason);
             },
+            .session_fork => |forked| self.sayFmt(
+                .chock,
+                "forked from {s} at event {d}; this is a new session",
+                .{ forked.source_session, forked.source_event },
+            ),
             .agent_complete => |done| {
                 var buffer: [256]u8 = undefined;
                 const said = std.fmt.bufPrint(&buffer, "the subagent {s} came back, {s}", .{
@@ -1134,13 +1227,16 @@ pub const Ui = struct {
                     .{opened.decision},
                 ),
             },
-            .session_end => |ended| if (ended.detail.len == 0)
-                self.sayFmt(.chock, "session ended, {s}", .{ended.reason.wireName()})
-            else
-                self.sayFmt(.chock, "session ended, {s}: {s}", .{
-                    ended.reason.wireName(),
-                    ended.detail[0..@min(ended.detail.len, shown_detail_bytes)],
-                }),
+            .session_end => |ended| {
+                self.completeMessageTurn(id);
+                if (ended.detail.len == 0)
+                    self.sayFmt(.chock, "session ended, {s}", .{ended.reason.wireName()})
+                else
+                    self.sayFmt(.chock, "session ended, {s}: {s}", .{
+                        ended.reason.wireName(),
+                        ended.detail[0..@min(ended.detail.len, shown_detail_bytes)],
+                    });
+            },
             .usage => |spent| {
                 self.tokens_in += spent.input_tokens +
                     spent.cache_creation_input_tokens +
@@ -1167,7 +1263,7 @@ pub const Ui = struct {
                 .assistant => {
                     self.openTurn();
                     for (m.content) |part| {
-                        if (part == .text) self.say(.agent, part.text);
+                        if (part == .text) self.sayMessage(.agent, part.text);
                     }
                     self.endLine();
                     self.turn_open = false;
@@ -1188,7 +1284,7 @@ pub const Ui = struct {
             .text => |text| {
                 self.openTurn();
                 self.foldReasoning();
-                self.say(.agent, text);
+                self.sayMessage(.agent, text);
             },
             .reasoning => |text| {
                 self.openTurn();
@@ -1331,16 +1427,26 @@ pub const Ui = struct {
     pub const kept_lines = 512;
 
     pub fn say(self: *Ui, voice: model.Voice, text: []const u8) void {
+        self.sayTagged(voice, text, false);
+    }
+
+    fn sayMessage(self: *Ui, voice: model.Voice, text: []const u8) void {
+        self.sayTagged(voice, text, true);
+    }
+
+    fn sayTagged(self: *Ui, voice: model.Voice, text: []const u8, is_message: bool) void {
         if (voice != self.pending_voice) self.endLine();
         self.pending_voice = voice;
 
         var rest = text;
         while (std.mem.indexOfScalar(u8, rest, '\n')) |at| {
+            self.pending_is_message = self.pending_is_message or is_message;
             self.pending.appendSlice(self.gpa, rest[0..at]) catch {};
             self.endRow();
             self.pending_voice = voice;
             rest = rest[at + 1 ..];
         }
+        self.pending_is_message = self.pending_is_message or is_message;
         self.pending.appendSlice(self.gpa, rest) catch {};
     }
 
@@ -1403,8 +1509,19 @@ pub const Ui = struct {
     }
 
     pub fn endRow(self: *Ui) void {
-        defer self.pending.clearRetainingCapacity();
-        self.addLine(self.lineOf(self.pending_voice, self.pending.items) orelse return);
+        defer {
+            self.pending.clearRetainingCapacity();
+            self.pending_is_message = false;
+        }
+        var line = self.lineOf(self.pending_voice, self.pending.items) orelse return;
+        line.message = self.pending_is_message;
+        self.addLine(line);
+    }
+
+    fn completeMessageTurn(self: *Ui, at: u64) void {
+        for (self.lines.items) |*line| {
+            if (line.message and line.fork_at == null) line.fork_at = at;
+        }
     }
 
     /// One stored line, with the markdown markers taken off and the runs they
@@ -1613,6 +1730,9 @@ pub const Ui = struct {
         const view_now = ctx.owner.activeView() orelse return measure;
         self.rows = measure.rowsIn(view_now.metrics.size.height);
         self.width = view_now.metrics.size.width;
+        if (self.sessions_open) {
+            self.sidebar = if (self.fitsSidebar()) .sessions else .none;
+        }
         return measure;
     }
 
@@ -1899,8 +2019,8 @@ pub const Ui = struct {
         while (blank > 0) : (blank -= 1) {
             lines.add(ctx.arena, plainRow(ctx, "", colors.fg));
         }
-        for (shown) |line| {
-            lines.add(ctx.arena, self.voicedRow(ctx, measure, line, colors));
+        for (shown, 0..) |line, at| {
+            lines.add(ctx.arena, self.messageRow(ctx, measure, line, at, colors));
         }
         if (open != 0) {
             lines.add(ctx.arena, self.voicedRow(ctx, measure, .{
@@ -2350,6 +2470,8 @@ pub const Ui = struct {
 
     pub fn showRows(self: *const Ui, arena: std.mem.Allocator) []const Shown {
         var out: std.ArrayList(Shown) = .empty;
+        var last_fork: ?u64 = null;
+        var last_fork_voice: ?model.Voice = null;
         for (self.lines.items, 0..) |line, at| {
             const fold = line.fold;
             if (line.gap) {
@@ -2379,6 +2501,9 @@ pub const Ui = struct {
                     return out.items;
 
             for (head, 0..) |spans, part| {
+                const show_fork = part == 0 and line.fork_at != null and
+                    (last_fork == null or last_fork.? != line.fork_at.? or
+                        last_fork_voice == null or last_fork_voice.? != line.voice);
                 out.append(arena, .{
                     .voice = line.voice,
                     .text = joinSpans(arena, spans) catch return out.items,
@@ -2386,7 +2511,13 @@ pub const Ui = struct {
                     .pinned = if (part == 0) line.pinned else "",
                     .fold_at = if (fold != null and part == 0) at else null,
                     .open = if (fold) |one| one.open else false,
+                    .fork_at = line.fork_at,
+                    .show_fork = show_fork,
                 }) catch return out.items;
+            }
+            if (line.fork_at) |fork_at| {
+                last_fork = fork_at;
+                last_fork_voice = line.voice;
             }
 
             const one = fold orelse continue;
@@ -2785,6 +2916,38 @@ pub const Ui = struct {
             said,
             row(ctx, measure, right, tone),
         );
+    }
+
+    fn messageRow(
+        self: *Ui,
+        ctx: *phantom.BuildContext,
+        measure: layout.Measure,
+        line: Shown,
+        index: usize,
+        colors: phantom.ColorScheme,
+    ) phantom.Widget {
+        var reserved = line;
+        // Give wrapping the button's cells without drawing a second copy of
+        // its label underneath the real Phantom button.
+        if (line.show_fork) reserved.pinned = "      ";
+        const drawn = self.voicedRow(ctx, measure, reserved, colors);
+        const at = line.fork_at orelse return drawn;
+        if (index >= max_message_taps) return drawn;
+        self.message_taps[index] = .{ .ui = self, .at = at };
+        const tapped = ctx.new(phantom.GestureDetector{
+            .child = drawn,
+            .on_tap = onMessageTap,
+            .ctx = &self.message_taps[index],
+        }).widget();
+        if (!line.show_fork) return tapped;
+
+        const button = ctx.new(phantom.Button{
+            .variant = .secondary,
+            .on_tap = onMessageTap,
+            .ctx = &self.message_taps[index],
+            .child = row(ctx, measure, " fork ", colors.fg_muted),
+        }).widget();
+        return pinnedRow(ctx, measure, self.transcriptRoom().width, tapped, button);
     }
 
     fn voicedText(

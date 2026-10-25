@@ -61,7 +61,7 @@ pub const App = struct {
                 return ctx.new(phantom.Text{ .text = "out of memory" }).widget();
 
             self.followPick(ui);
-            self.followSubmit(ui);
+            self.followSubmit(ctx.arena, ui);
             return chock_ui.Ui.rootOf(ctx, ui);
         }
 
@@ -93,8 +93,8 @@ pub const App = struct {
             // Beside the transcript and not over it, so the list stays in view
             // while a session is read. A narrow page falls back to the picker,
             // which `toggleSessions` does by itself.
-            one.toggleSessions();
             if (self.namedSession()) |id| self.open(one, id);
+            one.showSessions();
             return one;
         }
 
@@ -115,8 +115,12 @@ pub const App = struct {
             ui.taken = null;
             self.open(ui, chosen);
 
+            self.showSessionInLocation(chosen);
+        }
+
+        fn showSessionInLocation(self: *State, id: []const u8) void {
             var room: [128]u8 = undefined;
-            const said = std.fmt.bufPrint(&room, session_path ++ "{s}", .{chosen}) catch return;
+            const said = std.fmt.bufPrint(&room, session_path ++ "{s}", .{id}) catch return;
             // A push and not a replace: the list is where the back button goes.
             self.base.element.owner.platform.writeLocation(said, .push);
         }
@@ -127,6 +131,7 @@ pub const App = struct {
             const kept = gpa.dupe(u8, id) catch return;
             if (self.opened) |one| gpa.free(one);
             self.opened = kept;
+            ui.clearTranscript();
             ui.current_session = kept;
             self.reaching.?.watch(kept);
             self.seen = 0;
@@ -134,18 +139,24 @@ pub const App = struct {
         }
 
         /// Send whatever a person typed.
-        fn followSubmit(self: *State, ui: *chock_ui.Ui) void {
+        fn followSubmit(self: *State, arena: std.mem.Allocator, ui: *chock_ui.Ui) void {
             if (!ui.submitted) return;
             defer ui.beginInput();
 
             const session = self.opened orelse return;
+            if (ui.takeForkRequest()) |at| {
+                self.forkSession(arena, ui, session, at);
+                return;
+            }
             switch (chock_ui.ui.answerFor(ui.typed.items)) {
                 .nothing => {},
-                // The commands act on a loop this page is not inside, so saying
-                // nothing would look like the message was sent.
-                .command => {
-                    ui.say(.chock, "a command only works where the session is running");
-                    ui.endLine();
+                .command => |command| switch (command) {
+                    .fork => self.forkSession(arena, ui, session, null),
+                    // These commands act on a loop this page is not inside.
+                    else => {
+                        ui.say(.chock, "that command only works where the session is running");
+                        ui.endLine();
+                    },
                 },
                 // Not drawn here: the daemon writes the message to the log and
                 // the stream brings it back, so saying it now would show it
@@ -158,6 +169,23 @@ pub const App = struct {
                     };
                 },
             }
+        }
+
+        fn forkSession(
+            self: *State,
+            arena: std.mem.Allocator,
+            ui: *chock_ui.Ui,
+            session: []const u8,
+            at: ?u64,
+        ) void {
+            const child = self.reaching.?.source().fork(arena, session, at) catch {
+                ui.say(.chock, self.reaching.?.source().whyLast() orelse
+                    "the session was not forked");
+                ui.endLine();
+                return;
+            };
+            self.open(ui, child);
+            self.showSessionInLocation(child);
         }
 
         /// Follow one session's events from the start of its log.

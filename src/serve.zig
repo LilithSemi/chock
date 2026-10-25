@@ -332,6 +332,7 @@ pub const Route = enum {
     page,
     sessions,
     projects,
+    fork,
     prompt,
     events,
     /// The same events as `events`, read once and answered whole. A browser
@@ -350,6 +351,7 @@ pub fn routeOf(target: []const u8) ?Route {
     if (std.mem.eql(u8, path, "/api/events")) return .events;
     if (std.mem.eql(u8, path, "/api/lines")) return .lines;
     if (std.mem.eql(u8, path, "/api/answer")) return .answer;
+    if (std.mem.eql(u8, path, "/api/fork")) return .fork;
     if (std.mem.eql(u8, path, "/api/prompt")) return .prompt;
     // Everything else is a file of the page, or nothing. The name is matched
     // against the bundle rather than against a directory, so a request can
@@ -391,7 +393,7 @@ fn handle(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Req
     // A route that changes what a session does is a POST, so nothing that
     // prefetches a link can drive it.
     const wanted: std.http.Method = switch (route) {
-        .answer, .prompt => .POST,
+        .answer, .fork, .prompt => .POST,
         .page, .asset, .sessions, .projects, .events, .lines => .GET,
     };
     if (request.head.method != wanted and !(wanted == .GET and request.head.method == .HEAD)) {
@@ -414,6 +416,7 @@ fn handle(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Req
         .events => try serveEvents(serve, arena, request),
         .lines => try serveLines(serve, arena, request),
         .answer => try serveAnswer(serve, arena, request),
+        .fork => try serveFork(serve, arena, request),
         .prompt => try servePrompt(serve, arena, request),
     }
 }
@@ -680,13 +683,34 @@ fn serveAnswer(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Serve
     try askDaemon(serve, arena, request, asked, "{\"answered\":true}");
 }
 
-/// Put one request to the daemon and answer `good` when it says yes.
+fn serveFork(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
+    const session = queryValue(request.head.target, "session") orelse {
+        try sendWhole(request, "that needs a session\n", .{ .status = .bad_request });
+        return;
+    };
+    const at = if (queryValue(request.head.target, "at")) |text|
+        std.fmt.parseInt(u64, text, 10) catch {
+            try sendWhole(request, "the fork point must be an event offset\n", .{ .status = .bad_request });
+            return;
+        }
+    else
+        null;
+    const project = projectOf(serve, arena, request.head.target);
+    try askDaemon(serve, arena, request, .{ .fork = .{
+        .project = project,
+        .session = session,
+        .at = at,
+    } }, null);
+}
+
+/// Put one request to the daemon and answer `good` when supplied, or pass the
+/// daemon's success text through when the caller needs its result.
 fn askDaemon(
     serve: *Serve,
     arena: std.mem.Allocator,
     request: *std.http.Server.Request,
     asked: control.Request,
-    good: []const u8,
+    good: ?[]const u8,
 ) !void {
     const stream = serve.daemon.connect(serve.io) catch |err| {
         try respondUnreachable(arena, request, serve.daemon, err);
@@ -738,7 +762,11 @@ fn askDaemon(
         try respondDaemonRefusal(arena, request, answered.said orelse "the daemon said nothing");
         return;
     }
-    try sendWhole(request, good, .{ .extra_headers = &json_headers });
+    if (good) |body| {
+        try sendWhole(request, body, .{ .extra_headers = &json_headers });
+    } else {
+        try sendWhole(request, answered.said orelse "", .{});
+    }
 }
 
 /// The most one message may be. A prompt past this is not a person typing.
@@ -1167,6 +1195,7 @@ test "every route is one the dispatch has a case for, and a query does not make 
     try testing.expectEqual(Route.projects, routeOf("/api/projects").?);
     try testing.expectEqual(Route.events, routeOf("/api/events").?);
     try testing.expectEqual(Route.answer, routeOf("/api/answer").?);
+    try testing.expectEqual(Route.fork, routeOf("/api/fork?session=01JQ").?);
     try testing.expectEqual(Route.prompt, routeOf("/api/prompt?session=01JQ").?);
 
     try testing.expectEqual(Route.events, routeOf("/api/events?session=01&after=0").?);
@@ -1205,6 +1234,7 @@ test "every route is one the dispatch has a case for, and a query does not make 
         "/api/events",
         "/api/lines",
         "/api/answer",
+        "/api/fork",
         "/api/prompt",
         "/boot.js",
     }) |target| {

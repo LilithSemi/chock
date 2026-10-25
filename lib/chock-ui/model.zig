@@ -314,6 +314,7 @@ pub fn markerText(open: bool, focused: bool) []const u8 {
 }
 
 pub const Command = enum {
+    fork,
     help,
     plan,
     usage,
@@ -321,6 +322,7 @@ pub const Command = enum {
 
     pub fn typed(self: Command) []const u8 {
         return switch (self) {
+            .fork => "/fork",
             .help => "/help",
             .plan => "/plan",
             .usage => "/usage",
@@ -330,6 +332,7 @@ pub const Command = enum {
 
     pub fn does(self: Command) []const u8 {
         return switch (self) {
+            .fork => "branch from the latest completed turn",
             .help => "every key, and every command",
             .plan => "the plan, kept at the side of the screen",
             .usage => "the tokens and the cost so far",
@@ -337,7 +340,7 @@ pub const Command = enum {
         };
     }
 
-    pub const all = [_]Command{ .help, .plan, .usage, .@"resume" };
+    pub const all = [_]Command{ .fork, .help, .plan, .usage, .@"resume" };
 };
 
 pub fn commandOf(line: []const u8) ?Command {
@@ -453,4 +456,8 @@ pub const Line = struct {
     pinned: []const u8 = "",
     fold: ?Fold = null,
     gap: bool = false,
+    message: bool = false,
+    /// The session.end event after this message. It appears only once the turn
+    /// is complete, so a tap never forks an unfinished transcript.
+    fork_at: ?u64 = null,
 };

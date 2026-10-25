@@ -58,7 +58,7 @@ pub const Exit = enum(u8) {
     rate_limited = 12,
 
     pub fn code(self: Exit) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -203,7 +203,7 @@ pub const commands = [_]Command{
     },
     .{
         .name = "sessions",
-        .summary = "List this project's sessions, say which are running, and remove one.",
+        .summary = "List, fork, verify, or remove this project's sessions.",
         .run = sessions_cmd.main,
     },
     .{
@@ -435,7 +435,7 @@ test "no two exit codes are the same, so a script can tell every outcome apart" 
     var codes: [field_count]u8 = undefined;
     var count: usize = 0;
     inline for (@typeInfo(Exit).@"enum".field_names, @typeInfo(Exit).@"enum".field_values) |_, field_value| {
-        const value: Exit = @enumFromInt(field_value);
+        const value: Exit = @fromBackingInt(@intCast(field_value));
         try testing.expect(!seen.contains(value));
         seen.insert(value);
         for (codes[0..count]) |code| try testing.expect(code != value.code());

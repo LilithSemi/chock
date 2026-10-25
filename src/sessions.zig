@@ -1,5 +1,5 @@
 //! `chock sessions`: lists this project's sessions and verifies, seals,
-//! exports, removes, or prunes a session's log.
+//! exports, forks, removes, or prunes a session's log.
 
 const std = @import("std");
 const chock_auth = @import("chock-auth");
@@ -31,7 +31,7 @@ pub const day_ms: u64 = 24 * 60 * 60 * 1000;
 
 const usage_text =
     \\Usage: chock sessions [list|verify [<session>]|seal [<session>]|
-    \\                       export [<session>] --to <dir>|remove <session>|prune] [options]
+    \\                       export [<session>] --to <dir>|fork <session>|remove <session>|prune] [options]
     \\
     \\With no subcommand, says what every session of this project was, oldest first,
     \\and which of them is running now, marked with a * at the start of the row. A
@@ -64,6 +64,12 @@ const usage_text =
     \\here; one that has left cannot. `chock run --export-dir` does the same thing
     \\line by line as a session runs, which is what an installation should use.
     \\
+    \\fork makes a new session from an idle session's audited transcript. By default it
+    \\forks at the last completed turn; --at names a session.end event byte offset. The
+    \\inherited prefix stays byte-for-byte identical and a session.fork event records its
+    \\source and head digest. Running the new session starts a fresh isolated workspace
+    \\and, when configured, a fresh microVM.
+    \\
     \\A session log is the only record of what an agent did, so removing one asks
     \\first. It takes the session's workspace and sandbox root with it.
     \\
@@ -74,6 +80,7 @@ const usage_text =
     \\Options:
     \\  --project <dir>      The project. Defaults to the current directory.
     \\  --to <dir>           For export: where the copies go. Made if it is not there.
+    \\  --at <event>         For fork: a session.end event byte offset. Defaults to the last.
     \\  --older-than <days>  For prune: remove sessions that started before this.
     \\  --require-card       For seal: sign on a card or write nothing. Refuses every
     \\                       software seal, including the one a machine with no reader
@@ -93,6 +100,7 @@ const Options = struct {
     org_bundle: ?[]const u8 = null,
     to: ?[]const u8 = null,
     require_card: bool = false,
+    at: ?u64 = null,
 };
 
 const Action = enum {
@@ -100,12 +108,13 @@ const Action = enum {
     verify,
     seal,
     @"export",
+    fork,
     remove,
     prune,
 
     fn takesSession(self: Action) bool {
         return switch (self) {
-            .verify, .seal, .@"export", .remove => true,
+            .verify, .seal, .@"export", .fork, .remove => true,
             .list, .prune => false,
         };
     }
@@ -182,6 +191,18 @@ pub fn main(
         return exportSessions(arena, io, dir, options.session, options.to.?);
     }
 
+    if (options.action == .fork) {
+        if (!session_paths.isValidId(options.session)) {
+            tty.print(
+                .err,
+                "chock sessions fork: \"{s}\" is not a session identifier\n",
+                .{options.session},
+            );
+            return Exit.usage.code();
+        }
+        return forkSession(arena, io, &env, dir, project_root, options.session, options.at, null);
+    }
+
     if (options.action == .remove and !session_paths.isValidId(options.session)) {
         tty.print(
             .err,
@@ -196,7 +217,7 @@ pub fn main(
     const action = switch (options.action) {
         .remove => remove_action,
         .prune => prune_action,
-        .list, .verify, .seal, .@"export" => unreachable,
+        .list, .verify, .seal, .@"export", .fork => unreachable,
     };
     if (try retentionRefusal(arena, org_rules, action)) |why| {
         tty.print(.warn, "chock sessions {s}: {s}\n", .{ @tagName(options.action), why });
@@ -217,7 +238,7 @@ pub fn main(
     const console = stdin.console();
 
     return switch (options.action) {
-        .list, .verify, .seal, .@"export" => unreachable,
+        .list, .verify, .seal, .@"export", .fork => unreachable,
         .remove => removeSession(
             arena,
             io,
@@ -514,6 +535,12 @@ pub fn fold(
                 }
             },
             .session_end => |ended| one.end = try dupeReason(allocator, ended.reason),
+            .session_fork => {
+                one.end = null;
+                one.spend = .{};
+                one.model = "";
+                models.clearRetainingCapacity();
+            },
             .session_title => |named| one.title = try allocator.dupe(u8, named.title),
             .usage => |turn| {
                 var counted = turn;
@@ -1126,7 +1153,7 @@ fn signedWithText(
                 "PIV slot {X:0>2}, and that is {s}: {s}.",
             .{
                 subject,
-                @intFromEnum(chock_pcsc.attempt.seal_slot),
+                @backingInt(chock_pcsc.attempt.seal_slot),
                 levelRank(choice.level),
                 levelText(choice.level),
             },
@@ -1138,7 +1165,7 @@ fn signedWithText(
             .{
                 subject,
                 choice.reader,
-                @intFromEnum(chock_pcsc.attempt.seal_slot),
+                @backingInt(chock_pcsc.attempt.seal_slot),
                 levelRank(choice.level),
                 levelText(choice.level),
             },
@@ -1207,7 +1234,7 @@ fn sealMain(
     if (attempt.metadata) |slot| tty.detail(
         "PIV slot {X:0>2}: {s}, PIN policy {s}, touch policy {s}\n",
         .{
-            @intFromEnum(chock_pcsc.attempt.seal_slot),
+            @backingInt(chock_pcsc.attempt.seal_slot),
             slot.algorithm.text(),
             @tagName(slot.pin_policy),
             @tagName(slot.touch_policy),
@@ -1332,7 +1359,7 @@ const TerminalPin = struct {
         const asked = std.fmt.bufPrint(
             &text,
             "PIN for the card in PIV slot {X:0>2}: ",
-            .{@intFromEnum(question.slot)},
+            .{@backingInt(question.slot)},
         ) catch "PIN for the card: ";
 
         const typed = tty.readSecret(self.io, asked, out[0..]) catch |err|
@@ -1560,6 +1587,172 @@ fn exportSessions(
         .{ faulted, sessions.len, if (sessions.len == 1) "log" else "logs" },
     );
     return Exit.faulted.code();
+}
+
+const ForkPoint = struct {
+    event: u64,
+    after: u64,
+    head: chain.Digest,
+};
+
+pub fn forkSession(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    dir: []const u8,
+    project_root: []const u8,
+    source_id: []const u8,
+    wanted: ?u64,
+    child_out: ?*[session_paths.id_length]u8,
+) !u8 {
+    const source_path = try logPathIn(arena, dir, source_id);
+    _ = std.Io.Dir.cwd().statFile(io, source_path, .{}) catch {
+        tty.print(.err, "chock sessions fork: this project has no session {s} ({s})\n", .{
+            source_id,
+            dir,
+        });
+        return Exit.usage.code();
+    };
+    var source_backing = chock_proto.storage.JsonLines{
+        .log = chock_proto.log.Log.open(io, source_path, source_id) catch |err| {
+            tty.print(.err, "chock sessions fork: session {s} could not be read: {s}\n", .{
+                source_id,
+                @errorName(err),
+            });
+            return Exit.usage.code();
+        },
+    };
+    const source = source_backing.storage();
+    defer source.close(io);
+
+    var source_lock = source.lock(io) catch |err| {
+        if (err == error.Busy) {
+            tty.print(.err, "chock sessions fork: session {s} is still running\n", .{source_id});
+        } else {
+            tty.print(.err, "chock sessions fork: session {s} could not be locked: {s}\n", .{
+                source_id,
+                @errorName(err),
+            });
+        }
+        return Exit.usage.code();
+    };
+    defer source_lock.unlock(io) catch {};
+
+    var verifier = try source.verifier(io);
+    var replay = try source.replay(arena, io, 0);
+    defer replay.deinit();
+
+    var point: ?ForkPoint = null;
+    var wanted_was_not_end = false;
+    var ending: chain.Ending = .complete;
+    var ending_at: u64 = 0;
+    while (true) {
+        const line_start = replay.at();
+        const parsed = replay.next(io) catch {
+            ending = .undecodable;
+            ending_at = line_start;
+            break;
+        } orelse {
+            ending = if (replay.truncated()) .torn else .complete;
+            ending_at = line_start;
+            break;
+        };
+        defer parsed.deinit();
+
+        verifier.take(parsed.value.id, replay.line(), parsed.value.prev);
+        const is_wanted = if (wanted) |offset| parsed.value.id == offset else true;
+        if (is_wanted and parsed.value.event == .session_end) {
+            point = .{
+                .event = parsed.value.id,
+                .after = replay.at(),
+                .head = chain.of(replay.line()),
+            };
+        } else if (wanted != null and is_wanted) {
+            wanted_was_not_end = true;
+        }
+    }
+
+    const report = verifier.finish(ending, ending_at);
+    if (report.verdict != .intact) {
+        tty.print(.err, "chock sessions fork: session {s} is not an intact complete hash chain ({s})\n", .{
+            source_id,
+            @tagName(report.verdict),
+        });
+        return Exit.faulted.code();
+    }
+
+    const chosen = point orelse {
+        if (wanted) |offset| {
+            tty.print(.err, "chock sessions fork: event {d} {s}\n", .{
+                offset,
+                if (wanted_was_not_end) "is not a session.end event" else "does not exist",
+            });
+        } else {
+            tty.print(.err, "chock sessions fork: session {s} has no completed turn to fork\n", .{source_id});
+        }
+        return Exit.usage.code();
+    };
+
+    const child_id = session_paths.newId(io);
+    const child_id_text: []const u8 = &child_id;
+    const child_paths = try session_paths.pathsFor(arena, env, project_root, child_id_text);
+    session_paths.create(io, child_paths) catch |err| {
+        tty.print(.err, "chock sessions fork: the child session directory could not be made: {s}\n", .{@errorName(err)});
+        return Exit.faulted.code();
+    };
+
+    var child_file = std.Io.Dir.createFileAbsolute(io, child_paths.log, .{ .exclusive = true }) catch |err| {
+        tty.print(.err, "chock sessions fork: the child log could not be made: {s}\n", .{@errorName(err)});
+        return Exit.faulted.code();
+    };
+    var keep_child = false;
+    defer {
+        if (child_file.handle != -1) child_file.close(io);
+        if (!keep_child) std.Io.Dir.cwd().deleteFile(io, child_paths.log) catch {};
+    }
+
+    var source_file = try std.Io.Dir.openFileAbsolute(io, source_path, .{});
+    defer source_file.close(io);
+    var copied: u64 = 0;
+    var buffer: [64 * 1024]u8 = undefined;
+    while (copied < chosen.after) {
+        const want: usize = @intCast(@min(buffer.len, chosen.after - copied));
+        const read = try source_file.readPositionalAll(io, buffer[0..want], copied);
+        if (read == 0) return error.Unexpected;
+        try child_file.writeStreamingAll(io, buffer[0..read]);
+        copied += read;
+    }
+    try child_file.sync(io);
+    child_file.close(io);
+    child_file.handle = -1;
+
+    var child_backing = chock_proto.storage.JsonLines{
+        .log = try chock_proto.log.Log.open(io, child_paths.log, child_id_text),
+    };
+    const child = child_backing.storage();
+    defer child.close(io);
+    var child_lock = try child.lock(io);
+    defer child_lock.unlock(io) catch {};
+    _ = try child_lock.append(arena, io, .{ .session_fork = .{
+        .source_session = source_id,
+        .source_event = chosen.event,
+        .source_head = &chosen.head,
+    } }, std.Io.Timestamp.now(io, .real).toMilliseconds());
+
+    keep_child = true;
+    session_paths.markProject(io, child_paths, project_root);
+    if (child_out) |out| {
+        out.* = child_id;
+        return Exit.finished.code();
+    }
+    tty.out(.plain, "{s}\n", .{child_id_text});
+    tty.print(
+        .plain,
+        "chock sessions fork: forked {s} at event {d}. Continue with:\n" ++
+            "  chock run --session {s}\n",
+        .{ source_id, chosen.event, child_id_text },
+    );
+    return Exit.finished.code();
 }
 
 pub const Removal = struct {
@@ -1905,6 +2098,12 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             options.to = args[index];
             continue;
         }
+        if (std.mem.eql(u8, argument, "--at")) {
+            index += 1;
+            if (index >= args.len) return error.BadArguments;
+            options.at = std.fmt.parseInt(u64, args[index], 10) catch return error.BadArguments;
+            continue;
+        }
         if (std.mem.eql(u8, argument, "--require-card")) {
             options.require_card = true;
             continue;
@@ -1924,12 +2123,14 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
         options.session = argument;
     }
 
-    if (options.action == .remove and options.session.len == 0) return error.BadArguments;
+    if ((options.action == .remove or options.action == .fork) and options.session.len == 0)
+        return error.BadArguments;
     if (!options.action.takesSession() and options.session.len != 0) return error.BadArguments;
     if (options.action == .prune and options.older_than_days == null) return error.BadArguments;
     if (options.action != .prune and options.older_than_days != null) return error.BadArguments;
     if (options.action == .@"export" and options.to == null) return error.BadArguments;
     if (options.action != .@"export" and options.to != null) return error.BadArguments;
+    if (options.action != .fork and options.at != null) return error.BadArguments;
     if (options.action != .seal and options.require_card) return error.BadArguments;
     return options;
 }
@@ -2044,6 +2245,11 @@ test "the command line names an action and exactly what that action needs" {
     try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('A')), removing.session);
     try testing.expect(!removing.yes);
 
+    const forking = try parseOptions(&.{ "fork", "01JQ" ++ @as([22]u8, @splat('F')), "--at", "42" });
+    try testing.expectEqual(Action.fork, forking.action);
+    try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('F')), forking.session);
+    try testing.expectEqual(@as(?u64, 42), forking.at);
+
     const pruning = try parseOptions(&.{ "prune", "--older-than", "30", "--yes" });
     try testing.expectEqual(Action.prune, pruning.action);
     try testing.expectEqual(@as(?u32, 30), pruning.older_than_days);
@@ -2058,10 +2264,113 @@ test "the command line names an action and exactly what that action needs" {
     try testing.expectError(error.BadArguments, parseOptions(&.{"prune"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "prune", "--older-than", "not-a-number" }));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "list", "--older-than", "30" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{"fork"}));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "list", "--at", "42" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "fork", "01JQ" ++ @as([22]u8, @splat('F')), "--at", "nope" }));
 
     try testing.expectError(error.BadArguments, parseOptions(&.{"forget-everything"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{"--project"}));
     try testing.expectError(error.HelpWanted, parseOptions(&.{"--help"}));
+}
+
+test "fork copies an exact completed prefix and records where the child diverged" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state_home = try scratchDir(arena, &tmp, "state");
+    const project = try scratchDir(arena, &tmp, "project");
+    try std.Io.Dir.createDirAbsolute(io, project, .default_dir);
+
+    var env = std.process.Environ.Map.init(arena);
+    try env.put("XDG_STATE_HOME", state_home);
+
+    const source_id = "01JQ" ++ @as([22]u8, @splat('S'));
+    const source_paths = try session_paths.pathsFor(arena, &env, project, source_id);
+    try session_paths.create(io, source_paths);
+    try makeLog(arena, io, source_paths.dir, source_id, &.{
+        .{ .workspace_open = .{
+            .kind = .worktree,
+            .attempt = "01JQ" ++ @as([22]u8, @splat('W')),
+            .path = "/source/work",
+            .base_commit = "aaaa1111",
+        } },
+        .{ .message = .{ .role = .user, .content = &.{.{ .text = "fork from here" }} } },
+        .{ .usage = .{ .model = "source-model", .input_tokens = 100, .cost = .free } },
+        .{ .session_end = .{ .reason = .finished, .detail = "" } },
+        // The default boundary is the last end, not merely the end of file.
+        .{ .session_title = .{ .title = "not inherited" } },
+    });
+
+    var output: tty.Capture = undefined;
+    output.start(io, testing.allocator);
+    defer output.stop(io);
+    try testing.expectEqual(
+        Exit.finished.code(),
+        try forkSession(arena, io, &env, source_paths.dir, project, source_id, null, null),
+    );
+
+    const child_id = (try session_paths.newestId(arena, io, &env, project)).?;
+    try testing.expect(!std.mem.eql(u8, &child_id, source_id));
+    const child_path = try logPathIn(arena, source_paths.dir, &child_id);
+    var child_backing = chock_proto.storage.JsonLines{
+        .log = try chock_proto.log.Log.open(io, child_path, &child_id),
+    };
+    const child = child_backing.storage();
+    defer child.close(io);
+
+    const report = try chock_proto.storage.verify(child, arena, io);
+    try testing.expectEqual(chain.Verdict.intact, report.verdict);
+
+    var folded = state.Session.init(testing.allocator);
+    defer folded.deinit();
+    var replay = try child.replay(arena, io, 0);
+    defer replay.deinit();
+    var fork_offset: ?u64 = null;
+    var fork_head: ?chain.Digest = null;
+    var source_end_offset: ?u64 = null;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        try folded.apply(parsed.value);
+        switch (parsed.value.event) {
+            .session_fork => |forked| {
+                fork_offset = parsed.value.id;
+                source_end_offset = forked.source_event;
+                try testing.expectEqualStrings(source_id, forked.source_session);
+                var digest: chain.Digest = undefined;
+                try testing.expectEqual(digest.len, forked.source_head.len);
+                @memcpy(&digest, forked.source_head);
+                fork_head = digest;
+            },
+            .session_title => return error.TestUnexpectedResult,
+            else => {},
+        }
+    }
+
+    try testing.expect(fork_offset != null);
+    try testing.expect(source_end_offset != null);
+    try testing.expect(!folded.ended);
+    try testing.expect(folded.workspace == null);
+    try testing.expectEqualStrings(source_id, folded.forked_from);
+    try testing.expectEqual(@as(usize, 1), folded.context.items.len);
+    try testing.expectEqual(@as(u64, 0), folded.spend.turns);
+
+    const listed = (try fold(arena, io, source_paths.dir, &child_id)).?;
+    try testing.expect(listed.end == null);
+    try testing.expectEqual(@as(u64, 0), listed.spend.turns);
+    try testing.expectEqual(@as(usize, 0), listed.model_count);
+
+    const source_bytes = try readLog(arena, io, source_paths.dir, source_id);
+    const child_bytes = try readLog(arena, io, source_paths.dir, &child_id);
+    const inherited_len: usize = @intCast(fork_offset.?);
+    try testing.expect(inherited_len < source_bytes.len);
+    try testing.expectEqualSlices(u8, source_bytes[0..inherited_len], child_bytes[0..inherited_len]);
+
+    const end_line = try readLogLineAt(arena, io, source_paths.log, source_end_offset.?);
+    try testing.expectEqualStrings(&chain.of(end_line), &fork_head.?);
 }
 
 test "a session another process owns reads as live, and the probe leaves its lock alone" {
@@ -2838,6 +3147,19 @@ test "a time is printed in UTC, and a number that is not a time says so" {
 fn readLog(arena: std.mem.Allocator, io: std.Io, dir: []const u8, id: []const u8) ![]u8 {
     const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}" ++ log_suffix, .{ dir, id }, 0);
     return std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 * 1024 * 1024));
+}
+
+fn readLogLineAt(arena: std.mem.Allocator, io: std.Io, path: [:0]const u8, offset: u64) ![]u8 {
+    var backing = chock_proto.storage.JsonLines{
+        .log = try chock_proto.log.Log.open(io, path, ""),
+    };
+    const store = backing.storage();
+    defer store.close(io);
+    var replay = try store.replay(arena, io, offset);
+    defer replay.deinit();
+    const parsed = (try replay.next(io)).?;
+    defer parsed.deinit();
+    return arena.dupe(u8, replay.line());
 }
 
 fn writeLog(arena: std.mem.Allocator, io: std.Io, dir: []const u8, id: []const u8, bytes: []const u8) !void {

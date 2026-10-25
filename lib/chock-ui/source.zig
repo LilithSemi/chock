@@ -137,6 +137,15 @@ pub const Source = struct {
             message: []const u8,
         ) Error!void,
 
+        /// Fork one completed turn, or the latest one when `at` is null. The
+        /// returned child identifier belongs to `arena`.
+        fork: *const fn (
+            ptr: *anyopaque,
+            arena: std.mem.Allocator,
+            session: []const u8,
+            at: ?u64,
+        ) Error![]const u8,
+
         /// Answer one question. A second answer to the same request is refused
         /// by whoever holds the session, not here.
         answer: *const fn (
@@ -173,6 +182,15 @@ pub const Source = struct {
         return self.vtable.prompt(self.ptr, session, message);
     }
 
+    pub fn fork(
+        self: Source,
+        arena: std.mem.Allocator,
+        session: []const u8,
+        at: ?u64,
+    ) Error![]const u8 {
+        return self.vtable.fork(self.ptr, arena, session, at);
+    }
+
     pub fn answer(
         self: Source,
         session: []const u8,
@@ -196,6 +214,7 @@ pub const empty: Source = .{
         .events = emptyEvents,
         .asks = emptyAsks,
         .prompt = emptyPrompt,
+        .fork = emptyFork,
         .answer = emptyAnswer,
         .whyLast = emptyWhy,
     },
@@ -216,6 +235,10 @@ fn emptyAsks(_: *anyopaque, _: std.mem.Allocator) Error![]const Ask {
 
 fn emptyPrompt(_: *anyopaque, _: []const u8, _: []const u8) Error!void {}
 
+fn emptyFork(_: *anyopaque, arena: std.mem.Allocator, session: []const u8, _: ?u64) Error![]const u8 {
+    return arena.dupe(u8, session) catch error.OutOfMemory;
+}
+
 fn emptyAnswer(_: *anyopaque, _: []const u8, _: u64, _: Decision) Error!void {}
 
 fn emptyWhy(_: *anyopaque) ?[]const u8 {
@@ -228,6 +251,9 @@ test "a source that reaches nothing answers empty rather than failing" {
     try std.testing.expectEqual(@as(usize, 0), (try empty.events(arena, "01", 0)).len);
     try std.testing.expectEqual(@as(usize, 0), (try empty.asks(arena)).len);
     try empty.prompt("01", "hello");
+    const child = try empty.fork(arena, "01", null);
+    defer arena.free(child);
+    try std.testing.expectEqualStrings("01", child);
     try empty.answer("01", 1, .yes);
     try std.testing.expectEqual(@as(?[]const u8, null), empty.whyLast());
 }

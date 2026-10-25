@@ -106,6 +106,7 @@ pub const Web = struct {
         .events = events,
         .asks = asks,
         .prompt = prompt,
+        .fork = fork,
         .answer = answer,
         .whyLast = whyLast,
     };
@@ -292,7 +293,32 @@ pub const Web = struct {
             "/api/prompt?session={s}{s}",
             .{ session, self.namedProject(arena) },
         ) catch return error.OutOfMemory;
-        try self.post(arena, target, message);
+        _ = try self.post(arena, target, message);
+    }
+
+    fn fork(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        session: []const u8,
+        at: ?u64,
+    ) ui_source.Error![]const u8 {
+        const self: *Web = @ptrCast(@alignCast(ptr));
+        const at_query = if (at) |offset|
+            std.fmt.allocPrint(arena, "&at={d}", .{offset}) catch return error.OutOfMemory
+        else
+            "";
+        const target = std.fmt.allocPrint(
+            arena,
+            "/api/fork?session={s}{s}{s}",
+            .{ session, at_query, self.namedProject(arena) },
+        ) catch return error.OutOfMemory;
+        const response = std.mem.trim(u8, try self.post(arena, target, ""), " \t\r\n");
+        const end = std.mem.indexOfAny(u8, response, "\t\r\n") orelse response.len;
+        if (end == 0) {
+            self.note("the daemon returned no child session identifier");
+            return error.Refused;
+        }
+        return response[0..end];
     }
 
     fn answer(
@@ -312,7 +338,7 @@ pub const Web = struct {
             "/api/answer?session={s}&request={d}&decision={s}{s}",
             .{ session, request, @tagName(decision), self.namedProject(arena) },
         ) catch return error.OutOfMemory;
-        try self.post(arena, target, "");
+        _ = try self.post(arena, target, "");
     }
 
     /// Ask for something that changes a session, and say plainly when it did not
@@ -325,7 +351,7 @@ pub const Web = struct {
         arena: std.mem.Allocator,
         target: []const u8,
         payload: []const u8,
-    ) ui_source.Error!void {
+    ) ui_source.Error![]const u8 {
         if (!self.reachable()) return error.Unreachable;
         const url = std.fmt.allocPrint(arena, "http://{s}{s}", .{ self.origin, target }) catch
             return error.OutOfMemory;
@@ -354,13 +380,14 @@ pub const Web = struct {
             self.note(if (said.len != 0)
                 std.fmt.bufPrint(&room, "{s} ({d})", .{
                     said[0..@min(said.len, 400)],
-                    @intFromEnum(reply.status),
+                    @backingInt(reply.status),
                 }) catch said
             else
                 reply.status.phrase() orelse "the daemon refused");
             return error.Refused;
         }
         self.clear();
+        return body.written();
     }
 
     fn whyLast(ptr: *anyopaque) ?[]const u8 {

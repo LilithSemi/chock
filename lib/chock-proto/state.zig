@@ -282,6 +282,12 @@ pub const Session = struct {
     model_alias: []const u8 = "",
     parent_session: []const u8 = "",
 
+    /// Transcript lineage, distinct from `parent_session`, which is an agent
+    /// delegation relationship and carries policy promises.
+    forked_from: []const u8 = "",
+    forked_at: u64 = 0,
+    forked_head: []const u8 = "",
+
     ended: bool = false,
     end_reason: event.SessionEndReason = .{ .unknown = "" },
     end_detail: []const u8 = "",
@@ -324,6 +330,23 @@ pub const Session = struct {
                 self.ended = true;
                 self.end_reason = try dupeSessionEndReason(allocator, end.reason);
                 self.end_detail = try allocator.dupe(u8, end.detail);
+            },
+            .session_fork => |forked| {
+                self.forked_from = try allocator.dupe(u8, forked.source_session);
+                self.forked_at = forked.source_event;
+                self.forked_head = try allocator.dupe(u8, forked.source_head);
+                // An inherited session.end closes the source prefix, not this
+                // new branch. The child receives its own session.end later.
+                self.ended = false;
+                self.end_reason = .{ .unknown = "" };
+                self.end_detail = "";
+                self.parent_session = "";
+                self.children = .empty;
+                self.grants = .{};
+                self.spend = .{};
+                // The source workspace path belongs to the source. `run`
+                // records a fresh workspace before the child starts.
+                self.workspace = null;
             },
             .session_spawn => |spawn| {
                 try self.children.append(allocator, try childFrom(allocator, spawn));
@@ -1417,4 +1440,38 @@ test "a handed over session ends, and the workspace it names is still the one on
     try std.testing.expect(std.meta.activeTag(session.end_reason) != .canceled_by_user);
     try std.testing.expectEqualStrings("/work/01ATTEMPT", session.workspace.?.path);
     try std.testing.expectEqualStrings("aaaa1111", session.workspace.?.base_commit);
+}
+
+test "a fork inherits context but reopens the child and drops the source workspace" {
+    const allocator = std.testing.allocator;
+    var session = Session.init(allocator);
+    defer session.deinit();
+
+    try session.apply(.{ .id = 1, .session = "01SOURCE", .time_ms = 1, .event = .{
+        .message = .{ .role = .user, .content = &.{.{ .text = "inherited" }} },
+    } });
+    try session.apply(.{ .id = 2, .session = "01SOURCE", .time_ms = 2, .event = .{ .workspace_open = .{
+        .kind = .worktree,
+        .attempt = "01ATTEMPT",
+        .path = "/source/work",
+        .base_commit = "aaaa1111",
+    } } });
+    try session.apply(.{ .id = 3, .session = "01SOURCE", .time_ms = 3, .event = .{
+        .session_end = .{ .reason = .finished, .detail = "done" },
+    } });
+    try session.apply(.{ .id = 4, .session = "01CHILD", .time_ms = 4, .event = .{
+        .session_fork = .{
+            .source_session = "01SOURCE",
+            .source_event = 3,
+            .source_head = "0123456789abcdef",
+        },
+    } });
+
+    try std.testing.expectEqual(@as(usize, 1), session.context.items.len);
+    try std.testing.expectEqualStrings("inherited", session.context.items[0].data.message.content[0].text);
+    try std.testing.expect(!session.ended);
+    try std.testing.expect(session.workspace == null);
+    try std.testing.expectEqualStrings("01SOURCE", session.forked_from);
+    try std.testing.expectEqual(@as(u64, 3), session.forked_at);
+    try std.testing.expectEqualStrings("0123456789abcdef", session.forked_head);
 }

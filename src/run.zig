@@ -130,6 +130,8 @@ pub const Display = struct {
     first_message: []const u8 = "",
 };
 
+const ForkRequest = struct { at: ?u64 };
+
 pub fn main(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -205,12 +207,23 @@ fn mainWith(
 
     // `fork` carries only the calling thread, so this `Io` uses a failing allocator: a thread here would deadlock the forked child.
     var take_up: ?[]const u8 = null;
+    var fork_request: ?ForkRequest = null;
     var shipped: ShippingReport = .{};
 
     const outcome = phase: {
         var session_threaded = std.Io.Threaded.init(std.mem.Allocator.failing, .{ .environ = environ });
         defer session_threaded.deinit();
-        break :phase runSession(gpa, session_threaded.io(), environ, &env, &started, options, &take_up, &shipped);
+        break :phase runSession(
+            gpa,
+            session_threaded.io(),
+            environ,
+            &env,
+            &started,
+            options,
+            &take_up,
+            &fork_request,
+            &shipped,
+        );
     };
 
     var teardown_threaded = std.Io.Threaded.init(arena, .{ .environ = environ });
@@ -274,6 +287,22 @@ fn mainWith(
         return takeUp(teardown_io, &env, started.exe_path, started.project_root, id);
     }
 
+    if (fork_request) |request| {
+        var child_id: [session_paths.id_length]u8 = undefined;
+        const code = try sessions_cmd.forkSession(
+            arena,
+            teardown_io,
+            &env,
+            started.paths.dir,
+            started.project_root,
+            started.session_id,
+            request.at,
+            &child_id,
+        );
+        if (code != Exit.finished.code()) return code;
+        return takeFork(teardown_io, &env, started.exe_path, started.project_root, &child_id);
+    }
+
     return exitWithApply(result, applied, &shipped).code();
 }
 
@@ -302,6 +331,41 @@ fn takeUp(
             .err,
             "chock: session {s} could not be taken up ({s}). It was not started, and this one " ++
                 "has ended. `chock run --session {s} --adopt` is what this would have run.\n",
+            .{ id, @errorName(err), id },
+        );
+        return Exit.faulted.code();
+    };
+    return switch (try child.wait(io)) {
+        .exited => |code| code,
+        else => Exit.faulted.code(),
+    };
+}
+
+fn takeFork(
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    exe_path: []const u8,
+    project_root: []const u8,
+    id: []const u8,
+) !u8 {
+    const argv = [_][]const u8{
+        exe_path,
+        "run",
+        "--project",
+        project_root,
+        "--session",
+        id,
+        "--adopt",
+    };
+
+    var child = std.process.spawn(io, .{
+        .argv = &argv,
+        .environ_map = env,
+    }) catch |err| {
+        tty.print(
+            .err,
+            "chock: forked session {s}, but it could not be started ({s}). Continue with " ++
+                "`chock run --session {s} --adopt`.\n",
             .{ id, @errorName(err), id },
         );
         return Exit.faulted.code();
@@ -1156,10 +1220,11 @@ fn start(
     var image = try loadImage(gpa, arena, io, env, project_root);
     errdefer if (image) |*one| one.deinit(io);
 
-    const dev_shell = if (image != null)
+    var dev_shell = if (image != null)
         null
     else
         try loadDevShell(gpa, io, env, project_root, dev_shell_dir, dev_shell_name, staging_dir);
+    errdefer if (dev_shell) |*shell| shell.deinit();
 
     const tool_env = if (image) |*one|
         try imageToolEnvironment(arena, one)
@@ -9945,6 +10010,7 @@ fn runSession(
     started: *Started,
     options: Options,
     take_up: *?[]const u8,
+    fork_request: *?ForkRequest,
     shipped: *ShippingReport,
 ) !Exit {
     var http = switch (started.adapter) {
@@ -10521,6 +10587,10 @@ fn runSession(
                     take_up.* = id;
                     break;
                 },
+                .fork => |at| {
+                    fork_request.* = .{ .at = at };
+                    break;
+                },
             }
         }
 
@@ -10531,7 +10601,7 @@ fn runSession(
         if (!keepAsking(try finalExit(gpa, io, started.storage), interrupt.requested())) break;
     }
 
-    if (turns == 0) return .usage;
+    if (turns == 0 and fork_request.* == null) return .usage;
 
     return try finalExit(gpa, io, started.storage);
 }

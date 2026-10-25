@@ -1736,11 +1736,10 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .optimize = optimize,
         // A real path and not a fragment, so a session can be linked and a
-        // reload lands back in it. `/s` is listed so the page carries
-        // `<base href="/">`: without it a page served at `/s/<id>` looks for
-        // `./boot.js` one directory down and loads nothing.
+        // reload lands back in it. `base_path` keeps the assets rooted at `/`
+        // when Chock's server answers `/s/<id>` with Phantom's plain shell.
         .url_strategy = .path,
-        .prerender_routes = &.{"s"},
+        .base_path = "/",
         .imports = &.{
             .{ .name = "chock-ui", .module = chock_ui_wasm },
             .{ .name = "chock-proto", .module = chock_proto_wasm },
