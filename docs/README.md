@@ -24,6 +24,8 @@ Start with [running.md](running.md) for a session end to end, and
   things Chock will not take from one.
 - [using/subagents.md](using/subagents.md) - `spawn_agent`, the depth and width
   limits, the budget slice, and a spawn that waits or carries on.
+- [using/forks.md](using/forks.md) - branch at a completed turn, restore its Git
+  workspace and latest microVM, and keep the parent and child independent.
 - [using/memory.md](using/memory.md) - the notes an agent keeps between
   sessions, their bounds, and the hazard a writable memory directory is.
 - [using/instructions.md](using/instructions.md) - the three layers of

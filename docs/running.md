@@ -104,9 +104,16 @@ chock sessions verify [<session>]       # read the hash chain, and the seal
 chock sessions seal [<session>]         # sign the head of a log's chain
 chock sessions seal --require-card      # sign on a card, or write nothing
 chock sessions export [<session>] --to <dir>
+chock sessions fork <session id> [--at <session.end event>]
 chock sessions remove <session id>
 chock sessions prune --older-than 30
 ```
+
+The full-screen interface accepts `/fork`, and each completed message offers a
+fork control for its exact turn. The child keeps an audited copy of the chosen
+transcript prefix and restores that turn's Git workspace when one was saved.
+[forks.md](using/forks.md) covers lineage, historical turns, microVM snapshots,
+and the cases that deliberately cold boot.
 
 Every run writes a `session.config` event, holding what a person put on the
 command line and the SHA-256 of the `chock.zon` the policy came from:

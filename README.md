@@ -46,6 +46,9 @@ approval nobody answers is a refusal.
   [docs/using/nix.md](docs/using/nix.md).
 - Subagents, bounded in depth and width by the project. See
   [docs/using/subagents.md](docs/using/subagents.md).
+- Session forks at any completed turn, with Git workspace restoration and a
+  warm microVM checkpoint at the latest turn. See
+  [docs/using/forks.md](docs/using/forks.md).
 - Notes an agent keeps between sessions, outside your project. See
   [docs/using/memory.md](docs/using/memory.md).
 - Tools you supply yourself, as WebAssembly. See

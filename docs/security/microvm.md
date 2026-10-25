@@ -303,9 +303,27 @@ A guest `chock run` forked writes its console to `<session>.guest-console`
 beside the session's log and never to standard output, because a kernel boot
 interleaved with the agent's own transcript is unreadable for both. A guest
 the daemon forked writes to the daemon's own output instead. `chock run` exits
-every turn, so a guest it owns boots and dies with it, while the daemon owning
-one is meant to save that boot and today does not, for the reason below, but
-it does keep the vCPU threads out of the process that dispatches tool calls.
+every turn, so a guest it owns checkpoints when a fork needs it. The daemon
+keeps a guest warm between turns, checkpoints it after five idle minutes, and
+restores that checkpoint after a daemon restart. Both keep the vCPU threads
+out of the process that dispatches tool calls.
+
+### Session forks and snapshots
+
+A latest-turn session fork copies the quiescent guest checkpoint when the Git
+workspace at that same turn was copied too. The source keeps its own file, so
+the two branches resume independently. A historical fork cold boots: applying
+the latest VM state to an older transcript and workspace would combine states
+that never existed together.
+
+Snapshot restoration rebinds exported share names to the receiving session's
+current host paths. The snapshot does not grant an old source path to the
+child. Once a restored guest is ready, Chock deletes the consumed file; the
+next quiescent checkpoint is written from the new state. A corrupt or
+incompatible file is also deleted and followed by one cold-boot attempt.
+
+Snapshots are disabled for an SEV guest. Its memory is encrypted for that VM,
+so Chock does not claim it can be copied into another session.
 
 ### How the daemon forks a guest
 

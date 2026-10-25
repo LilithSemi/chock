@@ -55,6 +55,12 @@ start  <project directory>\t<message>
 adopt  <project directory>\t<session id>
     -> ok <session id>\t<log path>
 
+fork   <project directory>\t<session id>[\t<session.end event>]
+    -> ok <child session id>\t<child log path>
+
+prompt <project directory>\t<session id>\t<message>
+    -> ok <session id>\t<log path>
+
 read   <session id> <last event id>
     -> one line per event, then the connection closes.
 
