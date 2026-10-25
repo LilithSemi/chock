@@ -58,6 +58,14 @@ const Serial = if (serial_on_port) device.Uart16550 else device.Pl011;
 
 const Machine = if (builtin.os.tag == .macos) backend.hvf.Machine else backend.kvm.Machine;
 
+// Mirage has no backend platform controller on macOS: Chock supplies the GIC
+// there. Snapshot code is Linux-only, but function signatures are analyzed on
+// every target before the compile-time guard in their bodies can return.
+const SnapshotController = if (builtin.os.tag == .linux)
+    backend.platform.Controller
+else
+    device.Gicv2;
+
 // KVM makes the guest's memory, starts its processors, and holds the interrupt controller. Hypervisor.framework does none of them.
 const own_memory = builtin.os.tag == .macos;
 const own_cpus = builtin.os.tag == .macos;
@@ -1240,7 +1248,7 @@ fn saveSnapshot(
     io: std.Io,
     file: *std.Io.File,
     machine: *Machine,
-    gic: *backend.platform.Controller,
+    gic: *SnapshotController,
     memory: *GuestMemory,
     ram_size: u64,
     cpu_ids: []const backend.Backend.VcpuId,
