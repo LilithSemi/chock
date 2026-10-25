@@ -4,7 +4,7 @@
 const std = @import("std");
 const chock_core = @import("chock-core");
 
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const skills = chock_core.skills;

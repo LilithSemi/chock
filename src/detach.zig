@@ -8,7 +8,7 @@ const chock_proto = @import("chock-proto");
 
 const session_paths = @import("session.zig");
 const sessions_cmd = @import("sessions.zig");
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const control = chock_proto.control;

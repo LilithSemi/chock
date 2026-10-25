@@ -16,7 +16,7 @@ const chock_net = @import("chock-net");
 
 const session_paths = @import("session.zig");
 const run = @import("run.zig");
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const version_line = @import("main.zig").version_line;
 const tty = @import("tty.zig");
 const ui = @import("ui.zig");
@@ -1709,7 +1709,7 @@ fn removeDeadProbeRoots(
         const digits = entry.name[probe_dir_prefix.len + 1 ..];
         const pid = std.fmt.parseInt(std.posix.pid_t, digits, 10) catch continue;
         // Signal 0 is not a member of std.posix.SIG and the enum is open, so it is written this way.
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => {
                 const path = std.fs.path.join(arena, &.{ project_dir, entry.name }) catch continue;
                 remove(arena, io, path);
@@ -2259,12 +2259,12 @@ fn filterAnswer(err: chock_net.nftables.Error) Answer {
 
 fn netnsStepByte(diag: ?chock_net.netns.Diagnostic) u8 {
     const one = diag orelse return 0;
-    return @intFromEnum(one.step) + 1;
+    return @backingInt(one.step) + 1;
 }
 
 fn nftablesStepByte(diag: ?chock_net.nftables.Diagnostic) u8 {
     const one = diag orelse return 0;
-    return @intFromEnum(one.step) + 1;
+    return @backingInt(one.step) + 1;
 }
 
 fn probeMounts(write_fd: i32, root: []const u8) void {
@@ -2340,7 +2340,7 @@ fn say(write_fd: i32, step: Step, answer: Answer) void {
 }
 
 fn sayDetail(write_fd: i32, step: Step, answer: Answer, detail: u8) void {
-    const record = [record_bytes]u8{ @intFromEnum(step), @intFromEnum(answer), detail };
+    const record = [record_bytes]u8{ @backingInt(step), @backingInt(answer), detail };
     _ = linux.write(write_fd, &record, record.len);
 }
 
@@ -3361,7 +3361,7 @@ test "a kernel that has no module names the call and the modprobe line, and one 
         .namespaces = .ok,
         .router_network = .ok,
         .router_filter = .absent,
-        .router_filter_step = @intFromEnum(chock_net.nftables.Step.relay_rule) + 1,
+        .router_filter_step = @backingInt(chock_net.nftables.Step.relay_rule) + 1,
     });
     const rows = try rowsFor(arena, m);
 
@@ -3390,7 +3390,7 @@ test "a kernel that has no module names the call and the modprobe line, and one 
     applyRouter(arena, &no_dummy, .{
         .namespaces = .ok,
         .router_network = .absent,
-        .router_network_step = @intFromEnum(chock_net.netns.Step.dummy_create) + 1,
+        .router_network_step = @backingInt(chock_net.netns.Step.dummy_create) + 1,
     });
     const dummy_rows = try rowsFor(arena, no_dummy);
     const network = rowNamed(dummy_rows, "router network").?;
@@ -3412,7 +3412,7 @@ test "a kernel that has no module names the call and the modprobe line, and one 
     applyRouter(arena, &refused, .{
         .namespaces = .ok,
         .router_network = .refused,
-        .router_network_step = @intFromEnum(chock_net.netns.Step.route4_add) + 1,
+        .router_network_step = @backingInt(chock_net.netns.Step.route4_add) + 1,
     });
     const refused_rows = try rowsFor(arena, refused);
     const row = rowNamed(refused_rows, "router network").?;
@@ -3436,11 +3436,11 @@ test "a child that never reached the network says so, and is never read as a ker
     try testing.expectEqual(@as(?[]const u8, null), routerStepName(chock_net.netns.Step, 0));
     try testing.expectEqualStrings(
         "open_socket",
-        routerStepName(chock_net.netns.Step, @intFromEnum(chock_net.netns.Step.open_socket) + 1).?,
+        routerStepName(chock_net.netns.Step, @backingInt(chock_net.netns.Step.open_socket) + 1).?,
     );
     try testing.expectEqualStrings(
         "open_socket",
-        routerStepName(chock_net.nftables.Step, @intFromEnum(chock_net.nftables.Step.open_socket) + 1).?,
+        routerStepName(chock_net.nftables.Step, @backingInt(chock_net.nftables.Step.open_socket) + 1).?,
     );
     try testing.expectEqual(@as(?[]const u8, null), routerStepName(chock_net.netns.Step, 250));
 
@@ -3583,7 +3583,7 @@ test "a machine that cannot route says so in its exit code, because every tool c
         .namespaces = .ok,
         .router_network = .ok,
         .router_filter = .absent,
-        .router_filter_step = @intFromEnum(chock_net.nftables.Step.batch_begin) + 1,
+        .router_filter_step = @backingInt(chock_net.nftables.Step.batch_begin) + 1,
     });
     const rows = try rowsFor(arena, no_modules);
     try testing.expectEqual(Verdict.blocked, verdictFor(rows));

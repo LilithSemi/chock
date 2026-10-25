@@ -15,7 +15,7 @@ const session_paths = @import("session.zig");
 const show_cmd = @import("session_show.zig");
 const usage_cmd = @import("usage.zig");
 const workspace_cmd = @import("workspace.zig");
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const chain = chock_proto.chain;

@@ -100,6 +100,46 @@ pub const Ask = struct {
 
 pub const Decision = enum { yes, no };
 
+/// A stable, renderer-neutral description of one isolated workspace review.
+/// The same shape feeds the terminal, desktop and browser interfaces.
+pub const Review = struct {
+    kind: Kind,
+    base: []const u8 = "",
+    source: []const u8 = "",
+    files: []const File = &.{},
+
+    pub const Kind = enum { git, overlay };
+    pub const File = struct {
+        path: []const u8,
+        old_path: []const u8 = "",
+        status: []const u8,
+        selectable: bool = true,
+        binary: bool = false,
+        /// Binary, rename, deletion, symlink and mode changes are deliberately
+        /// decided as one file. Ordinary text modifications expose hunks.
+        atomic: bool = false,
+        hunks: []const Hunk = &.{},
+    };
+    pub const Hunk = struct {
+        number: usize,
+        header: []const u8,
+        lines: []const Line = &.{},
+    };
+    pub const Line = struct {
+        origin: enum { context, addition, deletion },
+        text: []const u8,
+    };
+};
+
+pub const HunkChoice = struct { path: []const u8, number: usize };
+
+pub const Selection = struct {
+    paths: []const []const u8 = &.{},
+    hunks: []const HunkChoice = &.{},
+    rejected_paths: []const []const u8 = &.{},
+    rejected_hunks: []const HunkChoice = &.{},
+};
+
 /// A way of reaching sessions. The caller owns `ptr` and keeps it alive for as
 /// long as any screen holds this.
 pub const Source = struct {
@@ -149,6 +189,23 @@ pub const Source = struct {
             at: ?u64,
         ) Error![]const u8,
 
+        /// Read the stable workspace boundary belonging to a finished session.
+        review: *const fn (
+            ptr: *anyopaque,
+            arena: std.mem.Allocator,
+            session: []const u8,
+        ) Error!Review,
+
+        /// Materialize exactly this selection without moving a user branch.
+        select: *const fn (
+            ptr: *anyopaque,
+            session: []const u8,
+            selection: Selection,
+        ) Error!void,
+
+        /// Remove the materialized result and leave the user branch alone.
+        undoSelection: *const fn (ptr: *anyopaque, session: []const u8) Error!void,
+
         /// Answer one question. A second answer to the same request is refused
         /// by whoever holds the session, not here.
         answer: *const fn (
@@ -194,6 +251,18 @@ pub const Source = struct {
         return self.vtable.fork(self.ptr, arena, session, at);
     }
 
+    pub fn review(self: Source, arena: std.mem.Allocator, session: []const u8) Error!Review {
+        return self.vtable.review(self.ptr, arena, session);
+    }
+
+    pub fn select(self: Source, session: []const u8, selection: Selection) Error!void {
+        return self.vtable.select(self.ptr, session, selection);
+    }
+
+    pub fn undoSelection(self: Source, session: []const u8) Error!void {
+        return self.vtable.undoSelection(self.ptr, session);
+    }
+
     pub fn answer(
         self: Source,
         session: []const u8,
@@ -218,6 +287,9 @@ pub const empty: Source = .{
         .asks = emptyAsks,
         .prompt = emptyPrompt,
         .fork = emptyFork,
+        .review = emptyReview,
+        .select = emptySelect,
+        .undoSelection = emptyUndoSelection,
         .answer = emptyAnswer,
         .whyLast = emptyWhy,
     },
@@ -242,6 +314,14 @@ fn emptyFork(_: *anyopaque, arena: std.mem.Allocator, session: []const u8, _: ?u
     return arena.dupe(u8, session) catch error.OutOfMemory;
 }
 
+fn emptyReview(_: *anyopaque, _: std.mem.Allocator, _: []const u8) Error!Review {
+    return .{ .kind = .git };
+}
+
+fn emptySelect(_: *anyopaque, _: []const u8, _: Selection) Error!void {}
+
+fn emptyUndoSelection(_: *anyopaque, _: []const u8) Error!void {}
+
 fn emptyAnswer(_: *anyopaque, _: []const u8, _: u64, _: Decision) Error!void {}
 
 fn emptyWhy(_: *anyopaque) ?[]const u8 {
@@ -257,6 +337,9 @@ test "a source that reaches nothing answers empty rather than failing" {
     const child = try empty.fork(arena, "01", null);
     defer arena.free(child);
     try std.testing.expectEqualStrings("01", child);
+    try std.testing.expectEqual(Review.Kind.git, (try empty.review(arena, "01")).kind);
+    try empty.select("01", .{});
+    try empty.undoSelection("01");
     try empty.answer("01", 1, .yes);
     try std.testing.expectEqual(@as(?[]const u8, null), empty.whyLast());
 }

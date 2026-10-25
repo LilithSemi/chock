@@ -68,7 +68,7 @@ pub const Filters = struct {
             .diff => self.diffs,
             .session_spawn, .agent_complete => self.subagents,
             .usage => self.usage,
-            .workspace_open, .workspace_integrate, .workspace_adopt => self.workspace,
+            .workspace_open, .workspace_integrate, .workspace_adopt, .workspace_select => self.workspace,
             .sandbox_open,
             .sandbox_supervisor,
             .sandbox_syscalls,
@@ -265,6 +265,9 @@ fn writeCompact(arena: std.mem.Allocator, envelope: event.Envelope) !void {
         .workspace_integrate => |one| tty.out(.plain, " mode={s} ref={s}", .{
             try inlineText(arena, one.mode), try inlineText(arena, one.ref),
         }),
+        .workspace_select => |one| tty.out(.plain, " result={s} commit={s} files={d} hunks={d}", .{
+            try inlineText(arena, one.result), try inlineText(arena, one.result_commit), one.files, one.hunks,
+        }),
         .network_summary => |one| tty.out(.plain, " granted={d} refused={d}", .{ one.granted, one.refused }),
         .unknown => |one| tty.out(.warn, " unknown={s}", .{try inlineText(arena, one.kind)}),
         inline else => |payload| {
@@ -404,6 +407,18 @@ fn writeHuman(arena: std.mem.Allocator, envelope: event.Envelope, full: bool) !v
         .workspace_adopt => |one| tty.out(.plain, "  {s}: {d} files, {d} deleted, {d} skipped\n", .{
             try inlineText(arena, one.path), one.files, one.deleted, one.skipped,
         }),
+        .workspace_select => |one| {
+            tty.out(.plain, "  {s} -> {s}: {d} files, {d} hunks, {d} binary\n", .{
+                try inlineText(arena, one.source), try inlineText(arena, one.result),
+                one.files,                         one.hunks,
+                one.binary_files,
+            });
+            if (one.result_commit.len != 0) tty.out(.plain, "  immutable result commit {s}\n", .{
+                try inlineText(arena, one.result_commit),
+            });
+            for (one.accepted) |selector| tty.out(.plain, "  accepted {s}\n", .{try inlineText(arena, selector)});
+            for (one.rejected) |selector| tty.out(.plain, "  rejected {s}\n", .{try inlineText(arena, selector)});
+        },
         .sandbox_open => |one| tty.out(.plain, "  attempt {s}: {s}, write/execute {s}\n", .{
             try inlineText(arena, one.attempt), try inlineText(arena, one.decision), try inlineText(arena, one.write_execute.wireName()),
         }),

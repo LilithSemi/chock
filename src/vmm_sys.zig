@@ -133,8 +133,8 @@ pub fn ownSession() void {
 pub fn endWithParent() void {
     if (darwin) return;
     _ = linux.prctl(
-        @intFromEnum(linux.PR.SET_PDEATHSIG),
-        @intFromEnum(linux.SIG.KILL),
+        @backingInt(linux.PR.SET_PDEATHSIG),
+        @backingInt(linux.SIG.KILL),
         0,
         0,
         0,
@@ -236,7 +236,7 @@ fn codeFor(status: u32) u8 {
     const W = if (darwin) std.c.W else linux.W;
     if (W.IFEXITED(status)) return W.EXITSTATUS(status);
     if (W.IFSIGNALED(status)) {
-        const signal: u8 = @intCast(@intFromEnum(W.TERMSIG(status)) & 0x7f);
+        const signal: u8 = @intCast(@backingInt(W.TERMSIG(status)) & 0x7f);
         return 128 + signal;
     }
     return 1;

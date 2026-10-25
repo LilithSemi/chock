@@ -14,7 +14,8 @@ const chock_proto = @import("chock-proto");
 const run_cmd = @import("run.zig");
 const session_paths = @import("session.zig");
 const sessions_cmd = @import("sessions.zig");
-const Exit = @import("main.zig").Exit;
+const workspace_cmd = @import("workspace.zig");
+const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const control = chock_proto.control;
@@ -575,6 +576,9 @@ fn serve(daemon: *Daemon, arena: std.mem.Allocator, stream: *std.Io.net.Stream) 
         .adopt => |one| handleAdopt(daemon, writer, one),
         .create => |one| handleCreate(daemon, writer, one),
         .fork => |one| handleFork(daemon, writer, one),
+        .review => |one| handleReview(daemon, arena, writer, one),
+        .select => |one| handleSelect(daemon, arena, writer, one),
+        .undo_selection => |one| handleUndoSelection(daemon, arena, writer, one),
         .prompt => |one| handlePrompt(daemon, writer, one),
         .cancel => |one| handleCancel(daemon, writer, one),
         .read => |one| handleRead(daemon, arena, writer, one),
@@ -700,6 +704,66 @@ fn handleFork(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Fork
         forked.id,
         .{ .forked = if (forked.latest and forked.workspace) source_id else null },
     );
+}
+
+fn handleReview(daemon: *Daemon, arena: std.mem.Allocator, writer: *std.Io.Writer, one: control.Request.Review) void {
+    _ = checkedSession(writer, one.project, one.session) orelse return;
+    const dir = session_paths.projectDir(arena, daemon.env, one.project) catch {
+        fail(writer, "the session directory could not be built");
+        return;
+    };
+    const payload = workspace_cmd.reviewJson(arena, daemon.gpa, daemon.io, one.project, dir, one.session) catch |err| {
+        fail(writer, @errorName(err));
+        return;
+    };
+    say(writer, .{ .record = .{ .id = 0, .payload = payload } });
+}
+
+fn handleSelect(daemon: *Daemon, arena: std.mem.Allocator, writer: *std.Io.Writer, one: control.Request.Select) void {
+    _ = checkedSession(writer, one.project, one.session) orelse return;
+    const Choice = struct {
+        paths: []const []const u8 = &.{},
+        hunks: []const workspace_cmd.HunkSelector = &.{},
+        rejected_paths: []const []const u8 = &.{},
+        rejected_hunks: []const workspace_cmd.HunkSelector = &.{},
+    };
+    const choice = std.json.parseFromSliceLeaky(Choice, arena, one.payload, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch {
+        fail(writer, "the workspace selection is not valid JSON");
+        return;
+    };
+    const dir = session_paths.projectDir(arena, daemon.env, one.project) catch {
+        fail(writer, "the session directory could not be built");
+        return;
+    };
+    const code = workspace_cmd.selectWorkspace(arena, daemon.gpa, daemon.io, daemon.env, one.project, dir, .{
+        .session = one.session,
+        .paths = choice.paths,
+        .hunks = choice.hunks,
+        .rejected_paths = choice.rejected_paths,
+        .rejected_hunks = choice.rejected_hunks,
+    });
+    if (code != Exit.finished.code()) {
+        fail(writer, "the workspace selection was refused; the source or selected result may have changed");
+        return;
+    }
+    say(writer, .{ .ok = "selected" });
+}
+
+fn handleUndoSelection(daemon: *Daemon, arena: std.mem.Allocator, writer: *std.Io.Writer, one: control.Request.UndoSelection) void {
+    _ = checkedSession(writer, one.project, one.session) orelse return;
+    const dir = session_paths.projectDir(arena, daemon.env, one.project) catch {
+        fail(writer, "the session directory could not be built");
+        return;
+    };
+    const code = workspace_cmd.undoSelection(arena, daemon.io, daemon.env, one.project, dir, one.session);
+    if (code != Exit.finished.code()) {
+        fail(writer, "the selected workspace result could not be removed");
+        return;
+    }
+    say(writer, .{ .ok = "undone" });
 }
 
 fn handlePrompt(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Prompt) void {

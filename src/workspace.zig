@@ -9,13 +9,13 @@ const ziggit = @import("ziggit");
 const approval = @import("approval.zig");
 const session_paths = @import("session.zig");
 const sessions_cmd = @import("sessions.zig");
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const work_suffix = ".work";
 
 const usage_text =
-    \\Usage: chock workspace [list|clear|adopt <session>|review <session>] [options]
+    \\Usage: chock workspace [list|clear|adopt <session>|review <session>|select <session>|undo <session>] [options]
     \\
     \\With no subcommand, says which workspaces this project's sessions left behind.
     \\A session that ends cleanly removes its own. A session that errored, was
@@ -38,25 +38,41 @@ const usage_text =
     \\Repeat --path to show only named files. Paths are literal: wildcard and
     \\pathspec syntax has no special meaning.
     \\
+    \\select <session> creates refs/chock/selected/<session> from accepted files
+    \\and hunks without moving the checked-out branch. With no accept selector,
+    \\everything is accepted except explicit rejects. A changed patch may instead
+    \\be supplied with --patch. undo <session> removes that selected result.
+    \\
     \\A workspace whose session is running now is never removed, because that session
     \\is writing into it. Such a row is marked with a * at the start.
     \\
     \\Options:
     \\  --project <dir>   The project. Defaults to the current directory.
     \\  --yes             Do not ask. Only for a caller that has already decided.
-    \\  --path <file>     For review: include this project-relative path. Repeatable.
+    \\  --path <file>     For review: show this path. For select: accept its whole change.
+    \\                    Repeatable; paths are literal.
+    \\  --hunk <file:n>   For select: accept one numbered text hunk. Repeatable.
+    \\  --reject-path <file>  For select: reject a whole file. Repeatable.
+    \\  --reject-hunk <file:n> For select: reject one numbered text hunk. Repeatable.
+    \\  --patch <file>    For select: apply an edited unified patch instead of selectors.
     \\
 ++ tty.options_text;
 
-const Options = struct {
+pub const Options = struct {
     project: ?[]const u8 = null,
     action: Action = .list,
     yes: bool = false,
     session: ?[]const u8 = null,
     paths: []const []const u8 = &.{},
+    hunks: []const HunkSelector = &.{},
+    rejected_paths: []const []const u8 = &.{},
+    rejected_hunks: []const HunkSelector = &.{},
+    patch: ?[]const u8 = null,
 };
 
-const Action = enum { list, clear, adopt, review };
+pub const HunkSelector = struct { path: []const u8, number: usize };
+
+const Action = enum { list, clear, adopt, review, select, undo };
 
 pub fn main(
     arena: std.mem.Allocator,
@@ -93,6 +109,12 @@ pub fn main(
 
     if (options.action == .review) {
         return reviewWorkspace(arena, gpa, io, project_root, dir, options.session, options.paths);
+    }
+    if (options.action == .select) {
+        return selectWorkspace(arena, gpa, io, &env, project_root, dir, options);
+    }
+    if (options.action == .undo) {
+        return undoSelection(arena, io, &env, project_root, dir, options.session);
     }
 
     const kept = try list(arena, io, dir);
@@ -370,6 +392,9 @@ const ParseError = error{ HelpWanted, BadArguments };
 fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) (ParseError || std.mem.Allocator.Error)!Options {
     var options = Options{};
     var paths: std.ArrayList([]const u8) = .empty;
+    var hunks: std.ArrayList(HunkSelector) = .empty;
+    var rejected_paths: std.ArrayList([]const u8) = .empty;
+    var rejected_hunks: std.ArrayList(HunkSelector) = .empty;
     var index: usize = 0;
     var saw_action = false;
 
@@ -392,19 +417,63 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) (ParseError 
             try paths.append(arena, args[index]);
             continue;
         }
+        if (std.mem.eql(u8, argument, "--hunk") or std.mem.eql(u8, argument, "--reject-hunk")) {
+            const reject = std.mem.eql(u8, argument, "--reject-hunk");
+            index += 1;
+            if (index >= args.len) return error.BadArguments;
+            const selector = parseHunkSelector(args[index]) orelse return error.BadArguments;
+            if (reject) try rejected_hunks.append(arena, selector) else try hunks.append(arena, selector);
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "--reject-path")) {
+            index += 1;
+            if (index >= args.len) return error.BadArguments;
+            try rejected_paths.append(arena, args[index]);
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "--patch")) {
+            index += 1;
+            if (index >= args.len or options.patch != null) return error.BadArguments;
+            options.patch = args[index];
+            continue;
+        }
         if (argument.len != 0 and argument[0] == '-') return error.BadArguments;
 
         if (!saw_action) {
-            options.action = std.meta.stringToEnum(Action, argument) orelse return error.BadArguments;
+            options.action = actionOf(argument) orelse return error.BadArguments;
             saw_action = true;
             continue;
         }
-        if ((options.action != .adopt and options.action != .review) or options.session != null) return error.BadArguments;
+        if ((options.action != .adopt and options.action != .review and options.action != .select and options.action != .undo) or options.session != null) return error.BadArguments;
         options.session = argument;
     }
-    if (paths.items.len != 0 and options.action != .review) return error.BadArguments;
+    if (paths.items.len != 0 and options.action != .review and options.action != .select) return error.BadArguments;
+    if ((hunks.items.len != 0 or rejected_paths.items.len != 0 or rejected_hunks.items.len != 0 or options.patch != null) and options.action != .select) return error.BadArguments;
+    if (options.patch != null and (paths.items.len != 0 or hunks.items.len != 0 or rejected_paths.items.len != 0 or rejected_hunks.items.len != 0)) return error.BadArguments;
     options.paths = try paths.toOwnedSlice(arena);
+    options.hunks = try hunks.toOwnedSlice(arena);
+    options.rejected_paths = try rejected_paths.toOwnedSlice(arena);
+    options.rejected_hunks = try rejected_hunks.toOwnedSlice(arena);
     return options;
+}
+
+fn actionOf(text: []const u8) ?Action {
+    if (std.mem.eql(u8, text, "list")) return .list;
+    if (std.mem.eql(u8, text, "clear")) return .clear;
+    if (std.mem.eql(u8, text, "adopt")) return .adopt;
+    if (std.mem.eql(u8, text, "review")) return .review;
+    if (std.mem.eql(u8, text, "select")) return .select;
+    if (std.mem.eql(u8, text, "undo")) return .undo;
+    return null;
+}
+
+fn parseHunkSelector(text: []const u8) ?HunkSelector {
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return null;
+    const path = text[0..colon];
+    if (!reviewPathIsSafe(path)) return null;
+    const number = std.fmt.parseUnsigned(usize, text[colon + 1 ..], 10) catch return null;
+    if (number == 0) return null;
+    return .{ .path = path, .number = number };
 }
 
 fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]const u8 {
@@ -553,6 +622,169 @@ fn patchSelected(paths: []const []const u8, patch: ziggit.Patch) bool {
     return pathSelected(paths, patch.old_path) or pathSelected(paths, patch.new_path);
 }
 
+pub const ReviewWire = struct {
+    kind: enum { git, overlay },
+    base: []const u8 = "",
+    source: []const u8 = "",
+    files: []const File = &.{},
+
+    pub const File = struct {
+        path: []const u8,
+        old_path: []const u8 = "",
+        status: []const u8,
+        selectable: bool = true,
+        binary: bool = false,
+        atomic: bool = false,
+        hunks: []const Hunk = &.{},
+    };
+    pub const Hunk = struct {
+        number: usize,
+        header: []const u8,
+        lines: []const Line,
+    };
+    pub const Line = struct {
+        origin: enum { context, addition, deletion },
+        text: []const u8,
+    };
+};
+
+/// Structured review data for every Phantom frontend. The session log fixes
+/// the base and workspace kind; callers never infer either from the worktree.
+pub fn reviewJson(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    session_dir: []const u8,
+    session_id: []const u8,
+) ![]const u8 {
+    if (!session_paths.isValidId(session_id)) return error.InvalidSession;
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ session_dir, session_id }, 0);
+    if (sessions_cmd.livenessOf(io, log_path) != .idle) return error.SessionNotIdle;
+    const opened = lastWorkspaceOpen(arena, io, log_path, session_id) orelse return error.NoWorkspace;
+
+    switch (opened.kind) {
+        .unknown => return error.UnknownWorkspace,
+        .overlay => {
+            const work = try std.fmt.allocPrint(arena, "{s}/{s}{s}", .{ session_dir, session_id, work_suffix });
+            const scratch = try std.fs.path.join(arena, &.{ work, opened.attempt });
+            var diag: ?chock_workspace.Diagnostic = null;
+            var overlay = try chock_workspace.overlay.adopt(gpa, io, project_root, scratch, &diag);
+            defer overlay.deinit(gpa);
+            var report = try overlay.changedFiles(gpa, io, &diag);
+            defer report.deinit(gpa);
+            const files = try arena.alloc(ReviewWire.File, report.changed.len + report.skipped.len);
+            var at: usize = 0;
+            for (report.changed) |one| {
+                var hunks: []const ReviewWire.Hunk = &.{};
+                var binary = false;
+                var atomic = true;
+                if (one.kind == .modified) text: {
+                    const old_path = try std.fs.path.join(arena, &.{ project_root, one.path });
+                    const new_path = try std.fs.path.join(arena, &.{ overlay.upper, one.path });
+                    const old_stat = std.Io.Dir.cwd().statFile(io, old_path, .{ .follow_symlinks = false }) catch break :text;
+                    const new_stat = std.Io.Dir.cwd().statFile(io, new_path, .{ .follow_symlinks = false }) catch break :text;
+                    if (old_stat.kind != .file or new_stat.kind != .file or old_stat.permissions != new_stat.permissions) break :text;
+                    const old_bytes = std.Io.Dir.cwd().readFileAlloc(io, old_path, gpa, .limited(16 * 1024 * 1024)) catch break :text;
+                    defer gpa.free(old_bytes);
+                    const new_bytes = std.Io.Dir.cwd().readFileAlloc(io, new_path, gpa, .limited(16 * 1024 * 1024)) catch break :text;
+                    defer gpa.free(new_bytes);
+                    var patch = ziggit.diffBlobs(gpa, one.path, one.path, old_bytes, new_bytes, .{}) catch break :text;
+                    defer patch.deinit(gpa);
+                    binary = patch.binary;
+                    atomic = patch.binary;
+                    if (!patch.binary) hunks = try wireHunks(arena, patch.hunks);
+                }
+                files[at] = .{
+                    .path = try arena.dupe(u8, one.path),
+                    .status = @tagName(one.kind),
+                    .binary = binary,
+                    .atomic = atomic,
+                    .hunks = hunks,
+                };
+                at += 1;
+            }
+            for (report.skipped) |one| {
+                files[at] = .{
+                    .path = try arena.dupe(u8, one.path),
+                    .status = try std.fmt.allocPrint(arena, "skipped: {s}", .{one.reason}),
+                    .selectable = false,
+                    .atomic = true,
+                };
+                at += 1;
+            }
+            return std.json.Stringify.valueAlloc(arena, ReviewWire{
+                .kind = .overlay,
+                .source = scratch,
+                .files = files,
+            }, .{});
+        },
+        .worktree => {},
+    }
+    if (opened.base_commit.len == 0) return error.NoBaseCommit;
+
+    var project = try std.Io.Dir.openDirAbsolute(io, project_root, .{ .iterate = true });
+    defer project.close(io);
+    var diag: ?ziggit.Diagnostic = null;
+    defer if (diag) |*fault| fault.deinit(gpa);
+    var layout = try ziggit.discover(gpa, io, project, .{}, &diag);
+    var repo = ziggit.Repository.open(gpa, io, layout, .{}, &diag) catch |err| {
+        layout.deinit(io);
+        return err;
+    };
+    defer repo.deinit();
+    const base = try ziggit.resolve(gpa, &repo, opened.base_commit, &diag);
+    const source_ref = try std.fmt.allocPrint(arena, "refs/chock/{s}", .{session_id});
+    const tip = try repo.refs.resolve(source_ref, &diag);
+    var diff = try ziggit.diffCommits(gpa, &repo.odb, base, tip, .{ .detect_copies = true }, &diag);
+    defer diff.deinit(gpa);
+
+    const files = try arena.alloc(ReviewWire.File, diff.patches.len);
+    for (diff.patches, files) |patch, *file| {
+        const hunks = try wireHunks(arena, patch.hunks);
+        file.* = .{
+            .path = try arena.dupe(u8, patch.new_path),
+            .old_path = if (std.mem.eql(u8, patch.old_path, patch.new_path)) "" else try arena.dupe(u8, patch.old_path),
+            .status = @tagName(patch.status),
+            .binary = patch.binary,
+            .atomic = !patchSupportsHunks(patch),
+            .hunks = hunks,
+        };
+    }
+    return std.json.Stringify.valueAlloc(arena, ReviewWire{
+        .kind = .git,
+        .base = opened.base_commit,
+        .source = source_ref,
+        .files = files,
+    }, .{});
+}
+
+fn wireHunks(arena: std.mem.Allocator, source: []const ziggit.Hunk) ![]const ReviewWire.Hunk {
+    const hunks = try arena.alloc(ReviewWire.Hunk, source.len);
+    for (source, hunks, 1..) |hunk, *out, number| {
+        const lines = try arena.alloc(ReviewWire.Line, hunk.lines.len);
+        for (hunk.lines, lines) |line, *copy| copy.* = .{
+            .origin = switch (line.origin) {
+                .context => .context,
+                .addition => .addition,
+                .deletion => .deletion,
+            },
+            .text = try arena.dupe(u8, line.content),
+        };
+        out.* = .{
+            .number = number,
+            .header = try std.fmt.allocPrint(arena, "@@ -{d},{d} +{d},{d} @@", .{
+                hunk.old_start,
+                hunk.old_lines,
+                hunk.new_start,
+                hunk.new_lines,
+            }),
+            .lines = lines,
+        };
+    }
+    return hunks;
+}
+
 test "review path selection recognizes either side of a rename" {
     const patch = ziggit.Patch{
         .old_path = "before.txt",
@@ -579,6 +811,667 @@ fn sayGitReviewFault(
         diag.* = null;
     }
     tty.print(.err, ".\n", .{});
+}
+
+pub fn selectWorkspace(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    session_dir: []const u8,
+    options: Options,
+) u8 {
+    const session_id = options.session orelse {
+        tty.print(.err, "chock workspace select: name the session whose work you want to select.\n", .{});
+        return Exit.usage.code();
+    };
+    if (!session_paths.isValidId(session_id)) {
+        tty.print(.err, "chock workspace select: {s} is not a session identifier.\n", .{session_id});
+        return Exit.usage.code();
+    }
+    for (options.paths) |path| if (!reviewPathIsSafe(path)) {
+        tty.print(.err, "chock workspace select: {s} is not a project-relative path.\n", .{path});
+        return Exit.usage.code();
+    };
+    for (options.rejected_paths) |path| if (!reviewPathIsSafe(path)) {
+        tty.print(.err, "chock workspace select: {s} is not a project-relative path.\n", .{path});
+        return Exit.usage.code();
+    };
+    // Hunk selectors are parsed and logged by the public contract now; their
+    // application is handled below once a patch has ordinary text hunks.
+
+    const log_path = std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ session_dir, session_id }, 0) catch
+        return Exit.faulted.code();
+    switch (sessions_cmd.livenessOf(io, log_path)) {
+        .idle => {},
+        .live, .unknown => {
+            tty.print(.err, "chock workspace select: session {s} may still be changing, so no selection was made.\n", .{session_id});
+            return Exit.refused.code();
+        },
+    }
+    const opened = lastWorkspaceOpen(arena, io, log_path, session_id) orelse {
+        tty.print(.err, "chock workspace select: session {s} names no workspace.\n", .{session_id});
+        return Exit.usage.code();
+    };
+    switch (opened.kind) {
+        .overlay => return selectOverlay(arena, gpa, io, project_root, session_dir, session_id, opened, options, log_path),
+        .worktree => {},
+        .unknown => {
+            tty.print(.err, "chock workspace select: that workspace kind is not understood.\n", .{});
+            return Exit.usage.code();
+        },
+    }
+    if (opened.base_commit.len == 0) {
+        tty.print(.err, "chock workspace select: session {s} recorded no Git base commit.\n", .{session_id});
+        return Exit.usage.code();
+    }
+
+    var project = std.Io.Dir.openDirAbsolute(io, project_root, .{ .iterate = true }) catch return Exit.faulted.code();
+    defer project.close(io);
+    var diag: ?ziggit.Diagnostic = null;
+    defer if (diag) |*fault| fault.deinit(gpa);
+    var layout = ziggit.discover(gpa, io, project, .{}, &diag) catch |err| {
+        sayGitReviewFault(gpa, session_id, "the Git repository could not be found", err, &diag);
+        return Exit.usage.code();
+    };
+    var repo = ziggit.Repository.open(gpa, io, layout, .{}, &diag) catch |err| {
+        layout.deinit(io);
+        sayGitReviewFault(gpa, session_id, "the Git repository could not be opened", err, &diag);
+        return Exit.usage.code();
+    };
+    defer repo.deinit();
+    const base = ziggit.resolve(gpa, &repo, opened.base_commit, &diag) catch |err| {
+        sayGitReviewFault(gpa, session_id, "the recorded base commit could not be resolved", err, &diag);
+        return Exit.usage.code();
+    };
+    const source_ref = std.fmt.allocPrint(arena, "refs/chock/{s}", .{session_id}) catch return Exit.faulted.code();
+    const tip = repo.refs.resolve(source_ref, &diag) catch |err| {
+        sayGitReviewFault(gpa, session_id, "the session ref could not be resolved", err, &diag);
+        return Exit.usage.code();
+    };
+    var diff = ziggit.diffCommits(gpa, &repo.odb, base, tip, .{ .detect_copies = true }, &diag) catch |err| {
+        sayGitReviewFault(gpa, session_id, "the session changes could not be read", err, &diag);
+        return Exit.faulted.code();
+    };
+    defer diff.deinit(gpa);
+
+    if (!selectorsExist(diff, options)) {
+        tty.print(.err, "chock workspace select: a selector did not name a changed file or hunk.\n", .{});
+        return Exit.usage.code();
+    }
+
+    var nonce: [8]u8 = undefined;
+    io.random(&nonce);
+    const hex = std.fmt.bytesToHex(nonce, .lower);
+    const index_path = std.fmt.allocPrint(arena, "{s}/.{s}-{s}.index", .{ session_dir, session_id, &hex }) catch
+        return Exit.faulted.code();
+    defer std.Io.Dir.deleteFileAbsolute(io, index_path) catch {};
+    var git_env = env.clone(arena) catch return Exit.faulted.code();
+    defer git_env.deinit();
+    git_env.put("GIT_INDEX_FILE", index_path) catch return Exit.faulted.code();
+    git_env.put("GIT_AUTHOR_NAME", "Chock review") catch return Exit.faulted.code();
+    git_env.put("GIT_AUTHOR_EMAIL", "review@chock.invalid") catch return Exit.faulted.code();
+    git_env.put("GIT_COMMITTER_NAME", "Chock review") catch return Exit.faulted.code();
+    git_env.put("GIT_COMMITTER_EMAIL", "review@chock.invalid") catch return Exit.faulted.code();
+
+    _ = selectionGit(arena, io, &git_env, project_root, &.{ "read-tree", opened.base_commit }) catch return Exit.faulted.code();
+
+    var files: usize = 0;
+    var hunks: usize = 0;
+    var binary_files: usize = 0;
+    if (options.patch) |patch_file| {
+        _ = selectionGit(arena, io, &git_env, project_root, &.{ "apply", "--cached", "--check", "--", patch_file }) catch return Exit.usage.code();
+        _ = selectionGit(arena, io, &git_env, project_root, &.{ "apply", "--cached", "--", patch_file }) catch return Exit.faulted.code();
+        const names = selectionGit(arena, io, &git_env, project_root, &.{ "diff", "--cached", "--name-only", opened.base_commit }) catch return Exit.faulted.code();
+        var lines = std.mem.splitScalar(u8, names, '\n');
+        while (lines.next()) |path| {
+            if (path.len == 0) continue;
+            var proposed = false;
+            for (diff.patches) |candidate| if (patchSelected(&.{path}, candidate)) {
+                proposed = true;
+                if (candidate.binary) binary_files += 1;
+                break;
+            };
+            if (!proposed) {
+                tty.print(.err, "chock workspace select: edited patch path {s} was not part of the session proposal.\n", .{path});
+                return Exit.usage.code();
+            }
+            files += 1;
+        }
+    } else {
+        var partial_text: std.Io.Writer.Allocating = .init(gpa);
+        defer partial_text.deinit();
+        for (diff.patches) |patch| {
+            if (wholePatchSelected(options, patch)) {
+                applyWholePatch(arena, io, &git_env, project_root, patch) catch return Exit.faulted.code();
+                files += 1;
+                if (patch.binary) binary_files += 1;
+                continue;
+            }
+            var chosen: std.ArrayList(ziggit.Hunk) = .empty;
+            defer chosen.deinit(gpa);
+            for (patch.hunks, 1..) |hunk, number| {
+                if (!hunkSelected(options, patch, number)) continue;
+                chosen.append(gpa, hunk) catch return Exit.faulted.code();
+            }
+            if (chosen.items.len == 0) continue;
+            if (!patchSupportsHunks(patch)) {
+                tty.print(
+                    .err,
+                    "chock workspace select: {s} can only be accepted or rejected as a whole file " ++
+                        "because it is binary, renamed, deleted, a symlink, or changes mode.\n",
+                    .{patch.new_path},
+                );
+                return Exit.usage.code();
+            }
+            var selected_patch = patch;
+            selected_patch.hunks = chosen.items;
+            selected_patch.writeUnified(&partial_text.writer) catch return Exit.faulted.code();
+            files += 1;
+            hunks += chosen.items.len;
+        }
+        if (partial_text.written().len != 0) {
+            const patch_path = std.fmt.allocPrint(arena, "{s}.patch", .{index_path}) catch return Exit.faulted.code();
+            defer std.Io.Dir.deleteFileAbsolute(io, patch_path) catch {};
+            var patch_file = std.Io.Dir.createFileAbsolute(io, patch_path, .{ .exclusive = true }) catch return Exit.faulted.code();
+            patch_file.writeStreamingAll(io, partial_text.written()) catch {
+                patch_file.close(io);
+                return Exit.faulted.code();
+            };
+            patch_file.close(io);
+            _ = selectionGit(arena, io, &git_env, project_root, &.{ "apply", "--cached", "--check", "--", patch_path }) catch return Exit.usage.code();
+            _ = selectionGit(arena, io, &git_env, project_root, &.{ "apply", "--cached", "--", patch_path }) catch return Exit.faulted.code();
+        }
+    }
+
+    if (files == 0) {
+        tty.print(.err, "chock workspace select: the selection accepts no changes.\n", .{});
+        return Exit.usage.code();
+    }
+
+    const tree = selectionGit(arena, io, &git_env, project_root, &.{"write-tree"}) catch return Exit.faulted.code();
+    const message = std.fmt.allocPrint(arena, "chock: selected changes from session {s}", .{session_id}) catch return Exit.faulted.code();
+    const commit = selectionGit(arena, io, &git_env, project_root, &.{ "commit-tree", tree, "-p", opened.base_commit, "-m", message }) catch
+        return Exit.faulted.code();
+    const result_ref = std.fmt.allocPrint(arena, "refs/chock/selected/{s}", .{session_id}) catch return Exit.faulted.code();
+    var previous = chock_workspace.git.run(arena, io, &git_env, project_root, &.{ "rev-parse", "--verify", result_ref }, null) catch
+        return Exit.faulted.code();
+    defer previous.deinit(arena);
+    const expected = switch (previous.term) {
+        .exited => |code| if (code == 0) std.mem.trimEnd(u8, previous.stdout, "\n") else "",
+        else => "",
+    };
+    _ = selectionGit(arena, io, &git_env, project_root, &.{ "update-ref", result_ref, commit, expected }) catch return Exit.refused.code();
+
+    const accepted = selectionNames(arena, options.paths, options.hunks) catch return Exit.faulted.code();
+    const rejected = selectionNames(arena, options.rejected_paths, options.rejected_hunks) catch return Exit.faulted.code();
+    recordSelection(arena, io, log_path, session_id, .{
+        .source = source_ref,
+        .result = result_ref,
+        .result_commit = commit,
+        .base_commit = opened.base_commit,
+        .accepted = accepted,
+        .rejected = rejected,
+        .files = files,
+        .hunks = hunks,
+        .binary_files = binary_files,
+        .edited_patch = options.patch != null,
+    }) catch {
+        if (expected.len == 0) {
+            _ = selectionGit(arena, io, &git_env, project_root, &.{ "update-ref", "-d", result_ref, commit }) catch {};
+        } else {
+            _ = selectionGit(arena, io, &git_env, project_root, &.{ "update-ref", result_ref, expected, commit }) catch {};
+        }
+        tty.print(.err, "chock workspace select: the selection could not be written to the session audit log, so its ref was restored.\n", .{});
+        return Exit.faulted.code();
+    };
+    tty.print(.plain, "chock workspace select: selected result {s} is at {s}.\n", .{ commit, result_ref });
+    tty.out(.plain, "The checked-out branch was not moved. Undo with: chock workspace undo {s}\n", .{session_id});
+    return Exit.finished.code();
+}
+
+fn wholePatchSelected(options: Options, patch: ziggit.Patch) bool {
+    const explicit_accept = options.paths.len != 0 or options.hunks.len != 0;
+    const accepted = if (explicit_accept)
+        options.paths.len != 0 and patchSelected(options.paths, patch)
+    else
+        true;
+    if (!accepted or (options.rejected_paths.len != 0 and patchSelected(options.rejected_paths, patch))) return false;
+    for (options.rejected_hunks) |selector| if (patchSelected(&.{selector.path}, patch)) return false;
+    return true;
+}
+
+fn hunkSelected(options: Options, patch: ziggit.Patch, number: usize) bool {
+    if (options.rejected_paths.len != 0 and patchSelected(options.rejected_paths, patch)) return false;
+    for (options.rejected_hunks) |selector| {
+        if (selector.number == number and patchSelected(&.{selector.path}, patch)) return false;
+    }
+    if (options.paths.len != 0 and patchSelected(options.paths, patch)) return true;
+    for (options.hunks) |selector| {
+        if (selector.number == number and patchSelected(&.{selector.path}, patch)) return true;
+    }
+    return options.paths.len == 0 and options.hunks.len == 0;
+}
+
+fn patchSupportsHunks(patch: ziggit.Patch) bool {
+    if (patch.binary or patch.status != .modified or patch.old_mode != patch.new_mode) return false;
+    const mode = patch.new_mode orelse return false;
+    return mode == .blob or mode == .blob_executable;
+}
+
+test "only ordinary text modifications expose hunk decisions" {
+    const ordinary = ziggit.Patch{
+        .old_path = "a",
+        .new_path = "a",
+        .status = .modified,
+        .old_mode = .blob,
+        .new_mode = .blob,
+    };
+    try testing.expect(patchSupportsHunks(ordinary));
+    var special = ordinary;
+    special.binary = true;
+    try testing.expect(!patchSupportsHunks(special));
+    special = ordinary;
+    special.status = .renamed;
+    try testing.expect(!patchSupportsHunks(special));
+    special = ordinary;
+    special.status = .deleted;
+    try testing.expect(!patchSupportsHunks(special));
+    special = ordinary;
+    special.new_mode = .blob_executable;
+    try testing.expect(!patchSupportsHunks(special));
+    special = ordinary;
+    special.new_mode = .symlink;
+    special.old_mode = .symlink;
+    try testing.expect(!patchSupportsHunks(special));
+}
+
+fn selectionNames(
+    arena: std.mem.Allocator,
+    paths: []const []const u8,
+    hunks: []const HunkSelector,
+) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.appendSlice(arena, paths);
+    for (hunks) |selector| {
+        try names.append(arena, try std.fmt.allocPrint(arena, "{s}:{d}", .{ selector.path, selector.number }));
+    }
+    return names.toOwnedSlice(arena);
+}
+
+fn selectorsExist(diff: ziggit.Diff, options: Options) bool {
+    for (options.paths) |path| {
+        var found = false;
+        for (diff.patches) |patch| if (patchSelected(&.{path}, patch)) {
+            found = true;
+            break;
+        };
+        if (!found) return false;
+    }
+    for (options.rejected_paths) |path| {
+        var found = false;
+        for (diff.patches) |patch| if (patchSelected(&.{path}, patch)) {
+            found = true;
+            break;
+        };
+        if (!found) return false;
+    }
+    for (options.hunks) |selector| if (!hunkExists(diff, selector)) return false;
+    for (options.rejected_hunks) |selector| if (!hunkExists(diff, selector)) return false;
+    return true;
+}
+
+fn hunkExists(diff: ziggit.Diff, selector: HunkSelector) bool {
+    if (selector.number == 0) return false;
+    for (diff.patches) |patch| {
+        if (!patchSelected(&.{selector.path}, patch)) continue;
+        return !patch.binary and selector.number <= patch.hunks.len;
+    }
+    return false;
+}
+
+fn applyWholePatch(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    patch: ziggit.Patch,
+) !void {
+    if (patch.status == .deleted or patch.status == .renamed) {
+        _ = try selectionGit(arena, io, env, project_root, &.{ "update-index", "--force-remove", "--", patch.old_path });
+    }
+    if (patch.status == .deleted) return;
+    var oid_buffer: [ziggit.Oid.max_formatted_length]u8 = undefined;
+    const oid = patch.new_oid.?.toHex(&oid_buffer);
+    const mode = try std.fmt.allocPrint(arena, "{o}", .{@backingInt(patch.new_mode.?)});
+    _ = try selectionGit(arena, io, env, project_root, &.{ "update-index", "--add", "--cacheinfo", mode, oid, patch.new_path });
+}
+
+fn selectionGit(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    argv: []const []const u8,
+) ![]const u8 {
+    var output = try chock_workspace.git.run(arena, io, env, project_root, argv, null);
+    defer output.deinit(arena);
+    const code = switch (output.term) {
+        .exited => |one| one,
+        else => return error.GitDidNotExit,
+    };
+    if (code != 0) {
+        tty.print(.err, "chock workspace select: Git refused the selection: {s}", .{output.stderr});
+        return error.GitFailed;
+    }
+    return arena.dupe(u8, std.mem.trimEnd(u8, output.stdout, "\n"));
+}
+
+fn recordSelection(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    log_path: [:0]const u8,
+    session_id: []const u8,
+    selected: chock_proto.event.WorkspaceSelect,
+) !void {
+    const log = try chock_proto.log.Log.open(io, log_path, session_id);
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+    _ = try locked.append(arena, io, .{ .workspace_select = selected }, std.Io.Timestamp.now(io, .real).toMilliseconds());
+}
+
+pub const selected_dir_name = ".chock-selected";
+
+fn selectOverlay(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    session_dir: []const u8,
+    session_id: []const u8,
+    opened: Opened,
+    options: Options,
+    log_path: [:0]const u8,
+) u8 {
+    if (options.patch != null) {
+        tty.print(.err, "chock workspace select: edited patches require a Git workspace.\n", .{});
+        return Exit.usage.code();
+    }
+    const work = std.fmt.allocPrint(arena, "{s}/{s}{s}", .{ session_dir, session_id, work_suffix }) catch return Exit.faulted.code();
+    const scratch = std.fs.path.join(arena, &.{ work, opened.attempt }) catch return Exit.faulted.code();
+    var diag: ?chock_workspace.Diagnostic = null;
+    var overlay = chock_workspace.overlay.adopt(gpa, io, project_root, scratch, &diag) catch return Exit.usage.code();
+    defer overlay.deinit(gpa);
+    var report = overlay.changedFiles(gpa, io, &diag) catch return Exit.faulted.code();
+    defer report.deinit(gpa);
+
+    for (options.paths) |path| if (!overlayChanged(report.changed, path)) {
+        tty.print(.err, "chock workspace select: {s} is not a changed selectable path.\n", .{path});
+        return Exit.usage.code();
+    };
+    for (options.rejected_paths) |path| if (!overlayChanged(report.changed, path)) {
+        tty.print(.err, "chock workspace select: {s} is not a changed selectable path.\n", .{path});
+        return Exit.usage.code();
+    };
+    for (options.hunks) |selector| if (selector.number == 0 or !overlayChanged(report.changed, selector.path)) return Exit.usage.code();
+    for (options.rejected_hunks) |selector| if (selector.number == 0 or !overlayChanged(report.changed, selector.path)) return Exit.usage.code();
+
+    var selected: std.ArrayList([]const u8) = .empty;
+    var partial: std.ArrayList(struct { path: []const u8, patch: ziggit.Patch }) = .empty;
+    defer {
+        for (partial.items) |*one| one.patch.deinit(gpa);
+        partial.deinit(gpa);
+    }
+    const explicit = options.paths.len != 0 or options.hunks.len != 0;
+    var selected_hunks: usize = 0;
+    var binary_files: usize = 0;
+    for (report.changed) |one| {
+        const path_accept = pathSelected(options.paths, one.path) and options.paths.len != 0;
+        const path_reject = options.rejected_paths.len != 0 and pathSelected(options.rejected_paths, one.path);
+        var has_hunk_selector = false;
+        for (options.hunks) |selector| if (std.mem.eql(u8, selector.path, one.path)) {
+            has_hunk_selector = true;
+            break;
+        };
+        var has_hunk_reject = false;
+        for (options.rejected_hunks) |selector| if (std.mem.eql(u8, selector.path, one.path)) {
+            has_hunk_reject = true;
+            break;
+        };
+        if (path_reject or (explicit and !path_accept and !has_hunk_selector)) continue;
+        if (!has_hunk_selector and !has_hunk_reject) {
+            selected.append(arena, one.path) catch return Exit.faulted.code();
+            continue;
+        }
+        if (one.kind != .modified) {
+            tty.print(.err, "chock workspace select: {s} is file-atomic and has no selectable text hunks.\n", .{one.path});
+            return Exit.usage.code();
+        }
+        const old_path = std.fs.path.join(arena, &.{ project_root, one.path }) catch return Exit.faulted.code();
+        const new_path = std.fs.path.join(arena, &.{ overlay.upper, one.path }) catch return Exit.faulted.code();
+        const old_bytes = std.Io.Dir.cwd().readFileAlloc(io, old_path, arena, .limited(16 * 1024 * 1024)) catch return Exit.usage.code();
+        const new_bytes = std.Io.Dir.cwd().readFileAlloc(io, new_path, arena, .limited(16 * 1024 * 1024)) catch return Exit.usage.code();
+        var patch = ziggit.diffBlobs(gpa, one.path, one.path, old_bytes, new_bytes, .{}) catch return Exit.usage.code();
+        if (patch.binary) {
+            patch.deinit(gpa);
+            tty.print(.err, "chock workspace select: {s} is binary and must be decided as a whole file.\n", .{one.path});
+            return Exit.usage.code();
+        }
+        for (options.hunks) |selector| if (std.mem.eql(u8, selector.path, one.path) and selector.number > patch.hunks.len) {
+            patch.deinit(gpa);
+            return Exit.usage.code();
+        };
+        for (options.rejected_hunks) |selector| if (std.mem.eql(u8, selector.path, one.path) and selector.number > patch.hunks.len) {
+            patch.deinit(gpa);
+            return Exit.usage.code();
+        };
+        var any = false;
+        for (patch.hunks, 1..) |_, number| if (overlayHunkSelected(options, one.path, number)) {
+            any = true;
+            selected_hunks += 1;
+        };
+        if (!any) {
+            patch.deinit(gpa);
+            continue;
+        }
+        selected.append(arena, one.path) catch {
+            patch.deinit(gpa);
+            return Exit.faulted.code();
+        };
+        partial.append(gpa, .{ .path = one.path, .patch = patch }) catch {
+            patch.deinit(gpa);
+            return Exit.faulted.code();
+        };
+    }
+    if (selected.items.len == 0) {
+        tty.print(.err, "chock workspace select: the selection accepts no changes.\n", .{});
+        return Exit.usage.code();
+    }
+    for (report.changed) |one| {
+        if (one.kind == .deleted or !pathSelected(selected.items, one.path)) continue;
+        const source_path = std.fs.path.join(arena, &.{ overlay.upper, one.path }) catch continue;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, source_path, arena, .limited(16 * 1024 * 1024)) catch continue;
+        if (std.mem.indexOfScalar(u8, bytes, 0) != null) binary_files += 1;
+    }
+
+    const root = std.fs.path.join(arena, &.{ project_root, selected_dir_name }) catch return Exit.faulted.code();
+    const destination = std.fs.path.join(arena, &.{ root, session_id }) catch return Exit.faulted.code();
+    const carried = overlay.carryOutSelected(gpa, io, destination, selected.items, &diag) catch |err| {
+        if (err == error.WorkAlreadyCarriedOut) tty.print(.err, "chock workspace select: {s} already exists; undo it before replacing the selection.\n", .{destination});
+        return Exit.refused.code();
+    };
+    var keep_result = false;
+    defer if (!keep_result) std.Io.Dir.cwd().deleteTree(io, destination) catch {};
+    for (partial.items) |one| {
+        const old_path = std.fs.path.join(arena, &.{ project_root, one.path }) catch return Exit.faulted.code();
+        const old_bytes = std.Io.Dir.cwd().readFileAlloc(io, old_path, arena, .limited(16 * 1024 * 1024)) catch return Exit.faulted.code();
+        const contents = applySelectedHunks(arena, old_bytes, one.patch.hunks, options, one.path) catch return Exit.faulted.code();
+        const target = std.fs.path.join(arena, &.{ destination, chock_workspace.overlay.carried_files_name, one.path }) catch return Exit.faulted.code();
+        var file = std.Io.Dir.createFileAbsolute(io, target, .{ .truncate = true }) catch return Exit.faulted.code();
+        defer file.close(io);
+        file.writeStreamingAll(io, contents) catch return Exit.faulted.code();
+    }
+    const accepted = selectionNames(arena, options.paths, options.hunks) catch return Exit.faulted.code();
+    const rejected = selectionNames(arena, options.rejected_paths, options.rejected_hunks) catch return Exit.faulted.code();
+    recordSelection(arena, io, log_path, session_id, .{
+        .source = scratch,
+        .result = destination,
+        .accepted = accepted,
+        .rejected = rejected,
+        .files = carried.files + carried.deleted,
+        .hunks = selected_hunks,
+        .binary_files = binary_files,
+    }) catch {
+        tty.print(.err, "chock workspace select: the selection could not be written to the session audit log, so its directory was removed.\n", .{});
+        return Exit.faulted.code();
+    };
+    keep_result = true;
+    tty.print(.plain, "chock workspace select: selected overlay work is in {s}.\n", .{destination});
+    tty.out(.plain, "Nothing in the project was overwritten. Undo with: chock workspace undo {s}\n", .{session_id});
+    return Exit.finished.code();
+}
+
+fn overlayChanged(changed: []const chock_workspace.overlay.ChangedFile, path: []const u8) bool {
+    for (changed) |one| if (std.mem.eql(u8, one.path, path)) return true;
+    return false;
+}
+
+fn overlayHunkSelected(options: Options, path: []const u8, number: usize) bool {
+    for (options.rejected_hunks) |one| if (one.number == number and std.mem.eql(u8, one.path, path)) return false;
+    if (options.paths.len != 0 and pathSelected(options.paths, path)) return true;
+    for (options.hunks) |one| if (one.number == number and std.mem.eql(u8, one.path, path)) return true;
+    return options.paths.len == 0 and options.hunks.len == 0;
+}
+
+fn applySelectedHunks(
+    arena: std.mem.Allocator,
+    old: []const u8,
+    hunks: []const ziggit.Hunk,
+    options: Options,
+    path: []const u8,
+) ![]const u8 {
+    var old_lines: std.ArrayList([]const u8) = .empty;
+    defer old_lines.deinit(arena);
+    var start: usize = 0;
+    for (old, 0..) |byte, at| if (byte == '\n') {
+        try old_lines.append(arena, old[start .. at + 1]);
+        start = at + 1;
+    };
+    if (start < old.len) try old_lines.append(arena, old[start..]);
+    var out: std.ArrayList(u8) = .empty;
+    var cursor: usize = 0;
+    for (hunks, 1..) |hunk, number| {
+        if (!overlayHunkSelected(options, path, number)) continue;
+        const before = hunk.old_start -| 1;
+        while (cursor < before and cursor < old_lines.items.len) : (cursor += 1) try out.appendSlice(arena, old_lines.items[cursor]);
+        for (hunk.lines) |line| switch (line.origin) {
+            .context => {
+                try out.appendSlice(arena, line.content);
+                cursor += 1;
+            },
+            .deletion => cursor += 1,
+            .addition => try out.appendSlice(arena, line.content),
+        };
+    }
+    while (cursor < old_lines.items.len) : (cursor += 1) try out.appendSlice(arena, old_lines.items[cursor]);
+    return out.toOwnedSlice(arena);
+}
+
+test "selected overlay hunks preserve every unselected part of the base" {
+    const old = "one\nold-a\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\nold-b\nnineteen\ntwenty\n";
+    const changed = "one\nnew-a\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\nnew-b\nnineteen\ntwenty\n";
+    var patch = try ziggit.diffBlobs(testing.allocator, "notes", "notes", old, changed, .{ .context_lines = 1 });
+    defer patch.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), patch.hunks.len);
+    const result = try applySelectedHunks(testing.allocator, old, patch.hunks, .{
+        .hunks = &.{.{ .path = "notes", .number = 1 }},
+    }, "notes");
+    defer testing.allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "new-a") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "old-b") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "new-b") == null);
+}
+
+pub fn undoSelection(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    session_dir: []const u8,
+    wanted: ?[]const u8,
+) u8 {
+    const session_id = wanted orelse return Exit.usage.code();
+    if (!session_paths.isValidId(session_id)) return Exit.usage.code();
+    const log_path = std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ session_dir, session_id }, 0) catch return Exit.faulted.code();
+    if (lastSelectionResult(arena, io, log_path, session_id)) |last_result| {
+        const overlay_result = std.fs.path.join(arena, &.{ project_root, selected_dir_name, session_id }) catch return Exit.faulted.code();
+        if (std.mem.eql(u8, last_result, overlay_result)) {
+            const parked = std.fmt.allocPrint(arena, "{s}.undoing", .{overlay_result}) catch return Exit.faulted.code();
+            if (std.Io.Dir.cwd().statFile(io, parked, .{ .follow_symlinks = false })) |_| {
+                tty.print(.err, "chock workspace undo: the recovery path {s} is already occupied.\n", .{parked});
+                return Exit.refused.code();
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => {
+                    tty.print(.err, "chock workspace undo: the recovery path {s} is already occupied.\n", .{parked});
+                    return Exit.refused.code();
+                },
+            }
+            std.Io.Dir.renameAbsolute(overlay_result, parked, io) catch |err| {
+                tty.print(.err, "chock workspace undo: {s} could not be isolated for removal: {s}.\n", .{ overlay_result, @errorName(err) });
+                return Exit.refused.code();
+            };
+            recordSelection(arena, io, log_path, session_id, .{ .source = overlay_result, .result = "", .undone = true }) catch {
+                std.Io.Dir.renameAbsolute(parked, overlay_result, io) catch {};
+                tty.print(.err, "chock workspace undo: the removal could not be added to the session audit log.\n", .{});
+                return Exit.faulted.code();
+            };
+            std.Io.Dir.cwd().deleteTree(io, parked) catch |err| {
+                tty.print(.warn, "chock workspace undo: the result was undone, but temporary {s} could not be removed: {s}.\n", .{ parked, @errorName(err) });
+            };
+            tty.print(.plain, "chock workspace undo: removed {s}; the project was not changed.\n", .{overlay_result});
+            return Exit.finished.code();
+        }
+    }
+    const result_ref = std.fmt.allocPrint(arena, "refs/chock/selected/{s}", .{session_id}) catch return Exit.faulted.code();
+    const previous = selectionGit(arena, io, env, project_root, &.{ "rev-parse", "--verify", result_ref }) catch return Exit.usage.code();
+    _ = selectionGit(arena, io, env, project_root, &.{ "update-ref", "-d", result_ref, previous }) catch return Exit.refused.code();
+    recordSelection(arena, io, log_path, session_id, .{ .source = result_ref, .result = "", .undone = true }) catch {
+        _ = selectionGit(arena, io, env, project_root, &.{ "update-ref", result_ref, previous, "" }) catch {};
+        tty.print(.err, "chock workspace undo: the removal could not be added to the session audit log.\n", .{});
+        return Exit.faulted.code();
+    };
+    tty.print(.plain, "chock workspace undo: removed {s}; the checked-out branch was not changed.\n", .{result_ref});
+    return Exit.finished.code();
+}
+
+fn lastSelectionResult(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    log_path: [:0]const u8,
+    session_id: []const u8,
+) ?[]const u8 {
+    const log = chock_proto.log.Log.open(io, log_path, session_id) catch return null;
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(io);
+    var replay = store.replay(arena, io, 0) catch return null;
+    defer replay.deinit();
+    var result: ?[]const u8 = null;
+    while (replay.next(io) catch null) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .workspace_select) continue;
+        const selected = parsed.value.event.workspace_select;
+        result = if (selected.undone or selected.result.len == 0)
+            null
+        else
+            arena.dupe(u8, selected.result) catch return null;
+    }
+    return result;
 }
 
 fn reviewOverlay(
@@ -619,6 +1512,21 @@ fn reviewOverlay(
             .modified => "M",
             .deleted => "D",
         }, one.path });
+        if (one.kind == .modified) text: {
+            const old_path = std.fs.path.join(arena, &.{ project_root, one.path }) catch break :text;
+            const new_path = std.fs.path.join(arena, &.{ overlay.upper, one.path }) catch break :text;
+            const old_stat = std.Io.Dir.cwd().statFile(io, old_path, .{ .follow_symlinks = false }) catch break :text;
+            const new_stat = std.Io.Dir.cwd().statFile(io, new_path, .{ .follow_symlinks = false }) catch break :text;
+            if (old_stat.kind != .file or new_stat.kind != .file or old_stat.permissions != new_stat.permissions) break :text;
+            const old_bytes = std.Io.Dir.cwd().readFileAlloc(io, old_path, arena, .limited(16 * 1024 * 1024)) catch break :text;
+            const new_bytes = std.Io.Dir.cwd().readFileAlloc(io, new_path, arena, .limited(16 * 1024 * 1024)) catch break :text;
+            var patch = ziggit.diffBlobs(arena, one.path, one.path, old_bytes, new_bytes, .{}) catch break :text;
+            defer patch.deinit(arena);
+            var rendered: std.Io.Writer.Allocating = .init(arena);
+            defer rendered.deinit();
+            patch.writeUnified(&rendered.writer) catch break :text;
+            tty.out(.plain, "{s}", .{rendered.written()});
+        }
         shown += 1;
     }
     for (report.skipped) |one| {
@@ -946,6 +1854,22 @@ test "the command line names an action and nothing else" {
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "list", "--path", "README.md" }));
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "review", "id", "--path" }));
 
+    const selected = try parseOptions(arena, &.{
+        "select",        "01JQAAAAAAAAAAAAAAAAAAAAAA",
+        "--path",        "src/main.zig",
+        "--hunk",        "src/other.zig:2",
+        "--reject-path", "generated.bin",
+        "--reject-hunk", "src/other.zig:3",
+    });
+    try testing.expectEqual(Action.select, selected.action);
+    try testing.expectEqualStrings("src/main.zig", selected.paths[0]);
+    try testing.expectEqualStrings("src/other.zig", selected.hunks[0].path);
+    try testing.expectEqual(@as(usize, 2), selected.hunks[0].number);
+    try testing.expectEqualStrings("generated.bin", selected.rejected_paths[0]);
+    try testing.expectEqual(@as(usize, 3), selected.rejected_hunks[0].number);
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "select", "01JQAAAAAAAAAAAAAAAAAAAAAA", "--hunk", "file:0" }));
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "select", "01JQAAAAAAAAAAAAAAAAAAAAAA", "--patch", "one.diff", "--path", "one" }));
+
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{"remove-everything"}));
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "clear", "clear" }));
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{"--project"}));
@@ -995,10 +1919,16 @@ test "review shows the recorded Git change and literal path filters select exact
     try std.Io.Dir.createDirAbsolute(io, sessions, .default_dir);
     try writeUnder(arena, io, project, "one.txt", "one before\n");
     try writeUnder(arena, io, project, "two.txt", "two before\n");
+    try writeUnder(arena, io, project, "delete.txt", "delete me\n");
+    try writeUnder(arena, io, project, "rename.txt", "rename me\n");
+    try writeUnder(arena, io, project, "mode.sh", "#!/bin/sh\nexit 0\n");
+    try writeUnder(arena, io, project, "binary.bin", "old\x00bytes");
+    const link_path = try std.fs.path.join(arena, &.{ project, "current-link" });
+    try std.Io.Dir.cwd().symLink(io, "one.txt", link_path, .{});
 
     var env = std.process.Environ.Map.init(arena);
     _ = try gitForTest(arena, io, &env, project, &.{"init"});
-    _ = try gitForTest(arena, io, &env, project, &.{ "add", "--", "one.txt", "two.txt" });
+    _ = try gitForTest(arena, io, &env, project, &.{ "add", "--", "." });
     _ = try gitForTest(arena, io, &env, project, &.{
         "-c",
         "user.name=Chock Test",
@@ -1012,7 +1942,13 @@ test "review shows the recorded Git change and literal path filters select exact
 
     try writeUnder(arena, io, project, "one.txt", "one after\n");
     try writeUnder(arena, io, project, "two.txt", "two after\n");
-    _ = try gitForTest(arena, io, &env, project, &.{ "add", "--", "one.txt", "two.txt" });
+    try writeUnder(arena, io, project, "binary.bin", "new\x00bytes");
+    try std.Io.Dir.deleteFileAbsolute(io, link_path);
+    try std.Io.Dir.cwd().symLink(io, "two.txt", link_path, .{});
+    _ = try gitForTest(arena, io, &env, project, &.{ "rm", "--", "delete.txt" });
+    _ = try gitForTest(arena, io, &env, project, &.{ "mv", "--", "rename.txt", "renamed.txt" });
+    _ = try gitForTest(arena, io, &env, project, &.{ "add", "--", "." });
+    _ = try gitForTest(arena, io, &env, project, &.{ "update-index", "--chmod=+x", "mode.sh" });
     _ = try gitForTest(arena, io, &env, project, &.{
         "-c",
         "user.name=Chock Test",
@@ -1053,6 +1989,58 @@ test "review shows the recorded Git change and literal path filters select exact
     try testing.expect(std.mem.indexOf(u8, said.out(), "one after") != null);
     try testing.expect(std.mem.indexOf(u8, said.out(), "two after") == null);
     try testing.expect(std.mem.indexOf(u8, said.out(), "diff --git a/one.txt b/one.txt") != null);
+
+    const selected_code = selectWorkspace(arena, testing.allocator, io, &env, project, sessions, .{
+        .action = .select,
+        .session = id,
+        .paths = &.{"one.txt"},
+    });
+    try testing.expectEqual(Exit.finished.code(), selected_code);
+    const selected_ref = try std.fmt.allocPrint(arena, "refs/chock/selected/{s}", .{id});
+    const selected_names = try gitForTest(arena, io, &env, project, &.{ "diff", "--name-only", base, selected_ref });
+    try testing.expectEqualStrings("one.txt", selected_names);
+    const selected_commit = try gitForTest(arena, io, &env, project, &.{ "rev-parse", selected_ref });
+    const audit = try std.Io.Dir.cwd().readFileAlloc(io, log_path, arena, .limited(64 * 1024));
+    try testing.expect(std.mem.indexOf(u8, audit, selected_commit) != null);
+    try testing.expectEqualStrings(base, try gitForTest(arena, io, &env, project, &.{ "rev-parse", "HEAD" }));
+
+    try testing.expectEqual(Exit.finished.code(), undoSelection(arena, io, &env, project, sessions, id));
+    var missing = try chock_workspace.git.run(arena, io, &env, project, &.{ "show-ref", "--verify", selected_ref }, null);
+    defer missing.deinit(arena);
+    try testing.expect(switch (missing.term) {
+        .exited => |code| code != 0,
+        else => false,
+    });
+
+    try testing.expectEqual(Exit.finished.code(), selectWorkspace(arena, testing.allocator, io, &env, project, sessions, .{
+        .session = id,
+        .hunks = &.{.{ .path = "one.txt", .number = 1 }},
+    }));
+    try testing.expectEqualStrings("one.txt", try gitForTest(arena, io, &env, project, &.{ "diff", "--name-only", base, selected_ref }));
+    try testing.expectEqual(Exit.finished.code(), undoSelection(arena, io, &env, project, sessions, id));
+
+    try testing.expectEqual(Exit.finished.code(), selectWorkspace(arena, testing.allocator, io, &env, project, sessions, .{
+        .session = id,
+        .paths = &.{ "delete.txt", "renamed.txt", "mode.sh", "current-link", "binary.bin" },
+    }));
+    const special_difference = try gitForTest(arena, io, &env, project, &.{
+        "diff",       "--name-only", selected_ref,  result,    "--",
+        "delete.txt", "rename.txt",  "renamed.txt", "mode.sh", "current-link",
+        "binary.bin",
+    });
+    try testing.expectEqualStrings("", special_difference);
+    try testing.expectEqual(Exit.finished.code(), undoSelection(arena, io, &env, project, sessions, id));
+
+    const edited = try gitForTest(arena, io, &env, project, &.{ "diff", base, result, "--", "one.txt" });
+    const edited_path = try std.fs.path.join(arena, &.{ project, "edited.patch" });
+    const edited_with_newline = try std.fmt.allocPrint(arena, "{s}\n", .{edited});
+    try writeUnder(arena, io, project, "edited.patch", edited_with_newline);
+    try testing.expectEqual(Exit.finished.code(), selectWorkspace(arena, testing.allocator, io, &env, project, sessions, .{
+        .session = id,
+        .patch = edited_path,
+    }));
+    try testing.expectEqualStrings("one.txt", try gitForTest(arena, io, &env, project, &.{ "diff", "--name-only", base, selected_ref }));
+    try testing.expectEqual(Exit.finished.code(), undoSelection(arena, io, &env, project, sessions, id));
 }
 
 fn makeSessionDir(arena: std.mem.Allocator, io: std.Io, root: []const u8, ids: []const []const u8) !void {
@@ -1536,12 +2524,14 @@ test "review lists an overlay's changes without adopting or modifying the projec
     const root = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
     const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
     try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
-    try writeUnder(arena, testing.io, project, "tracked.txt", "original\n");
+    const old_text = "one\nold-a\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\nold-b\nnineteen\ntwenty\n";
+    const changed_text = "one\nnew-a\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\nnew-b\nnineteen\ntwenty\n";
+    try writeUnder(arena, testing.io, project, "tracked.txt", old_text);
 
     const id = "01JQ" ++ @as([22]u8, @splat('V'));
     const attempt = "01JQ" ++ @as([22]u8, @splat('W'));
     const upper = try makeOverlaySession(arena, testing.io, root, id, attempt, .overlay);
-    try writeUnder(arena, testing.io, upper, "tracked.txt", "changed\n");
+    try writeUnder(arena, testing.io, upper, "tracked.txt", changed_text);
     try writeUnder(arena, testing.io, upper, "notes/new.md", "new\n");
 
     var said: tty.Capture = undefined;
@@ -1558,11 +2548,46 @@ test "review lists an overlay's changes without adopting or modifying the projec
         testing.io,
         try std.fs.path.join(arena, &.{ project, "tracked.txt" }),
         arena,
-        .limited(64),
+        .limited(4096),
     );
-    try testing.expectEqualStrings("original\n", original);
+    try testing.expectEqualStrings(old_text, original);
     const adopted = try std.fmt.allocPrint(arena, "{s}/{s}", .{ project, adopted_dir_name });
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, adopted, .{}));
+
+    var env = std.process.Environ.Map.init(arena);
+    try testing.expectEqual(Exit.finished.code(), selectWorkspace(
+        arena,
+        testing.allocator,
+        testing.io,
+        &env,
+        project,
+        root,
+        .{ .session = id, .paths = &.{"notes/new.md"} },
+    ));
+    const selected_file = try std.fs.path.join(arena, &.{ project, selected_dir_name, id, "files", "notes", "new.md" });
+    const selected_bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, selected_file, arena, .limited(64));
+    try testing.expectEqualStrings("new\n", selected_bytes);
+    const unselected_file = try std.fs.path.join(arena, &.{ project, selected_dir_name, id, "files", "tracked.txt" });
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, unselected_file, .{}));
+    try testing.expectEqual(Exit.finished.code(), undoSelection(arena, testing.io, &env, project, root, id));
+    const selected_root = try std.fs.path.join(arena, &.{ project, selected_dir_name, id });
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, selected_root, .{}));
+
+    try testing.expectEqual(Exit.finished.code(), selectWorkspace(
+        arena,
+        testing.allocator,
+        testing.io,
+        &env,
+        project,
+        root,
+        .{ .session = id, .hunks = &.{.{ .path = "tracked.txt", .number = 1 }} },
+    ));
+    const partial_file = try std.fs.path.join(arena, &.{ selected_root, "files", "tracked.txt" });
+    const partial_bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, partial_file, arena, .limited(4096));
+    try testing.expect(std.mem.indexOf(u8, partial_bytes, "new-a") != null);
+    try testing.expect(std.mem.indexOf(u8, partial_bytes, "old-b") != null);
+    try testing.expect(std.mem.indexOf(u8, partial_bytes, "new-b") == null);
+    try testing.expectEqual(Exit.finished.code(), undoSelection(arena, testing.io, &env, project, root, id));
 }
 
 test "a session that worked in a git worktree is refused, and sent to the ref that already holds its work" {

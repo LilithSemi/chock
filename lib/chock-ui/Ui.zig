@@ -13,6 +13,7 @@ const host_mod = @import("host.zig");
 const layout = @import("layout.zig");
 const model = @import("model.zig");
 const text_mod = @import("text.zig");
+const source_mod = @import("source.zig");
 
 const Host = host_mod.Host;
 
@@ -211,11 +212,14 @@ pub fn wrapText(
     return out.items;
 }
 
+pub const ReviewAction = enum { open, apply, undo };
+
 pub const Ask = union(enum) {
     done,
     message: []const u8,
     take_up: []const u8,
     fork: ?u64,
+    review: ReviewAction,
 };
 
 const Mark = struct {
@@ -328,6 +332,11 @@ pub const Ui = struct {
     current_session: []const u8 = "",
     taken: ?[]const u8 = null,
     fork_requested: ?ForkRequest = null,
+    review_requested: ?ReviewAction = null,
+    review: ?source_mod.Review = null,
+    review_choices: []ReviewChoice = &.{},
+    review_taps: [max_review_taps]ReviewTap = @splat(.{}),
+    review_group_taps: [max_review_taps]ReviewGroupTap = @splat(.{}),
     message_taps: [max_message_taps]MessageTap = @splat(.{}),
 
     tasks: ?*chock_core.tasks.Table = null,
@@ -409,13 +418,64 @@ pub const Ui = struct {
     /// answers the arrow keys; only the rows past this are keyboard only.
     const max_picker_taps = 256;
     const max_message_taps = 256;
+    const max_review_taps = 512;
 
     const ForkRequest = struct { at: ?u64 };
+    pub const ReviewRequest = ReviewAction;
 
     const MessageTap = struct {
         ui: ?*Ui = null,
         at: u64 = 0,
     };
+
+    const ReviewChoice = struct {
+        path: []const u8,
+        number: usize = 0,
+        accepted: bool = true,
+    };
+
+    const ReviewTap = struct { ui: ?*Ui = null, index: usize = 0 };
+    const ReviewGroupTap = struct { ui: ?*Ui = null, first: usize = 0, len: usize = 0 };
+
+    fn onReviewTap(ctx: *anyopaque) void {
+        const tap: *ReviewTap = @ptrCast(@alignCast(ctx));
+        const self = tap.ui orelse return;
+        if (tap.index >= self.review_choices.len) return;
+        self.review_choices[tap.index].accepted = !self.review_choices[tap.index].accepted;
+        self.host.invalidate();
+    }
+
+    fn onReviewGroupTap(ctx: *anyopaque) void {
+        const tap: *ReviewGroupTap = @ptrCast(@alignCast(ctx));
+        const self = tap.ui orelse return;
+        if (tap.first + tap.len > self.review_choices.len) return;
+        const choices = self.review_choices[tap.first .. tap.first + tap.len];
+        var all_accepted = true;
+        for (choices) |choice| all_accepted = all_accepted and choice.accepted;
+        for (choices) |*choice| choice.accepted = !all_accepted;
+        self.host.invalidate();
+    }
+
+    fn onReviewApply(ctx: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.review_requested = .apply;
+        self.submitted = true;
+        self.host.invalidate();
+    }
+
+    fn onReviewOpen(ctx: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.review_requested = .open;
+        self.submitted = true;
+        self.host.invalidate();
+    }
+
+    fn onReviewUndo(ctx: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.review_requested = .undo;
+        self.submitted = true;
+        self.host.invalidate();
+    }
 
     fn onMessageTap(ctx: *anyopaque) void {
         const tap: *MessageTap = @ptrCast(@alignCast(ctx));
@@ -464,6 +524,10 @@ pub const Ui = struct {
         }
 
         while (true) {
+            if (self.review_requested) |request| {
+                self.review_requested = null;
+                return .{ .review = request };
+            }
             if (self.fork_requested) |request| {
                 self.fork_requested = null;
                 return .{ .fork = request.at };
@@ -487,6 +551,10 @@ pub const Ui = struct {
             if (self.fork_requested) |request| {
                 self.fork_requested = null;
                 return .{ .fork = request.at };
+            }
+            if (self.review_requested) |request| {
+                self.review_requested = null;
+                return .{ .review = request };
             }
 
             switch (answerFor(self.typed.items)) {
@@ -546,6 +614,7 @@ pub const Ui = struct {
     pub fn runCommand(self: *Ui, command: model.Command) void {
         switch (command) {
             .fork => self.fork_requested = .{ .at = null },
+            .review => self.review_requested = .open,
             .help => self.openHelp(),
             .plan => self.togglePlan(),
             .usage => self.sayUsage(),
@@ -823,6 +892,84 @@ pub const Ui = struct {
         const request = self.fork_requested orelse return null;
         self.fork_requested = null;
         return request.at;
+    }
+
+    pub fn takeReviewRequest(self: *Ui) ?ReviewRequest {
+        const request = self.review_requested orelse return null;
+        self.review_requested = null;
+        return request;
+    }
+
+    pub fn showReview(self: *Ui, review: source_mod.Review) void {
+        const arena = self.arena.allocator();
+        const files = arena.alloc(source_mod.Review.File, review.files.len) catch return;
+        var choices: std.ArrayList(ReviewChoice) = .empty;
+        for (review.files, files) |file, *copy| {
+            const hunks = arena.alloc(source_mod.Review.Hunk, file.hunks.len) catch return;
+            for (file.hunks, hunks) |hunk, *hunk_copy| {
+                const lines = arena.alloc(source_mod.Review.Line, hunk.lines.len) catch return;
+                for (hunk.lines, lines) |line, *line_copy| line_copy.* = .{
+                    .origin = line.origin,
+                    .text = arena.dupe(u8, line.text) catch return,
+                };
+                hunk_copy.* = .{
+                    .number = hunk.number,
+                    .header = arena.dupe(u8, hunk.header) catch return,
+                    .lines = lines,
+                };
+            }
+            copy.* = .{
+                .path = arena.dupe(u8, file.path) catch return,
+                .old_path = arena.dupe(u8, file.old_path) catch return,
+                .status = arena.dupe(u8, file.status) catch return,
+                .selectable = file.selectable,
+                .binary = file.binary,
+                .atomic = file.atomic,
+                .hunks = hunks,
+            };
+            if (!file.selectable) continue;
+            if (file.atomic or file.hunks.len == 0) {
+                choices.append(arena, .{ .path = copy.path }) catch return;
+            } else for (hunks) |hunk| {
+                choices.append(arena, .{ .path = copy.path, .number = hunk.number }) catch return;
+            }
+        }
+        self.review = .{
+            .kind = review.kind,
+            .base = arena.dupe(u8, review.base) catch return,
+            .source = arena.dupe(u8, review.source) catch return,
+            .files = files,
+        };
+        self.review_choices = choices.items;
+        self.pane = .{ .kind = .review };
+        self.host.invalidate();
+    }
+
+    pub fn reviewSelection(self: *Ui, arena: std.mem.Allocator) !source_mod.Selection {
+        var paths: std.ArrayList([]const u8) = .empty;
+        var hunks: std.ArrayList(source_mod.HunkChoice) = .empty;
+        var rejected_paths: std.ArrayList([]const u8) = .empty;
+        var rejected_hunks: std.ArrayList(source_mod.HunkChoice) = .empty;
+        for (self.review_choices) |choice| {
+            if (choice.number == 0) {
+                if (choice.accepted)
+                    try paths.append(arena, choice.path)
+                else
+                    try rejected_paths.append(arena, choice.path);
+            } else {
+                const hunk = source_mod.HunkChoice{ .path = choice.path, .number = choice.number };
+                if (choice.accepted)
+                    try hunks.append(arena, hunk)
+                else
+                    try rejected_hunks.append(arena, hunk);
+            }
+        }
+        return .{
+            .paths = try paths.toOwnedSlice(arena),
+            .hunks = try hunks.toOwnedSlice(arena),
+            .rejected_paths = try rejected_paths.toOwnedSlice(arena),
+            .rejected_hunks = try rejected_hunks.toOwnedSlice(arena),
+        };
     }
 
     /// Empty session-specific presentation before another log is replayed into
@@ -1930,6 +2077,7 @@ pub const Ui = struct {
         const pane = &self.pane.?;
         const all = switch (pane.kind) {
             .keys => helpRows(ctx.arena) catch return &.{},
+            .review => return self.reviewPaneRows(ctx, rows, colors),
         };
         const total: u16 = @intCast(@min(all.len, std.math.maxInt(u16)));
 
@@ -1939,6 +2087,7 @@ pub const Ui = struct {
 
         lines.add(ctx.arena, self.bandRow(ctx, switch (pane.kind) {
             .keys => " keys",
+            .review => unreachable,
         }, colors.blue_light));
 
         var index: u16 = pane.at;
@@ -1958,6 +2107,140 @@ pub const Ui = struct {
                 left,
             }) catch " Esc closes this", colors.fg_muted));
         return lines.items();
+    }
+
+    fn reviewPaneRows(
+        self: *Ui,
+        ctx: *phantom.BuildContext,
+        rows: u16,
+        colors: phantom.ColorScheme,
+    ) []const phantom.Widget {
+        const review = self.review orelse return &.{};
+        // Keep the two actions visible while the middle scrolls independently.
+        var lines = Rows{ .left = rows };
+        lines.add(ctx.arena, self.bandRow(ctx, " workspace review", colors.blue_light));
+        lines.add(ctx.arena, self.bandRow(ctx, " Click to include. Up/down scroll.", colors.fg_muted));
+        const scroll_at = if (self.pane) |pane| pane.at else 0;
+        var seen: u16 = 0;
+        var choice_at: usize = 0;
+        var group_at: usize = 0;
+        for (review.files) |file| {
+            if (!file.selectable) {
+                addReviewRow(&lines, &seen, scroll_at, ctx.arena, self.bandRow(ctx, std.fmt.allocPrint(ctx.arena, " [ ] {s} {s}", .{
+                    file.status,
+                    file.path,
+                }) catch file.path, colors.fg_muted));
+                continue;
+            }
+            if (file.atomic or file.hunks.len == 0) {
+                if (choice_at >= self.review_choices.len) break;
+                const choice = self.review_choices[choice_at];
+                const atomic_note = if (file.atomic) " (whole file)" else "";
+                const text = std.fmt.allocPrint(ctx.arena, " [{s}] {s} {s}{s}", .{
+                    if (choice.accepted) "x" else " ",
+                    file.status,
+                    file.path,
+                    atomic_note,
+                }) catch file.path;
+                const drawn = self.bandRow(ctx, text, if (choice.accepted) colors.fg else colors.fg_muted);
+                if (choice_at < max_review_taps) {
+                    self.review_taps[choice_at] = .{ .ui = self, .index = choice_at };
+                    addReviewRow(&lines, &seen, scroll_at, ctx.arena, ctx.new(phantom.GestureDetector{
+                        .child = drawn,
+                        .on_tap = onReviewTap,
+                        .ctx = &self.review_taps[choice_at],
+                    }).widget());
+                } else addReviewRow(&lines, &seen, scroll_at, ctx.arena, drawn);
+                choice_at += 1;
+                continue;
+            }
+            const first = choice_at;
+            const count = @min(file.hunks.len, self.review_choices.len -| first);
+            var accepted: usize = 0;
+            for (self.review_choices[first .. first + count]) |choice| accepted += @intFromBool(choice.accepted);
+            const mark: []const u8 = if (accepted == count) "x" else if (accepted == 0) " " else "-";
+            const header = self.bandRow(ctx, std.fmt.allocPrint(ctx.arena, " [{s}] {s} {s}", .{
+                mark, file.status, file.path,
+            }) catch file.path, colors.fg);
+            if (group_at < max_review_taps) {
+                self.review_group_taps[group_at] = .{ .ui = self, .first = first, .len = count };
+                addReviewRow(&lines, &seen, scroll_at, ctx.arena, ctx.new(phantom.GestureDetector{
+                    .child = header,
+                    .on_tap = onReviewGroupTap,
+                    .ctx = &self.review_group_taps[group_at],
+                }).widget());
+            } else addReviewRow(&lines, &seen, scroll_at, ctx.arena, header);
+            group_at += 1;
+            for (file.hunks) |hunk| {
+                if (choice_at >= self.review_choices.len) break;
+                const choice = self.review_choices[choice_at];
+                const label = std.fmt.allocPrint(ctx.arena, " [{s}] hunk {d} {s}", .{
+                    if (choice.accepted) "x" else " ", hunk.number, hunk.header,
+                }) catch hunk.header;
+                const drawn = self.bandRow(ctx, label, if (choice.accepted) colors.blue_light else colors.fg_muted);
+                if (choice_at < max_review_taps) {
+                    self.review_taps[choice_at] = .{ .ui = self, .index = choice_at };
+                    addReviewRow(&lines, &seen, scroll_at, ctx.arena, ctx.new(phantom.GestureDetector{
+                        .child = drawn,
+                        .on_tap = onReviewTap,
+                        .ctx = &self.review_taps[choice_at],
+                    }).widget());
+                } else addReviewRow(&lines, &seen, scroll_at, ctx.arena, drawn);
+                choice_at += 1;
+                for (hunk.lines) |line| {
+                    const prefix: []const u8 = switch (line.origin) {
+                        .context => " ",
+                        .addition => "+",
+                        .deletion => "-",
+                    };
+                    addReviewRow(&lines, &seen, scroll_at, ctx.arena, self.bandRow(ctx, std.fmt.allocPrint(ctx.arena, "  {s}{s}", .{
+                        prefix, std.mem.trimEnd(u8, line.text, "\n"),
+                    }) catch line.text, switch (line.origin) {
+                        .context => colors.fg_muted,
+                        .addition => colors.blue_light,
+                        .deletion => colors.fg,
+                    }));
+                }
+            }
+        }
+        const apply = self.bandRow(ctx, " [ apply selection ]", colors.blue_light);
+        lines.add(ctx.arena, ctx.new(phantom.GestureDetector{
+            .child = apply,
+            .on_tap = onReviewApply,
+            .ctx = self,
+        }).widget());
+        const undo = self.bandRow(ctx, " [ undo selected result ]   Esc closes", colors.fg_muted);
+        lines.add(ctx.arena, ctx.new(phantom.GestureDetector{
+            .child = undo,
+            .on_tap = onReviewUndo,
+            .ctx = self,
+        }).widget());
+        return lines.items();
+    }
+
+    fn addReviewRow(
+        lines: *Rows,
+        seen: *u16,
+        at: u16,
+        arena: std.mem.Allocator,
+        widget: phantom.Widget,
+    ) void {
+        if (seen.* >= at and lines.left > 2) lines.add(arena, widget);
+        seen.* +|= 1;
+    }
+
+    fn reviewRowCount(self: *const Ui) u16 {
+        const review = self.review orelse return 0;
+        var total: usize = 0;
+        for (review.files) |file| {
+            if (!file.selectable or file.atomic or file.hunks.len == 0) {
+                total += 1;
+                continue;
+            }
+            total += 1;
+            for (file.hunks) |hunk| total += 1 + hunk.lines.len;
+        }
+        return @intCast(@min(total, std.math.maxInt(u16)));
     }
 
     fn headerRows(
@@ -2361,6 +2644,12 @@ pub const Ui = struct {
         )) catch {};
 
         if (self.phase == .message) {
+            pieces.append(ctx.arena, ctx.new(phantom.Button{
+                .variant = .secondary,
+                .on_tap = onReviewOpen,
+                .ctx = self,
+                .child = row(ctx, self.measure, " review ", colors.fg_muted),
+            }).widget()) catch {};
             const field = ctx.new(phantom.TextField{
                 .color = colors.fg,
                 .caret_color = colors.blue_light,
@@ -2698,13 +2987,20 @@ pub const Ui = struct {
     pub fn onPaneKey(self: *Ui, event: phantom.input.KeyEvent) bool {
         if (self.pane == null) return false;
         const pane = &self.pane.?;
-        const room = layout.split(self.rows, self.panelRows()).transcript -| 2;
+        const reserved: u16 = switch (pane.kind) {
+            .keys => 2,
+            .review => 4,
+        };
+        const room = layout.split(self.rows, self.panelRows()).transcript -| reserved;
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
-        const all = switch (pane.kind) {
-            .keys => helpRows(arena_state.allocator()) catch return false,
+        const total: u16 = switch (pane.kind) {
+            .keys => total: {
+                const all = helpRows(arena_state.allocator()) catch return false;
+                break :total @intCast(@min(all.len, std.math.maxInt(u16)));
+            },
+            .review => self.reviewRowCount(),
         };
-        const total: u16 = @intCast(@min(all.len, std.math.maxInt(u16)));
 
         switch (event.keysym) {
             .up => {
@@ -2720,6 +3016,19 @@ pub const Ui = struct {
                 return true;
             },
             else => {
+                if (pane.kind == .review) {
+                    const typed = event.text orelse return false;
+                    if (std.mem.eql(u8, typed, "a")) {
+                        self.review_requested = .apply;
+                        self.submitted = true;
+                        return true;
+                    }
+                    if (std.mem.eql(u8, typed, "u")) {
+                        self.review_requested = .undo;
+                        self.submitted = true;
+                        return true;
+                    }
+                }
                 const typed = event.text orelse return false;
                 if (std.mem.eql(u8, typed, "?")) {
                     self.pane = null;
@@ -3141,6 +3450,36 @@ test "the fork command requests the latest completed turn" {
     try std.testing.expect(requested != null);
     try std.testing.expect(requested.? == null);
     try std.testing.expect(ui.takeForkRequest() == null);
+}
+
+test "workspace review keeps whole-file and hunk choices separate" {
+    const ui = try Ui.init(std.testing.allocator, std.testing.io, host_mod.quiet);
+    defer ui.deinit();
+    ui.showReview(.{ .kind = .git, .files = &.{
+        .{ .path = "image.bin", .status = "modified", .binary = true, .atomic = true },
+        .{ .path = "main.zig", .status = "modified", .hunks = &.{
+            .{ .number = 1, .header = "@@ -1 +1 @@" },
+            .{ .number = 2, .header = "@@ -8 +8 @@" },
+        } },
+    } });
+    try std.testing.expectEqual(@as(usize, 3), ui.review_choices.len);
+    ui.review_choices[2].accepted = false;
+    const selected = try ui.reviewSelection(std.testing.allocator);
+    defer std.testing.allocator.free(selected.paths);
+    defer std.testing.allocator.free(selected.hunks);
+    defer std.testing.allocator.free(selected.rejected_paths);
+    defer std.testing.allocator.free(selected.rejected_hunks);
+    try std.testing.expectEqual(@as(usize, 1), selected.paths.len);
+    try std.testing.expectEqualStrings("image.bin", selected.paths[0]);
+    try std.testing.expectEqual(@as(usize, 1), selected.hunks.len);
+    try std.testing.expectEqual(@as(usize, 1), selected.hunks[0].number);
+    try std.testing.expectEqual(@as(usize, 1), selected.rejected_hunks.len);
+    try std.testing.expectEqual(@as(usize, 2), selected.rejected_hunks[0].number);
+
+    var group = Ui.ReviewGroupTap{ .ui = ui, .first = 1, .len = 2 };
+    Ui.onReviewGroupTap(&group);
+    try std.testing.expect(!ui.review_choices[1].accepted);
+    try std.testing.expect(!ui.review_choices[2].accepted);
 }
 
 test "a message tap requests its exact completed turn" {

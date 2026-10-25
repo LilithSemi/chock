@@ -156,6 +156,20 @@ pub const Overlay = struct {
         destination: []const u8,
         diag: ?*?Diagnostic,
     ) Error!CarriedOut {
+        return self.carryOutSelected(allocator, io, destination, &.{}, diag);
+    }
+
+    /// Carry only literal project-relative paths. An empty list means all,
+    /// preserving `carryOut`'s behavior. The destination remains all-or-nothing:
+    /// an existing directory is never merged into or overwritten.
+    pub fn carryOutSelected(
+        self: Overlay,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        destination: []const u8,
+        selected: []const []const u8,
+        diag: ?*?Diagnostic,
+    ) Error!CarriedOut {
         // Checked before the upper layer is opened, so a refusal never leaves a half-written directory.
         const occupied = std.Io.Dir.cwd().statFile(io, destination, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => null,
@@ -185,6 +199,7 @@ pub const Overlay = struct {
         }
 
         for (report.skipped) |one| {
+            if (!selectedPath(selected, one.path)) continue;
             const line = std.fmt.allocPrint(allocator, "{s}: {s}", .{ one.path, one.reason }) catch return error.OutOfMemory;
             errdefer allocator.free(line);
             skipped.append(allocator, line) catch return error.OutOfMemory;
@@ -192,6 +207,7 @@ pub const Overlay = struct {
 
         var carried: usize = 0;
         for (report.changed) |one| {
+            if (!selectedPath(selected, one.path)) continue;
             if (one.kind == .deleted) {
                 deleted.append(allocator, one.path) catch return error.OutOfMemory;
                 continue;
@@ -208,6 +224,12 @@ pub const Overlay = struct {
         return .{ .files = carried, .deleted = deleted.items.len, .skipped = skipped.items.len };
     }
 };
+
+fn selectedPath(selected: []const []const u8, path: []const u8) bool {
+    if (selected.len == 0) return true;
+    for (selected) |one| if (std.mem.eql(u8, one, path)) return true;
+    return false;
+}
 
 const driver = switch (builtin.os.tag) {
     .linux => @import("linux/overlay.zig"),

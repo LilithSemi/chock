@@ -396,8 +396,8 @@ fn answer(
     return wire.write(writer, wire.Answer{
         .ended = switch (term) {
             .exited => |code| .{ .exited = code },
-            .signal => |sig| .{ .signalled = @intFromEnum(sig) },
-            .stopped => |sig| .{ .stopped = @intFromEnum(sig) },
+            .signal => |sig| .{ .signalled = @backingInt(sig) },
+            .stopped => |sig| .{ .stopped = @backingInt(sig) },
             .unknown => |code| .{ .unknown = code },
         },
         // A guest kernel with no Landlock at all is a fact the host must see.

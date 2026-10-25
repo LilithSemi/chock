@@ -286,6 +286,43 @@ patch from the base commit recorded by the session to that ref. Repeat
 `--path <file>` to limit the patch to exact project-relative names; the names
 are literal, so Git wildcard and pathspec syntax is not evaluated.
 
+`/review` opens the same structured diff in the session interface. Because the
+interface is one Phantom widget tree, its file and hunk switches are the same in
+the browser, desktop window, and terminal. Applying the switches creates
+`refs/chock/selected/<session id>` as one auditable commit whose parent is the
+recorded base. It does not move `HEAD` or any branch. The command-line form is:
+
+```
+chock workspace select 01K2... --path src/parser.zig
+chock workspace select 01K2... --hunk src/parser.zig:2
+chock workspace select 01K2... --reject-path generated.bin
+chock workspace select 01K2... --reject-hunk src/parser.zig:3
+chock workspace select 01K2... --patch /tmp/edited.patch
+```
+
+Selectors use the hunk numbers shown by review. With no accept selector, all
+changes are accepted except explicit rejects. An edited patch is checked and
+applied against the recorded base in a private index; it cannot be combined
+with selectors. The session log records every accepted and rejected selector,
+the result ref, its immutable commit ID, and whether the result came from an
+edited patch.
+
+Ordinary modified text can be selected by hunk. Binary files, additions,
+deletions, renames, copies, symlinks, type changes, and permission changes are
+file-atomic: review labels them as whole-file decisions and refuses a hunk
+selector. Their bytes, names, modes, and link targets are taken from the
+session commit rather than from the checked-out tree.
+
+Creating a selection uses compare-and-swap when replacing an earlier selected
+ref. A running session is refused, a changed destination is never silently
+overwritten, and no checked-out file is touched. Branch integration remains the
+existing policy-controlled apply or an explicit Git operation by the user.
+Return to the pre-selection state with one command:
+
+```
+chock workspace undo 01K2...
+```
+
 An approved apply merges the work into the branch you have checked out, and the
 prompt names that branch and that merge before you answer. A project can say
 `rebase` or `squash` in the `apply` block of `chock.zon` instead, or `ask` to be
@@ -303,6 +340,8 @@ clean run removes its own workspace.
 chock workspace                     # every kept workspace, with its size
 chock workspace review 01K2...      # inspect work parked at the session's ref
 chock workspace review 01K2... --path src/parser.zig
+chock workspace select 01K2... --hunk src/parser.zig:1
+chock workspace undo 01K2...
 chock workspace clear
 ```
 
@@ -319,6 +358,16 @@ and a path that could not be carried is named with its reason in `skipped`.
 Before copying, `chock workspace review <session id>` lists the overlay paths as
 added, modified, or deleted. It accepts the same repeatable literal `--path`
 filter as Git review and does not write into the project.
+
+Selection works for overlays too. It writes only the accepted result beneath
+`.chock-selected/<session id>`; it never overlays that result onto the project.
+Ordinary modified text exposes hunks. Added and deleted paths, binaries,
+symlinks, replacements, and permission changes remain file-atomic. An existing
+selection directory is a conflict and is not merged or overwritten. The same
+`chock workspace undo <session id>` command removes only that recorded result;
+the original kept workspace remains available until `workspace clear`.
+An overlay has no rename identity, so a rename is shown explicitly as one
+deleted path and one added path; each is a separate whole-file decision.
 
 ```
 chock workspace adopt 01K2...       # take the work out of one kept overlay

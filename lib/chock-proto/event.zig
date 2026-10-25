@@ -118,6 +118,7 @@ pub const Kind = enum {
     workspace_open,
     workspace_integrate,
     workspace_adopt,
+    workspace_select,
     sandbox_open,
     sandbox_supervisor,
     sandbox_syscalls,
@@ -165,6 +166,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .workspace_open = "workspace.open",
     .workspace_integrate = "workspace.integrate",
     .workspace_adopt = "workspace.adopt",
+    .workspace_select = "workspace.select",
     .sandbox_open = "sandbox.open",
     .sandbox_supervisor = "sandbox.supervisor",
     .sandbox_syscalls = "sandbox.syscalls",
@@ -894,6 +896,30 @@ pub const WorkspaceAdopt = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
+/// A human-created result containing some or all of a parked workspace.
+/// `source` and `result` are refs for Git and paths for overlays. Selectors
+/// are kept verbatim so the log says exactly what the human accepted and
+/// rejected, rather than only retaining aggregate counts.
+pub const WorkspaceSelect = struct {
+    source: []const u8,
+    result: []const u8,
+    /// Immutable Git object named by `result`; empty for overlay artifacts.
+    result_commit: []const u8 = "",
+    base_commit: []const u8 = "",
+    accepted: []const []const u8 = &.{},
+    rejected: []const []const u8 = &.{},
+    files: u64 = 0,
+    hunks: u64 = 0,
+    binary_files: u64 = 0,
+    edited_patch: bool = false,
+    undone: bool = false,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 pub const SandboxOpen = struct {
     attempt: []const u8,
     write_execute: WriteExecuteRule,
@@ -1131,6 +1157,7 @@ pub const Event = union(Kind) {
     workspace_open: WorkspaceOpen,
     workspace_integrate: WorkspaceIntegrate,
     workspace_adopt: WorkspaceAdopt,
+    workspace_select: WorkspaceSelect,
     sandbox_open: SandboxOpen,
     sandbox_supervisor: SandboxSupervisor,
     sandbox_syscalls: SandboxSyscalls,
@@ -1715,6 +1742,19 @@ test "no serialized envelope contains a raw newline, whatever the Kind, and ever
         .{ .workspace_adopt = .{
             .attempt = nl,
             .path = nl,
+        } },
+        .{ .workspace_select = .{
+            .source = nl,
+            .result = nl,
+            .result_commit = nl,
+            .base_commit = nl,
+            .accepted = &.{nl},
+            .rejected = &.{nl},
+            .files = 2,
+            .hunks = 3,
+            .binary_files = 1,
+            .edited_patch = true,
+            .undone = false,
         } },
         .{ .sandbox_open = .{
             .attempt = nl,

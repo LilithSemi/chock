@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 const chock_auth = @import("chock-auth");
 const chock_policy = @import("chock-policy");
 
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const usage_text =

@@ -148,10 +148,15 @@ pub const App = struct {
                 self.forkSession(arena, ui, session, at);
                 return;
             }
+            if (ui.takeReviewRequest()) |request| {
+                self.workspaceReview(arena, ui, session, request);
+                return;
+            }
             switch (chock_ui.ui.answerFor(ui.typed.items)) {
                 .nothing => {},
                 .command => |command| switch (command) {
                     .fork => self.forkSession(arena, ui, session, null),
+                    .review => self.workspaceReview(arena, ui, session, .open),
                     // These commands act on a loop this page is not inside.
                     else => {
                         ui.say(.chock, "that command only works where the session is running");
@@ -167,6 +172,45 @@ pub const App = struct {
                             "the message was not sent");
                         ui.endLine();
                     };
+                },
+            }
+        }
+
+        fn workspaceReview(
+            self: *State,
+            arena: std.mem.Allocator,
+            ui: *chock_ui.Ui,
+            session: []const u8,
+            request: chock_ui.Ui.ReviewRequest,
+        ) void {
+            const source = self.reaching.?.source();
+            switch (request) {
+                .open => {
+                    const review = source.review(arena, session) catch {
+                        ui.say(.chock, source.whyLast() orelse "the workspace review could not be opened");
+                        ui.endLine();
+                        return;
+                    };
+                    ui.showReview(review);
+                },
+                .apply => {
+                    const selection = ui.reviewSelection(arena) catch return;
+                    source.select(session, selection) catch {
+                        ui.say(.chock, source.whyLast() orelse "the workspace selection was not created");
+                        ui.endLine();
+                        return;
+                    };
+                    ui.say(.chock, "the selected result was created without moving your branch");
+                    ui.endLine();
+                },
+                .undo => {
+                    source.undoSelection(session) catch {
+                        ui.say(.chock, source.whyLast() orelse "the selected result was not removed");
+                        ui.endLine();
+                        return;
+                    };
+                    ui.say(.chock, "the selected result was removed; your branch was not changed");
+                    ui.endLine();
                 },
             }
         }

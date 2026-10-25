@@ -4,7 +4,7 @@ const std = @import("std");
 const chock_proto = @import("chock-proto");
 
 const session_paths = @import("session.zig");
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const state = chock_proto.state;

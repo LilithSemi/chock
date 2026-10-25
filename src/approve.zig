@@ -6,7 +6,7 @@ const chock_proto = @import("chock-proto");
 
 const approval = @import("approval.zig");
 const session_paths = @import("session.zig");
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const event = chock_proto.event;

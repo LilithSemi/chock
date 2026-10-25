@@ -4,7 +4,7 @@ const std = @import("std");
 const chock_auth = @import("chock-auth");
 const chock_proto = @import("chock-proto");
 
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const control = chock_proto.control;
@@ -333,6 +333,9 @@ pub const Route = enum {
     sessions,
     projects,
     fork,
+    review,
+    select,
+    undo_selection,
     prompt,
     events,
     /// The same events as `events`, read once and answered whole. A browser
@@ -352,6 +355,9 @@ pub fn routeOf(target: []const u8) ?Route {
     if (std.mem.eql(u8, path, "/api/lines")) return .lines;
     if (std.mem.eql(u8, path, "/api/answer")) return .answer;
     if (std.mem.eql(u8, path, "/api/fork")) return .fork;
+    if (std.mem.eql(u8, path, "/api/workspace/review")) return .review;
+    if (std.mem.eql(u8, path, "/api/workspace/select")) return .select;
+    if (std.mem.eql(u8, path, "/api/workspace/undo")) return .undo_selection;
     if (std.mem.eql(u8, path, "/api/prompt")) return .prompt;
     // Everything else is a file of the page, or nothing. The name is matched
     // against the bundle rather than against a directory, so a request can
@@ -393,8 +399,8 @@ fn handle(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Req
     // A route that changes what a session does is a POST, so nothing that
     // prefetches a link can drive it.
     const wanted: std.http.Method = switch (route) {
-        .answer, .fork, .prompt => .POST,
-        .page, .asset, .sessions, .projects, .events, .lines => .GET,
+        .answer, .fork, .prompt, .select, .undo_selection => .POST,
+        .page, .asset, .sessions, .projects, .events, .lines, .review => .GET,
     };
     if (request.head.method != wanted and !(wanted == .GET and request.head.method == .HEAD)) {
         try sendWhole(request, "that route does not take that method\n", .{ .status = .method_not_allowed });
@@ -417,6 +423,9 @@ fn handle(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Req
         .lines => try serveLines(serve, arena, request),
         .answer => try serveAnswer(serve, arena, request),
         .fork => try serveFork(serve, arena, request),
+        .review => try serveReview(serve, arena, request),
+        .select => try serveSelect(serve, arena, request),
+        .undo_selection => try serveUndoSelection(serve, arena, request),
         .prompt => try servePrompt(serve, arena, request),
     }
 }
@@ -702,6 +711,50 @@ fn serveFork(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.
         .session = session,
         .at = at,
     } }, null);
+}
+
+fn serveReview(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
+    const session = queryValue(request.head.target, "session") orelse {
+        try sendWhole(request, "a session is required\n", .{ .status = .bad_request });
+        return;
+    };
+    const project = projectOf(serve, arena, request.head.target);
+    try sendRecords(serve, arena, request, .{ .review = .{ .project = project, .session = session } });
+}
+
+fn serveSelect(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
+    const session_raw = queryValue(request.head.target, "session") orelse {
+        try sendWhole(request, "a session is required\n", .{ .status = .bad_request });
+        return;
+    };
+    const project = projectOf(serve, arena, request.head.target);
+    const session = try arena.dupe(u8, session_raw);
+    var body_buffer: [8 * 1024]u8 = undefined;
+    const reader = request.readerExpectContinue(&body_buffer) catch {
+        try sendWhole(request, "the selection could not be read\n", .{ .status = .bad_request });
+        return;
+    };
+    const body = reader.allocRemaining(arena, .limited(1024 * 1024)) catch {
+        try sendWhole(request, "the selection could not be read\n", .{ .status = .bad_request });
+        return;
+    };
+    try askDaemon(serve, arena, request, .{ .select = .{
+        .project = project,
+        .session = session,
+        .payload = body,
+    } }, "selected\n");
+}
+
+fn serveUndoSelection(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
+    const session = queryValue(request.head.target, "session") orelse {
+        try sendWhole(request, "a session is required\n", .{ .status = .bad_request });
+        return;
+    };
+    const project = projectOf(serve, arena, request.head.target);
+    try askDaemon(serve, arena, request, .{ .undo_selection = .{
+        .project = project,
+        .session = session,
+    } }, "undone\n");
 }
 
 /// Put one request to the daemon and answer `good` when supplied, or pass the
@@ -1236,6 +1289,9 @@ test "every route is one the dispatch has a case for, and a query does not make 
         "/api/lines",
         "/api/answer",
         "/api/fork",
+        "/api/workspace/review",
+        "/api/workspace/select",
+        "/api/workspace/undo",
         "/api/prompt",
         "/boot.js",
     }) |target| {

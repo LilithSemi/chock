@@ -240,7 +240,7 @@ pub fn refusalFor(writer: *std.Io.Writer, address: Address, err: Address.Connect
     }
 }
 
-/// The wire's number, not the program's: moves only on a breaking change.
+/// The wire's number, not the program's: moves only on a breaking change before a stable release.
 pub const protocol_version: u32 = 1;
 
 pub const protocol_name = "chock-control";
@@ -373,6 +373,9 @@ pub const Verb = enum {
     adopt,
     create,
     fork,
+    review,
+    select,
+    undo_selection,
     prompt,
     cancel,
     read,
@@ -388,6 +391,9 @@ pub const Request = union(Verb) {
     adopt: Adopt,
     create: Create,
     fork: Fork,
+    review: Review,
+    select: Select,
+    undo_selection: UndoSelection,
     prompt: Prompt,
     cancel: Cancel,
     read: Read,
@@ -404,6 +410,12 @@ pub const Request = union(Verb) {
     pub const Create = struct { project: []const u8 };
     /// Copy a completed prefix into a new session. Null means its latest turn.
     pub const Fork = struct { project: []const u8, session: []const u8, at: ?u64 };
+    pub const Review = struct { project: []const u8, session: []const u8 };
+    /// JSON keeps project-relative paths lossless while the outer protocol
+    /// remains one line. JSON escapes tabs and newlines rather than turning
+    /// them into field separators.
+    pub const Select = struct { project: []const u8, session: []const u8, payload: []const u8 };
+    pub const UndoSelection = struct { project: []const u8, session: []const u8 };
     /// Stops the running turn; a no-op if there is none.
     pub const Cancel = struct { project: []const u8, session: []const u8 };
     /// A message in a session that already exists; `start` both creates and speaks.
@@ -448,6 +460,19 @@ pub const Request = union(Verb) {
                     .at = if (std.mem.eql(u8, at, "latest")) null else std.fmt.parseInt(u64, at, 10) catch return error.BadArguments,
                 } };
             },
+            .review => .{ .review = .{
+                .project = try field(asked.rest, 0, 2),
+                .session = try field(asked.rest, 1, 2),
+            } },
+            .select => .{ .select = .{
+                .project = try field(asked.rest, 0, 3),
+                .session = try field(asked.rest, 1, 3),
+                .payload = try field(asked.rest, 2, 3),
+            } },
+            .undo_selection => .{ .undo_selection = .{
+                .project = try field(asked.rest, 0, 2),
+                .session = try field(asked.rest, 1, 2),
+            } },
             .cancel => .{ .cancel = .{
                 .project = try field(asked.rest, 0, 2),
                 .session = try field(asked.rest, 1, 2),
@@ -499,6 +524,9 @@ pub const Request = union(Verb) {
                 try writer.print("fork {s}\t{s}\t{d}\n", .{ one.project, one.session, at })
             else
                 try writer.print("fork {s}\t{s}\tlatest\n", .{ one.project, one.session }),
+            .review => |one| try writer.print("review {s}\t{s}\n", .{ one.project, one.session }),
+            .select => |one| try writer.print("select {s}\t{s}\t{s}\n", .{ one.project, one.session, one.payload }),
+            .undo_selection => |one| try writer.print("undo_selection {s}\t{s}\n", .{ one.project, one.session }),
             .cancel => |one| try writer.print("cancel {s}\t{s}\n", .{ one.project, one.session }),
             .prompt => |one| try writer.print(
                 "prompt {s}\t{s}\t{s}\n",
@@ -856,6 +884,9 @@ test "every verb round trips from a request to a line and back" {
         .{ .create = .{ .project = "/home/ross/chock" } },
         .{ .fork = .{ .project = "/home/ross/chock", .session = id, .at = null } },
         .{ .fork = .{ .project = "/home/ross/chock", .session = id, .at = 4096 } },
+        .{ .review = .{ .project = "/home/ross/chock", .session = id } },
+        .{ .select = .{ .project = "/home/ross/chock", .session = id, .payload = "{\"paths\":[\"src/main.zig\"]}" } },
+        .{ .undo_selection = .{ .project = "/home/ross/chock", .session = id } },
         .{ .cancel = .{ .project = "/home/ross/chock", .session = id } },
         .{ .prompt = .{
             .project = "/home/ross/chock",

@@ -113,6 +113,9 @@ pub const Web = struct {
         .asks = asks,
         .prompt = prompt,
         .fork = fork,
+        .review = review,
+        .select = select,
+        .undoSelection = undoSelection,
         .answer = answer,
         .whyLast = whyLast,
     };
@@ -327,6 +330,62 @@ pub const Web = struct {
             return error.Refused;
         }
         return response[0..end];
+    }
+
+    fn review(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        session: []const u8,
+    ) ui_source.Error!ui_source.Review {
+        const self: *Web = @ptrCast(@alignCast(ptr));
+        const target = std.fmt.allocPrint(
+            arena,
+            "/api/workspace/review?session={s}{s}",
+            .{ session, self.namedProject(arena) },
+        ) catch return error.OutOfMemory;
+        const said = try self.get(arena, target);
+        const parsed = std.json.parseFromSliceLeaky(
+            []ui_source.Review,
+            arena,
+            said,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
+        ) catch {
+            self.note("the workspace review could not be read");
+            return error.Refused;
+        };
+        if (parsed.len != 1) {
+            self.note("the daemon returned no workspace review");
+            return error.Refused;
+        }
+        self.clear();
+        return parsed[0];
+    }
+
+    fn select(ptr: *anyopaque, session: []const u8, selection: ui_source.Selection) ui_source.Error!void {
+        const self: *Web = @ptrCast(@alignCast(ptr));
+        var room = std.heap.ArenaAllocator.init(self.gpa);
+        defer room.deinit();
+        const arena = room.allocator();
+        const target = std.fmt.allocPrint(
+            arena,
+            "/api/workspace/select?session={s}{s}",
+            .{ session, self.namedProject(arena) },
+        ) catch return error.OutOfMemory;
+        const payload = std.json.Stringify.valueAlloc(arena, selection, .{}) catch return error.OutOfMemory;
+        _ = try self.post(arena, target, payload);
+    }
+
+    fn undoSelection(ptr: *anyopaque, session: []const u8) ui_source.Error!void {
+        const self: *Web = @ptrCast(@alignCast(ptr));
+        var room = std.heap.ArenaAllocator.init(self.gpa);
+        defer room.deinit();
+        const arena = room.allocator();
+        const target = std.fmt.allocPrint(
+            arena,
+            "/api/workspace/undo?session={s}{s}",
+            .{ session, self.namedProject(arena) },
+        ) catch return error.OutOfMemory;
+        _ = try self.post(arena, target, "");
     }
 
     fn answer(

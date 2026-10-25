@@ -27,7 +27,7 @@ const interrupt = @import("interrupt.zig");
 const handover = @import("handover.zig");
 const session_paths = @import("session.zig");
 const ui = @import("ui.zig");
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const exitFor = @import("main.zig").exitFor;
 
 const usage_text =
@@ -10868,6 +10868,11 @@ fn runSession(
                 .fork => |at| {
                     fork_request.* = .{ .at = at };
                     break;
+                },
+                .review => {
+                    one.say(.chock, "workspace review opens after this session is idle; detach or finish it, then use the session review button");
+                    one.endLine();
+                    continue;
                 },
             }
         }

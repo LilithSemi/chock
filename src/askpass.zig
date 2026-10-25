@@ -4,7 +4,7 @@ const std = @import("std");
 const chock_broker = @import("chock-broker");
 const chock_proto = @import("chock-proto");
 
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const askpass = chock_broker.askpass;

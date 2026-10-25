@@ -281,7 +281,7 @@ pub const Pane = struct {
 
     kind: Kind,
 
-    pub const Kind = enum { keys };
+    pub const Kind = enum { keys, review };
 
     pub fn move(self: *Pane, by: i8, room: u16, total: u16) void {
         const last = total -| room;
@@ -315,6 +315,7 @@ pub fn markerText(open: bool, focused: bool) []const u8 {
 
 pub const Command = enum {
     fork,
+    review,
     help,
     plan,
     usage,
@@ -323,6 +324,7 @@ pub const Command = enum {
     pub fn typed(self: Command) []const u8 {
         return switch (self) {
             .fork => "/fork",
+            .review => "/review",
             .help => "/help",
             .plan => "/plan",
             .usage => "/usage",
@@ -333,6 +335,7 @@ pub const Command = enum {
     pub fn does(self: Command) []const u8 {
         return switch (self) {
             .fork => "branch from the latest completed turn",
+            .review => "review and select the isolated workspace diff",
             .help => "every key, and every command",
             .plan => "the plan, kept at the side of the screen",
             .usage => "the tokens and the cost so far",
@@ -340,7 +343,7 @@ pub const Command = enum {
         };
     }
 
-    pub const all = [_]Command{ .fork, .help, .plan, .usage, .@"resume" };
+    pub const all = [_]Command{ .fork, .review, .help, .plan, .usage, .@"resume" };
 };
 
 pub fn commandOf(line: []const u8) ?Command {

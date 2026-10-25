@@ -12,7 +12,7 @@ const event = chock_proto.event;
 const jsonrpc = chock_acp.jsonrpc;
 const updates = chock_acp.update;
 
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const session_paths = @import("session.zig");
 const tty = @import("tty.zig");
 

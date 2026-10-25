@@ -49,6 +49,9 @@ approval nobody answers is a refusal.
 - Session forks at any completed turn, with Git workspace restoration and a
   warm microVM checkpoint at the latest turn. See
   [docs/using/forks.md](docs/using/forks.md).
+- Shared Git and overlay diff review, with file and hunk selection, auditable
+  results, and one-command undo without moving your branch. See
+  [docs/running.md](docs/running.md#getting-the-work-back).
 - Notes an agent keeps between sessions, outside your project. See
   [docs/using/memory.md](docs/using/memory.md).
 - Tools you supply yourself, as WebAssembly. See

@@ -6,7 +6,7 @@ const std = @import("std");
 const chock_auth = @import("chock-auth");
 const chock_provider = @import("chock-provider");
 
-const Exit = @import("main.zig").Exit;
+const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const usage_text =
