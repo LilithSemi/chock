@@ -108,14 +108,20 @@ const Daemon = struct {
 
     fn deinit(self: *Daemon) void {
         for (self.sessions.items) |entry| {
+            var keep_snapshot = entry.has_snapshot;
             if (entry.guest) |one| {
-                one.running.stopping.store(true, .release);
+                if (one.running.snapshot_allowed.load(.acquire)) {
+                    one.running.snapshotting.store(true, .release);
+                } else {
+                    one.running.stopping.store(true, .release);
+                }
                 one.running.thread.join();
+                keep_snapshot = one.running.snapshot_saved.load(.acquire);
                 self.gpa.destroy(one.running);
                 self.gpa.free(one.socket);
             }
             self.gpa.free(entry.log_path);
-            std.Io.Dir.deleteFileAbsolute(self.io, entry.snapshot_path) catch {};
+            if (!keep_snapshot) std.Io.Dir.deleteFileAbsolute(self.io, entry.snapshot_path) catch {};
             self.gpa.free(entry.snapshot_path);
             self.gpa.free(entry.project);
         }
@@ -808,6 +814,7 @@ fn beginSession(
         .log_path = log_path,
         .snapshot_path = snapshot_path,
         .project = project_copy,
+        .has_snapshot = snapshotOnDisk(daemon.io, snapshot_path),
     }) catch {
         daemon.gpa.free(log_path);
         daemon.gpa.free(snapshot_path);
@@ -1066,6 +1073,12 @@ fn startGuest(
         }
         return null;
     }
+
+    // A snapshot describes the quiescent guest before this one resumed. Once
+    // the restored guest is ready it is the authoritative state; retaining the
+    // old file would let a daemon crash roll the session back to an earlier
+    // tool-side state on its next start.
+    if (restore != null) std.Io.Dir.deleteFileAbsolute(daemon.io, snapshot_path) catch {};
 
     if (!daemon.rememberGuest(id, .{ .running = running, .socket = socket })) {
         running.stopping.store(true, .release);
@@ -1357,6 +1370,11 @@ fn guestSnapshotPath(
         .{ daemon.socket_dir, tail },
         0,
     ) catch null;
+}
+
+fn snapshotOnDisk(io: std.Io, path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return stat.kind == .file;
 }
 
 fn guestSocketPath(
@@ -2099,6 +2117,43 @@ test "remembering another turn does not duplicate a daemon session" {
         .project = duplicate_project,
     })));
     try testing.expectEqual(@as(usize, 1), daemon.sessions.items.len);
+}
+
+test "a quiescent checkpoint survives daemon teardown and is discoverable again" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buffer);
+    const snapshot_path = try std.fmt.allocPrintSentinel(
+        gpa,
+        "{s}/session.snapshot",
+        .{dir_buffer[0..dir_len]},
+        0,
+    );
+    defer gpa.free(snapshot_path);
+    var snapshot = try std.Io.Dir.createFileAbsolute(io, snapshot_path, .{});
+    try snapshot.writeStreamingAll(io, "guest state");
+    snapshot.close(io);
+    try testing.expect(snapshotOnDisk(io, snapshot_path));
+    try testing.expect(!snapshotOnDisk(io, dir_buffer[0..dir_len]));
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var daemon = Daemon{ .gpa = gpa, .io = io, .exe_path = "/nowhere/chock", .env = &env };
+    const id = "01JQ" ++ @as([22]u8, @splat('Q'));
+    try testing.expect(try daemon.remember(.{
+        .id = id.*,
+        .log_path = try gpa.dupeSentinel(u8, "/nowhere/session.jsonl", 0),
+        .snapshot_path = try gpa.dupeSentinel(u8, snapshot_path, 0),
+        .project = try gpa.dupe(u8, "/project"),
+        .has_snapshot = true,
+    }));
+    daemon.deinit();
+
+    try testing.expect(snapshotOnDisk(io, snapshot_path));
 }
 
 test "adopt refuses a session it may not take, and starts nothing when it does" {
