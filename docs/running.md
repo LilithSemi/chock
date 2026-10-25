@@ -316,6 +316,9 @@ files sit there for you to read with `diff -r` and take with `cp`, and every
 path the session deleted is named in `.chock-adopted/<session id>/deleted` for
 you to act on. A destination that already holds something is refused by name,
 and a path that could not be carried is named with its reason in `skipped`.
+Before copying, `chock workspace review <session id>` lists the overlay paths as
+added, modified, or deleted. It accepts the same repeatable literal `--path`
+filter as Git review and does not write into the project.
 
 ```
 chock workspace adopt 01K2...       # take the work out of one kept overlay

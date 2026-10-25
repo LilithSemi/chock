@@ -33,8 +33,9 @@ const usage_text =
     \\work is already at refs/chock/<session>.
     \\
     \\review <session> shows the exact Git patch between the base recorded in the
-    \\session log and refs/chock/<session>. Repeat --path to show only named files.
-    \\Paths are literal: wildcard and pathspec syntax has no special meaning.
+    \\session log and refs/chock/<session>, or an overlay's change manifest.
+    \\Repeat --path to show only named files. Paths are literal: wildcard and
+    \\pathspec syntax has no special meaning.
     \\
     \\A workspace whose session is running now is never removed, because that session
     \\is writing into it. Such a row is marked with a * at the start.
@@ -434,6 +435,16 @@ fn reviewWorkspace(
         tty.print(.err, "chock workspace review: {s} is not a session identifier.\n", .{session_id});
         return Exit.usage.code();
     }
+    for (paths) |path| {
+        if (!reviewPathIsSafe(path)) {
+            tty.print(
+                .err,
+                "chock workspace review: {s} is not a project-relative path.\n",
+                .{path},
+            );
+            return Exit.usage.code();
+        }
+    }
 
     const log_path = std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ session_dir, session_id }, 0) catch
         return Exit.faulted.code();
@@ -441,6 +452,25 @@ fn reviewWorkspace(
         tty.print(.err, "chock workspace review: session {s} has no log in this project.\n", .{session_id});
         return Exit.usage.code();
     };
+    switch (sessions_cmd.livenessOf(io, log_path)) {
+        .idle => {},
+        .live => {
+            tty.print(
+                .err,
+                "chock workspace review: session {s} is running, so its work does not have a stable review boundary yet.\n",
+                .{session_id},
+            );
+            return Exit.refused.code();
+        },
+        .unknown => {
+            tty.print(
+                .err,
+                "chock workspace review: the lock on session {s} could not be tested, so its work may still be changing.\n",
+                .{session_id},
+            );
+            return Exit.refused.code();
+        },
+    }
     const opened = lastWorkspaceOpen(arena, io, log_path, session_id) orelse {
         tty.print(
             .err,
@@ -451,15 +481,7 @@ fn reviewWorkspace(
     };
     switch (opened.kind) {
         .worktree => {},
-        .overlay => {
-            tty.print(
-                .err,
-                "chock workspace review: session {s} used an overlay workspace. " ++
-                    "Use `chock workspace adopt {s}` to copy its changes out for review.\n",
-                .{ session_id, session_id },
-            );
-            return Exit.usage.code();
-        },
+        .overlay => return reviewOverlay(arena, io, project_root, session_dir, session_id, opened.attempt, paths),
         .unknown => |name| {
             tty.print(
                 .err,
@@ -486,14 +508,6 @@ fn reviewWorkspace(
         "--",
     }) catch return Exit.faulted.code();
     for (paths) |path| {
-        if (!reviewPathIsSafe(path)) {
-            tty.print(
-                .err,
-                "chock workspace review: {s} is not a project-relative path.\n",
-                .{path},
-            );
-            return Exit.usage.code();
-        }
         const literal = std.fmt.allocPrint(arena, ":(top,literal){s}", .{path}) catch return Exit.faulted.code();
         argv.append(arena, literal) catch return Exit.faulted.code();
     }
@@ -526,6 +540,65 @@ fn reviewWorkspace(
     return Exit.finished.code();
 }
 
+fn reviewOverlay(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    session_dir: []const u8,
+    session_id: []const u8,
+    attempt: []const u8,
+    paths: []const []const u8,
+) u8 {
+    const work = std.fmt.allocPrint(arena, "{s}/{s}{s}", .{ session_dir, session_id, work_suffix }) catch
+        return Exit.faulted.code();
+    const scratch = std.fs.path.join(arena, &.{ work, attempt }) catch return Exit.faulted.code();
+    var diag: ?chock_workspace.Diagnostic = null;
+    var overlay = chock_workspace.overlay.adopt(arena, io, project_root, scratch, &diag) catch |err| {
+        sayReviewFault(session_id, "the overlay could not be opened", err, diag);
+        return Exit.usage.code();
+    };
+    defer overlay.deinit(arena);
+    diag = null;
+    var report = overlay.changedFiles(arena, io, &diag) catch |err| {
+        sayReviewFault(session_id, "the overlay changes could not be read", err, diag);
+        return Exit.faulted.code();
+    };
+    defer report.deinit(arena);
+    std.mem.sort(chock_workspace.overlay.ChangedFile, report.changed, {}, struct {
+        fn lessThan(_: void, left: chock_workspace.overlay.ChangedFile, right: chock_workspace.overlay.ChangedFile) bool {
+            return std.mem.order(u8, left.path, right.path) == .lt;
+        }
+    }.lessThan);
+
+    var shown: usize = 0;
+    for (report.changed) |one| {
+        if (!pathSelected(paths, one.path)) continue;
+        tty.out(.plain, "{s} {s}\n", .{ switch (one.kind) {
+            .added => "A",
+            .modified => "M",
+            .deleted => "D",
+        }, one.path });
+        shown += 1;
+    }
+    for (report.skipped) |one| {
+        if (!pathSelected(paths, one.path)) continue;
+        tty.print(.warn, "? {s}: {s}\n", .{ one.path, one.reason });
+        shown += 1;
+    }
+    if (shown == 0) {
+        tty.print(.plain, "chock workspace review: session {s} has no changes in this selection.\n", .{session_id});
+    }
+    return Exit.finished.code();
+}
+
+fn pathSelected(paths: []const []const u8, candidate: []const u8) bool {
+    if (paths.len == 0) return true;
+    for (paths) |path| {
+        if (std.mem.eql(u8, path, candidate)) return true;
+    }
+    return false;
+}
+
 fn reviewPathIsSafe(path: []const u8) bool {
     if (path.len == 0 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null) return false;
     var parts = std.mem.splitScalar(u8, path, '/');
@@ -533,6 +606,20 @@ fn reviewPathIsSafe(path: []const u8) bool {
         if (std.mem.eql(u8, part, "..")) return false;
     }
     return true;
+}
+
+fn sayReviewFault(
+    session_id: []const u8,
+    doing: []const u8,
+    err: anyerror,
+    diag: ?chock_workspace.Diagnostic,
+) void {
+    if (diag) |fault| {
+        var held = fault;
+        tty.print(.err, "chock workspace review: {s} for session {s}: {f}\n", .{ doing, session_id, &held });
+        return;
+    }
+    tty.print(.err, "chock workspace review: {s} for session {s}: {s}\n", .{ doing, session_id, @errorName(err) });
 }
 
 pub const adopted_dir_name = ".chock-adopted";
@@ -1393,6 +1480,49 @@ test "an overlay a session left behind is adopted, and what it changed and what 
     try testing.expectEqual(@as(u64, 2), row.files);
     try testing.expectEqual(@as(u64, 1), row.deleted);
     try testing.expectEqual(@as(u64, 0), row.skipped);
+}
+
+test "review lists an overlay's changes without adopting or modifying the project" {
+    if (@import("builtin").os.tag != .linux) return;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buffer);
+    const root = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
+    const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
+    try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
+    try writeUnder(arena, testing.io, project, "tracked.txt", "original\n");
+
+    const id = "01JQ" ++ @as([22]u8, @splat('V'));
+    const attempt = "01JQ" ++ @as([22]u8, @splat('W'));
+    const upper = try makeOverlaySession(arena, testing.io, root, id, attempt, .overlay);
+    try writeUnder(arena, testing.io, upper, "tracked.txt", "changed\n");
+    try writeUnder(arena, testing.io, upper, "notes/new.md", "new\n");
+
+    var env = std.process.Environ.Map.init(arena);
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+    try testing.expectEqual(
+        Exit.finished.code(),
+        reviewWorkspace(arena, testing.io, &env, project, root, id, &.{"notes/new.md"}),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.out(), "A notes/new.md") != null);
+    try testing.expect(std.mem.indexOf(u8, said.out(), "tracked.txt") == null);
+
+    const original = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        try std.fs.path.join(arena, &.{ project, "tracked.txt" }),
+        arena,
+        .limited(64),
+    );
+    try testing.expectEqualStrings("original\n", original);
+    const adopted = try std.fmt.allocPrint(arena, "{s}/{s}", .{ project, adopted_dir_name });
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, adopted, .{}));
 }
 
 test "a session that worked in a git worktree is refused, and sent to the ref that already holds its work" {
