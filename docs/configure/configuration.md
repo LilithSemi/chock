@@ -54,6 +54,21 @@ Every field of it defaults to false, and two instances of one kind may differ:
 A tool is offered to the model only when the adapter can express it and the
 provider instance does it.
 
+Run `chock models` to see the effective local view: provider instances, the
+default model, context limits, and the features each adapter can faithfully
+carry. `chock models --provider <name>` narrows that report to one instance.
+The command does not read credentials or contact the provider, so it reports
+configured and adapter capabilities rather than making an unverified claim
+about a remote model. Provider-side search is named as unavailable; web search
+continues to use Chock's separately configured, policy-controlled tool.
+
+Add `--probe` to opt into credential lookup and one authenticated `GET
+/models` request per selected provider. The returned model identifiers are
+sorted before they are printed. `chock models --provider <name> --probe` is the
+narrow form. The same typed catalogue result is kept in `chock-auth`, so the
+daemon and graphical clients can use it for a model switcher without parsing
+terminal output or handling credentials themselves.
+
 ## Naming a credential
 
 A provider names its credential one of three ways:

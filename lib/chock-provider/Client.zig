@@ -13,19 +13,50 @@ pub const Adapter = enum {
     openai_responses,
     anthropic,
 
-    pub fn carries(self: Adapter, capability: message.Capability) bool {
+    pub const Features = struct {
+        tool_calls: bool,
+        image_results: bool,
+        reasoning: bool,
+        cache_accounting: bool,
+        provider_search: bool,
+    };
+
+    /// What Chock's adapter can faithfully carry. A provider instance may
+    /// narrow this further (images are opt-in in config.zon), but configuration
+    /// cannot make an adapter support a wire feature it does not implement.
+    pub fn features(self: Adapter) Features {
         return switch (self) {
-            .openai_compatible, .openai_responses => switch (capability) {
-                .tool_calls => true,
-                .image_results => true,
-            },
-            .anthropic => switch (capability) {
-                .tool_calls => true,
-                .image_results => true,
+            .openai_compatible, .openai_responses, .anthropic => .{
+                .tool_calls = true,
+                .image_results = true,
+                .reasoning = true,
+                .cache_accounting = true,
+                // Search is a brokered Chock tool today, never a provider-side
+                // tool selected by the model API.
+                .provider_search = false,
             },
         };
     }
+
+    pub fn carries(self: Adapter, capability: message.Capability) bool {
+        const supported = self.features();
+        return switch (capability) {
+            .tool_calls => supported.tool_calls,
+            .image_results => supported.image_results,
+        };
+    }
 };
+
+test "adapter features name only behavior the neutral client carries" {
+    inline for (std.meta.tags(Adapter)) |adapter| {
+        const supported = adapter.features();
+        try std.testing.expect(supported.tool_calls);
+        try std.testing.expect(supported.image_results);
+        try std.testing.expect(supported.reasoning);
+        try std.testing.expect(supported.cache_accounting);
+        try std.testing.expect(!supported.provider_search);
+    }
+}
 
 pub const Stop = struct {
     reason: []const u8,
