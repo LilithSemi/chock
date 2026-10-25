@@ -288,7 +288,12 @@ fn mainWith(
     }
 
     if (fork_request) |request| {
-        var child_id: [session_paths.id_length]u8 = undefined;
+        const source_snapshot = if (started.own_guest != null)
+            try ownGuestSnapshotPath(arena, started.state_dir, started.session_id)
+        else
+            null;
+
+        var forked: sessions_cmd.Forked = undefined;
         const code = try sessions_cmd.forkSession(
             arena,
             teardown_io,
@@ -297,10 +302,24 @@ fn mainWith(
             started.project_root,
             started.session_id,
             request.at,
-            &child_id,
+            &forked,
         );
         if (code != Exit.finished.code()) return code;
-        return takeFork(teardown_io, &env, started.exe_path, started.project_root, &child_id);
+        if (forked.latest) {
+            if (source_snapshot) |from| {
+                const to = try ownGuestSnapshotPath(arena, started.state_dir, &forked.id);
+                std.Io.Dir.renameAbsolute(from, to, teardown_io) catch |err| tty.print(
+                    .warn,
+                    "chock: the microVM checkpoint could not move to the fork: {t}\n",
+                    .{err},
+                );
+            }
+        } else if (source_snapshot) |path| {
+            // A historical transcript cannot correspond to the VM checkpoint,
+            // which always represents the source's latest completed turn.
+            std.Io.Dir.deleteFileAbsolute(teardown_io, path) catch {};
+        }
+        return takeFork(teardown_io, &env, started.exe_path, started.project_root, &forked.id);
     }
 
     return exitWithApply(result, applied, &shipped).code();
@@ -792,7 +811,7 @@ fn start(
 
     // The guest is forked here, before the credential is read, so its copied memory never holds the token.
     var own_guest: ?*OwnGuest = null;
-    errdefer if (own_guest) |one| one.stop(io);
+    errdefer if (own_guest) |one| one.stop(io, false);
     if (sandbox_choice.chosen() == .microvm) {
         try refuseGuestOverChockOwn(arena, io, env, project_root);
         if (options.guest == null) {
@@ -10047,7 +10066,7 @@ fn runSession(
     defer guest_arena.deinit();
 
     var guest_link: ?*GuestLink = null;
-    defer if (started.own_guest) |one| one.stop(io);
+    defer if (started.own_guest) |one| one.stop(io, fork_request.* != null);
 
     const guest_socket: ?[]const u8 = options.guest orelse socket: {
         const one = started.own_guest orelse break :socket null;
@@ -10057,7 +10076,7 @@ fn runSession(
     if (guest_socket) |socket_path| {
         const room = guest_arena.allocator();
         const shares = try guestShares(room, io, started);
-        if (started.own_guest) |one| try readyOwnGuest(room, io, one, shares);
+        if (started.own_guest != null) try readyOwnGuest(room, io, started, shares);
         guest_link = try attachGuest(room, io, socket_path, shares);
         // The pointer has to name the copy that lives on, not the temporary.
         chock_core.tools.useDriver(.{ .guest = &guest_link.?.guest });
@@ -11235,9 +11254,17 @@ const OwnGuest = struct {
     child: vmm.Child,
     socket: [:0]const u8,
     console: [:0]const u8,
+    snapshot: [:0]const u8,
+    snapshot_allowed: bool = false,
+    restoring: bool = false,
 
-    fn stop(self: *OwnGuest, io: std.Io) void {
-        self.child.stop();
+    fn stop(self: *OwnGuest, io: std.Io, checkpoint: bool) void {
+        var saving = checkpoint and self.snapshot_allowed;
+        if (saving) self.child.snapshotStop() catch |err| {
+            saving = false;
+            tty.print(.warn, "chock: the guest could not be asked for a checkpoint: {t}\n", .{err});
+            self.child.stop();
+        } else self.child.stop();
         const code = self.child.wait();
         if (code == 0) {
             tty.detail("chock: the guest's own process ended, answering 0\n", .{});
@@ -11250,8 +11277,22 @@ const OwnGuest = struct {
             );
         }
         std.Io.Dir.deleteFileAbsolute(io, self.socket) catch {};
+        if (!saving or code != 0) std.Io.Dir.deleteFileAbsolute(io, self.snapshot) catch {};
     }
 };
+
+fn ownGuestSnapshotPath(
+    arena: std.mem.Allocator,
+    state_dir: []const u8,
+    session_id: []const u8,
+) std.mem.Allocator.Error![:0]const u8 {
+    return std.fmt.allocPrintSentinel(
+        arena,
+        "{s}/g-{s}.snapshot",
+        .{ state_dir, session_id[session_id.len - 12 ..] },
+        0,
+    );
+}
 
 fn refuseGuestOverChockOwn(
     arena: std.mem.Allocator,
@@ -11308,6 +11349,11 @@ fn forkOwnGuest(
         .{ state_dir, session_id[session_id.len - 12 ..] },
         0,
     ) catch return error.OutOfMemory;
+    const snapshot = try ownGuestSnapshotPath(arena, state_dir, session_id);
+    const restore = if (std.Io.Dir.cwd().statFile(io, snapshot, .{})) |stat|
+        if (stat.size > 0) snapshot else null
+    else |_|
+        null;
 
     if (socket.len > std.Io.net.UnixAddress.max_len) {
         tty.print(
@@ -11342,6 +11388,8 @@ fn forkOwnGuest(
         .session = socket,
         .memory_mb = choice.memory(guest_machine, builtin.os.tag),
         .cpus = choice.processors(guest_machine, builtin.os.tag),
+        .restore = restore,
+        .save = snapshot,
         .control = vmm.fork_sets_control,
     }, file.handle) catch |err| {
         tty.print(
@@ -11353,11 +11401,44 @@ fn forkOwnGuest(
         return error.Reported;
     };
 
-    held.* = .{ .child = child, .socket = socket, .console = console };
+    held.* = .{
+        .child = child,
+        .socket = socket,
+        .console = console,
+        .snapshot = snapshot,
+        .restoring = restore != null,
+    };
     return held;
 }
 
 fn readyOwnGuest(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    started: *Started,
+    shares: []const chock_net.vm_shares.Share,
+) StartError!void {
+    const one = started.own_guest.?;
+    while (true) {
+        readyOwnGuestOnce(arena, io, one, shares) catch |err| {
+            if (!one.restoring) return err;
+            tty.print(.warn, "chock run: the microVM checkpoint could not be restored; trying a cold boot\n", .{});
+            one.stop(io, false);
+            const cold = try forkOwnGuest(
+                arena,
+                io,
+                started.state_dir,
+                started.sandbox_choice,
+                started.paths.dir,
+                started.session_id,
+            );
+            one.* = cold.*;
+            continue;
+        };
+        return;
+    }
+}
+
+fn readyOwnGuestOnce(
     arena: std.mem.Allocator,
     io: std.Io,
     one: *OwnGuest,
@@ -11366,6 +11447,7 @@ fn readyOwnGuest(
     one.child.sendShares(arena, try forGuest(arena, shares)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Broke => {
+            if (one.restoring) return error.Reported;
             tty.print(
                 .err,
                 "chock run: the guest's own process would not take this session's directories, " ++
@@ -11379,11 +11461,12 @@ fn readyOwnGuest(
     one.child.waitReady(io, guest_boot_ms) catch |err| {
         if (one.child.fault()) |said| {
             if (said.detail.len == 0) {
-                tty.print(.err, "chock run: the guest: {s}.\n", .{said.said});
+                tty.print(if (one.restoring) .warn else .err, "chock run: the guest: {s}.\n", .{said.said});
             } else {
-                tty.print(.err, "chock run: the guest: {s}: {s}\n", .{ said.said, said.detail });
+                tty.print(if (one.restoring) .warn else .err, "chock run: the guest: {s}: {s}\n", .{ said.said, said.detail });
             }
         }
+        if (one.restoring) return error.Reported;
         tty.print(
             .err,
             "chock run: the guest did not come up ({t}), so the session does not start. Its " ++
@@ -11392,6 +11475,7 @@ fn readyOwnGuest(
         );
         return error.Reported;
     };
+    one.snapshot_allowed = vmm.snapshots and one.child.sev == .off;
 
     if (one.child.sev != .off) {
         tty.print(.dim, "chock run: the guest's memory is encrypted ({s}).\n", .{one.child.sev.text()});

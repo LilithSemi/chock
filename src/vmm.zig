@@ -674,6 +674,12 @@ fn host(
 
     var offered: fs_mod.Export = try fs_mod.Export.init(gpa, io);
     defer offered.deinit();
+    if (restored) |parts| {
+        restoreExport(gpa, io, snapshot_bytes.?, parts, options.shares, &offered) catch {
+            fault.* = .{ .said = "the guest snapshot is missing Chock's filesystem state" };
+            return 1;
+        };
+    }
     for (options.shares) |each| {
         offered.offer(each.name, each.host_path, each.writable) catch {
             fault.* = .{ .said = "a directory could not be offered", .detail = each.name };
@@ -965,6 +971,7 @@ fn host(
             cpu_ids,
             &shared_fs,
             &channel,
+            &offered,
         ) catch |err| {
             fault.* = .{ .said = "the guest snapshot could not be written", .detail = @errorName(err) };
             return 1;
@@ -1032,6 +1039,7 @@ const Devices = struct {
 
 const transport_magic = "chock snapshot devices\x00";
 const transport_state_bytes = 32;
+const export_magic = "chock snapshot export\x00";
 
 fn writeTransport(mmio: anytype, out: *[transport_state_bytes]u8) void {
     std.mem.writeInt(u32, out[0..4], mmio.queue_sel, .little);
@@ -1069,6 +1077,164 @@ fn restoreTransports(
     readTransport(&vsock.mmio, bytes[state_at..][0..transport_state_bytes]);
 }
 
+fn appendInt(bytes: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime T: type, value: T) !void {
+    var room: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &room, value, .little);
+    try bytes.appendSlice(gpa, &room);
+}
+
+fn takeInt(comptime T: type, bytes: []const u8, at: *usize) !T {
+    if (bytes.len -| at.* < @sizeOf(T)) return error.Truncated;
+    const value = std.mem.readInt(T, bytes[at.*..][0..@sizeOf(T)], .little);
+    at.* += @sizeOf(T);
+    return value;
+}
+
+fn takeBytes(bytes: []const u8, at: *usize, count: usize) ![]const u8 {
+    if (bytes.len -| at.* < count) return error.Truncated;
+    const value = bytes[at.*..][0..count];
+    at.* += count;
+    return value;
+}
+
+fn saveExport(gpa: std.mem.Allocator, offered: *fs_mod.Export, bytes: *std.ArrayList(u8)) !void {
+    // An open host descriptor cannot be reconstructed in another VMM. At the
+    // quiescent turn boundary there should be none; refusing the checkpoint is
+    // safer than restoring a handle as another file.
+    for (&offered.handles) |handle| {
+        if (handle.open != null or handle.walking != null) return error.ExportBusy;
+    }
+
+    try bytes.appendSlice(gpa, export_magic);
+    try appendInt(bytes, gpa, u32, fs_mod.Export.max_offers);
+    for (&offered.offers) |offer| {
+        try appendInt(bytes, gpa, u32, offer.generation);
+        try bytes.append(gpa, @intFromBool(offer.used));
+        try bytes.append(gpa, @intFromBool(offer.writable));
+        const name = if (offer.used) offer.name else &.{};
+        try appendInt(bytes, gpa, u16, std.math.cast(u16, name.len) orelse return error.NameTooLong);
+        try bytes.appendSlice(gpa, name);
+    }
+
+    try appendInt(bytes, gpa, u32, std.math.cast(u32, offered.nodes.items.len) orelse return error.TooManyNodes);
+    for (offered.nodes.items) |node| {
+        try appendInt(bytes, gpa, u32, node.offer);
+        try appendInt(bytes, gpa, u32, node.generation);
+        try appendInt(bytes, gpa, u32, node.own);
+        try appendInt(bytes, gpa, u64, node.lookups);
+        try appendInt(bytes, gpa, u32, std.math.cast(u32, node.path.len) orelse return error.NameTooLong);
+        try bytes.appendSlice(gpa, node.path);
+    }
+
+    try appendInt(bytes, gpa, u32, std.math.cast(u32, offered.free_nodes.items.len) orelse return error.TooManyNodes);
+    for (offered.free_nodes.items) |index| try appendInt(bytes, gpa, u32, index);
+}
+
+fn shareNamed(shares: []const shares_mod.Share, name: []const u8) ?shares_mod.Share {
+    for (shares) |share| if (std.mem.eql(u8, share.name, name)) return share;
+    return null;
+}
+
+fn restoreExport(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    bytes: []const u8,
+    parts: core.Snapshot.Parts,
+    shares: []const shares_mod.Share,
+    offered: *fs_mod.Export,
+) !void {
+    const at = core.Snapshot.size(parts) + transport_magic.len + 2 * transport_state_bytes;
+    if (bytes.len < at) return error.Truncated;
+    try restoreExportBytes(gpa, io, bytes[at..], shares, offered);
+}
+
+fn restoreExportBytes(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    bytes: []const u8,
+    shares: []const shares_mod.Share,
+    offered: *fs_mod.Export,
+) !void {
+    var at: usize = 0;
+    if (!std.mem.eql(u8, try takeBytes(bytes, &at, export_magic.len), export_magic)) return error.BadMagic;
+    if (try takeInt(u32, bytes, &at) != fs_mod.Export.max_offers) return error.DifferentOfferCount;
+
+    var rebuilt = try fs_mod.Export.init(gpa, io);
+    errdefer rebuilt.deinit();
+    for (&rebuilt.offers) |*slot| {
+        const generation = try takeInt(u32, bytes, &at);
+        const used = (try takeInt(u8, bytes, &at)) != 0;
+        const writable = (try takeInt(u8, bytes, &at)) != 0;
+        const name = try takeBytes(bytes, &at, try takeInt(u16, bytes, &at));
+        slot.generation = generation;
+        if (!used) continue;
+
+        // Paths belong to the receiving session, not to the snapshot. A fork
+        // restores a name into the directory granted under that name now.
+        const share = shareNamed(shares, name) orelse return error.ShareChanged;
+        const held_name = try gpa.dupe(u8, name);
+        const held_at = gpa.dupe(u8, share.host_path) catch |err| {
+            gpa.free(held_name);
+            return err;
+        };
+        slot.* = .{
+            .used = true,
+            .name = held_name,
+            .at = held_at,
+            .writable = writable and share.writable,
+            .generation = generation,
+        };
+    }
+
+    for (rebuilt.nodes.items[1..]) |node| gpa.free(node.path);
+    rebuilt.nodes.clearRetainingCapacity();
+    const node_count = try takeInt(u32, bytes, &at);
+    if (node_count < 2) return error.BadNodes;
+    try rebuilt.nodes.ensureTotalCapacity(gpa, node_count);
+    for (0..node_count) |index| {
+        const offer = try takeInt(u32, bytes, &at);
+        const generation = try takeInt(u32, bytes, &at);
+        const own = try takeInt(u32, bytes, &at);
+        const lookups = try takeInt(u64, bytes, &at);
+        const saved_path = try takeBytes(bytes, &at, try takeInt(u32, bytes, &at));
+        const path: []u8 = if (index == 0) &.{} else try gpa.dupe(u8, saved_path);
+        rebuilt.nodes.append(gpa, .{
+            .offer = offer,
+            .generation = generation,
+            .own = own,
+            .path = path,
+            .lookups = lookups,
+        }) catch |err| {
+            if (index != 0) gpa.free(path);
+            return err;
+        };
+        if (lookups == 0 or index <= 1) continue;
+        if (offer >= rebuilt.offers.len or !rebuilt.offers[offer].used or rebuilt.offers[offer].generation != generation)
+            return error.BadNode;
+        var key_room: [4200]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_room, "{d}/{d}/{s}", .{ offer, generation, path });
+        if (rebuilt.known.contains(key)) return error.BadNode;
+        const held = try gpa.dupe(u8, key);
+        rebuilt.known.put(gpa, held, (@as(u64, own) << 32) | @as(u32, @intCast(index))) catch |err| {
+            gpa.free(held);
+            return err;
+        };
+    }
+
+    const free_count = try takeInt(u32, bytes, &at);
+    try rebuilt.free_nodes.ensureTotalCapacity(gpa, free_count);
+    for (0..free_count) |_| {
+        const index = try takeInt(u32, bytes, &at);
+        if (index < 2 or index >= rebuilt.nodes.items.len or rebuilt.nodes.items[index].lookups != 0)
+            return error.BadFreeNode;
+        rebuilt.free_nodes.appendAssumeCapacity(index);
+    }
+    if (at != bytes.len) return error.TrailingData;
+
+    offered.deinit();
+    offered.* = rebuilt;
+}
+
 fn saveSnapshot(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1080,6 +1246,7 @@ fn saveSnapshot(
     cpu_ids: []const backend.Backend.VcpuId,
     fs: *device.virtio.Fs,
     vsock: *device.virtio.Vsock,
+    offered: *fs_mod.Export,
 ) !void {
     if (comptime builtin.os.tag != .linux) return error.SnapshotUnsupported;
 
@@ -1128,7 +1295,11 @@ fn saveSnapshot(
         .queues = &queues,
     };
     const core_size = core.Snapshot.size(parts);
-    const bytes = try gpa.alloc(u8, core_size + transport_magic.len + 2 * transport_state_bytes);
+    var export_bytes: std.ArrayList(u8) = .empty;
+    defer export_bytes.deinit(gpa);
+    try saveExport(gpa, offered, &export_bytes);
+
+    const bytes = try gpa.alloc(u8, core_size + transport_magic.len + 2 * transport_state_bytes + export_bytes.items.len);
     defer gpa.free(bytes);
     _ = try core.Snapshot.write(parts, bytes[0..core_size]);
     @memcpy(bytes[core_size..][0..transport_magic.len], transport_magic);
@@ -1137,6 +1308,8 @@ fn saveSnapshot(
     at += transport_state_bytes;
     writeTransport(&vsock.mmio, bytes[at..][0..transport_state_bytes]);
     at += transport_state_bytes;
+    @memcpy(bytes[at..][0..export_bytes.items.len], export_bytes.items);
+    at += export_bytes.items.len;
 
     try file.writeStreamingAll(io, bytes[0..at]);
     try file.sync(io);
@@ -1166,6 +1339,9 @@ const Pump = struct {
             .keep_running => {},
             .stop => return false,
             .snapshot => {
+                // Observe a client that closed at the end of the turn before
+                // freezing vsock. A fork must not inherit the old host stream.
+                self.session.pump(self.vsock);
                 self.snapshot_asked.store(true, .release);
                 return false;
             },
@@ -1735,6 +1911,55 @@ test "snapshot transport state round trips without host pointers" {
     var after: Transport = .{};
     readTransport(&after, &bytes);
     try testing.expectEqualDeep(before, after);
+}
+
+test "snapshot filesystem nodes are rebound to the receiving session" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const source_shares = [_]shares_mod.Share{
+        .{ .name = "work", .host_path = "/old/session", .writable = true },
+    };
+    var source = try fs_mod.Export.init(testing.allocator, io);
+    defer source.deinit();
+    try source.offer(source_shares[0].name, source_shares[0].host_path, true);
+    try source.nodes.append(testing.allocator, .{
+        .offer = 0,
+        .generation = source.offers[0].generation,
+        .own = 7,
+        .path = try testing.allocator.dupe(u8, "src/main.zig"),
+        .lookups = 2,
+    });
+    try source.nodes.append(testing.allocator, .{
+        .offer = 0,
+        .generation = source.offers[0].generation,
+        .own = 3,
+        .path = try testing.allocator.dupe(u8, ""),
+        .lookups = 0,
+    });
+    try source.free_nodes.append(testing.allocator, 3);
+
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(testing.allocator);
+    try saveExport(testing.allocator, &source, &bytes);
+
+    const destination_shares = [_]shares_mod.Share{
+        .{ .name = "work", .host_path = "/new/session", .writable = false },
+    };
+    var restored = try fs_mod.Export.init(testing.allocator, io);
+    defer restored.deinit();
+    try restoreExportBytes(testing.allocator, io, bytes.items, &destination_shares, &restored);
+
+    try testing.expect(restored.offers[0].used);
+    try testing.expectEqualStrings("/new/session", restored.offers[0].at);
+    try testing.expect(!restored.offers[0].writable);
+    try testing.expectEqual(@as(usize, 4), restored.nodes.items.len);
+    try testing.expectEqual(@as(u32, 7), restored.nodes.items[2].own);
+    try testing.expectEqualStrings("src/main.zig", restored.nodes.items[2].path);
+    try testing.expectEqual(@as(u64, 2), restored.nodes.items[2].lookups);
+    try testing.expectEqual(@as(usize, 1), restored.known.count());
+    try testing.expectEqualSlices(u32, &.{3}, restored.free_nodes.items);
 }
 
 test "a signalled child reads as signalled, and one that will not stop is killed" {

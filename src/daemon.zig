@@ -68,6 +68,13 @@ const Guest = struct {
     turns: u64 = 0,
 };
 
+const ForkSnapshot = union(enum) {
+    none,
+    wait,
+    file,
+    guest: Guest,
+};
+
 // PR_SET_PDEATHSIG fires when the thread that forked the guest ends, not when its process does, so the thread lives as long as the guest.
 const Running = struct {
     thread: std.Thread,
@@ -173,6 +180,37 @@ const Daemon = struct {
         for (self.sessions.items) |*entry| {
             if (!std.mem.eql(u8, &entry.id, id)) continue;
             entry.has_snapshot = saved;
+            entry.snapshotting = false;
+            return;
+        }
+    }
+
+    fn claimForkSnapshot(self: *Daemon, id: []const u8) ForkSnapshot {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |*entry| {
+            if (!std.mem.eql(u8, &entry.id, id)) continue;
+            if (entry.snapshotting) return .wait;
+            if (entry.has_snapshot) {
+                entry.has_snapshot = false;
+                entry.snapshotting = true;
+                return .file;
+            }
+            const guest = entry.guest orelse return .none;
+            if (!guest.running.snapshot_allowed.load(.acquire)) return .none;
+            entry.guest = null;
+            entry.snapshotting = true;
+            return .{ .guest = guest };
+        }
+        return .none;
+    }
+
+    fn finishForkSnapshot(self: *Daemon, id: []const u8, kept: bool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |*entry| {
+            if (!std.mem.eql(u8, &entry.id, id)) continue;
+            entry.has_snapshot = kept;
             entry.snapshotting = false;
             return;
         }
@@ -620,7 +658,7 @@ fn handleFork(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Fork
         fail(writer, "the session directory could not be built");
         return;
     };
-    var child_id: [session_paths.id_length]u8 = undefined;
+    var forked: sessions_cmd.Forked = undefined;
     const code = sessions_cmd.forkSession(
         arena,
         daemon.io,
@@ -629,7 +667,7 @@ fn handleFork(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Fork
         one.project,
         &source_id,
         one.at,
-        &child_id,
+        &forked,
     ) catch {
         fail(writer, "that session could not be forked");
         return;
@@ -639,7 +677,13 @@ fn handleFork(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Fork
         return;
     }
 
-    beginSession(daemon, writer, one.project, child_id, .forked);
+    beginSession(
+        daemon,
+        writer,
+        one.project,
+        forked.id,
+        .{ .forked = if (forked.latest) source_id else null },
+    );
 }
 
 fn handlePrompt(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Prompt) void {
@@ -710,7 +754,9 @@ fn checkedSession(
 const Begin = union(enum) {
     say: []const u8,
     carry_on,
-    forked,
+    /// The source id is present only when this is its latest completed turn,
+    /// the one an idle guest can represent.
+    forked: ?[session_paths.id_length]u8,
     nothing,
 };
 
@@ -757,6 +803,14 @@ fn beginSession(
         return;
     };
 
+    if (begin == .forked) {
+        if (begin.forked) |source_id| {
+            if (transferForkSnapshot(daemon, &source_id, snapshot_path)) {
+                daemon.noteSnapshot(&id, true);
+            }
+        }
+    }
+
     if (begin == .nothing) {
         var opened = openLog(daemon, writer, log_path, &id) orelse return;
         opened.backing.log.close(daemon.io);
@@ -776,7 +830,10 @@ fn beginSession(
             .id = id,
             .project = project_copy,
             .message = owned_message,
-            .adopt = begin == .carry_on or begin == .forked,
+            .adopt = switch (begin) {
+                .carry_on, .forked => true,
+                .say, .nothing => false,
+            },
         };
         const thread = std.Thread.spawn(.{}, runChild, .{child}) catch {
             if (owned_message) |text| daemon.gpa.free(text);
@@ -1289,6 +1346,52 @@ fn guestSocketPath(
         return null;
     }
     return path;
+}
+
+/// Move a source session's quiescent checkpoint to a new session. A rename is
+/// deliberate: a checkpoint is large, and two sessions must never both believe
+/// they own the same mutable VM state.
+fn transferForkSnapshot(
+    daemon: *Daemon,
+    source_id: *const [session_paths.id_length]u8,
+    target_path: []const u8,
+) bool {
+    const source_path = daemon.snapshotPathFor(source_id) orelse return false;
+
+    while (true) switch (daemon.claimForkSnapshot(source_id)) {
+        .wait => std.Io.sleep(
+            daemon.io,
+            .fromNanoseconds(guest_look_ms * std.time.ns_per_ms),
+            .awake,
+        ) catch return false,
+        .none => return false,
+        .file => break,
+        .guest => |guest| {
+            guest.running.snapshotting.store(true, .release);
+            guest.running.thread.join();
+            const saved = guest.running.snapshot_saved.load(.acquire);
+            daemon.gpa.destroy(guest.running);
+            daemon.gpa.free(guest.socket);
+            if (!saved) {
+                daemon.finishForkSnapshot(source_id, false);
+                std.Io.Dir.deleteFileAbsolute(daemon.io, source_path) catch {};
+                return false;
+            }
+            break;
+        },
+    };
+    std.Io.Dir.renameAbsolute(source_path, target_path, daemon.io) catch |err| {
+        daemon.finishForkSnapshot(source_id, true);
+        tty.print(
+            .warn,
+            "chock daemon: session {s}'s microVM checkpoint could not move to its fork: {t}\n",
+            .{ source_id, err },
+        );
+        return false;
+    };
+    daemon.finishForkSnapshot(source_id, false);
+    tty.detail("chock daemon: session {s}'s microVM checkpoint moved to its fork\n", .{source_id});
+    return true;
 }
 
 fn releaseGuestLater(daemon: *Daemon, id: [session_paths.id_length]u8, turn: u64) void {
@@ -2001,6 +2104,56 @@ test "adopt refuses a session it may not take, and starts nothing when it does" 
         try testing.expect(std.mem.indexOf(u8, got.answer, "running now") != null);
         try testing.expectEqual(@as(usize, 0), got.remembered);
     }
+}
+
+test "a completed checkpoint moves from a source session to its fork" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buffer);
+    const dir = dir_buffer[0..dir_len];
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var daemon = Daemon{
+        .gpa = gpa,
+        .io = io,
+        .exe_path = "/nowhere/chock",
+        .env = &env,
+        .socket_dir = dir,
+    };
+    defer daemon.deinit();
+
+    const source_id = "01JQ" ++ @as([22]u8, @splat('S'));
+    const target_id = "01JQ" ++ @as([22]u8, @splat('T'));
+    const source_path = guestSnapshotPath(&daemon, source_id).?;
+    const target_path = guestSnapshotPath(&daemon, target_id).?;
+    defer gpa.free(target_path);
+    defer std.Io.Dir.deleteFileAbsolute(io, target_path) catch {};
+
+    const log_path = try gpa.dupeSentinel(u8, "/nowhere/source.jsonl", 0);
+    const project = try gpa.dupe(u8, "/project");
+    try daemon.remember(.{
+        .id = source_id.*,
+        .log_path = log_path,
+        .snapshot_path = source_path,
+        .project = project,
+        .has_snapshot = true,
+    });
+
+    var snapshot = try std.Io.Dir.createFileAbsolute(io, source_path, .{});
+    try snapshot.writeStreamingAll(io, "guest state");
+    snapshot.close(io);
+
+    try testing.expect(transferForkSnapshot(&daemon, source_id, target_path));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, source_path, .{}));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, target_path, gpa, .limited(64));
+    defer gpa.free(bytes);
+    try testing.expectEqualStrings("guest state", bytes);
+    try testing.expect(!daemon.takeSnapshot(source_id));
 }
 
 test "a listing over the wire says what the local fold says" {

@@ -67,8 +67,9 @@ const usage_text =
     \\fork makes a new session from an idle session's audited transcript. By default it
     \\forks at the last completed turn; --at names a session.end event byte offset. The
     \\inherited prefix stays byte-for-byte identical and a session.fork event records its
-    \\source and head digest. Running the new session starts a fresh isolated workspace
-    \\and, when configured, a fresh microVM.
+    \\source and head digest. Running the new session starts a fresh isolated workspace.
+    \\A latest-turn fork may restore the source's quiescent microVM; historical forks
+    \\and unavailable checkpoints start a fresh guest.
     \\
     \\A session log is the only record of what an agent did, so removing one asks
     \\first. It takes the session's workspace and sandbox root with it.
@@ -1595,6 +1596,12 @@ const ForkPoint = struct {
     head: chain.Digest,
 };
 
+pub const Forked = struct {
+    id: [session_paths.id_length]u8,
+    source_event: u64,
+    latest: bool,
+};
+
 pub fn forkSession(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -1603,7 +1610,7 @@ pub fn forkSession(
     project_root: []const u8,
     source_id: []const u8,
     wanted: ?u64,
-    child_out: ?*[session_paths.id_length]u8,
+    forked_out: ?*Forked,
 ) !u8 {
     const source_path = try logPathIn(arena, dir, source_id);
     _ = std.Io.Dir.cwd().statFile(io, source_path, .{}) catch {
@@ -1643,6 +1650,7 @@ pub fn forkSession(
     defer replay.deinit();
 
     var point: ?ForkPoint = null;
+    var latest_end: ?u64 = null;
     var wanted_was_not_end = false;
     var ending: chain.Ending = .complete;
     var ending_at: u64 = 0;
@@ -1660,6 +1668,7 @@ pub fn forkSession(
         defer parsed.deinit();
 
         verifier.take(parsed.value.id, replay.line(), parsed.value.prev);
+        if (parsed.value.event == .session_end) latest_end = parsed.value.id;
         const is_wanted = if (wanted) |offset| parsed.value.id == offset else true;
         if (is_wanted and parsed.value.event == .session_end) {
             point = .{
@@ -1741,8 +1750,12 @@ pub fn forkSession(
 
     keep_child = true;
     session_paths.markProject(io, child_paths, project_root);
-    if (child_out) |out| {
-        out.* = child_id;
+    if (forked_out) |out| {
+        out.* = .{
+            .id = child_id,
+            .source_event = chosen.event,
+            .latest = latest_end != null and latest_end.? == chosen.event,
+        };
         return Exit.finished.code();
     }
     tty.out(.plain, "{s}\n", .{child_id_text});
@@ -2308,12 +2321,14 @@ test "fork copies an exact completed prefix and records where the child diverged
     var output: tty.Capture = undefined;
     output.start(io, testing.allocator);
     defer output.stop(io);
+    var fork_result: Forked = undefined;
     try testing.expectEqual(
         Exit.finished.code(),
-        try forkSession(arena, io, &env, source_paths.dir, project, source_id, null, null),
+        try forkSession(arena, io, &env, source_paths.dir, project, source_id, null, &fork_result),
     );
 
-    const child_id = (try session_paths.newestId(arena, io, &env, project)).?;
+    const child_id = fork_result.id;
+    try testing.expect(fork_result.latest);
     try testing.expect(!std.mem.eql(u8, &child_id, source_id));
     const child_path = try logPathIn(arena, source_paths.dir, &child_id);
     var child_backing = chock_proto.storage.JsonLines{
@@ -2371,6 +2386,58 @@ test "fork copies an exact completed prefix and records where the child diverged
 
     const end_line = try readLogLineAt(arena, io, source_paths.log, source_end_offset.?);
     try testing.expectEqualStrings(&chain.of(end_line), &fork_head.?);
+}
+
+test "a historical fork is not reported as the latest checkpoint" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state_home = try scratchDir(arena, &tmp, "state");
+    const project = try scratchDir(arena, &tmp, "project");
+    try std.Io.Dir.createDirAbsolute(io, project, .default_dir);
+    var env = std.process.Environ.Map.init(arena);
+    try env.put("XDG_STATE_HOME", state_home);
+
+    const source_id = "01JQ" ++ @as([22]u8, @splat('H'));
+    const paths = try session_paths.pathsFor(arena, &env, project, source_id);
+    try session_paths.create(io, paths);
+    try makeLog(arena, io, paths.dir, source_id, &.{
+        .{ .message = .{ .role = .user, .content = &.{.{ .text = "first" }} } },
+        .{ .session_end = .{ .reason = .finished, .detail = "" } },
+        .{ .message = .{ .role = .user, .content = &.{.{ .text = "second" }} } },
+        .{ .session_end = .{ .reason = .finished, .detail = "" } },
+    });
+
+    var backing = chock_proto.storage.JsonLines{
+        .log = try chock_proto.log.Log.open(io, paths.log, source_id),
+    };
+    const store = backing.storage();
+    var replay = try store.replay(arena, io, 0);
+    var first_end: ?u64 = null;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event == .session_end) {
+            first_end = parsed.value.id;
+            break;
+        }
+    }
+    replay.deinit();
+    store.close(io);
+
+    var output: tty.Capture = undefined;
+    output.start(io, testing.allocator);
+    defer output.stop(io);
+    var forked: Forked = undefined;
+    try testing.expectEqual(
+        Exit.finished.code(),
+        try forkSession(arena, io, &env, paths.dir, project, source_id, first_end.?, &forked),
+    );
+    try testing.expectEqual(first_end.?, forked.source_event);
+    try testing.expect(!forked.latest);
 }
 
 test "a session another process owns reads as live, and the probe leaves its lock alone" {
