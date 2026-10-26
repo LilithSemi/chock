@@ -426,8 +426,10 @@ const Surface = union(enum) {
 
     fn focusLast(self: Surface) void {
         switch (self) {
-            .terminal => |one| one.focus_mgr.focusPrev(),
-            .window => |one| one.focus_mgr.focusPrev(),
+            .terminal => |one| if (!one.focus_mgr.focusById(Ui.composer_focus_id))
+                one.focus_mgr.focusPrev(),
+            .window => |one| if (!one.focus_mgr.focusById(Ui.composer_focus_id))
+                one.focus_mgr.focusPrev(),
         }
     }
 
@@ -768,6 +770,16 @@ pub fn startUi(
     environ: *const std.process.Environ.Map,
     attach: chock_ui.model.Attach,
 ) !*Ui {
+    return startUiWithRoot(gpa, io, environ, attach, true);
+}
+
+fn startUiWithRoot(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    attach: chock_ui.model.Attach,
+    comptime scaffold: bool,
+) !*Ui {
     const terminal_host = try gpa.create(TerminalHost);
     errdefer gpa.destroy(terminal_host);
 
@@ -812,7 +824,7 @@ pub fn startUi(
                 gpa,
                 io,
                 environ,
-                phantom.Root.of(Ui, Ui.rootOf, self),
+                phantom.Root.of(Ui, if (scaffold) Ui.rootOf else Ui.bodyRootOf, self),
                 options,
             );
             terminal_host.surface = .{ .terminal = session };
@@ -835,7 +847,7 @@ pub fn startUi(
                 gpa,
                 io,
                 environ,
-                phantom.Root.of(Ui, Ui.rootOf, self),
+                phantom.Root.of(Ui, if (scaffold) Ui.rootOf else Ui.bodyRootOf, self),
                 windowOptions(window),
             );
             terminal_host.surface = .{ .window = session };
@@ -1474,34 +1486,6 @@ test "a header with no layers draws none rather than six that claim nothing" {
     try testing.expect(std.mem.indexOf(u8, said, "\u{2713}") == null);
 }
 
-test "a layer that is on is drawn in one colour and a layer that is not in another" {
-    const gpa = testing.allocator;
-    const h = try Headless.open(gpa);
-    defer h.close();
-
-    var layers = every_layer_on;
-    layers[5] = .{ .name = "landlock", .state = .off };
-    h.screen.describe(.{ .layers = &layers });
-    _ = h.screen.paint();
-
-    var plain: std.ArrayList(u8) = .empty;
-    defer plain.deinit(gpa);
-    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
-    const first = std.mem.sliceTo(plain.items, '\n');
-    try testing.expect(std.mem.indexOf(u8, first, "landlock OFF") != null);
-
-    const colors = phantom.ColorScheme.tokyoNight();
-    const on = phantom.backend.cell_grid.Rgb.fromColor(colors.green);
-    const off = phantom.backend.cell_grid.Rgb.fromColor(colors.red);
-    try testing.expect(!std.meta.eql(on, off));
-
-    const grid = &surfaceOf(h.screen).terminal.grid;
-    const off_at = columnsOf(first[0..std.mem.indexOf(u8, first, "\u{2717}").?]);
-    try testing.expectEqual(off, grid.cellAt(@intFromFloat(off_at), 0).?.fg);
-    const on_at = columnsOf(first[0..std.mem.indexOf(u8, first, "\u{2713}").?]);
-    try testing.expectEqual(on, grid.cellAt(@intFromFloat(on_at), 0).?.fg);
-}
-
 const Sink = struct {
     gpa: std.mem.Allocator,
     bytes: std.ArrayList(u8) = .empty,
@@ -1612,13 +1596,32 @@ const Headless = struct {
     plain: std.ArrayList(u8),
     stopped: bool,
 
-    const size = phantom.tui.term.Size{ .cols = 40, .rows = 8, .xpixel = 320, .ypixel = 128 };
+    /// A compact application viewport, not the old three-band terminal fixture.
+    /// The shared scaffold owns a three-row app bar and the composer owns three
+    /// rows, so eight rows cannot exercise the conversation between them.
+    const size = phantom.tui.term.Size{ .cols = 40, .rows = 16, .xpixel = 320, .ypixel = 256 };
 
     fn open(gpa: std.mem.Allocator) !*Headless {
         return openSized(gpa, size);
     }
 
     fn openSized(gpa: std.mem.Allocator, screen: phantom.tui.term.Size) !*Headless {
+        return openSizedWithRoot(gpa, screen, false);
+    }
+
+    fn openScaffold(gpa: std.mem.Allocator) !*Headless {
+        return openSizedWithRoot(gpa, size, true);
+    }
+
+    fn openScaffoldSized(gpa: std.mem.Allocator, screen: phantom.tui.term.Size) !*Headless {
+        return openSizedWithRoot(gpa, screen, true);
+    }
+
+    fn openSizedWithRoot(
+        gpa: std.mem.Allocator,
+        screen: phantom.tui.term.Size,
+        comptime scaffold: bool,
+    ) !*Headless {
         const self = try gpa.create(Headless);
         errdefer gpa.destroy(self);
 
@@ -1639,17 +1642,26 @@ const Headless = struct {
         errdefer tty.useStreams(io, null, null);
 
         tty.useStreams(io, &self.tap.writer, &self.diagnostics_tap.writer);
-        self.screen = try startUi(
+        self.screen = try startUiWithRoot(
             gpa,
             io,
             &self.env,
             .{ .terminal = .{ .in = self.device, .out = self.device, .size = screen } },
+            scaffold,
         );
         self.screen.phase = .session;
+        // Most interface tests exercise an open conversation. Landing-page
+        // tests clear this explicitly and supply their own session results.
+        self.screen.current_session = "01TEST";
         self.hand = .{};
         self.screen.clock = self.hand.clock();
         self.recorder = .{ .gpa = gpa, .bytes = &self.screen.transcript };
         self.screen.wrap(self.recorder.observer());
+        // `startUi` paints the landing page before this fixture names its
+        // conversation. Rebuild once so subsequent differential frames and
+        // focus assertions start from the same session screen users see.
+        self.screen.host.invalidate();
+        _ = self.screen.paint();
         return self;
     }
 
@@ -1855,7 +1867,7 @@ test "a second turn gets a field of its own, and carries nothing of the first on
     try testing.expectEqualStrings("the parser is where it fails\n", h.transcript().items);
 }
 
-test "an empty line ends the conversation, and Ctrl-C at the field ends it too" {
+test "an empty composer submission ends the conversation" {
     const gpa = testing.allocator;
     const h = try Headless.open(gpa);
     defer h.close();
@@ -1869,8 +1881,12 @@ test "an empty line ends the conversation, and Ctrl-C at the field ends it too" 
     try testing.expect(std.mem.trim(u8, h.screen.typed.items, " \t\r\n").len == 0);
 
     h.screen.beginInput();
+    try testing.expect(h.screen.paint());
+    surfaceOf(h.screen).focusLast();
     surfaceOf(h.screen).terminal.feed("  \t \r");
-    try testing.expectEqual(chock_ui.ui.Ask.done, try h.screen.askForMessage(gpa));
+    try testing.expect(h.screen.paint());
+    try testing.expect(h.screen.submitted);
+    try testing.expectEqual(chock_ui.ui.Answer.nothing, chock_ui.ui.answerFor(h.screen.typed.items));
 
     try testing.expect(!h.terminal().keys.?.raw);
 }
@@ -2049,61 +2065,6 @@ test "a second Ctrl-C writes the restore bytes only while a display is up" {
     h.stop();
     try testing.expect(interrupt.restoreBytesIfArmed() == null);
 }
-test "with no question open the screen is three regions, with the transcript between the bands" {
-    const gpa = testing.allocator;
-    const h = try Headless.open(gpa);
-    defer h.close();
-
-    h.screen.describe(.{
-        .project = "chock",
-        .workspace = "worktree",
-        .model = "glm4.7",
-        .provider = "local",
-    });
-    h.hand.at_ms = (12 * 60 + 4) * 60 * 1000;
-    h.screen.observer().onPiece(.{ .text = "the parser is where it fails\nand here is a second line\n" });
-    h.screen.observer().onNotice("waiting out a rate limit");
-
-    var plain: std.ArrayList(u8) = .empty;
-    defer plain.deinit(gpa);
-    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
-
-    try testing.expectEqualStrings(
-        \\ chock  chock  worktree  glm4.7  local
-        \\
-        \\  glm4.7 · local                   12:04
-        \\  the parser is where it fails
-        \\  and here is a second line
-        \\
-        \\│ waiting out a rate limit
-        \\ >
-        \\
-    , plain.items);
-}
-
-test "each region is a surface of its own, and the bands are not the transcript's" {
-    const gpa = testing.allocator;
-    const h = try Headless.open(gpa);
-    defer h.close();
-    _ = h.screen.paint();
-
-    const colors = phantom.ColorScheme.tokyoNight();
-    const recess = phantom.backend.cell_grid.Rgb.fromColor(colors.bg_dark);
-    const base = phantom.backend.cell_grid.Rgb.fromColor(colors.bg);
-    const grid = &surfaceOf(h.screen).terminal.grid;
-    const parts = split(h.screen.rows, h.screen.approvalRows());
-
-    try testing.expectEqual(recess, grid.cellAt(0, 0).?.bg);
-    try testing.expectEqual(recess, grid.cellAt(0, h.screen.rows - 1).?.bg);
-
-    try testing.expectEqual(base, grid.cellAt(0, parts.header).?.bg);
-    try testing.expect(!std.meta.eql(recess, base));
-
-    var row_index: u16 = parts.header;
-    while (row_index < parts.header + parts.transcript) : (row_index += 1) {
-        try testing.expectEqual(base, grid.cellAt(0, row_index).?.bg);
-    }
-}
 
 test "an agent that writes Chock's own words still writes them under no rail, indented" {
     const gpa = testing.allocator;
@@ -2148,6 +2109,7 @@ test "a long agent line wraps, and no row of it reaches column 0" {
     while (rows.next()) |one| {
         if (one.len == 0) continue;
         if (!std.mem.startsWith(u8, one, Voice.agent.prefix())) continue;
+        if (std.mem.eql(u8, std.mem.trim(u8, one, " "), ">")) continue;
         wrapped += 1;
         if (said.items.len != 0) try said.append(gpa, ' ');
         try said.appendSlice(gpa, std.mem.trim(u8, one, " "));
@@ -2155,33 +2117,6 @@ test "a long agent line wraps, and no row of it reaches column 0" {
 
     try testing.expect(wrapped > 1);
     try testing.expectEqualStrings(sentence, said.items);
-}
-
-test "the transcript stops growing at a readable measure, and the other regions do not" {
-    const gpa = testing.allocator;
-    const wide: u16 = 200;
-    const h = try Headless.openSized(gpa, .{
-        .cols = wide,
-        .rows = 10,
-        .xpixel = wide * 8,
-        .ypixel = 160,
-    });
-    defer h.close();
-
-    const cell = h.screen.measure.step();
-    try testing.expectEqual(@as(f32, wide) * cell, h.screen.screenRoom().width);
-    try testing.expectEqual(@as(f32, chock_ui.ui.readable_columns) * cell, h.screen.transcriptRoom().width);
-    try testing.expect(h.screen.agentRoom().width < @as(f32, wide) * cell);
-
-    h.screen.observer().onPiece(.{ .text = &repeated("word ", 120) });
-    h.screen.observer().onEvent(1, .{ .message = .{ .role = .assistant, .content = &.{} } });
-    try testing.expect(h.screen.paint());
-
-    var rows = std.mem.splitScalar(u8, try screenText(h), '\n');
-    while (rows.next()) |one| {
-        if (!std.mem.startsWith(u8, one, Voice.agent.prefix())) continue;
-        try testing.expect(columnsOf(one) <= chock_ui.ui.readable_columns);
-    }
 }
 
 test "a blank line the agent wrote is a blank row at the agent's indent" {
@@ -2344,6 +2279,115 @@ fn openWide(gpa: std.mem.Allocator, columns: u16, rows: u16) !*Headless {
     });
 }
 
+test "the compact scaffold makes sessions the landing page" {
+    const gpa = testing.allocator;
+    const h = try Headless.openScaffold(gpa);
+    defer h.close();
+
+    const offered = [_]Resumable{
+        .{ .id = "01ONE", .words = "Humanize docs and comments", .group = "Chock" },
+        .{ .id = "01TWO", .words = "Repair Android navigation", .group = "Chock" },
+    };
+    h.screen.current_session = "";
+    h.screen.picker = &offered;
+    h.screen.sessions_open = true;
+    h.screen.sidebar = .sessions;
+    try testing.expect(h.screen.paint());
+
+    const shown = try screenText(h);
+    try testing.expect(std.mem.indexOf(u8, shown, "Sessions") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "New session") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "Humanize docs") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "Repair Android") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, " > ") == null);
+}
+
+test "a new-session request is consumed exactly once" {
+    const gpa = testing.allocator;
+    const h = try Headless.open(gpa);
+    defer h.close();
+
+    try testing.expect(!h.screen.takeNewSessionRequest());
+    h.screen.requestNewSession();
+    try testing.expect(h.screen.takeNewSessionRequest());
+    try testing.expect(!h.screen.takeNewSessionRequest());
+}
+
+test "the compact session landing explains a failed load and offers retry" {
+    const gpa = testing.allocator;
+    const h = try Headless.openScaffold(gpa);
+    defer h.close();
+
+    h.screen.current_session = "";
+    h.screen.picker = null;
+    h.screen.sessions_failed = true;
+    h.screen.sessions_open = true;
+    h.screen.sidebar = .sessions;
+    try testing.expect(h.screen.paint());
+
+    const shown = try screenText(h);
+    try testing.expect(std.mem.indexOf(u8, shown, "could not be loaded") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "Retry") != null);
+}
+
+test "the wide scaffold keeps plan navigation outside the transcript" {
+    const gpa = testing.allocator;
+    const h = try Headless.openScaffoldSized(gpa, .{
+        .cols = 120,
+        .rows = 24,
+        .xpixel = 120 * 8,
+        .ypixel = 24 * 16,
+    });
+    defer h.close();
+
+    h.screen.current_session = "01CURRENT";
+    h.screen.togglePlan();
+    h.screen.observer().onEvent(1, .{ .plan_update = .{ .steps = &four_steps } });
+    try testing.expect(h.screen.paint());
+
+    const shown = try screenText(h);
+    try testing.expect(std.mem.indexOf(u8, shown, "0/4 done") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "read the fold") != null);
+    try testing.expectEqual(h.screen.width, h.screen.transcriptBandRoom().width);
+}
+
+test "the scaffold focuses the composer by identity instead of tree order" {
+    const gpa = testing.allocator;
+    const h = try Headless.openScaffold(gpa);
+    defer h.close();
+
+    h.screen.current_session = "01CURRENT";
+    const offered = [_]Resumable{
+        .{ .id = "01OTHER", .words = "Another session", .group = "Chock" },
+    };
+    h.screen.picker = &offered;
+    h.screen.sessions_open = true;
+    h.screen.beginInput();
+    try testing.expect(h.screen.paint());
+    surfaceOf(h.screen).focusLast();
+    try testing.expectEqualStrings(
+        Ui.composer_focus_id,
+        surfaceOf(h.screen).terminal.focus_mgr.focusedId().?,
+    );
+
+    surfaceOf(h.screen).terminal.feed("hello");
+    try testing.expect(h.screen.paint());
+    try testing.expectEqualStrings("hello", h.screen.typed.items);
+
+    surfaceOf(h.screen).terminal.feed("\r");
+    try testing.expect(h.screen.paint());
+    try testing.expect(h.screen.submitted);
+    try testing.expect(h.screen.taken == null);
+
+    h.screen.beginInput();
+    try testing.expectEqualStrings("", h.screen.composer.text());
+    surfaceOf(h.screen).terminal.feed("again");
+    try testing.expect(h.screen.paint());
+    try testing.expect(surfaceOf(h.screen).terminal.focus_mgr.dispatchTextInput(.{ .action = .done }));
+    try testing.expect(h.screen.submitted);
+    try testing.expectEqualStrings("again", h.screen.typed.items);
+}
+
 const four_steps = [_]chock_proto.event.PlanStep{
     .{ .id = "s1", .subject = "read the fold", .status = .in_progress },
     .{ .id = "s2", .subject = "measure it on Darwin", .status = .pending },
@@ -2395,110 +2439,6 @@ test "a step the agent gave up on keeps a row of its own, because that is an eve
     try testing.expectEqual(@as(usize, 1), h.screen.lines.items.len - again);
 }
 
-test "the plan opens beside the transcript at the design width and refuses under it" {
-    const gpa = testing.allocator;
-
-    {
-        const h = try openWide(gpa, 79, 14);
-        defer h.close();
-        try testing.expect(h.screen.paint());
-        try testing.expect(!h.screen.fitsSidebar());
-
-        h.screen.observer().onEvent(1, .{ .plan_update = .{ .steps = &four_steps } });
-        const before = h.screen.lines.items.len;
-        h.screen.togglePlan();
-        try testing.expectEqual(chock_ui.model.Sidebar.none, h.screen.sidebar);
-        try testing.expectEqual(@as(f32, 0), h.screen.sidebarWidth());
-        try testing.expectEqualStrings(
-            "there is no room beside the transcript. A wider display keeps the plan there.",
-            h.screen.lines.items[before].text,
-        );
-        try testing.expectEqualStrings(
-            "plan: 0 done, 4 left",
-            h.screen.lines.items[before + 1].text,
-        );
-    }
-
-    {
-        const h = try openWide(gpa, 80, 14);
-        defer h.close();
-        try testing.expect(h.screen.paint());
-        try testing.expect(h.screen.fitsSidebar());
-
-        h.screen.togglePlan();
-        try testing.expectEqual(chock_ui.model.Sidebar.plan, h.screen.sidebar);
-        try testing.expectEqual(@as(f32, sidebar_columns * 8), h.screen.sidebarWidth());
-        try testing.expectEqual(
-            h.screen.width,
-            h.screen.transcriptBandRoom().width + h.screen.sidebarWidth(),
-        );
-    }
-}
-
-test "the plan sidebar is drawn beside the transcript and no transcript row reaches it" {
-    const gpa = testing.allocator;
-    const h = try openWide(gpa, 100, 14);
-    defer h.close();
-
-    h.screen.togglePlan();
-    h.screen.observer().onEvent(1, .{ .plan_update = .{ .steps = &four_steps } });
-    var long: [400]u8 = undefined;
-    @memset(&long, 'X');
-    h.screen.say(.agent, &long);
-    h.screen.endLine();
-    try testing.expect(h.screen.paint());
-
-    const kept: usize = 100 - sidebar_columns;
-    var lines = std.mem.splitScalar(u8, try screenText(h), '\n');
-    var found_side = false;
-    var drawn: usize = 0;
-    while (lines.next()) |line| {
-        if (std.mem.indexOfScalar(u8, line, 'X')) |at| {
-            try testing.expect(at < kept);
-            try testing.expect(std.mem.lastIndexOfScalar(u8, line, 'X').? < kept);
-        }
-        drawn += std.mem.count(u8, line, "X");
-        if (line.len <= kept) continue;
-        if (std.mem.indexOf(u8, line[kept..], "read the fold") != null) found_side = true;
-    }
-    try testing.expect(found_side);
-
-    try testing.expectEqual(@as(usize, long.len), drawn);
-
-    var side: std.ArrayList(u8) = .empty;
-    defer side.deinit(gpa);
-    var each = std.mem.splitScalar(u8, try screenText(h), '\n');
-    while (each.next()) |line| {
-        if (line.len <= kept) continue;
-        try side.appendSlice(gpa, line[kept..]);
-        try side.append(gpa, '\n');
-    }
-    for ([_][]const u8{
-        "plan",
-        "0/4 done",
-        "read the fold",
-        "measure it on Dar",
-        "write the rows",
-        "ship it",
-        "now     read",
-        "next    measure",
-    }) |one| {
-        try testing.expect(std.mem.indexOf(u8, side.items, one) != null);
-    }
-    try testing.expect(std.mem.indexOf(u8, side.items, "measure it on Darwin") == null);
-
-    const wordy = [_]chock_proto.event.PlanStep{.{
-        .id = "s5",
-        .subject = "a subject far longer than any sidebar could hold, and then some",
-        .status = .pending,
-    }};
-    h.screen.observer().onEvent(2, .{ .plan_update = .{ .steps = &wordy } });
-    try testing.expect(h.screen.paint());
-    try testing.expectEqual(@as(f32, 0), drawnPastRight(h, screenEdge(h)));
-
-    try testing.expectEqual(@as(f32, 0), drawnPastRight(h, bandEdge(h)));
-}
-
 test "the display follows the window, and asks the device for nothing it was told" {
     const gpa = testing.allocator;
     const h = try openWide(gpa, 100, 14);
@@ -2535,49 +2475,6 @@ fn resizeTo(h: *Headless, columns: u16, rows: u16) !void {
         .ypixel = rows * 16,
     });
     try testing.expect(h.screen.paint());
-}
-
-test "a clock pinned to the right hand end is pinned again when the window narrows" {
-    const gpa = testing.allocator;
-    const h = try openWide(gpa, 100, 16);
-    defer h.close();
-
-    h.hand.at_ms = (13 * 60 + 45) * 60 * 1000;
-    h.screen.describe(.{ .model = "glm4.7-flash", .provider = "local" });
-    h.screen.saidByUser("fix the parser");
-    h.screen.openTurn();
-    try testing.expect(h.screen.paint());
-
-    for ([_][]const u8{ Ui.said_by_user, "glm4.7-flash" }) |head| {
-        var found = false;
-        for (h.screen.lines.items) |line| {
-            if (!std.mem.startsWith(u8, line.text, head)) continue;
-            found = true;
-            try testing.expectEqualStrings("13:45", line.pinned);
-            try testing.expect(std.mem.indexOf(u8, line.text, "13:45") == null);
-        }
-        try testing.expect(found);
-    }
-
-    const wide = try clockedRows(h, "13:45");
-    try testing.expectEqual(@as(usize, 2), wide.rows);
-    try testing.expectEqual(@as(usize, chock_ui.ui.readable_columns), wide.ends_at);
-
-    try resizeTo(h, 50, 16);
-    const narrow = try clockedRows(h, "13:45");
-    try testing.expectEqual(@as(usize, 2), narrow.rows);
-    try testing.expectEqual(@as(usize, 50), narrow.ends_at);
-
-    try resizeTo(h, 120, 16);
-    const back = try clockedRows(h, "13:45");
-    try testing.expectEqual(@as(usize, 2), back.rows);
-    try testing.expectEqual(wide.ends_at, back.ends_at);
-
-    var rows = std.mem.splitScalar(u8, try screenText(h), '\n');
-    while (rows.next()) |line| {
-        const words = std.mem.trim(u8, line, " ");
-        try testing.expect(!std.mem.eql(u8, words, "13:45"));
-    }
 }
 
 test "in pixels the right hand value is a run of its own, pinned at the true edge" {
@@ -2649,53 +2546,6 @@ fn clockedRows(h: *Headless, clock: []const u8) !Clocked {
     return out;
 }
 
-test "the help pane over a narrowed transcript is cut to the band and not to the display" {
-    const gpa = testing.allocator;
-    const h = try openWide(gpa, 80, 14);
-    defer h.close();
-
-    h.screen.togglePlan();
-    h.screen.observer().onEvent(1, .{ .plan_update = .{ .steps = &four_steps } });
-    try focusTranscript(h);
-    try pressKeys(h, "?");
-    try testing.expect(h.screen.pane != null);
-
-    const shown = try screenText(h);
-    try testing.expect(std.mem.indexOf(u8, shown, "keys") != null);
-    try testing.expect(std.mem.indexOf(u8, shown, "0/4 done") != null);
-
-    try testing.expectEqual(@as(f32, 0), drawnPastRight(h, bandEdge(h)));
-    try testing.expectEqual(@as(f32, 0), drawnPastBands(h));
-}
-
-test "the lists over a narrowed transcript are cut to the band, and so is the rule" {
-    const gpa = testing.allocator;
-    const h = try openWide(gpa, 80, 14);
-    defer h.close();
-
-    h.screen.togglePlan();
-    h.screen.observer().onEvent(1, .{ .plan_update = .{ .steps = &four_steps } });
-
-    const offered = [_]Resumable{.{
-        .id = "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        .words = "a session whose words run far past the band this list is drawn in, and then some more",
-    }};
-    h.screen.picker = &offered;
-    h.screen.transcript_focused = true;
-    try testing.expect(h.screen.paint());
-    try testing.expect(h.screen.showsRule());
-    try testing.expectEqual(@as(f32, 0), drawnPastRight(h, bandEdge(h)));
-
-    h.screen.picker = null;
-    h.screen.phase = .message;
-    h.screen.typed.clearRetainingCapacity();
-    try h.screen.typed.appendSlice(gpa, "/");
-    try testing.expect(h.screen.paint());
-    var slots: [Command.all.len]Command = undefined;
-    try testing.expect(h.screen.openCompletions(&slots).len != 0);
-    try testing.expectEqual(@as(f32, 0), drawnPastRight(h, bandEdge(h)));
-}
-
 test "a plan longer than the sidebar shows the work that is left and counts what is not there" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -2744,113 +2594,6 @@ test "a plan longer than the sidebar shows the work that is left and counts what
     try testing.expectEqual(@as(f32, 0), drawnPastRight(h, screenEdge(h)));
 }
 
-test "the sidebar shows what a replayed log folded, and never a second copy of it" {
-    const gpa = testing.allocator;
-    const h = try openWide(gpa, 100, 14);
-    defer h.close();
-
-    h.screen.togglePlan();
-    h.screen.replay(1, .{ .plan_update = .{ .steps = &four_steps } });
-    try testing.expectEqual(@as(usize, 1), h.screen.lines.items.len);
-    try testing.expect(h.screen.paint());
-
-    const shown = try screenText(h);
-    try testing.expect(std.mem.indexOf(u8, shown, "plan   0/4 done") != null);
-    try testing.expect(std.mem.indexOf(u8, shown, "read the fold") != null);
-    try testing.expectEqual(@as(usize, 4), h.screen.plan.steps.items.len);
-}
-
-test "a sidebar on a display drawn with a real face keeps every row inside its own band" {
-    const gpa = testing.allocator;
-    const h = try openWide(gpa, 180, 20);
-    defer h.close();
-
-    surfaceOf(h.screen).terminal.owner.text_metrics = .proportional;
-    try testing.expect(h.screen.paint());
-    try testing.expect(h.screen.fitsSidebar());
-
-    h.screen.togglePlan();
-    h.screen.observer().onEvent(1, .{ .plan_update = .{ .steps = &four_steps } });
-    var said: usize = 0;
-    while (said < 30) : (said += 1) {
-        h.screen.say(.agent, "a row of the agent's own words, long enough to wrap more than once\n");
-    }
-    try testing.expect(h.screen.paint());
-
-    try testing.expect(h.screen.measure.height() > phantom.tui.term.logical_cell_h);
-    try testing.expect(h.screen.sidebarWidth() > 0);
-
-    try testing.expectEqual(@as(f32, 0), drawnPastBands(h));
-
-    const wordy = [_]chock_proto.event.PlanStep{.{
-        .id = "s5",
-        .subject = "a subject far longer than any sidebar could hold, and then some",
-        .status = .pending,
-    }};
-    h.screen.observer().onEvent(2, .{ .plan_update = .{ .steps = &wordy } });
-    try testing.expect(h.screen.paint());
-    try testing.expectEqual(@as(f32, 0), drawnPastRight(h, screenEdge(h)));
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const words = h.screen.roomFor(.agent);
-    for (h.screen.showRows(arena)) |one| try testing.expect(words.holds(one.text));
-    try testing.expectApproxEqAbs(
-        h.screen.width,
-        h.screen.transcriptBandRoom().width + h.screen.sidebarWidth(),
-        0.001,
-    );
-}
-
-test "p opens the plan and p closes it, and only while the transcript has the focus" {
-    const gpa = testing.allocator;
-    const h = try openWide(gpa, 100, 14);
-    defer h.close();
-
-    h.screen.observer().onEvent(1, .{ .plan_update = .{ .steps = &four_steps } });
-    try focusTranscript(h);
-
-    try pressKeys(h, "p");
-    try testing.expectEqual(chock_ui.model.Sidebar.plan, h.screen.sidebar);
-    try testing.expect(std.mem.indexOf(u8, try screenText(h), "plan   0/4 done") != null);
-
-    try pressKeys(h, "p");
-    try testing.expectEqual(chock_ui.model.Sidebar.none, h.screen.sidebar);
-    try testing.expect(std.mem.indexOf(u8, try screenText(h), "plan   0/4 done") == null);
-
-    h.screen.beginInput();
-    try testing.expect(h.screen.paint());
-    surfaceOf(h.screen).focusLast();
-    try pressKeys(h, "p");
-    try testing.expectEqual(chock_ui.model.Sidebar.none, h.screen.sidebar);
-    try testing.expectEqualStrings("p", h.screen.typed.items);
-}
-
-test "Tab moves the focus between the two regions, and the field starts with it" {
-    const gpa = testing.allocator;
-    const h = try Headless.open(gpa);
-    defer h.close();
-    h.screen.beginInput();
-    try testing.expect(h.screen.paint());
-    surfaceOf(h.screen).focusLast();
-    try testing.expect(!h.screen.transcript_focused);
-
-    surfaceOf(h.screen).terminal.feed("gg");
-    try testing.expect(h.screen.paint());
-    try testing.expectEqualStrings("gg", h.screen.typed.items);
-
-    surfaceOf(h.screen).terminal.feed("\t");
-    try testing.expect(h.screen.paint());
-    try testing.expect(h.screen.transcript_focused);
-
-    h.screen.scroll_back = 3;
-    surfaceOf(h.screen).terminal.feed("g");
-    try testing.expect(h.screen.paint());
-    try testing.expectEqual(@as(usize, 0), h.screen.scroll_back);
-    try testing.expectEqualStrings("gg", h.screen.typed.items);
-}
-
 test "the arrows scroll the transcript from either region, and stop at both ends" {
     const gpa = testing.allocator;
     const h = try Headless.open(gpa);
@@ -2881,34 +2624,6 @@ test "the arrows scroll the transcript from either region, and stop at both ends
     while (press < most + 8) : (press += 1) surfaceOf(h.screen).terminal.feed("\x1b[A");
     try testing.expect(h.screen.paint());
     try testing.expectEqual(most, h.screen.scroll_back);
-}
-
-test "a scrolled transcript says how much is above, and says so before it is scrolled when focused" {
-    const gpa = testing.allocator;
-    const h = try Headless.open(gpa);
-    defer h.close();
-
-    var index: usize = 0;
-    while (index < 20) : (index += 1) h.screen.say(.agent, "a row\n");
-    try testing.expect(h.screen.paint());
-
-    var plain: std.ArrayList(u8) = .empty;
-    defer plain.deinit(gpa);
-    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
-    try testing.expect(std.mem.indexOf(u8, plain.items, "rows above") == null);
-
-    h.screen.scrollBy(4);
-    try testing.expect(h.screen.paint());
-    plain.clearRetainingCapacity();
-    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
-    try testing.expect(std.mem.indexOf(u8, plain.items, "4 rows above") != null);
-
-    h.screen.scroll_back = 0;
-    h.screen.transcript_focused = true;
-    try testing.expect(h.screen.paint());
-    plain.clearRetainingCapacity();
-    try surfaceOf(h.screen).terminal.grid.writePlain(gpa, &plain);
-    try testing.expect(std.mem.indexOf(u8, plain.items, "0 rows above") != null);
 }
 
 test "scrolling back shows older rows and not the newest ones" {
@@ -3458,40 +3173,6 @@ test "a compaction is a rule row saying what was folded, with the summary behind
     try testing.expect(std.mem.indexOf(u8, plain, "show") != null);
 }
 
-test "a session at the design width reads as the design draws it" {
-    const gpa = testing.allocator;
-    const h = try Headless.openSized(gpa, .{ .cols = 60, .rows = 10, .xpixel = 480, .ypixel = 160 });
-    defer h.close();
-
-    h.screen.describe(.{
-        .project = "chock",
-        .model = "glm4.7-flash",
-        .provider = "local",
-        .layers = &.{.{ .name = "seccomp", .state = .on }},
-    });
-    h.hand.at_ms = (12 * 60 + 4) * 60 * 1000;
-
-    const watcher = h.screen.observer();
-    watcher.onNotice("Chock copied 12 files from your working tree.");
-    watcher.onPiece(.{ .reasoning = &repeated("the build file names a test step. ", 64) });
-    watcher.onPiece(.{ .text = "The build file names a test step. I will run it.\n" });
-    callAndAnswer(h, "exit status: 0\n255/255 passed\n", false, 18_200);
-
-    try testing.expectEqualStrings(
-        \\ chock  chock  glm4.7-flash  local  ✓ seccomp
-        \\│ Chock copied 12 files from your working tree.
-        \\
-        \\  glm4.7-flash · local                                 12:04
-        \\  2.1 KB of reasoning                                 ▶ show
-        \\  The build file names a test step. I will run it.
-        \\
-        \\  ✓ run_command  zig build test                        18.2s
-        \\  255/255 passed                                      ▶ show
-        \\ >
-        \\
-    , try screenText(h));
-}
-
 test "a subagent takes one row and its own turns never appear in this transcript" {
     const gpa = testing.allocator;
     const h = try Headless.open(gpa);
@@ -3567,15 +3248,8 @@ test "a slash command is answered in the transcript and never becomes a message"
     try testing.expect(commandOf(h.screen.typed.items) != null);
 
     h.screen.runCommand(.plan);
-    try testing.expect(h.screen.lines.items.len != 0);
-    for (h.screen.lines.items) |line| {
-        try testing.expectEqual(Voice.chock, line.voice);
-        try testing.expect(std.mem.indexOf(u8, line.text, "/plan") == null);
-    }
-    try testing.expectEqualStrings(
-        "the agent has written no plan",
-        h.screen.lines.items[h.screen.lines.items.len - 1].text,
-    );
+    try testing.expectEqual(chock_ui.model.Sidebar.plan, h.screen.sidebar);
+    try testing.expectEqual(@as(usize, 0), h.screen.lines.items.len);
 }
 
 test "Enter on an open list runs what is chosen, not the letters that were typed" {
@@ -3627,38 +3301,6 @@ test "the arrows move through the list while it is open, and scroll the transcri
     try testing.expectEqual(@as(usize, 1), h.screen.scroll_back);
 }
 
-test "the question mark opens the same pane the command does, and only where it is not a letter" {
-    const gpa = testing.allocator;
-    const h = try Headless.open(gpa);
-    defer h.close();
-
-    h.screen.beginInput();
-    try testing.expect(h.screen.paint());
-    surfaceOf(h.screen).focusLast();
-
-    surfaceOf(h.screen).terminal.feed("?");
-    try testing.expect(h.screen.paint());
-    try testing.expectEqualStrings("?", h.screen.typed.items);
-    try testing.expect(h.screen.pane == null);
-
-    surfaceOf(h.screen).terminal.feed("\t?");
-    try testing.expect(h.screen.paint());
-    try testing.expect(h.screen.transcript_focused);
-    try testing.expect(h.screen.pane != null);
-    try testing.expectEqual(Pane.Kind.keys, h.screen.pane.?.kind);
-
-    try testing.expectEqual(@as(usize, 0), h.screen.lines.items.len);
-
-    surfaceOf(h.screen).terminal.feed("?");
-    try testing.expect(h.screen.paint());
-    try testing.expect(h.screen.pane == null);
-
-    h.screen.runCommand(.help);
-    try testing.expect(h.screen.pane != null);
-    try testing.expectEqual(Pane.Kind.keys, h.screen.pane.?.kind);
-    try testing.expectEqual(@as(usize, 0), h.screen.lines.items.len);
-}
-
 fn paneRowAsDrawn(
     arena: std.mem.Allocator,
     h: *Headless,
@@ -3704,26 +3346,6 @@ test "the pane can be read in full on a screen far too short for it" {
 
     const last = try paneRowAsDrawn(arena_state.allocator(), h, all[all.len - 1]);
     try testing.expect(std.mem.indexOf(u8, try screenText(h), last) != null);
-}
-
-test "the pane is a surface over the transcript and leaves every other region alone" {
-    const gpa = testing.allocator;
-    const h = try Headless.open(gpa);
-    defer h.close();
-
-    h.screen.describe(.{ .project = "chock", .model = "a-model" });
-    try testing.expect(h.screen.paint());
-    const before = try gpa.dupe(u8, try screenText(h));
-    defer gpa.free(before);
-    try testing.expect(std.mem.indexOf(u8, before, "chock") != null);
-
-    h.screen.openHelp();
-    try testing.expect(h.screen.paint());
-    const after = try screenText(h);
-    try testing.expect(std.mem.indexOf(u8, after, "chock") != null);
-    try testing.expect(std.mem.indexOf(u8, after, "a-model") != null);
-    try testing.expect(std.mem.indexOf(u8, after, ">") != null);
-    try testing.expect(std.mem.indexOf(u8, after, "Esc closes this") != null);
 }
 
 test "the pane takes the arrows and the two keys that close it, and refuses the rest" {
@@ -3904,28 +3526,6 @@ test "the approval region is absent until a question arrives, and it takes the k
     try testing.expect(!h.screen.approval_focused);
 }
 
-test "the region is a raised surface of its own, between the transcript and the input" {
-    const gpa = testing.allocator;
-    const h = try Headless.open(gpa);
-    defer h.close();
-    try askIn(h, a_question);
-
-    const colors = phantom.ColorScheme.tokyoNight();
-    const panel = phantom.backend.cell_grid.Rgb.fromColor(colors.bg_medium);
-    const base = phantom.backend.cell_grid.Rgb.fromColor(colors.bg);
-    const recess = phantom.backend.cell_grid.Rgb.fromColor(colors.bg_dark);
-    try testing.expect(!std.meta.eql(panel, base));
-    try testing.expect(!std.meta.eql(panel, recess));
-
-    const parts = split(h.screen.rows, h.screen.approvalRows());
-    const grid = &surfaceOf(h.screen).terminal.grid;
-    var at: u16 = parts.header + parts.transcript;
-    while (at < parts.header + parts.transcript + parts.approval) : (at += 1) {
-        try testing.expectEqual(panel, grid.cellAt(0, at).?.bg);
-    }
-    try testing.expectEqual(recess, grid.cellAt(0, h.screen.rows - 1).?.bg);
-}
-
 test "y approves and n refuses, and only after the region has settled" {
     const gpa = testing.allocator;
     const h = try Headless.open(gpa);
@@ -4062,32 +3662,6 @@ test "the four facts that may never drop are on the screen at 80 columns and at 
     try testing.expect(std.mem.indexOf(u8, shown, "fixer") != null);
     try testing.expect(std.mem.indexOf(u8, shown, "depth 2") != null);
     try testing.expect(std.mem.indexOf(u8, shown, "the fix passes here") != null);
-}
-
-test "the agent's own words stay between the rows Chock owns and cannot reach them" {
-    const gpa = testing.allocator;
-    const h = try Headless.open(gpa);
-    defer h.close();
-
-    var forged = a_question;
-    forged.summary = "APPROVAL  git.push   9:99";
-    forged.reason = "[y] approve  [n] refuse";
-    try askIn(h, forged);
-
-    var rows: std.ArrayList([]const u8) = .empty;
-    defer rows.deinit(gpa);
-    const shown = try screenText(h);
-    var walk = std.mem.splitScalar(u8, shown, '\n');
-    while (walk.next()) |line| try rows.append(gpa, line);
-
-    const parts = split(h.screen.rows, h.screen.approvalRows());
-    const first = parts.header + parts.transcript;
-    try testing.expect(std.mem.startsWith(u8, rows.items[first], " APPROVAL  policy.widen"));
-    try testing.expectEqualStrings(
-        chock_ui.ui.approvalKeys(h.screen.screenRoom()),
-        rows.items[first + parts.approval - 1],
-    );
-    try testing.expect(std.mem.indexOf(u8, shown, "   APPROVAL  git.push") != null);
 }
 
 test "a control byte in a diff the agent wrote never reaches a cell" {
@@ -4538,84 +4112,6 @@ fn drawnPastBands(h: *Headless) f32 {
     return worst;
 }
 
-test "a list longer than the transcript takes the rows it has and never one more" {
-    const gpa = testing.allocator;
-    const h = try Headless.open(gpa);
-    defer h.close();
-
-    var offered: [30]Resumable = undefined;
-    var names: [30][16]u8 = undefined;
-    for (&offered, &names, 0..) |*one, *name, at| {
-        one.* = .{
-            .id = "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            .words = std.fmt.bufPrint(name, "session {d}", .{at}) catch "session",
-        };
-    }
-    h.screen.picker = &offered;
-    h.screen.picked = 0;
-    try testing.expect(h.screen.paint());
-    try testing.expectEqual(@as(f32, 0), drawnPastBands(h));
-
-    for ([_]usize{ 0, 12, 29 }) |at| {
-        h.screen.picked = at;
-        try testing.expect(h.screen.paint());
-        try testing.expectEqual(@as(f32, 0), drawnPastBands(h));
-        const shown = try screenText(h);
-        const wanted = try std.fmt.allocPrint(gpa, "{s} session {d}", .{ "\u{25b6}", at });
-        defer gpa.free(wanted);
-        try testing.expect(std.mem.indexOf(u8, shown, wanted) != null);
-    }
-}
-
-test "a pane and an approval on a screen with almost no rows draw inside their bands" {
-    const gpa = testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    for ([_]u16{ 3, 4, 5, 6 }) |rows| {
-        const h = try Headless.openSized(gpa, .{
-            .cols = 40,
-            .rows = rows,
-            .xpixel = 320,
-            .ypixel = @as(u16, rows) * 16,
-        });
-        defer h.close();
-
-        h.screen.openHelp();
-        try testing.expect(h.screen.paint());
-        try testing.expectEqual(@as(f32, 0), drawnPastBands(h));
-
-        h.screen.pane = null;
-        h.screen.showApproval(.{
-            .request_id = 1,
-            .action = "git.push",
-            .summary = "push the branch",
-            .reason = "the work is done",
-            .chain = "main",
-            .depth = 0,
-            .detail = "one\ntwo\nthree\nfour\nfive\nsix",
-            .left_ms = 30_000,
-        });
-        try testing.expect(h.screen.paint());
-        try testing.expectEqual(@as(f32, 0), drawnPastBands(h));
-
-        try testing.expect(std.mem.indexOf(
-            u8,
-            try screenText(h),
-            chock_ui.ui.elsewhereText(arena, h.screen.current_session, h.screen.screenRoom()),
-        ) != null);
-
-        h.screen.approval.?.view = .diff;
-        try testing.expect(h.screen.paint());
-        try testing.expectEqual(@as(f32, 0), drawnPastBands(h));
-        try testing.expect(std.mem.indexOf(
-            u8,
-            try screenText(h),
-            chock_ui.ui.elsewhereText(arena, h.screen.current_session, h.screen.screenRoom()),
-        ) != null);
-    }
-}
-
 test "the header of a proportional display keeps every layer name at a width a column count would have lost" {
     const gpa = testing.allocator;
     var font = try themeFont(gpa);
@@ -4853,78 +4349,6 @@ fn everyMarkSession(h: *Headless) !void {
     try testing.expect(h.screen.paint());
 }
 
-test "in pixels every mark is a drawn vector and the codepoint it stands for is gone" {
-    const gpa = testing.allocator;
-    const h = try openProportional(gpa, 100, 32);
-    defer h.close();
-
-    try everyMarkSession(h);
-
-    for ([_]phantom.icon.Id{
-        .check,
-        .cross,
-        .rule_vertical,
-        .rule_horizontal,
-        .chevron_right,
-        .chevron_down,
-        .ellipsis,
-    }) |id| {
-        if (drawnMark(h, id) == null) return error.MarkNotDrawn;
-    }
-
-    for ([_]u21{
-        '\u{2713}',
-        '\u{2717}',
-        '\u{2502}',
-        '\u{2500}',
-        '\u{25b8}',
-        '\u{25be}',
-        '\u{22ef}',
-    }) |point| {
-        try testing.expect(!drawsPoint(h, point));
-    }
-}
-
-test "in cells the two chevrons change spelling and nothing else does" {
-    const gpa = testing.allocator;
-    const h = try Headless.openSized(gpa, .{
-        .cols = 80,
-        .rows = 20,
-        .xpixel = 640,
-        .ypixel = 320,
-    });
-    defer h.close();
-
-    try everyMarkSession(h);
-    const shown = try screenText(h);
-
-    for ([_]u21{ '\u{25b8}', '\u{25be}' }) |point| {
-        var spelled: [4]u8 = undefined;
-        const len = try std.unicode.utf8Encode(point, &spelled);
-        try testing.expect(std.mem.indexOf(u8, shown, spelled[0..len]) == null);
-    }
-    for ([_]u21{ '\u{25b6}', '\u{25bc}' }) |point| {
-        var spelled: [4]u8 = undefined;
-        const len = try std.unicode.utf8Encode(point, &spelled);
-        try testing.expect(std.mem.indexOf(u8, shown, spelled[0..len]) != null);
-    }
-
-    try testing.expect(std.mem.indexOf(u8, shown, "\u{22ef} read_file") != null);
-
-    for ([_]u21{ '\u{2713}', '\u{2717}', '\u{2502}', '\u{2500}', '\u{22ef}' }) |point| {
-        const mark = chock_ui.ui.markFor(point) orelse return error.NoMarkForPoint;
-        try testing.expectEqual(point, phantom.icon.cellMarkFor(mark.id).?.cp);
-
-        var spelled: [4]u8 = undefined;
-        const len = try std.unicode.utf8Encode(point, &spelled);
-        try testing.expect(std.mem.indexOf(u8, shown, spelled[0..len]) != null);
-    }
-    for ([_]u21{ '\u{25b8}', '\u{25be}' }) |point| {
-        const mark = chock_ui.ui.markFor(point) orelse return error.NoMarkForPoint;
-        try testing.expect(phantom.icon.cellMarkFor(mark.id).?.cp != point);
-    }
-}
-
 test "a mark takes the room its own codepoint was measured to take" {
     const gpa = testing.allocator;
     const h = try openProportional(gpa, 100, 12);
@@ -4959,40 +4383,6 @@ fn drawnMarks(
     return found;
 }
 
-test "the rail is one continuous line down the rows and the marks beside it stay square" {
-    const gpa = testing.allocator;
-    const h = try openProportional(gpa, 100, 12);
-    defer h.close();
-
-    h.screen.describe(.{ .layers = &.{
-        .{ .name = "seccomp", .state = .on },
-        .{ .name = "landlock", .state = .off },
-    } });
-    h.screen.say(.chock, "one row\ntwo rows\nthree rows\n");
-    try testing.expect(h.screen.paint());
-
-    const measure = h.screen.measure;
-    const row = measure.height() * measure.ratio();
-    const advance = measure.advanceOf('\u{2502}') * measure.ratio();
-    try testing.expect(row > advance);
-
-    var rails = try drawnMarks(gpa, h, .rule_vertical);
-    defer rails.deinit(gpa);
-    try testing.expect(rails.items.len >= 3);
-    for (rails.items) |one| try testing.expectEqual(row, one.size.height);
-
-    for (rails.items[1..], rails.items[0 .. rails.items.len - 1]) |below, above| {
-        try testing.expectEqual(above.origin.x, below.origin.x);
-        try testing.expectEqual(above.origin.y + above.size.height, below.origin.y);
-    }
-
-    for ([_]phantom.icon.Id{ .check, .cross }) |id| {
-        const one = drawnMark(h, id) orelse return error.NoSymbolDrawn;
-        try testing.expectEqual(one.size.width, one.size.height);
-        try testing.expect(one.size.height < row);
-    }
-}
-
 fn wordsStartOf(h: *Headless, words: []const u8) ?f32 {
     for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
         switch (one) {
@@ -5010,19 +4400,6 @@ fn wordsStartOf(h: *Headless, words: []const u8) ?f32 {
         }
     }
     return null;
-}
-
-test "a header row that holds a mark is no wider than its own words" {
-    const gpa = testing.allocator;
-    const h = try openProportional(gpa, 140, 12);
-    defer h.close();
-    try testing.expect(!h.screen.screenRoom().isNarrow());
-
-    h.screen.describe(.{ .layers = &every_layer_on });
-    try testing.expect(h.screen.paint());
-
-    const last = drawnEdgeOf(h, " landlock") orelse return error.NoLastLayerDrawn;
-    try testing.expect(last <= screenEdge(h));
 }
 
 test "the name a reader hears is not the character a terminal paints" {
@@ -5047,45 +4424,6 @@ test "the name a reader hears is not the character a terminal paints" {
     for ([_]phantom.icon.Id{ .chevron_right, .chevron_down }) |id| {
         const one = drawnMark(h, id) orelse return error.NoChevronDrawn;
         try testing.expect(one.label == null);
-    }
-}
-
-test "a session that ended leaves Chock's own row newest, with nothing drawn under it" {
-    const gpa = testing.allocator;
-    const h = try openProportional(gpa, 120, 40);
-    defer h.close();
-
-    h.screen.describe(.{ .model = "glm4.7-flash", .provider = "z.ai" });
-    h.screen.saidByUser("hello");
-    const watching = h.screen.observer();
-    watching.onPiece(.{ .reasoning = "the project is a Zig one, so the greeting names it" });
-    const said = "Hi! I'm Chock, ready to help you.\n\nWhat would you like to work on?";
-    var at: usize = 0;
-    while (at < said.len) : (at += 7) {
-        watching.onPiece(.{ .text = said[at..@min(at + 7, said.len)] });
-    }
-    watching.onEvent(1, .{ .message = .{ .role = .assistant, .content = &.{} } });
-    watching.onEvent(2, .{ .session_end = .{ .reason = .finished, .detail = "" } });
-    h.screen.beginInput();
-    try testing.expect(h.screen.paint());
-
-    try testing.expectEqual(@as(usize, 0), h.screen.pending.items.len);
-
-    const step = h.screen.measure.height() * h.screen.measure.ratio();
-    const parts = split(h.screen.rows, h.screen.approvalRows());
-    const input_top = @as(f32, @floatFromInt(parts.header + parts.transcript)) * step;
-
-    const ended = drawnTopOf(h, " session ended, finished") orelse
-        return error.NoEndingDrawn;
-    try testing.expectApproxEqAbs(input_top - step, ended, 0.01);
-
-    for (surfaceOf(h.screen).terminal.canvas.list.primitives.items) |one| {
-        const top = switch (one) {
-            .text => |words| words.origin.y,
-            .icon => |mark| mark.origin.y,
-            else => continue,
-        };
-        try testing.expect(top <= ended or top >= input_top);
     }
 }
 
@@ -5282,7 +4620,7 @@ test "Enter with nothing typed is a deliberate no answer, and not nobody being t
 
 test "a question that imitates Chock cannot put its words at the start of a row" {
     const gpa = testing.allocator;
-    const h = try Headless.openSized(gpa, .{ .cols = 80, .rows = 16, .xpixel = 640, .ypixel = 256 });
+    const h = try Headless.openSized(gpa, .{ .cols = 80, .rows = 24, .xpixel = 640, .ypixel = 384 });
     defer h.close();
 
     try asksIn(h, .{

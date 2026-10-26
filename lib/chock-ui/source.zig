@@ -157,6 +157,13 @@ pub const Source = struct {
             arena: std.mem.Allocator,
         ) Error![]const Session,
 
+        /// Make an empty session in the source's default project. Its first
+        /// prompt starts the turn. The returned identifier belongs to `arena`.
+        create: *const fn (
+            ptr: *anyopaque,
+            arena: std.mem.Allocator,
+        ) Error![]const u8,
+
         /// The events of one session after `at`. Answering an empty slice means
         /// nothing new, which is not an error.
         events: *const fn (
@@ -225,6 +232,10 @@ pub const Source = struct {
         return self.vtable.sessions(self.ptr, arena);
     }
 
+    pub fn create(self: Source, arena: std.mem.Allocator) Error![]const u8 {
+        return self.vtable.create(self.ptr, arena);
+    }
+
     pub fn events(
         self: Source,
         arena: std.mem.Allocator,
@@ -283,6 +294,7 @@ pub const empty: Source = .{
     .ptr = undefined,
     .vtable = &.{
         .sessions = emptySessions,
+        .create = emptyCreate,
         .events = emptyEvents,
         .asks = emptyAsks,
         .prompt = emptyPrompt,
@@ -298,6 +310,10 @@ pub const empty: Source = .{
 
 fn emptySessions(_: *anyopaque, _: std.mem.Allocator) Error![]const Session {
     return &.{};
+}
+
+fn emptyCreate(_: *anyopaque, arena: std.mem.Allocator) Error![]const u8 {
+    return arena.dupe(u8, "") catch error.OutOfMemory;
 }
 
 fn emptyEvents(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u64) Error![]const Entry {
@@ -331,6 +347,7 @@ fn emptyWhy(_: *anyopaque) ?[]const u8 {
 test "a source that reaches nothing answers empty rather than failing" {
     const arena = std.testing.allocator;
     try std.testing.expectEqual(@as(usize, 0), (try empty.sessions(arena)).len);
+    try std.testing.expectEqualStrings("", try empty.create(arena));
     try std.testing.expectEqual(@as(usize, 0), (try empty.events(arena, "01", 0)).len);
     try std.testing.expectEqual(@as(usize, 0), (try empty.asks(arena)).len);
     try empty.prompt("01", "hello");

@@ -287,19 +287,22 @@ const Shown = struct {
 
 const Screen = struct {
     ui: *Ui,
+    scaffold: bool = true,
 
     pub const State = struct {
         base: phantom.StateBase = .{},
         ui: ?*Ui = null,
+        scaffold: bool = true,
 
         pub fn initState(self: *State, config: *const Screen) !void {
             self.ui = config.ui;
+            self.scaffold = config.scaffold;
             config.ui.screen = self;
         }
 
         pub fn build(self: *State, ctx: *phantom.BuildContext) anyerror!phantom.Widget {
             const ui = self.ui orelse return ctx.new(phantom.Text{ .text = "" }).widget();
-            return ui.view(ctx);
+            return if (self.scaffold) ui.view(ctx) else ui.bodyView(ctx);
         }
     };
 };
@@ -309,6 +312,8 @@ pub const answer_prompt = " > ";
 pub const question_unanswerable = " nobody can answer here. The agent is told so when the time runs out.";
 
 pub const Ui = struct {
+    pub const composer_focus_id = "chock-composer";
+
     gpa: std.mem.Allocator,
     io: std.Io,
     inner: ?chock_core.Loop.Observer = null,
@@ -316,6 +321,7 @@ pub const Ui = struct {
 
     phase: Phase = .message,
     typed: std.ArrayList(u8) = .empty,
+    composer: phantom.TextFieldController = .{},
     submitted: bool = false,
     primed: ?[]const u8 = null,
 
@@ -323,6 +329,7 @@ pub const Ui = struct {
     completion_selected: usize = 0,
 
     picker: ?[]const model.Resumable = null,
+    sessions_failed: bool = false,
     picked: usize = 0,
     /// What a tap on a picker row carries. One per row and a field rather than
     /// a local, because a tap arrives after the frame that drew it is gone and
@@ -331,6 +338,9 @@ pub const Ui = struct {
     sessions_dir: []const u8 = "",
     current_session: []const u8 = "",
     taken: ?[]const u8 = null,
+    /// Set by the navigation action and consumed by the application wiring,
+    /// which owns the source capable of creating the session.
+    new_requested: bool = false,
     fork_requested: ?ForkRequest = null,
     review_requested: ?ReviewAction = null,
     review: ?source_mod.Review = null,
@@ -480,9 +490,29 @@ pub const Ui = struct {
     fn onMessageTap(ctx: *anyopaque) void {
         const tap: *MessageTap = @ptrCast(@alignCast(ctx));
         const self = tap.ui orelse return;
+        // Zero is the unwritten-envelope sentinel, never a log event offset.
+        if (tap.at == 0) return;
         self.fork_requested = .{ .at = tap.at };
         self.submitted = true;
         self.host.invalidate();
+    }
+
+    fn submitMessage(self: *Ui) void {
+        var slots: [model.Command.all.len]model.Command = undefined;
+        const listed = self.openCompletions(&slots);
+        if (listed.len != 0) {
+            const chosen = listed[@min(self.completion_selected, listed.len - 1)];
+            self.typed.clearRetainingCapacity();
+            self.typed.appendSlice(self.gpa, chosen.typed()) catch {};
+        }
+
+        self.submitted = true;
+        self.host.invalidate();
+    }
+
+    fn onMessageSubmit(ctx: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.submitMessage();
     }
 
     const Tap = struct {
@@ -687,44 +717,23 @@ pub const Ui = struct {
 
     pub fn togglePlan(self: *Ui) void {
         if (self.sidebar == .plan) {
-            self.sidebar = .none;
-            return;
-        }
-        if (!self.fitsSidebar()) {
-            self.sayFmt(
-                .chock,
-                "there is no room beside the transcript. A wider display keeps the plan there.",
-                .{},
-            );
-            self.sayPlan();
+            self.sidebar = .sessions;
+            self.sessions_open = true;
+            self.refreshSessions();
             return;
         }
         self.sessions_open = false;
         self.sidebar = .plan;
     }
 
-    /// Keep the other sessions beside the transcript, rather than over it.
-    ///
-    /// The same list the picker shows, in the band instead of the middle, so a
-    /// person reads one session and still sees the rest.
+    /// Show the session list in the application's navigation surface.
     pub fn toggleSessions(self: *Ui) void {
-        if (self.sessions_open) {
-            self.sessions_open = false;
-            self.sidebar = .none;
-            self.picker = null;
-            return;
-        }
         self.sessions_open = true;
-        if (!self.fitsSidebar()) {
-            self.openPicker();
-            return;
-        }
         self.sidebar = .sessions;
         self.refreshSessions();
     }
 
-    /// Open the responsive session list before the first layout has measured
-    /// the view. `resize` chooses its wide or narrow presentation.
+    /// Open the session navigation before the first layout has measured it.
     pub fn showSessions(self: *Ui) void {
         self.sessions_open = true;
         self.sidebar = .sessions;
@@ -734,7 +743,12 @@ pub const Ui = struct {
     /// Read the session list again, keeping whatever row was chosen.
     pub fn refreshSessions(self: *Ui) void {
         const was = self.picked;
-        const offered = self.host.resumables(self.arena.allocator(), self.current_session) orelse return;
+        const offered = self.host.resumables(self.arena.allocator(), self.current_session) orelse {
+            self.sessions_failed = true;
+            self.picker = null;
+            return;
+        };
+        self.sessions_failed = false;
         self.picker = offered;
         self.picked = if (offered.len == 0) 0 else @min(was, offered.len - 1);
     }
@@ -881,6 +895,7 @@ pub const Ui = struct {
     pub fn beginInput(self: *Ui) void {
         self.host.takeKeys(.flush);
         self.typed.clearRetainingCapacity();
+        self.composer.setText("") catch {};
         self.submitted = false;
         self.phase = .message;
     }
@@ -892,6 +907,17 @@ pub const Ui = struct {
         const request = self.fork_requested orelse return null;
         self.fork_requested = null;
         return request.at;
+    }
+
+    pub fn requestNewSession(self: *Ui) void {
+        self.new_requested = true;
+        self.host.invalidate();
+    }
+
+    pub fn takeNewSessionRequest(self: *Ui) bool {
+        const requested = self.new_requested;
+        self.new_requested = false;
+        return requested;
     }
 
     pub fn takeReviewRequest(self: *Ui) ?ReviewRequest {
@@ -999,6 +1025,9 @@ pub const Ui = struct {
         self.question_said = null;
         self.question_filled = 0;
         _ = self.question_arena.reset(.retain_capacity);
+        self.fork_requested = null;
+        self.review_requested = null;
+        self.submitted = false;
         self.message_taps = @splat(.{});
     }
 
@@ -1630,16 +1659,11 @@ pub const Ui = struct {
     }
 
     pub fn transcriptBandRoom(self: *const Ui) layout.Room {
-        const room = self.screenRoom();
-        const side = self.sidebarWidth();
-        return .{
-            .measure = room.measure,
-            .width = if (room.width > side) room.width - side else 0,
-        };
+        return self.screenRoom();
     }
 
     fn sidebarRoom(self: *const Ui) layout.Room {
-        return .{ .measure = self.measure, .width = self.sidebarWidth() };
+        return .{ .measure = self.measure, .width = navigation_width - 24 };
     }
 
     pub fn roomFor(self: *const Ui, voice: model.Voice) layout.Room {
@@ -1818,19 +1842,278 @@ pub const Ui = struct {
         return carry_on;
     }
 
+    const navigation_breakpoint: f32 = 720;
+    const navigation_width: f32 = 256;
+    const app_bar_height: f32 = 56;
+
+    fn composerHeight(measure: layout.Measure) f32 {
+        return 3 * measure.height();
+    }
+
     fn view(self: *Ui, ctx: *phantom.BuildContext) phantom.Widget {
+        return self.scaffoldView(ctx);
+    }
+
+    fn scaffoldView(self: *Ui, ctx: *phantom.BuildContext) phantom.Widget {
+        const colors = phantom.ColorScheme.tokyoNight();
+        const scaffold = ctx.new(phantom.NavigationScaffold{
+            .body = .{ .ctx = self, .build = buildBody },
+            .navigation = .{ .ctx = self, .build = buildNavigation },
+            .title = .{ .ctx = self, .build = buildTitle },
+            .breakpoint = navigation_breakpoint,
+            .navigation_width = navigation_width,
+            .app_bar_height = app_bar_height,
+        });
+        return ctx.new(phantom.DecoratedBox{
+            .color = colors.bg,
+            .child = scaffold.widget(),
+        }).widget();
+    }
+
+    fn buildBody(ptr: ?*anyopaque, ctx: *phantom.BuildContext) phantom.Widget {
+        const self: *Ui = @ptrCast(@alignCast(ptr.?));
+        return self.bodyView(ctx);
+    }
+
+    fn buildNavigation(ptr: ?*anyopaque, ctx: *phantom.BuildContext) phantom.Widget {
+        const self: *Ui = @ptrCast(@alignCast(ptr.?));
+        return self.navigationView(ctx);
+    }
+
+    fn buildTitle(_: ?*anyopaque, ctx: *phantom.BuildContext) phantom.Widget {
+        const theme = phantom.Theme.of(ctx);
+        return ctx.new(phantom.Text{
+            .text = "Chock",
+            .font = theme.body_bold_font,
+            .size = 20,
+            .color = theme.colors.fg_primary,
+        }).widget();
+    }
+
+    fn navigationView(self: *Ui, ctx: *phantom.BuildContext) phantom.Widget {
+        const theme = phantom.Theme.of(ctx);
+        const colors = phantom.ColorScheme.tokyoNight();
+
+        const heading = ctx.new(phantom.Padding{
+            .insets = .{ .left = 4, .top = 4, .right = 4, .bottom = 12 },
+            .child = ctx.new(phantom.Text{
+                .text = "Chock",
+                .font = theme.heading_font,
+                .size = 22,
+                .color = theme.accent,
+            }).widget(),
+        }).widget();
+
+        const new_session = ctx.new(phantom.Button{
+            .variant = .primary,
+            .padding = .symmetric(12, 8),
+            .on_tap = onNavigationNew,
+            .ctx = self,
+            .child = ctx.new(phantom.Text{ .text = "New session" }).widget(),
+        }).widget();
+
+        const sessions = ctx.new(phantom.Button{
+            .variant = if (self.sidebar == .plan) .secondary else .primary,
+            .padding = .symmetric(12, 8),
+            .on_tap = onNavigationSessions,
+            .ctx = self,
+            .child = ctx.new(phantom.Text{ .text = "Sessions" }).widget(),
+        }).widget();
+        const plan = ctx.new(phantom.Button{
+            .variant = if (self.sidebar == .plan) .primary else .secondary,
+            .padding = .symmetric(12, 8),
+            .on_tap = onNavigationPlan,
+            .ctx = self,
+            .child = ctx.new(phantom.Text{ .text = "Plan" }).widget(),
+        }).widget();
+        const choices = ctx.new(phantom.Row(.{
+            .children = ctx.newSlice(phantom.Widget, &.{
+                ctx.new(phantom.Expanded(.{ .child = sessions })).widget(),
+                ctx.new(phantom.Expanded(.{
+                    .child = ctx.new(phantom.Padding{
+                        .insets = .{ .left = 8 },
+                        .child = plan,
+                    }).widget(),
+                })).widget(),
+            }),
+        })).widget();
+
+        const rows = self.navigationRows(ctx, colors, navigation_width - 24);
+        var navigation_children: std.ArrayList(phantom.Widget) = .empty;
+        navigation_children.append(ctx.arena, heading) catch {};
+        navigation_children.append(ctx.arena, new_session) catch {};
+        navigation_children.append(ctx.arena, ctx.new(phantom.Padding{
+            .insets = .{ .top = 8 },
+            .child = ctx.new(phantom.Text{ .text = "" }).widget(),
+        }).widget()) catch {};
+        navigation_children.append(ctx.arena, choices) catch {};
+        navigation_children.append(ctx.arena, ctx.new(phantom.Padding{
+            .insets = .{ .top = 12 },
+            .child = ctx.new(phantom.Text{ .text = "" }).widget(),
+        }).widget()) catch {};
+        navigation_children.appendSlice(ctx.arena, rows) catch {};
+        const content = ctx.new(phantom.Padding{
+            .insets = .all(12),
+            .child = ctx.new(phantom.ScrollView{
+                .child = ctx.new(phantom.Column(.{
+                    .children = navigation_children.items,
+                })).widget(),
+            }).widget(),
+        }).widget();
+        return ctx.new(phantom.DecoratedBox{
+            .color = colors.bg_dark,
+            .child = content,
+        }).widget();
+    }
+
+    fn navigationRows(
+        self: *Ui,
+        ctx: *phantom.BuildContext,
+        colors: phantom.ColorScheme,
+        item_width: f32,
+    ) []const phantom.Widget {
+        if (self.sidebar == .plan) {
+            const said = model.planRows(ctx.arena, self.plan, std.math.maxInt(u16)) catch return &.{};
+            var items: std.ArrayList(phantom.Widget) = .empty;
+            for (said) |one| {
+                const text = ctx.new(phantom.Text{
+                    .text = one.text,
+                    .wrap = true,
+                    .color = switch (one.tone) {
+                        .title => colors.blue_light,
+                        .now => colors.green,
+                        .step => colors.fg,
+                        .aside => colors.fg_muted,
+                    },
+                }).widget();
+                items.append(ctx.arena, ctx.new(phantom.Padding{
+                    .insets = .symmetric(8, 6),
+                    .child = text,
+                }).widget()) catch return items.items;
+            }
+            return items.items;
+        }
+
+        const offered = self.picker orelse &[_]model.Resumable{};
+        var items: std.ArrayList(phantom.Widget) = .empty;
+        const theme = phantom.Theme.of(ctx);
+        if (offered.len == 0) {
+            items.append(ctx.arena, ctx.new(phantom.Padding{
+                .insets = .all(8),
+                .child = ctx.new(phantom.Text{
+                    .text = if (self.sessions_failed)
+                        "Sessions could not be loaded. Check the server address and try again."
+                    else
+                        "No sessions found.",
+                    .wrap = true,
+                    .color = if (self.sessions_failed) colors.red else colors.fg_muted,
+                }).widget(),
+            }).widget()) catch return items.items;
+            if (self.sessions_failed) {
+                items.append(ctx.arena, ctx.new(phantom.Button{
+                    .variant = .secondary,
+                    .padding = .symmetric(12, 8),
+                    .on_tap = onNavigationRetry,
+                    .ctx = self,
+                    .child = ctx.new(phantom.Text{ .text = "Retry" }).widget(),
+                }).widget()) catch return items.items;
+            }
+            return items.items;
+        }
+        for (offered, 0..) |one, at| {
+            if (self.opensGroup(at)) {
+                items.append(ctx.arena, ctx.new(phantom.Padding{
+                    .insets = .{ .left = 8, .top = 12, .right = 8, .bottom = 4 },
+                    .child = ctx.new(phantom.Text{
+                        .text = one.group,
+                        .font = theme.body_bold_font,
+                        .color = colors.fg_muted,
+                        .wrap = true,
+                    }).widget(),
+                }).widget()) catch return items.items;
+            }
+
+            const chosen = at == self.picked;
+            const label = ctx.new(phantom.Text{
+                .text = one.words,
+                .wrap = true,
+                .color = if (one.refusal.len != 0)
+                    colors.red
+                else if (chosen)
+                    colors.blue_light
+                else
+                    colors.fg,
+            }).widget();
+            const card = ctx.new(phantom.SizedBox{
+                .width = item_width,
+                .child = ctx.new(phantom.DecoratedBox{
+                    .color = if (chosen) colors.bg_medium else null,
+                    .radius = 6,
+                    .child = ctx.new(phantom.Padding{
+                        .insets = .symmetric(8, 8),
+                        .child = label,
+                    }).widget(),
+                }).widget(),
+            }).widget();
+            if (one.refusal.len != 0 or at >= max_picker_taps) {
+                items.append(ctx.arena, card) catch return items.items;
+                continue;
+            }
+            self.picker_taps[at] = .{ .ui = self, .index = at };
+            items.append(ctx.arena, ctx.new(phantom.GestureDetector{
+                .child = card,
+                .on_tap = onPickerTap,
+                .ctx = &self.picker_taps[at],
+            }).widget()) catch return items.items;
+        }
+        return items.items;
+    }
+
+    fn onNavigationSessions(ptr: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ptr));
+        self.toggleSessions();
+        self.host.invalidate();
+    }
+
+    fn onNavigationNew(ptr: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ptr));
+        self.requestNewSession();
+    }
+
+    fn onNavigationPlan(ptr: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ptr));
+        self.sessions_open = false;
+        self.sidebar = .plan;
+        self.host.invalidate();
+    }
+
+    fn onNavigationRetry(ptr: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ptr));
+        self.refreshSessions();
+        self.host.invalidate();
+    }
+
+    fn bodyView(self: *Ui, ctx: *phantom.BuildContext) phantom.Widget {
         const colors = phantom.ColorScheme.tokyoNight();
         const measure = self.resize(ctx);
-        const parts = layout.split(self.rows, self.panelRows());
+        if (self.current_session.len == 0 and
+            phantom.MediaQuery.of(ctx).size.width < navigation_breakpoint)
+        {
+            return self.sessionLandingView(ctx, colors);
+        }
+        const parts = contentSplit(self.rows, self.panelRows());
+        const composer_height = composerHeight(measure);
 
         var regions: std.ArrayList(phantom.Widget) = .empty;
-        regions.append(ctx.arena, band(
-            ctx,
-            measure,
-            parts.header,
-            colors.bg_dark,
-            self.headerRows(ctx, colors),
-        )) catch {};
+        if (parts.header != 0) {
+            regions.append(ctx.arena, band(
+                ctx,
+                measure,
+                parts.header,
+                colors.bg_dark,
+                self.headerRows(ctx, colors),
+            )) catch {};
+        }
         regions.append(ctx.arena, self.middleRegions(
             ctx,
             measure,
@@ -1855,13 +2138,18 @@ pub const Ui = struct {
                 .ctx = self,
             }).widget()) catch {};
         }
-        regions.append(ctx.arena, band(
-            ctx,
-            measure,
-            parts.input,
-            colors.bg_dark,
-            self.inputRows(ctx, colors),
-        )) catch {};
+        regions.append(ctx.arena, ctx.new(phantom.SizedBox{
+            .height = composer_height,
+            .child = ctx.new(phantom.DecoratedBox{
+                .color = colors.bg_dark,
+                .child = ctx.new(phantom.Padding{
+                    .insets = .symmetric(8, 8),
+                    .child = ctx.new(phantom.Column(.{
+                        .children = self.inputRows(ctx, colors),
+                    })).widget(),
+                }).widget(),
+            }).widget(),
+        }).widget()) catch {};
 
         const screen = ctx.new(phantom.Column(.{ .children = regions.items })).widget();
         return ctx.new(phantom.KeyboardListener{
@@ -1871,15 +2159,75 @@ pub const Ui = struct {
         }).widget();
     }
 
+    fn sessionLandingView(
+        self: *Ui,
+        ctx: *phantom.BuildContext,
+        colors: phantom.ColorScheme,
+    ) phantom.Widget {
+        const theme = phantom.Theme.of(ctx);
+        const title = ctx.new(phantom.Text{
+            .text = "Sessions",
+            .font = theme.heading_font,
+            .size = 28,
+            .color = theme.colors.fg_primary,
+        }).widget();
+        const new_session = ctx.new(phantom.Button{
+            .variant = .primary,
+            .padding = .symmetric(12, 8),
+            .on_tap = onNavigationNew,
+            .ctx = self,
+            .child = ctx.new(phantom.Text{ .text = "New session" }).widget(),
+        }).widget();
+        const rows = self.navigationRows(ctx, colors, @max(0, self.width - 32));
+        var children: std.ArrayList(phantom.Widget) = .empty;
+        children.append(ctx.arena, ctx.new(phantom.Padding{
+            .insets = .{ .bottom = 12 },
+            .child = title,
+        }).widget()) catch {};
+        children.append(ctx.arena, ctx.new(phantom.Padding{
+            .insets = .{ .bottom = 16 },
+            .child = new_session,
+        }).widget()) catch {};
+        children.appendSlice(ctx.arena, rows) catch {};
+        return ctx.new(phantom.DecoratedBox{
+            .color = colors.bg,
+            .child = ctx.new(phantom.ScrollView{
+                .child = ctx.new(phantom.Padding{
+                    .insets = .all(16),
+                    .child = ctx.new(phantom.Column(.{ .children = children.items })).widget(),
+                }).widget(),
+            }).widget(),
+        }).widget();
+    }
+
+    fn contentSplit(rows: u16, wanted: u16) layout.Split {
+        const asked = @min(wanted, rows);
+        return .{
+            .header = 0,
+            .transcript = rows - asked,
+            .approval = asked,
+            .input = 0,
+        };
+    }
+
     fn resize(self: *Ui, ctx: *phantom.BuildContext) layout.Measure {
         const measure = layout.Measure.of(ctx);
         self.measure = measure;
-        const view_now = ctx.owner.activeView() orelse return measure;
-        self.rows = measure.rowsIn(view_now.metrics.size.height);
-        self.width = view_now.metrics.size.width;
-        if (self.sessions_open) {
-            self.sidebar = if (self.fitsSidebar()) .sessions else .none;
+        _ = ctx.owner.activeView() orelse return measure;
+        const media = phantom.MediaQuery.of(ctx);
+        var width = media.size.width;
+        var height = media.size.height;
+        const safe = media.view_padding;
+        if (width >= navigation_breakpoint) {
+            width = @max(0, width - navigation_width - safe.right);
+            height = @max(0, height - safe.top - safe.bottom);
+        } else {
+            width = @max(0, width - safe.left - safe.right);
+            height = @max(0, height - app_bar_height - safe.top - safe.bottom);
         }
+        self.rows = measure.rowsIn(@max(0, height - composerHeight(measure)));
+        self.width = width;
+        if (self.sessions_open) self.sidebar = .sessions;
         return measure;
     }
 
@@ -1916,22 +2264,9 @@ pub const Ui = struct {
             .ctx = self,
         }).widget();
 
-        const side = self.sidebarWidth();
-        const beside = if (side > 0) band(
-            ctx,
-            measure,
-            rows,
-            colors.bg_dark,
-            self.sidebarRows(ctx, rows, colors),
-        ) else plainRow(ctx, "", colors.fg);
-
-        const both = ctx.newSlice(phantom.Widget, &.{
-            ctx.new(phantom.Expanded(.{ .child = focused })).widget(),
-            ctx.new(phantom.SizedBox{ .width = side, .child = beside }).widget(),
-        });
         return ctx.new(phantom.SizedBox{
             .height = bandHeight(measure, rows),
-            .child = ctx.new(phantom.Row(.{ .children = both })).widget(),
+            .child = focused,
         }).widget();
     }
 
@@ -1941,7 +2276,7 @@ pub const Ui = struct {
         rows: u16,
         colors: phantom.ColorScheme,
     ) []const phantom.Widget {
-        if (self.sidebar == .sessions) return self.sessionRows(ctx, rows, colors);
+        if (self.sidebar != .plan) return self.sessionRows(ctx, rows, colors);
 
         var lines = Rows{ .left = rows };
         const said = model.planRows(ctx.arena, self.plan, rows) catch return &.{};
@@ -2277,12 +2612,10 @@ pub const Ui = struct {
 
         var slots: [model.Command.all.len]model.Command = undefined;
         const all_listed = self.openCompletions(&slots);
-        // The band beside this one has the list when it is open, so drawing it
-        // here as well would show every session twice.
-        const all_offered = if (self.sidebar == .sessions)
-            &[_]model.Resumable{}
-        else
-            self.picker orelse &[_]model.Resumable{};
+        // Session selection belongs to NavigationScaffold. Keeping it out of
+        // the transcript prevents groups and selection state from being spread
+        // through the conversation viewport on compact surfaces.
+        const all_offered = &[_]model.Resumable{};
         const taken: u16 = @intCast(@min(all_listed.len + all_offered.len, room));
         const listed = all_listed[0..@min(all_listed.len, taken)];
         const seats: u16 = @intCast(taken - listed.len);
@@ -2637,29 +2970,39 @@ pub const Ui = struct {
         colors: phantom.ColorScheme,
     ) []const phantom.Widget {
         var pieces: std.ArrayList(phantom.Widget) = .empty;
-        pieces.append(ctx.arena, plainRow(
-            ctx,
-            " > ",
-            if (self.transcript_focused) colors.fg_dim else colors.blue_light,
-        )) catch {};
 
         if (self.phase == .message) {
             pieces.append(ctx.arena, ctx.new(phantom.Button{
                 .variant = .secondary,
-                .on_tap = onReviewOpen,
+                .padding = .symmetric(8, 8),
+                .on_tap = onMessageSubmit,
                 .ctx = self,
-                .child = row(ctx, self.measure, " review ", colors.fg_muted),
+                .child = ctx.new(phantom.Text{
+                    .text = ">",
+                    .color = if (self.transcript_focused) colors.fg_dim else colors.blue_light,
+                }).widget(),
             }).widget()) catch {};
             const field = ctx.new(phantom.TextField{
+                .id = composer_focus_id,
                 .color = colors.fg,
                 .caret_color = colors.blue_light,
                 .on_change = onTyped,
+                .on_key = onMessageKey,
+                .controller = &self.composer,
                 .ctx = self,
             });
-            pieces.append(ctx.arena, ctx.new(phantom.KeyboardListener{
+            pieces.append(ctx.arena, ctx.new(phantom.Expanded(.{
                 .child = field.widget(),
-                .on_key = onMessageKey,
+            })).widget()) catch {};
+            pieces.append(ctx.arena, ctx.new(phantom.Button{
+                .variant = .secondary,
+                .padding = .symmetric(12, 8),
+                .on_tap = onReviewOpen,
                 .ctx = self,
+                .child = ctx.new(phantom.Text{
+                    .text = "Review",
+                    .color = colors.fg_muted,
+                }).widget(),
             }).widget()) catch {};
         }
 
@@ -2707,24 +3050,7 @@ pub const Ui = struct {
         if (event.keysym != .enter) return false;
         const self: *Ui = @ptrCast(@alignCast(context));
 
-        // Whoever drives this reads `submitted` on the next frame, and a host
-        // that only draws when asked would never take one.
-        defer self.host.invalidate();
-
-        if (self.picker != null) {
-            self.takePicked();
-            return true;
-        }
-
-        var slots: [model.Command.all.len]model.Command = undefined;
-        const listed = self.openCompletions(&slots);
-        if (listed.len != 0) {
-            const chosen = listed[@min(self.completion_selected, listed.len - 1)];
-            self.typed.clearRetainingCapacity();
-            self.typed.appendSlice(self.gpa, chosen.typed()) catch {};
-        }
-
-        self.submitted = true;
+        self.submitMessage();
         return true;
     }
 
@@ -2856,19 +3182,20 @@ pub const Ui = struct {
     }
 
     pub fn maxScrollBack(self: *const Ui) usize {
-        const parts = layout.split(self.rows, self.panelRows());
+        const parts = contentSplit(self.rows, self.panelRows());
         const room = parts.transcript -| 1;
         return self.shownCount() -| room;
     }
 
     pub fn showsRule(self: *const Ui) bool {
-        return self.transcript_focused or self.scroll_back != 0;
+        return self.scroll_back != 0;
     }
 
     /// How far one page key moves. One row short of the band, so a reader keeps
     /// a line of what they were looking at.
     fn pageRows(self: *const Ui) u16 {
-        return @max(1, layout.split(self.rows, self.panelRows()).transcript -| 1);
+        const parts = contentSplit(self.rows, self.panelRows());
+        return @max(1, parts.transcript -| 1);
     }
 
     pub fn scrollBy(self: *Ui, rows: i32) void {
@@ -3243,12 +3570,7 @@ pub const Ui = struct {
         const at = line.fork_at orelse return drawn;
         if (index >= max_message_taps) return drawn;
         self.message_taps[index] = .{ .ui = self, .at = at };
-        const tapped = ctx.new(phantom.GestureDetector{
-            .child = drawn,
-            .on_tap = onMessageTap,
-            .ctx = &self.message_taps[index],
-        }).widget();
-        if (!line.show_fork) return tapped;
+        if (!line.show_fork) return drawn;
 
         const button = ctx.new(phantom.Button{
             .variant = .secondary,
@@ -3256,7 +3578,7 @@ pub const Ui = struct {
             .ctx = &self.message_taps[index],
             .child = row(ctx, measure, " fork ", colors.fg_muted),
         }).widget();
-        return pinnedRow(ctx, measure, self.transcriptRoom().width, tapped, button);
+        return pinnedRow(ctx, measure, self.transcriptRoom().width, drawn, button);
     }
 
     fn voicedText(
@@ -3439,6 +3761,13 @@ pub const Ui = struct {
     pub fn rootOf(ctx: *phantom.BuildContext, self: *Ui) phantom.Widget {
         return phantom.StatefulWidget(Screen, ctx.new(Screen{ .ui = self }));
     }
+
+    /// The conversation component without the application scaffold. Native
+    /// and web applications use `rootOf`; detailed transcript tests use this
+    /// entry so navigation chrome cannot change message semantics snapshots.
+    pub fn bodyRootOf(ctx: *phantom.BuildContext, self: *Ui) phantom.Widget {
+        return phantom.StatefulWidget(Screen, ctx.new(Screen{ .ui = self, .scaffold = false }));
+    }
 };
 
 test "the fork command requests the latest completed turn" {
@@ -3493,4 +3822,28 @@ test "a message tap requests its exact completed turn" {
     const requested = ui.takeForkRequest();
     try std.testing.expect(requested != null);
     try std.testing.expectEqual(@as(u64, 2945995), requested.?.?);
+}
+
+test "an unwritten message event cannot request a fork" {
+    const ui = try Ui.init(std.testing.allocator, std.testing.io, host_mod.quiet);
+    defer ui.deinit();
+
+    var tapped = Ui.MessageTap{ .ui = ui, .at = 0 };
+    Ui.onMessageTap(&tapped);
+
+    try std.testing.expect(!ui.submitted);
+    try std.testing.expect(ui.takeForkRequest() == null);
+}
+
+test "switching transcripts drops actions from the previous session" {
+    const ui = try Ui.init(std.testing.allocator, std.testing.io, host_mod.quiet);
+    defer ui.deinit();
+
+    var tapped = Ui.MessageTap{ .ui = ui, .at = 4096 };
+    Ui.onMessageTap(&tapped);
+    try std.testing.expect(ui.submitted);
+
+    ui.clearTranscript();
+    try std.testing.expect(!ui.submitted);
+    try std.testing.expect(ui.takeForkRequest() == null);
 }

@@ -1723,14 +1723,21 @@ fn handleRead(
         fail(writer, "that is not a session identifier");
         return;
     }
-    const log_path = (daemon.logPathFor(one.session) catch {
+
+    const remembered = daemon.logPathFor(one.session) catch {
         fail(writer, "out of memory");
         return;
-    }) orelse {
-        fail(writer, "this daemon did not start a session with that identifier");
+    };
+    defer if (remembered) |path| daemon.gpa.free(path);
+
+    // Session identifiers are globally unique. A daemon can therefore recover
+    // an older session after a restart by looking through the same project
+    // directories its `list` request already exposes; the version-1 read API
+    // does not need a project field.
+    const log_path = remembered orelse logPathAnywhere(daemon, arena, one.session) orelse {
+        fail(writer, "no project has a session with that identifier");
         return;
     };
-    defer daemon.gpa.free(log_path);
 
     var opened = openLog(daemon, writer, log_path, one.session) orelse return;
     defer opened.close(daemon.io);
@@ -1741,6 +1748,26 @@ fn handleRead(
         return;
     };
     writer.flush() catch return;
+}
+
+fn logPathAnywhere(
+    daemon: *Daemon,
+    arena: std.mem.Allocator,
+    session: []const u8,
+) ?[:0]const u8 {
+    const projects = session_paths.listProjects(arena, daemon.io, daemon.env) catch return null;
+    for (projects) |project| {
+        const candidate = std.fmt.allocPrintSentinel(
+            arena,
+            "{s}/{s}.jsonl",
+            .{ project.dir, session },
+            0,
+        ) catch return null;
+        const file = std.Io.Dir.openFileAbsolute(daemon.io, candidate, .{}) catch continue;
+        file.close(daemon.io);
+        return candidate;
+    }
+    return null;
 }
 
 fn handleWatch(
@@ -2829,29 +2856,45 @@ test "answering a session that is not listening is a refusal and never a silent 
     try testing.expect(std.mem.indexOf(u8, traversal.answer, "not a session identifier") != null);
 }
 
-test "read serves only a session this daemon started, and never a path a client named" {
+test "read keeps its version 1 shape and can find a session after daemon restart" {
     const gpa = testing.allocator;
     const io = testing.io;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const home_len = try tmp.dir.realPath(io, &home_buffer);
+    const home = home_buffer[0..home_len];
+    const project = try std.fs.path.join(arena, &.{ home, "project" });
+
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
+    try env.put("HOME", home);
 
     var daemon = Daemon{ .gpa = gpa, .io = io, .exe_path = "/nowhere/chock", .env = &env };
     defer daemon.deinit();
 
-    var answer_buffer: [4096]u8 = undefined;
-    const got = probeRequest(
-        &daemon,
-        arena_state.allocator(),
-        &answer_buffer,
-        "read 01JQ" ++ @as([22]u8, @splat('A')) ++ " 0",
-    );
-    try testing.expect(std.mem.indexOf(u8, got.answer, "did not start a session") != null);
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
+    var paths = try session_paths.pathsFor(gpa, &env, project, id);
+    defer paths.deinit();
+    try session_paths.create(io, paths);
+    session_paths.markProject(io, paths, project);
+    const file = try std.Io.Dir.createFileAbsolute(io, paths.log, .{});
+    file.close(io);
 
-    const bad = probeRequest(&daemon, arena_state.allocator(), &answer_buffer, "read ../../etc/passwd 0");
+    try testing.expectEqualStrings(paths.log, logPathAnywhere(&daemon, arena, id).?);
+
+    var answer_buffer: [4096]u8 = undefined;
+    const bad = probeRequest(
+        &daemon,
+        arena,
+        &answer_buffer,
+        "read ../../etc/passwd 0",
+    );
     try testing.expect(std.mem.indexOf(u8, bad.answer, "not a session identifier") != null);
 }
 

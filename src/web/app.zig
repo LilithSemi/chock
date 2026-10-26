@@ -18,6 +18,13 @@ const web_source = @import("source.zig");
 const web_host = @import("host.zig");
 
 pub const App = struct {
+    /// Empty in a browser, where the page's own host is the API host. Native
+    /// clients name the `chock serve` host explicitly (without a scheme).
+    api_host: []const u8 = "",
+    /// Browsers have EventSource. Native clients follow the same log through
+    /// the bounded `/api/lines` endpoint instead.
+    poll_events: bool = false,
+
     pub fn widget(self: *const App) phantom.Widget {
         return phantom.stateful.statefulWidget(App, self);
     }
@@ -33,6 +40,10 @@ pub const App = struct {
         /// The stream carrying that session's events, closed when another
         /// session is opened.
         stream: ?phantom.EventSource = null,
+        poll: ?phantom.Scheduler.Handle = null,
+        api_host: []const u8 = "",
+        poll_events: bool = false,
+        poll_failed: bool = false,
         /// The offset of the newest event drawn.
         ///
         /// A browser reopens a dropped stream by itself and the daemon starts
@@ -48,6 +59,16 @@ pub const App = struct {
         /// it and a reload comes back to the same session.
         const session_path = "/s/";
 
+        pub fn initState(self: *State, config: *const App) !void {
+            self.api_host = config.api_host;
+            self.poll_events = config.poll_events;
+        }
+
+        pub fn didUpdateWidget(self: *State, config: *const App) !void {
+            self.api_host = config.api_host;
+            self.poll_events = config.poll_events;
+        }
+
         pub fn dispose(self: *State) void {
             const gpa = self.base.element.owner.gpa;
             self.closeStream();
@@ -60,6 +81,7 @@ pub const App = struct {
             const ui = self.interface() orelse
                 return ctx.new(phantom.Text{ .text = "out of memory" }).widget();
 
+            self.followCreate(ctx.arena, ui);
             self.followPick(ui);
             self.followSubmit(ctx.arena, ui);
             return chock_ui.Ui.rootOf(ctx, ui);
@@ -73,7 +95,10 @@ pub const App = struct {
             if (self.ui) |one| return one;
 
             const owner = self.base.element.owner;
-            const origin = owner.platform.readHost(&origin_buffer) orelse "";
+            const origin = if (self.api_host.len != 0)
+                self.api_host
+            else
+                owner.platform.readHost(&origin_buffer) orelse "";
             self.reaching = web_source.Web.init(owner.gpa, owner, origin);
             self.from_host = .{
                 .state = self,
@@ -90,9 +115,9 @@ pub const App = struct {
             // A link or a reload names the session it was looking at. With
             // nothing named, the first thing shown is the list of them, the same
             // picker a person opens in a terminal.
-            // Beside the transcript and not over it, so the list stays in view
-            // while a session is read. A narrow page falls back to the picker,
-            // which `toggleSessions` does by itself.
+            // NavigationScaffold keeps this beside a wide view and in the
+            // drawer on a compact one, without putting picker rows into the
+            // transcript.
             if (self.namedSession()) |id| self.open(one, id);
             one.showSessions();
             return one;
@@ -125,6 +150,25 @@ pub const App = struct {
             self.base.element.owner.platform.writeLocation(said, .push);
         }
 
+        fn followCreate(self: *State, arena: std.mem.Allocator, ui: *chock_ui.Ui) void {
+            if (!ui.takeNewSessionRequest()) return;
+
+            const source = self.reaching.?.source();
+            const id = source.create(arena) catch {
+                ui.say(.chock, source.whyLast() orelse "the session was not created");
+                ui.endLine();
+                return;
+            };
+            if (id.len == 0) {
+                ui.say(.chock, "the session source cannot create sessions");
+                ui.endLine();
+                return;
+            }
+            self.open(ui, id);
+            self.showSessionInLocation(id);
+            ui.beginInput();
+        }
+
         /// Read one session, whether a person picked it or a link named it.
         fn open(self: *State, ui: *chock_ui.Ui, id: []const u8) void {
             const gpa = self.base.element.owner.gpa;
@@ -133,6 +177,7 @@ pub const App = struct {
             self.opened = kept;
             ui.clearTranscript();
             ui.current_session = kept;
+            self.poll_failed = false;
             self.reaching.?.watch(kept);
             self.seen = 0;
             self.listen(kept);
@@ -241,6 +286,17 @@ pub const App = struct {
             self.closeStream();
             const ui = self.ui orelse return;
 
+            if (self.poll_events) {
+                self.pollOnce();
+                self.poll = self.base.scheduler().every(
+                    self.base.gpa(),
+                    std.time.ns_per_s,
+                    self,
+                    pollTick,
+                ) catch null;
+                return;
+            }
+
             var room: [1024]u8 = undefined;
             const url = std.fmt.bufPrint(
                 &room,
@@ -260,9 +316,49 @@ pub const App = struct {
         }
 
         fn closeStream(self: *State) void {
+            if (self.poll) |running| self.base.scheduler().cancel(running);
+            self.poll = null;
             const running = self.stream orelse return;
             self.stream = null;
             self.base.element.owner.platform.closeEventSource(running);
+        }
+
+        fn pollTick(ctx: *anyopaque) void {
+            const self: *State = @ptrCast(@alignCast(ctx));
+            self.pollOnce();
+        }
+
+        /// Native hosts do not provide the browser's EventSource hook. Read
+        /// only the tail that has not been drawn yet; the server closes this
+        /// response, so a temporarily unreachable host cannot strand a frame.
+        fn pollOnce(self: *State) void {
+            const ui = self.ui orelse return;
+            const session = self.opened orelse return;
+
+            var room = std.heap.ArenaAllocator.init(self.base.gpa());
+            defer room.deinit();
+            const entries = self.reaching.?.source().events(
+                room.allocator(),
+                session,
+                self.seen,
+            ) catch {
+                if (!self.poll_failed) {
+                    ui.say(.chock, self.reaching.?.source().whyLast() orelse
+                        "the daemon did not answer");
+                    ui.endLine();
+                    self.poll_failed = true;
+                    repaint(self);
+                }
+                return;
+            };
+
+            self.poll_failed = false;
+            for (entries) |entry| {
+                if (entry.at != 0 and entry.at <= self.seen) continue;
+                self.seen = entry.at;
+                ui.replay(entry.at, entry.ev);
+            }
+            if (entries.len != 0) repaint(self);
         }
 
         fn onStreamEvent(ctx: *anyopaque, got: phantom.ServerEvent) void {

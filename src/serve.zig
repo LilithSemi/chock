@@ -8,6 +8,7 @@ const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const control = chock_proto.control;
+const event = chock_proto.event;
 
 /// The browser interface, built by `build/web_bundle.zig` and carried here.
 ///
@@ -332,6 +333,7 @@ pub const Route = enum {
     page,
     sessions,
     projects,
+    create,
     fork,
     review,
     select,
@@ -351,6 +353,7 @@ pub fn routeOf(target: []const u8) ?Route {
     if (std.mem.eql(u8, path, "/")) return .page;
     if (std.mem.eql(u8, path, "/api/sessions")) return .sessions;
     if (std.mem.eql(u8, path, "/api/projects")) return .projects;
+    if (std.mem.eql(u8, path, "/api/create")) return .create;
     if (std.mem.eql(u8, path, "/api/events")) return .events;
     if (std.mem.eql(u8, path, "/api/lines")) return .lines;
     if (std.mem.eql(u8, path, "/api/answer")) return .answer;
@@ -399,7 +402,7 @@ fn handle(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Req
     // A route that changes what a session does is a POST, so nothing that
     // prefetches a link can drive it.
     const wanted: std.http.Method = switch (route) {
-        .answer, .fork, .prompt, .select, .undo_selection => .POST,
+        .answer, .create, .fork, .prompt, .select, .undo_selection => .POST,
         .page, .asset, .sessions, .projects, .events, .lines, .review => .GET,
     };
     if (request.head.method != wanted and !(wanted == .GET and request.head.method == .HEAD)) {
@@ -419,6 +422,7 @@ fn handle(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Req
         },
         .sessions => try serveSessions(serve, arena, request),
         .projects => try serveProjects(serve, arena, request),
+        .create => try serveCreate(serve, arena, request),
         .events => try serveEvents(serve, arena, request),
         .lines => try serveLines(serve, arena, request),
         .answer => try serveAnswer(serve, arena, request),
@@ -523,6 +527,16 @@ fn sendRecords(
     try sendWhole(request, json, .{ .extra_headers = &json_headers });
 }
 
+/// Log lines carry zero in their JSON `id`: their byte offset is known only
+/// after the line has been written and travels in the daemon record wrapper.
+/// A whole-response reader has no SSE `id:` field, so put that offset back in
+/// the envelope before handing it to the client.
+fn eventPayloadWithId(arena: std.mem.Allocator, payload: []const u8, id: u64) ![]const u8 {
+    var parsed = try event.fromJson(arena, payload);
+    parsed.value.id = id;
+    return event.toJson(arena, parsed.value);
+}
+
 /// One session's events after a point, answered whole and then closed.
 ///
 /// `serveEvents` holds a stream open, which a browser on phantom's web backend
@@ -557,7 +571,8 @@ fn serveLines(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server
             switch (reply) {
                 .record => |one| {
                     if (self.body.items.len != 0) try self.body.append(self.gpa, ',');
-                    try self.body.appendSlice(self.gpa, one.payload);
+                    const payload = try eventPayloadWithId(self.gpa, one.payload, one.id);
+                    try self.body.appendSlice(self.gpa, payload);
                 },
                 .failed => |text| {
                     self.failed = text;
@@ -691,6 +706,10 @@ fn serveAnswer(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Serve
     };
 
     try askDaemon(serve, arena, request, asked, "{\"answered\":true}");
+}
+
+fn serveCreate(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
+    try askDaemon(serve, arena, request, .{ .create = .{ .project = serve.project } }, null);
 }
 
 fn serveFork(serve: *Serve, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
@@ -1247,6 +1266,7 @@ test "every route is one the dispatch has a case for, and a query does not make 
     try testing.expectEqual(Route.page, routeOf("/s/01M2GPTA3SSYQ9X0KGRRNVY0MT?x=1").?);
     try testing.expectEqual(Route.sessions, routeOf("/api/sessions").?);
     try testing.expectEqual(Route.projects, routeOf("/api/projects").?);
+    try testing.expectEqual(Route.create, routeOf("/api/create").?);
     try testing.expectEqual(Route.events, routeOf("/api/events").?);
     try testing.expectEqual(Route.answer, routeOf("/api/answer").?);
     try testing.expectEqual(Route.fork, routeOf("/api/fork?session=01JQ").?);
@@ -1285,6 +1305,7 @@ test "every route is one the dispatch has a case for, and a query does not make 
         "/",
         "/api/sessions",
         "/api/projects",
+        "/api/create",
         "/api/events",
         "/api/lines",
         "/api/answer",
@@ -1344,6 +1365,19 @@ test "an event frame carries the log's own identifier and the log's own bytes" {
 
     try testing.expectEqualStrings("id: 4096\ndata: " ++ line ++ "\n\n", writer.buffered());
     try testing.expect(std.mem.endsWith(u8, writer.buffered(), "\n\n"));
+}
+
+test "a polled event carries the daemon record identifier" {
+    var room = std.heap.ArenaAllocator.init(testing.allocator);
+    defer room.deinit();
+
+    const payload =
+        \\{"id":0,"session":"01JQ","time_ms":1,"event":{"session.end":{"reason":"finished","detail":""}}}
+    ;
+    const with_id = try eventPayloadWithId(room.allocator(), payload, 4096);
+    const parsed = try event.fromJson(room.allocator(), with_id);
+    try testing.expectEqual(@as(u64, 4096), parsed.value.id);
+    try testing.expect(parsed.value.event == .session_end);
 }
 
 test "a daemon that is not running is a plain refusal that names what to do" {

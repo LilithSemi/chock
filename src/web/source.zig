@@ -109,6 +109,7 @@ pub const Web = struct {
 
     const vtable: Source.VTable = .{
         .sessions = sessions,
+        .create = create,
         .events = events,
         .asks = asks,
         .prompt = prompt,
@@ -149,7 +150,18 @@ pub const Web = struct {
         };
 
         if (reply.status != .ok) {
-            self.note(reply.status.phrase() orelse "the daemon refused");
+            const detail = std.mem.trim(u8, body.written(), " \t\r\n");
+            var room: [512]u8 = undefined;
+            self.note(if (detail.len != 0)
+                std.fmt.bufPrint(&room, "{d} from {s}: {s}", .{
+                    @backingInt(reply.status),
+                    target,
+                    detail[0..@min(detail.len, 400)],
+                }) catch detail
+            else
+                std.fmt.bufPrint(&room, "{d} from {s}", .{
+                    @backingInt(reply.status), target,
+                }) catch (reply.status.phrase() orelse "the daemon refused"));
             return error.Refused;
         }
         if (body.written().len > max_reply_bytes) {
@@ -208,6 +220,22 @@ pub const Web = struct {
         return out.items;
     }
 
+    /// Create in the project `chock serve` was started for. Session lists may
+    /// span projects, but a bare New action has that one unambiguous home.
+    fn create(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+    ) ui_source.Error![]const u8 {
+        const self: *Web = @ptrCast(@alignCast(ptr));
+        const response = std.mem.trim(u8, try self.post(arena, "/api/create", ""), " \t\r\n");
+        const end = std.mem.indexOfAny(u8, response, "\t\r\n") orelse response.len;
+        if (end == 0) {
+            self.note("the daemon returned no session identifier");
+            return error.Refused;
+        }
+        return response[0..end];
+    }
+
     /// Reads `/api/lines`, which answers once and closes.
     ///
     /// Not `/api/events`: that holds a stream open, and phantom's web backend
@@ -221,8 +249,8 @@ pub const Web = struct {
         const self: *Web = @ptrCast(@alignCast(ptr));
         const said = try self.get(arena, std.fmt.allocPrint(
             arena,
-            "/api/lines?session={s}&after={d}{s}",
-            .{ session, after, self.namedProject(arena) },
+            "/api/lines?session={s}&after={d}",
+            .{ session, after },
         ) catch return error.OutOfMemory);
         return self.envelopesIn(arena, said);
     }
@@ -257,8 +285,8 @@ pub const Web = struct {
 
         const said = try self.get(arena, std.fmt.allocPrint(
             arena,
-            "/api/lines?session={s}&after=0{s}",
-            .{ session, self.namedProject(arena) },
+            "/api/lines?session={s}&after=0",
+            .{session},
         ) catch return error.OutOfMemory);
         const entries = try self.envelopesIn(arena, said);
 
@@ -427,7 +455,10 @@ pub const Web = struct {
         const reply = self.owner.http().fetch(.{
             .url = url,
             .method = .POST,
-            .payload = if (payload.len == 0) null else payload,
+            // Keep an empty POST body present. On native std.http this emits a
+            // zero content length; treating it as null leaves a body-bearing
+            // method underspecified and can trip the Android client assertion.
+            .payload = payload,
             .response_writer = &body.writer,
         }) catch |err| {
             // The error and the address together. Without them a refused
@@ -445,12 +476,15 @@ pub const Web = struct {
             const said = std.mem.trim(u8, body.written(), " \t\r\n");
             var room: [512]u8 = undefined;
             self.note(if (said.len != 0)
-                std.fmt.bufPrint(&room, "{s} ({d})", .{
-                    said[0..@min(said.len, 400)],
+                std.fmt.bufPrint(&room, "{d} from {s}: {s}", .{
                     @backingInt(reply.status),
+                    target,
+                    said[0..@min(said.len, 400)],
                 }) catch said
             else
-                reply.status.phrase() orelse "the daemon refused");
+                std.fmt.bufPrint(&room, "{d} from {s}", .{
+                    @backingInt(reply.status), target,
+                }) catch (reply.status.phrase() orelse "the daemon refused"));
             return error.Refused;
         }
         self.clear();

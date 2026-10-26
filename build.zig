@@ -7,6 +7,67 @@ pub fn build(b: *std.Build) void {
 
     const gpu_drivers = b.option([]const u8, "gpu-drivers", "Specific GPU drivers to enable, defaults to Prism's choice.");
 
+    // A mobile target is the remote interface, not the Chock daemon. Its root
+    // receives only the protocol, UI, and remote-client imports; host-only
+    // imports such as the sandbox, providers, VMM, and CLI are never attached
+    // to the artifact. Keep this at the import boundary so another mobile
+    // packager (notably iOS) can use the same graph when Phantom gains one.
+    if (target.result.abi.isAndroid()) {
+        const phantom = b.dependency("phantom", .{
+            .target = target,
+            .optimize = optimize,
+            .@"gpu-drivers" = gpu_drivers,
+        });
+        const chock_proto = b.createModule(.{
+            .root_source_file = b.path("lib/chock-proto.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const chock_core = b.createModule(.{
+            .root_source_file = b.path("lib/chock-core.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        chock_core.addImport("chock-proto", chock_proto);
+        const chock_ui = b.createModule(.{
+            .root_source_file = b.path("lib/chock-ui.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        chock_ui.addImport("chock-proto", chock_proto);
+        chock_ui.addImport("chock-core", chock_core);
+        const remote_app = b.createModule(.{
+            .root_source_file = b.path("src/web/app.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        remote_app.addImport("phantom", phantom.module("phantom"));
+        remote_app.addImport("chock-ui", chock_ui);
+        remote_app.addImport("chock-proto", chock_proto);
+
+        const app_options = phantom_build.AppOptions{
+            .id = "ws.chock.android",
+            .exec_name = "chock-android",
+            .name = .{ .default = "Chock" },
+            .summary = .{ .default = "The Chock interface for Android" },
+            .android = .{
+                .permissions = &.{.internet},
+                .uses_cleartext_traffic = true,
+            },
+            .root = b.path("src/android/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chock-ui", .module = chock_ui },
+                .{ .name = "chock-proto", .module = chock_proto },
+                .{ .name = "chock-remote-app", .module = remote_app },
+            },
+        };
+        const app = phantom_build.addApp(b, phantom, app_options);
+        b.getInstallStep().dependOn(app);
+        return;
+    }
+
     const test_step = b.step("test", "Run all tests");
 
     // **One step a module, beside the one that runs them all.** The whole suite

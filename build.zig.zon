@@ -9,8 +9,8 @@
             .hash = "vulcan-0.0.0-d6EfZPAGqwC0PQ5R-cx6w1kZhW597HsaAIjPHwNa4LEt",
         },
         .phantom = .{
-            .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#a0f196e888a863f241f9cd886772b54e71279de2",
-            .hash = "phantom-0.1.0-HsUDTCQNKQA7zRX2iPzHjySicL8y90NOPsERfasMSdCH",
+            .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#f714d4ef226ce1ad16a9b0dc7b482cfb9875af86",
+            .hash = "phantom-0.1.0-HsUDTGo_KgDoJTQejHVQkb8cUExjzEK1VudPAqSLMqqW",
         },
         .udev = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/udev.zig#5b76bbccde9ef7bcb9b6447c0f2454f2ade51733",
