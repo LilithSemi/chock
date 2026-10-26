@@ -4,7 +4,7 @@ const std = @import("std");
 const chock_broker = @import("chock-broker");
 const chock_core = @import("chock-core");
 
-var listening: ?*chock_broker.handover.Endpoint = null;
+threadlocal var listening: ?*chock_broker.handover.Endpoint = null;
 
 var confirm_budget_ms: u64 = chock_broker.handover.default_confirm_budget_ms;
 
@@ -14,6 +14,14 @@ pub fn arm(endpoint: *chock_broker.handover.Endpoint) void {
 
 pub fn disarm() void {
     listening = null;
+}
+
+/// Replace the endpoint for this thread and return the one that was active.
+/// In-process child runs use this to restore their parent's handover endpoint.
+pub fn use(endpoint: ?*chock_broker.handover.Endpoint) ?*chock_broker.handover.Endpoint {
+    const previous = listening;
+    listening = endpoint;
+    return previous;
 }
 
 pub fn requested(io: std.Io, in_flight: chock_core.Loop.InFlight) bool {

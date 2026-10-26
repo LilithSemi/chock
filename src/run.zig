@@ -145,7 +145,19 @@ pub fn main(
     exe_path: []const u8,
     args: []const []const u8,
 ) !u8 {
-    return mainWith(arena, gpa, environ, exe_path, args, null);
+    return mainWith(arena, gpa, environ, exe_path, args, null, true);
+}
+
+/// Run one daemon-owned turn in the calling worker. The daemon owns process
+/// signals; cancellation reaches this thread through interrupt's scoped flag.
+pub fn mainForDaemon(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    environ: std.process.Environ,
+    exe_path: []const u8,
+    args: []const []const u8,
+) !u8 {
+    return mainWith(arena, gpa, environ, exe_path, args, null, false);
 }
 
 pub fn mainWithInterface(
@@ -160,7 +172,7 @@ pub fn mainWithInterface(
     return mainWith(arena, gpa, environ, exe_path, args, .{
         .attach = attach,
         .first_message = first_message,
-    });
+    }, true);
 }
 
 pub fn readOptions(arena: std.mem.Allocator, args: []const []const u8) !?Options {
@@ -183,6 +195,7 @@ fn mainWith(
     exe_path: []const u8,
     args: []const []const u8,
     display: ?Display,
+    install_signals: bool,
 ) !u8 {
     var options = (try readOptions(arena, args)) orelse return Exit.usage.code();
     if (options.help_wanted) return Exit.finished.code();
@@ -235,6 +248,7 @@ fn mainWith(
             &fork_request,
             &shipped,
             &streamed_event,
+            install_signals,
         );
     };
 
@@ -9876,29 +9890,28 @@ const SubagentSpawner = struct {
     }
 
     fn runToTheEnd(self: *SubagentSpawner, argv: []const []const u8) void {
-        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = self.environ });
-        defer threaded.deinit();
-        const io = threaded.io();
+        if (argv.len < 2 or !std.mem.eql(u8, argv[1], "run")) {
+            tty.print(.err, "chock: the subagent command is not a run\n", .{});
+            return;
+        }
 
-        var child = std.process.spawn(io, .{
-            .argv = argv,
-            .environ_map = self.env,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .inherit,
-        }) catch |err| {
-            tty.print(.err, "chock: the subagent could not be started: {t}\n", .{err});
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const previous_human_out = tty.useScopedHumanOut(false);
+        defer _ = tty.useScopedHumanOut(previous_human_out);
+
+        const status = mainForDaemon(
+            arena_state.allocator(),
+            self.gpa,
+            self.environ,
+            argv[0],
+            argv[2..],
+        ) catch |err| {
+            tty.print(.err, "chock: the subagent failed: {t}\n", .{err});
             return;
         };
-        const term = child.wait(io) catch |err| {
-            tty.print(.err, "chock: the subagent could not be waited for: {t}\n", .{err});
-            return;
-        };
-        switch (term) {
-            .exited => |status| if (status != 0) {
-                tty.print(.warn, "chock: the subagent exited {d}\n", .{status});
-            },
-            else => tty.print(.warn, "chock: the subagent did not exit normally\n", .{}),
+        if (status != 0) {
+            tty.print(.warn, "chock: the subagent exited {d}\n", .{status});
         }
     }
 
@@ -10278,7 +10291,12 @@ fn runSession(
     fork_request: *?ForkRequest,
     shipped: *ShippingReport,
     streamed_event: *?u64,
+    install_signals: bool,
 ) !Exit {
+    const previous_driver = chock_core.tools.driverNow();
+    chock_core.tools.useDriver(chock_net.Driver.native_driver);
+    defer chock_core.tools.useDriver(previous_driver);
+
     var http = switch (started.adapter) {
         .openai_compatible => chock_provider.Client.HttpClient.init(gpa, io, started.base_url, started.credential.token),
         .openai_responses => chock_provider.Client.HttpClient.initOpenAi(gpa, io, started.base_url, started.credential.token),
@@ -10611,10 +10629,10 @@ fn runSession(
         ),
     };
 
-    interrupt.install();
+    if (install_signals) interrupt.install();
 
-    if (started.handovers) |endpoint| handover.arm(endpoint);
-    defer handover.disarm();
+    const previous_handover = handover.use(started.handovers);
+    defer _ = handover.use(previous_handover);
 
     var session_arbiter = SessionArbiter{
         .gpa = gpa,

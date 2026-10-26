@@ -61,11 +61,21 @@ pub fn restoreBytesIfArmed() ?[]const u8 {
 }
 
 var stop_asked: std.atomic.Value(bool) = .init(false);
+threadlocal var scoped_stop: ?*const std.atomic.Value(bool) = null;
 
 const handled = [_]std.posix.SIG{ .INT, .TERM };
 
 pub fn requested() bool {
+    if (scoped_stop) |stop| return stop.load(.monotonic);
     return stop_asked.load(.monotonic);
+}
+
+/// Use a caller-owned stop flag on this thread. Session workers use this so
+/// one daemon request never cancels every session in the process.
+pub fn useScopedStop(stop: ?*const std.atomic.Value(bool)) ?*const std.atomic.Value(bool) {
+    const previous = scoped_stop;
+    scoped_stop = stop;
+    return previous;
 }
 
 pub fn requestStop() void {
@@ -197,4 +207,18 @@ test "a terminated session is asked to stop the same way an interrupted one is" 
     defer gpa.free(line);
     try testing.expectEqualStrings(first_message, line);
     forgetForTest();
+}
+
+test "a worker stop is scoped to its thread" {
+    forgetForTest();
+    requestStop();
+    defer forgetForTest();
+
+    var local: std.atomic.Value(bool) = .init(false);
+    const previous = useScopedStop(&local);
+    defer _ = useScopedStop(previous);
+
+    try testing.expect(!requested());
+    local.store(true, .monotonic);
+    try testing.expect(requested());
 }

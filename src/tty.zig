@@ -125,8 +125,16 @@ pub fn setHumanOut(enabled: bool) void {
     state.human_out = enabled;
 }
 
+threadlocal var scoped_human_out: ?bool = null;
+
+pub fn useScopedHumanOut(enabled: ?bool) ?bool {
+    const previous = scoped_human_out;
+    scoped_human_out = enabled;
+    return previous;
+}
+
 pub fn humanOut() bool {
-    return state.human_out;
+    return scoped_human_out orelse state.human_out;
 }
 
 pub fn stdoutIsTty() bool {
@@ -213,7 +221,7 @@ fn release() void {
 pub fn writeOut(bytes: []const u8) bool {
     take();
     defer release();
-    if (!state.human_out) return true;
+    if (!humanOut()) return true;
     const stream = streams.out orelse return false;
     stream.writeAll(bytes) catch {};
     return true;
@@ -242,7 +250,7 @@ fn flushOutHoldingLock() void {
 pub fn out(rank: Rank, comptime fmt: []const u8, args: anytype) void {
     take();
     defer release();
-    if (!state.human_out) return;
+    if (!humanOut()) return;
     const paint = stdoutPainter();
     const stream = streams.out orelse return printThroughDebug(paint, rank, fmt, args);
     write(stream, paint, rank, fmt, args);

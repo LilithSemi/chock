@@ -3601,7 +3601,7 @@ const SpawnThread = struct {
     }
 };
 
-var chosen_driver: chock_net.Driver = chock_net.Driver.native_driver;
+threadlocal var chosen_driver: chock_net.Driver = chock_net.Driver.native_driver;
 
 pub fn useDriver(one: chock_net.Driver) void {
     chosen_driver = one;
@@ -3611,7 +3611,7 @@ pub fn driverNow() chock_net.Driver {
     return chosen_driver;
 }
 
-var running_tool_handles: [tasks.max_tasks + 1]std.atomic.Value(?*palisade.Sandbox.Handle) = @splat(.init(null));
+threadlocal var running_tool_handles: [tasks.max_tasks + 1]std.atomic.Value(?*palisade.Sandbox.Handle) = @splat(.init(null));
 
 fn takeRunningSlot(handle: *palisade.Sandbox.Handle) ?usize {
     for (&running_tool_handles, 0..) |*slot, index| {

@@ -1,5 +1,6 @@
 //! `chock daemon`: the process that owns sessions and is the only thing a
-//! frontend talks to. It forks a child per session and runs no agent loop itself.
+//! frontend talks to. Agent turns run on owned worker threads; tools and sandbox
+//! supervisors remain separate processes where their isolation belongs.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -15,6 +16,7 @@ const run_cmd = @import("run.zig");
 const session_paths = @import("session.zig");
 const sessions_cmd = @import("sessions.zig");
 const workspace_cmd = @import("workspace.zig");
+const interrupt = @import("interrupt.zig");
 const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
@@ -29,8 +31,6 @@ const max_listeners: usize = 2;
 const max_connections: usize = 64;
 
 const watch_idle_ms: u64 = 250;
-
-const max_child_error_bytes: usize = 64 * 1024;
 
 const usage_text =
     \\Usage: chock daemon [options]
@@ -59,10 +59,14 @@ const Session = struct {
     log_path: [:0]u8,
     snapshot_path: [:0]u8,
     project: []u8,
-    pid: ?std.posix.pid_t = null,
+    turn: ?*Turn = null,
     guest: ?Guest = null,
     has_snapshot: bool = false,
     snapshotting: bool = false,
+};
+
+const Turn = struct {
+    stop: std.atomic.Value(bool) = .init(false),
 };
 
 const Guest = struct {
@@ -101,6 +105,7 @@ const Daemon = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     exe_path: []const u8,
+    environ: std.process.Environ = .empty,
     env: *std.process.Environ.Map,
     owner_uid: std.posix.uid_t = 0,
     mutex: std.Io.Mutex = .init,
@@ -283,21 +288,28 @@ const Daemon = struct {
         return true;
     }
 
-    fn notePid(self: *Daemon, id: []const u8, pid: ?std.posix.pid_t) void {
+    fn noteTurnWorker(self: *Daemon, id: []const u8, turn: ?*Turn) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.sessions.items) |*entry| {
-            if (std.mem.eql(u8, &entry.id, id)) entry.pid = pid;
+            if (!std.mem.eql(u8, &entry.id, id)) continue;
+            if (turn != null and entry.turn != null) return false;
+            entry.turn = turn;
+            return true;
         }
+        return false;
     }
 
-    fn pidFor(self: *Daemon, id: []const u8) ?std.posix.pid_t {
+    fn cancelTurn(self: *Daemon, id: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        for (self.sessions.items) |entry| {
-            if (std.mem.eql(u8, &entry.id, id)) return entry.pid;
+        for (self.sessions.items) |*entry| {
+            if (!std.mem.eql(u8, &entry.id, id)) continue;
+            const turn = entry.turn orelse return false;
+            turn.stop.store(true, .monotonic);
+            return true;
         }
-        return null;
+        return false;
     }
 
     fn logPathFor(self: *Daemon, id: []const u8) !?[:0]u8 {
@@ -335,6 +347,7 @@ pub fn main(
         .gpa = gpa,
         .io = io,
         .exe_path = exe_path,
+        .environ = environ,
         .env = &env,
         .owner_uid = std.posix.system.getuid(),
     };
@@ -793,21 +806,10 @@ fn handlePrompt(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Pr
 fn handleCancel(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Cancel) void {
     const id = checkedSession(writer, one.project, one.session) orelse return;
 
-    const pid = daemon.pidFor(&id) orelse {
+    if (!daemon.cancelTurn(&id)) {
         say(writer, .{ .ok = "that session is running nothing" });
         return;
-    };
-
-    std.posix.kill(pid, .INT) catch |err| switch (err) {
-        error.ProcessNotFound => {
-            say(writer, .{ .ok = "that session is running nothing" });
-            return;
-        },
-        else => {
-            fail(writer, "that session's turn could not be interrupted");
-            return;
-        },
-    };
+    }
     say(writer, .{ .ok = "interrupted" });
 }
 
@@ -949,19 +951,39 @@ fn beginSession(
             .forked, .nothing => unreachable,
         };
 
-        const child = Child{
+        const turn = daemon.gpa.create(Turn) catch {
+            daemon.gpa.free(child_project);
+            daemon.gpa.free(child_log_path);
+            if (owned_message) |text| daemon.gpa.free(text);
+            fail(writer, "out of memory");
+            return;
+        };
+        turn.* = .{};
+        if (!daemon.noteTurnWorker(&id, turn)) {
+            daemon.gpa.destroy(turn);
+            daemon.gpa.free(child_project);
+            daemon.gpa.free(child_log_path);
+            if (owned_message) |text| daemon.gpa.free(text);
+            fail(writer, "that session is already running a turn");
+            return;
+        }
+
+        const worker = TurnWorker{
             .daemon = daemon,
             .id = id,
             .project = child_project,
             .log_path = child_log_path,
             .message = owned_message,
+            .turn = turn,
             .adopt = switch (begin) {
                 .carry_on => true,
                 .say => false,
                 .forked, .nothing => unreachable,
             },
         };
-        const thread = std.Thread.spawn(.{}, runChild, .{child}) catch {
+        const thread = std.Thread.spawn(.{}, runTurn, .{worker}) catch {
+            _ = daemon.noteTurnWorker(&id, null);
+            daemon.gpa.destroy(turn);
             daemon.gpa.free(child_project);
             daemon.gpa.free(child_log_path);
             if (owned_message) |text| daemon.gpa.free(text);
@@ -1004,17 +1026,22 @@ fn refuseChockOwn(daemon: *Daemon, writer: *std.Io.Writer, project: []const u8) 
     return true;
 }
 
-const Child = struct {
+const TurnWorker = struct {
     daemon: *Daemon,
     id: [session_paths.id_length]u8,
     project: []u8,
     log_path: [:0]u8,
     message: ?[]u8,
+    turn: *Turn,
     adopt: bool,
 };
 
-fn runChild(child: Child) void {
+fn runTurn(child: TurnWorker) void {
     const daemon = child.daemon;
+    defer {
+        _ = daemon.noteTurnWorker(&child.id, null);
+        daemon.gpa.destroy(child.turn);
+    }
     defer daemon.gpa.free(child.project);
     defer daemon.gpa.free(child.log_path);
     defer if (child.message) |text| daemon.gpa.free(text);
@@ -1032,9 +1059,9 @@ fn runChild(child: Child) void {
     const turn = daemon.noteTurn(&child.id);
     defer if (turn) |which| releaseGuestLater(daemon, child.id, which);
 
-    var argv_buffer: [10][]const u8 = undefined;
+    var argv_buffer: [8][]const u8 = undefined;
     var argv_len: usize = 0;
-    for ([_][]const u8{ daemon.exe_path, "run", "--project", child.project, "--session", &child.id }) |word| {
+    for ([_][]const u8{ "--project", child.project, "--session", &child.id }) |word| {
         argv_buffer[argv_len] = word;
         argv_len += 1;
     }
@@ -1053,115 +1080,39 @@ fn runChild(child: Child) void {
     }
     const argv = argv_buffer[0..argv_len];
 
-    var process = std.process.spawn(daemon.io, .{
-        .argv = argv,
-        .environ_map = daemon.env,
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .pipe,
-    }) catch |err| {
-        tty.print(.err, "chock daemon: session {s} could not be started: {t}\n", .{ child.id, err });
-        publishChildFailure(child, before, "the session process could not be started", @errorName(err));
-        return;
-    };
+    var arena_state = std.heap.ArenaAllocator.init(daemon.gpa);
+    defer arena_state.deinit();
 
-    if (process.id) |pid| daemon.notePid(&child.id, pid);
-    defer daemon.notePid(&child.id, null);
+    const previous_stop = interrupt.useScopedStop(&child.turn.stop);
+    defer _ = interrupt.useScopedStop(previous_stop);
+    const previous_human_out = tty.useScopedHumanOut(false);
+    defer _ = tty.useScopedHumanOut(previous_human_out);
 
-    var errors_future = daemon.io.concurrent(captureChildErrors, .{
+    const status = run_cmd.mainForDaemon(
+        arena_state.allocator(),
         daemon.gpa,
-        daemon.io,
-        process.stderr.?,
-    }) catch {
-        tty.print(.err, "chock daemon: session {s} standard error could not be captured\n", .{child.id});
-        process.kill(daemon.io);
-        publishChildFailure(child, before, "the session process's errors could not be captured", "");
+        daemon.environ,
+        daemon.exe_path,
+        argv,
+    ) catch |err| {
+        tty.print(.err, "chock daemon: session {s} failed: {t}\n", .{ child.id, err });
+        publishChildFailure(child, before, "the session runner failed", @errorName(err));
         return;
     };
 
-    const term = process.wait(daemon.io) catch |err| {
-        tty.print(.err, "chock daemon: session {s} could not be waited for: {t}\n", .{ child.id, err });
-        const captured = errors_future.await(daemon.io);
-        defer captured.deinit(daemon.gpa);
-        printChildErrors(captured);
-        publishChildFailure(child, before, "the session process could not be waited for", @errorName(err));
-        return;
-    };
-
-    const captured = errors_future.await(daemon.io);
-    defer captured.deinit(daemon.gpa);
-    printChildErrors(captured);
-
-    switch (term) {
-        .exited => |status| {
-            tty.print(.plain, "chock daemon: session {s} exited {d}\n", .{ child.id, status });
-            if (status != 0) {
-                var fallback_buffer: [96]u8 = undefined;
-                const fallback = std.fmt.bufPrint(
-                    &fallback_buffer,
-                    "the session process exited with status {d}",
-                    .{status},
-                ) catch "the session process failed";
-                publishCapturedFailure(child, before, captured, fallback);
-            }
-        },
-        else => {
-            tty.print(.warn, "chock daemon: session {s} did not exit normally\n", .{child.id});
-            publishCapturedFailure(child, before, captured, "the session process did not exit normally");
-        },
+    tty.print(.plain, "chock daemon: session {s} exited {d}\n", .{ child.id, status });
+    if (status != 0) {
+        var detail_buffer: [96]u8 = undefined;
+        const detail = std.fmt.bufPrint(
+            &detail_buffer,
+            "the session runner exited with status {d}",
+            .{status},
+        ) catch "the session runner failed";
+        publishChildFailure(child, before, detail, "");
     }
 }
 
-const ChildErrors = struct {
-    bytes: std.ArrayList(u8) = .empty,
-    truncated: bool = false,
-    unreadable: bool = false,
-
-    fn deinit(self: ChildErrors, gpa: std.mem.Allocator) void {
-        var bytes = self.bytes;
-        bytes.deinit(gpa);
-    }
-};
-
-fn captureChildErrors(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) ChildErrors {
-    var captured: ChildErrors = .{};
-    var file_reader: std.Io.File.Reader = .initStreaming(file, io, &.{});
-    var buffer: [4096]u8 = undefined;
-
-    while (true) {
-        const read = file_reader.interface.readSliceShort(&buffer) catch {
-            captured.unreadable = true;
-            return captured;
-        };
-        if (read == 0) return captured;
-
-        const room = max_child_error_bytes - captured.bytes.items.len;
-        const keep = @min(room, read);
-        captured.bytes.appendSlice(gpa, buffer[0..keep]) catch {
-            captured.unreadable = true;
-            captured.bytes.clearAndFree(gpa);
-        };
-        if (keep != read) captured.truncated = true;
-    }
-}
-
-fn printChildErrors(captured: ChildErrors) void {
-    if (captured.bytes.items.len != 0) tty.print(.err, "{s}", .{captured.bytes.items});
-    if (captured.truncated) tty.print(.warn, "chock daemon: session error output was truncated\n", .{});
-    if (captured.unreadable) tty.print(.warn, "chock daemon: session error output could not be read completely\n", .{});
-}
-
-fn publishCapturedFailure(
-    child: Child,
-    before: u64,
-    captured: ChildErrors,
-    fallback: []const u8,
-) void {
-    const detail = std.mem.trim(u8, captured.bytes.items, " \t\r\n");
-    publishChildFailure(child, before, if (detail.len != 0) detail else fallback, "");
-}
-
-fn publishChildFailure(child: Child, before: u64, message: []const u8, suffix: []const u8) void {
+fn publishChildFailure(child: TurnWorker, before: u64, message: []const u8, suffix: []const u8) void {
     var detail_buffer: [512]u8 = undefined;
     const detail = if (suffix.len == 0)
         message
@@ -2494,7 +2445,7 @@ test "the daemon fork request creates an idle child at the requested turn" {
 
     const remembered = daemon.sessions.items[0];
     try testing.expectEqualStrings(child_id, &remembered.id);
-    try testing.expect(remembered.pid == null);
+    try testing.expect(remembered.turn == null);
     try testing.expect(remembered.guest == null);
 
     const sessions_dir = try session_paths.projectDir(arena, &env, project);
