@@ -29,11 +29,24 @@ pub const default_max_object_bytes: u64 = 16 << 20;
 
 pub const default_max_session_bytes: u64 = 256 << 20;
 
+/// At most this many stores or machines in one list. A project that needs
+/// more has named a set it cannot be checking by hand.
+pub const max_provenance_entries: usize = 32;
+
+/// What a project demands of where a provisioned tool came from. Every field at
+/// its default asks nothing. `lib/chock-nix/provenance.zig` does the reading.
+pub const Provenance = struct {
+    required: bool = false,
+    from: []const []const u8 = &.{},
+    built_by: []const []const u8 = &.{},
+};
+
 pub const Nix = struct {
     max_object_bytes: ?u64 = null,
     max_session_bytes: ?u64 = null,
     /// The attribute under `devShells.<system>`. Null is `default`.
     dev_shell: ?[]const u8 = null,
+    provenance: ?Provenance = null,
 };
 
 pub const Resolved = struct {
@@ -42,6 +55,7 @@ pub const Resolved = struct {
     max_object_bytes_from_org: bool = false,
     max_session_bytes_from_org: bool = false,
     dev_shell: ?[]const u8 = null,
+    provenance: ?Provenance = null,
 };
 
 pub fn foldLayers(project: Nix, operator: Nix, ceiling: ?Ceiling) Resolved {
@@ -49,6 +63,7 @@ pub fn foldLayers(project: Nix, operator: Nix, ceiling: ?Ceiling) Resolved {
         .max_object_bytes = project.max_object_bytes orelse operator.max_object_bytes orelse default_max_object_bytes,
         .max_session_bytes = project.max_session_bytes orelse operator.max_session_bytes orelse default_max_session_bytes,
         .dev_shell = project.dev_shell orelse operator.dev_shell,
+        .provenance = project.provenance orelse operator.provenance,
     };
     return underCeiling(resolved, ceiling);
 }
@@ -95,10 +110,24 @@ pub const Diagnostic = struct {
         dev_shell_not_a_string,
         dev_shell_empty,
         dev_shell_has_hash: []const u8,
+        provenance_not_a_struct,
+        provenance_unknown_field: []const u8,
+        provenance_required_not_a_bool,
+        provenance_not_a_list: []const u8,
+        provenance_list_too_long: []const u8,
+        provenance_entry_not_a_string: Entry,
+        provenance_entry_empty: Entry,
         negative_setting: []const u8,
         setting_overflow: []const u8,
         file_too_large: usize,
         read_failed: anyerror,
+    };
+
+    /// Which list, and which entry of it. The field name is this reader's own
+    /// word and never the file's, so it is never owned memory.
+    pub const Entry = struct {
+        field: []const u8,
+        at: usize,
     };
 
     pub const InvalidSetting = struct {
@@ -121,6 +150,7 @@ pub const Diagnostic = struct {
             .negative_setting,
             .setting_overflow,
             .dev_shell_has_hash,
+            .provenance_unknown_field,
             => |name| gpa.free(name),
             .invalid_setting => |setting| {
                 gpa.free(setting.field);
@@ -165,6 +195,34 @@ pub const Diagnostic = struct {
                 "{s}: the nix block's dev_shell field holds \"{s}\". A # separates the flake from " ++
                     "the attribute, so the name cannot hold one",
                 .{ self.source, name },
+            ),
+            .provenance_not_a_struct => try writer.print(
+                "{s}: the nix block's provenance field must hold a struct literal",
+                .{self.source},
+            ),
+            .provenance_unknown_field => |field| try writer.print(
+                "{s}: the nix block's provenance names a field this reader does not know: {s}",
+                .{ self.source, field },
+            ),
+            .provenance_required_not_a_bool => try writer.print(
+                "{s}: the nix block's provenance.required field must be true or false",
+                .{self.source},
+            ),
+            .provenance_not_a_list => |field| try writer.print(
+                "{s}: the nix block's provenance.{s} field must be a list of strings",
+                .{ self.source, field },
+            ),
+            .provenance_list_too_long => |field| try writer.print(
+                "{s}: the nix block's provenance.{s} field names more than {d} entries",
+                .{ self.source, field, max_provenance_entries },
+            ),
+            .provenance_entry_not_a_string => |entry| try writer.print(
+                "{s}: entry {d} of the nix block's provenance.{s} field is not a string",
+                .{ self.source, entry.at, entry.field },
+            ),
+            .provenance_entry_empty => |entry| try writer.print(
+                "{s}: entry {d} of the nix block's provenance.{s} field is empty, and a name cannot be",
+                .{ self.source, entry.at, entry.field },
             ),
             .negative_setting => |field| try writer.print(
                 "{s}: the nix block's {s} field is a negative number, and a byte cap cannot be",
@@ -262,6 +320,8 @@ fn parseFields(
                     nix.max_session_bytes = try readBytes(gpa, zoir, "max_session_bytes", value_node, source_name, diag);
                 } else if (std.mem.eql(u8, name, "dev_shell")) {
                     nix.dev_shell = try readDevShell(gpa, zoir, value_node, source_name, diag);
+                } else if (std.mem.eql(u8, name, "provenance")) {
+                    nix.provenance = try readProvenance(gpa, zoir, value_node, source_name, diag);
                 } else {
                     _ = note(diag, source_name, .{ .unknown_field = try gpa.dupe(u8, name) });
                     return error.InvalidNix;
@@ -274,6 +334,103 @@ fn parseFields(
         },
     }
     return nix;
+}
+
+fn readProvenance(
+    gpa: std.mem.Allocator,
+    zoir: std.zig.Zoir,
+    node: std.zig.Zoir.Node.Index,
+    source_name: []const u8,
+    diag: ?*?Diagnostic,
+) ParseError!Provenance {
+    var held = Provenance{};
+    errdefer freeProvenance(gpa, held);
+
+    const fields = switch (node.get(&zoir)) {
+        .empty_literal => return held,
+        .struct_literal => |fields| fields,
+        else => {
+            _ = note(diag, source_name, .provenance_not_a_struct);
+            return error.InvalidNix;
+        },
+    };
+
+    for (fields.names, 0..) |name_id, index| {
+        const name = name_id.get(&zoir);
+        const value_node = fields.vals.at(@intCast(index));
+        if (std.mem.eql(u8, name, "required")) {
+            held.required = switch (value_node.get(&zoir)) {
+                .true => true,
+                .false => false,
+                else => {
+                    _ = note(diag, source_name, .provenance_required_not_a_bool);
+                    return error.InvalidNix;
+                },
+            };
+        } else if (std.mem.eql(u8, name, "from")) {
+            held.from = try readNames(gpa, zoir, "from", value_node, source_name, diag);
+        } else if (std.mem.eql(u8, name, "built_by")) {
+            held.built_by = try readNames(gpa, zoir, "built_by", value_node, source_name, diag);
+        } else {
+            _ = note(diag, source_name, .{ .provenance_unknown_field = try gpa.dupe(u8, name) });
+            return error.InvalidNix;
+        }
+    }
+
+    return held;
+}
+
+pub fn freeProvenance(gpa: std.mem.Allocator, held: Provenance) void {
+    for (held.from) |one| gpa.free(one);
+    if (held.from.len != 0) gpa.free(held.from);
+    for (held.built_by) |one| gpa.free(one);
+    if (held.built_by.len != 0) gpa.free(held.built_by);
+}
+
+fn readNames(
+    gpa: std.mem.Allocator,
+    zoir: std.zig.Zoir,
+    field: []const u8,
+    node: std.zig.Zoir.Node.Index,
+    source_name: []const u8,
+    diag: ?*?Diagnostic,
+) ParseError![]const []const u8 {
+    const items = switch (node.get(&zoir)) {
+        .empty_literal => return &.{},
+        .array_literal => |list| list,
+        else => {
+            _ = note(diag, source_name, .{ .provenance_not_a_list = field });
+            return error.InvalidNix;
+        },
+    };
+
+    if (items.len > max_provenance_entries) {
+        _ = note(diag, source_name, .{ .provenance_list_too_long = field });
+        return error.InvalidNix;
+    }
+
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |one| gpa.free(one);
+        out.deinit(gpa);
+    }
+
+    for (0..items.len) |at| {
+        const text = switch (items.at(@intCast(at)).get(&zoir)) {
+            .string_literal => |text| text,
+            else => {
+                _ = note(diag, source_name, .{ .provenance_entry_not_a_string = .{ .field = field, .at = at } });
+                return error.InvalidNix;
+            },
+        };
+        if (text.len == 0) {
+            _ = note(diag, source_name, .{ .provenance_entry_empty = .{ .field = field, .at = at } });
+            return error.InvalidNix;
+        }
+        try out.append(gpa, try gpa.dupe(u8, text));
+    }
+
+    return out.toOwnedSlice(gpa);
 }
 
 fn readDevShell(
@@ -665,4 +822,106 @@ test "the project's dev_shell wins over the operator's, and an org ceiling says 
     const held = foldLayers(project, operator, bound);
     try testing.expectEqualStrings("ci", held.dev_shell.?);
     try testing.expectEqual(@as(u64, 1 << 20), held.max_object_bytes);
+}
+
+test "the provenance block reads the lists and the flag, and asks nothing by default" {
+    const gpa = testing.allocator;
+
+    const quiet = try parse(gpa, ".{ .nix = .{ .dev_shell = \"ci\" } }", null);
+    defer gpa.free(quiet.dev_shell.?);
+    try testing.expectEqual(@as(?Provenance, null), quiet.provenance);
+
+    const read = try parse(gpa,
+        \\.{ .nix = .{ .provenance = .{
+        \\  .required = true,
+        \\  .from = .{ "https://cache.flakehub.com", "https://cache.nixos.org" },
+        \\  .built_by = .{"zeta3a"},
+        \\} } }
+    , null);
+    defer freeProvenance(gpa, read.provenance.?);
+
+    const held = read.provenance.?;
+    try testing.expect(held.required);
+    try testing.expectEqual(@as(usize, 2), held.from.len);
+    try testing.expectEqualStrings("https://cache.flakehub.com", held.from[0]);
+    try testing.expectEqualStrings("zeta3a", held.built_by[0]);
+
+    const empty = try parse(gpa, ".{ .nix = .{ .provenance = .{} } }", null);
+    try testing.expect(!empty.provenance.?.required);
+    try testing.expectEqual(@as(usize, 0), empty.provenance.?.from.len);
+}
+
+test "a provenance block this reader cannot make sense of is refused by name" {
+    const gpa = testing.allocator;
+
+    const wrong = [_]struct { source: [:0]const u8, fault: std.meta.Tag(Diagnostic.Fault) }{
+        .{ .source = ".{ .nix = .{ .provenance = 3 } }", .fault = .provenance_not_a_struct },
+        .{
+            .source = ".{ .nix = .{ .provenance = .{ .substituters = .{\"a\"} } } }",
+            .fault = .provenance_unknown_field,
+        },
+        .{
+            .source = ".{ .nix = .{ .provenance = .{ .required = \"yes\" } } }",
+            .fault = .provenance_required_not_a_bool,
+        },
+        .{
+            .source = ".{ .nix = .{ .provenance = .{ .from = \"one\" } } }",
+            .fault = .provenance_not_a_list,
+        },
+        .{
+            .source = ".{ .nix = .{ .provenance = .{ .built_by = .{3} } } }",
+            .fault = .provenance_entry_not_a_string,
+        },
+        .{
+            .source = ".{ .nix = .{ .provenance = .{ .from = .{\"\"} } } }",
+            .fault = .provenance_entry_empty,
+        },
+    };
+
+    for (wrong) |one| {
+        var diag: ?Diagnostic = null;
+        defer if (diag) |*d| d.deinit(gpa);
+        try testing.expectError(error.InvalidNix, parse(gpa, one.source, &diag));
+        try testing.expectEqual(one.fault, std.meta.activeTag(diag.?.fault));
+
+        var text: [256]u8 = undefined;
+        const said = try std.fmt.bufPrint(&text, "{f}", .{diag.?});
+        try testing.expect(std.mem.indexOf(u8, said, "provenance") != null);
+    }
+}
+
+test "a list longer than the bound is refused, and the bound is in the sentence" {
+    const gpa = testing.allocator;
+
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa, ".{ .nix = .{ .provenance = .{ .from = .{");
+    for (0..max_provenance_entries + 1) |at| try source.print(gpa, "\"https://one-{d}\",", .{at});
+    try source.appendSlice(gpa, "} } } }");
+    const owned = try source.toOwnedSliceSentinel(gpa, 0);
+    defer gpa.free(owned);
+
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+    try testing.expectError(error.InvalidNix, parse(gpa, owned, &diag));
+    try testing.expectEqualStrings("from", diag.?.fault.provenance_list_too_long);
+
+    var text: [256]u8 = undefined;
+    const said = try std.fmt.bufPrint(&text, "{f}", .{diag.?});
+    try testing.expect(std.mem.indexOf(u8, said, "32") != null);
+}
+
+test "the project's provenance block wins over the operator's, as every other field does" {
+    const operator = Provenance{ .required = true, .from = &.{"https://cache.nixos.org"} };
+    const project = Provenance{ .built_by = &.{"zeta3a"} };
+
+    const theirs = foldLayers(.{ .provenance = project }, .{ .provenance = operator }, null);
+    try testing.expectEqualStrings("zeta3a", theirs.provenance.?.built_by[0]);
+    try testing.expect(!theirs.provenance.?.required);
+
+    const only_operator = foldLayers(.{}, .{ .provenance = operator }, null);
+    try testing.expect(only_operator.provenance.?.required);
+
+    const neither = foldLayers(.{}, .{}, null);
+    try testing.expectEqual(@as(?Provenance, null), neither.provenance);
 }

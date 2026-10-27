@@ -13,6 +13,7 @@ pub const eval = @import("chock-nix/eval.zig");
 pub const fetch = @import("chock-nix/fetch.zig");
 pub const inputs = @import("chock-nix/inputs.zig");
 pub const proc = @import("chock-nix/proc.zig");
+pub const provenance = @import("chock-nix/provenance.zig");
 pub const provision = @import("chock-nix/provision.zig");
 pub const store = @import("chock-nix/store.zig");
 
@@ -26,6 +27,7 @@ test {
     _ = fetch;
     _ = inputs;
     _ = proc;
+    _ = provenance;
     _ = provision;
     _ = store;
 }

@@ -273,6 +273,27 @@ Leave it out and Chock reads `default`, which is what `nix develop` reads.
 the session with Nix's own message. See
 [toolchains.md](../operate/toolchains.md#which-dev-shell).
 
+### Where a provisioned tool may come from
+
+The same block says what a tool `provide_tool` builds must say about its own
+origin:
+
+```zon
+.{
+    .nix = .{
+        .provenance = .{
+            .required = true,
+            .from = .{"https://cache.flakehub.com"},
+            .built_by = .{"builder-one"},
+        },
+    },
+}
+```
+
+Left out, nothing is asked and nothing is read. What each field means, and what
+a refusal says, is in
+[tools.md](../using/tools.md#where-it-came-from).
+
 ### Paths the worktree does not carry
 
 The agent works in a git worktree at HEAD, so a file git ignores is invisible

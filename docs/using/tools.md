@@ -107,6 +107,51 @@ A program provisioned this way lasts for that session only. What a project
 needs every time belongs in `flake.nix`. See
 [toolchains.md](../operate/toolchains.md).
 
+### Where it came from
+
+A provisioned program is realised by the Nix on your machine, which either
+builds it here or copies it from a store. Which of the two happened, and where
+from, is a record Nix keeps. A project can demand that record:
+
+```zon
+.{
+    .nix = .{
+        .provenance = .{
+            .required = true,
+            .from = .{"https://cache.flakehub.com"},
+            .built_by = .{"builder-one"},
+        },
+    },
+}
+```
+
+| Field | What it asks of a path |
+|---|---|
+| `required` | it says where it came from, rather than nothing |
+| `from` | every copy in the record names one of these stores |
+| `built_by` | every build in the record ran on one of these machines |
+
+A field left out asks nothing, and a block with no fields asks nothing at all,
+so Nix is never questioned and a session pays no call for it. Each field is read
+over the whole record: a path built on one machine and then copied through two
+caches holds one link for each step, and every link has to answer.
+
+A path that fails keeps the program out of the toolchain, and the agent is told
+what the path says beside what the project asked for. Three cases are refusals
+rather than warnings: a path Nix holds no record of, a build whose record names
+no machine while `built_by` names which machines may build, and a Nix that
+cannot answer at all. The last one needs Determinate Nix 3.16 or later, which
+is the first to hold both this record and the flag that asks for it.
+
+What is checked is the path the program is, and not the whole closure it links
+against. A tool's dependencies arrive from whichever stores your Nix is set to
+use, so one store named for every path in a closure would refuse every ordinary
+nixpkgs build. `.from` is a statement about the tool.
+
+Your own `chock.zon` and the project's are read the way every other field in
+the nix block is read: the project's block wins when it has one. An org bundle
+cannot set this.
+
 ### What it costs
 
 A request holds the turn and has no deadline. `nix build` on a cache miss is

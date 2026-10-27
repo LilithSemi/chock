@@ -826,3 +826,59 @@ test "a no refuses the fetch, and every host of the lock was in the one question
     try testing.expectEqualStrings("api.github.com", gate.asked.items[0]);
     try testing.expect(std.mem.indexOf(u8, answer.refused, "api.github.com") != null);
 }
+
+test "the provenance this machine records is read by the reader that judges it" {
+    if (nix_path.len == 0) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The nix program is itself in the store, so this machine always has one
+    // path to ask about.
+    const path = nixSaid(arena, io, &.{ "path-info", "--", nix_path }) orelse
+        return error.SkipZigTest;
+
+    const provenance = chock_nix.provenance;
+    const args = try provenance.argsFor(arena, &.{path});
+    const answered = nixSaid(arena, io, args) orelse return error.SkipZigTest;
+    try testing.expect(std.mem.indexOf(u8, answered, path) != null);
+
+    // The flags and the shape are right against the real nix: an answer this
+    // reader could not use would come back as `unreadable`, whatever the path
+    // happens to carry.
+    const asked = try provenance.check(arena, .{ .required = true }, answered);
+    try testing.expect(asked == .allowed or asked.refused.fault != .unreadable);
+    try testing.expectEqual(provenance.Verdict.allowed, try provenance.check(arena, .{}, answered));
+
+    if (asked != .allowed) return;
+
+    // The path says where it came from, so a demand nothing can answer must
+    // refuse it. Which link it carries decides which demand that is.
+    if (std.mem.indexOf(u8, answered, "\"copied\"") != null) {
+        const refused = try provenance.check(
+            arena,
+            .{ .from = &.{"http://chock-test-not-a-store"} },
+            answered,
+        );
+        try testing.expectEqual(
+            std.meta.Tag(provenance.Fault).copied_from,
+            std.meta.activeTag(refused.refused.fault),
+        );
+    }
+
+    if (std.mem.indexOf(u8, answered, "\"build\"") != null) {
+        const refused = try provenance.check(
+            arena,
+            .{ .built_by = &.{"chock-test-not-a-machine"} },
+            answered,
+        );
+        const fault = std.meta.activeTag(refused.refused.fault);
+        try testing.expect(fault == .built_by or fault == .build_host_unknown);
+    }
+}

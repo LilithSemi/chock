@@ -6,6 +6,7 @@ const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
 pub const Diagnostic = diagnostic.Diagnostic;
 const proc = @import("proc.zig");
+pub const provenance = @import("provenance.zig");
 const store = @import("store.zig");
 
 pub const Error = std.mem.Allocator.Error || error{
@@ -156,6 +157,9 @@ fn pinnedEnv(
 pub const Request = struct {
     program: []const u8,
     registry: []const u8 = default_registry,
+    /// What the project demands of where the built paths came from. The default
+    /// asks nothing and costs no call.
+    provenance: provenance.Expectation = .{},
 };
 
 pub const Provided = struct {
@@ -200,6 +204,10 @@ pub fn resolve(
         ) };
     }
 
+    if (try refusedProvenance(allocator, io, runner, request, out_paths)) |refusal| {
+        return .{ .refused = refusal };
+    }
+
     var said: []const u8 = "";
     const mounts = try mountsFor(allocator, io, runner, out_paths, &said) orelse {
         return .{ .refused = try std.fmt.allocPrint(
@@ -216,6 +224,28 @@ pub fn resolve(
         .bin_dirs = mounts.bin_dirs,
         .store_paths = mounts.store_paths,
     } };
+}
+
+/// The sentence that keeps a tool out, or null when the project asked nothing
+/// or every path answered it. A call that nix refuses lands here too: its
+/// stderr is read as the answer, which `check` reports as an unreadable one.
+fn refusedProvenance(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runner: Runner,
+    request: Request,
+    out_paths: []const []const u8,
+) Error!?[]u8 {
+    if (request.provenance.asksNothing()) return null;
+
+    const args = try provenance.argsFor(allocator, out_paths);
+    const answered = try runner.run(allocator, io, args);
+    const text = if (answered.succeeded()) answered.stdout else answered.stderr;
+
+    return switch (try provenance.check(allocator, request.provenance, text)) {
+        .allowed => null,
+        .refused => |one| try provenance.explain(allocator, request.provenance, one),
+    };
 }
 
 pub const Mounts = struct {
@@ -639,4 +669,83 @@ test "the installable is always the registry and the name, and asserts the check
     defer gpa.free(text);
     try testing.expectEqualStrings("nixpkgs#ripgrep", text);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "#"));
+}
+
+test "a tool from a store the project does not name is refused before it is mounted" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const replies = [_]FakeRunner.Reply{
+        .{ .stdout = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1\n" },
+        .{ .stdout =
+        \\{"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1":
+        \\{"provenance":{"from":"http://cache.elsewhere","next":null,"type":"copied"}}}
+        },
+    };
+    var fake = FakeRunner{ .gpa = gpa, .replies = &replies };
+    defer fake.deinit();
+
+    const answer = try resolve(arena, testing.io, fake.runner(), .{
+        .program = "ripgrep",
+        .provenance = .{ .from = &.{"https://cache.nixos.org"} },
+    });
+
+    try testing.expect(std.mem.indexOf(u8, answer.refused, "http://cache.elsewhere") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.refused, "https://cache.nixos.org") != null);
+
+    // Two calls: the build and the question about it. The closure is never
+    // asked for, because nothing of this tool is going to be mounted.
+    try testing.expectEqual(@as(usize, 2), fake.seen.items.len);
+    const asked = fake.seen.items[1];
+    try testing.expectEqualStrings("path-info", asked[0]);
+    try testing.expectEqualStrings("--json", asked[1]);
+}
+
+test "a tool that answers the expectation is mounted, and the question is asked once" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const replies = [_]FakeRunner.Reply{
+        .{ .stdout = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1\n" },
+        .{ .stdout =
+        \\{"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1":
+        \\{"provenance":{"buildHost":"zeta3a","drv":"d.drv","next":null,"output":"out",
+        \\"system":"aarch64-linux","tags":{},"type":"build"}}}
+        },
+        .{ .stdout = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1\n" },
+    };
+    var fake = FakeRunner{ .gpa = gpa, .replies = &replies };
+    defer fake.deinit();
+
+    const answer = try resolve(arena, testing.io, fake.runner(), .{
+        .program = "ripgrep",
+        .provenance = .{ .required = true, .built_by = &.{"zeta3a"} },
+    });
+    try testing.expectEqual(@as(usize, 1), answer.provided.store_paths.len);
+    try testing.expectEqual(@as(usize, 3), fake.seen.items.len);
+}
+
+test "a nix that cannot answer where a path came from keeps the tool out" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const replies = [_]FakeRunner.Reply{
+        .{ .stdout = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1\n" },
+        .{ .code = 1, .stderr = "error: unrecognised flag '--json-format'\n" },
+    };
+    var fake = FakeRunner{ .gpa = gpa, .replies = &replies };
+    defer fake.deinit();
+
+    const answer = try resolve(arena, testing.io, fake.runner(), .{
+        .program = "ripgrep",
+        .provenance = .{ .required = true },
+    });
+    try testing.expect(std.mem.indexOf(u8, answer.refused, "Determinate") != null);
+    try testing.expectEqual(@as(usize, 2), fake.seen.items.len);
 }

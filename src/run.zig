@@ -1710,6 +1710,7 @@ fn start(
         chain,
         model,
         dev_shell_dir,
+        nix_caps,
     );
 
     const nix_build = nixBuildFor(
@@ -3451,6 +3452,7 @@ const Provisioning = struct {
     nix_store_program: ?[]const u8,
     registry: []const u8,
     root_dir: ?[]const u8,
+    provenance: chock_nix.provenance.Expectation = .{},
 };
 
 const provision_action = chock_broker.actions.Kind.nix_build.wireName();
@@ -4425,6 +4427,7 @@ fn provisioningFor(
     chain_links: []const chock_proto.event.SpawnLink,
     model: []const u8,
     dev_shell_dir: ?[]const u8,
+    caps: chock_policy.nix.Resolved,
 ) std.mem.Allocator.Error!?Provisioning {
     const decision = try provisionDecision(arena, policy, chain_links, options.agent_kind, model);
     if (decision != .allow) {
@@ -4449,12 +4452,53 @@ fn provisioningFor(
         );
     }
 
+    const wanted = provenanceWanted(caps);
+    if (!wanted.asksNothing()) {
+        tty.detail(
+            "chock: a provisioned program is checked against this project's provenance " ++
+                "block before it is mounted\n",
+            .{},
+        );
+    }
+
     return .{
         .nix_program = nix_program,
         .nix_store_program = nix_store_program,
         .registry = chock_nix.provision.default_registry,
         .root_dir = dev_shell_dir,
+        .provenance = wanted,
     };
+}
+
+/// The nix block's own words, as the reader of a store path's provenance wants
+/// them. The two structs are checked against each other by a test below, so a
+/// field added to one cannot be dropped here without the suite saying so.
+fn provenanceWanted(caps: chock_policy.nix.Resolved) chock_nix.provenance.Expectation {
+    const held = caps.provenance orelse return .{};
+    return .{
+        .required = held.required,
+        .from = held.from,
+        .built_by = held.built_by,
+    };
+}
+
+test "what the nix block asks of a tool's provenance is what the reader is given" {
+    const fields = @typeInfo(chock_policy.nix.Provenance).@"struct".field_names;
+    const wanted = @typeInfo(chock_nix.provenance.Expectation).@"struct".field_names;
+    try testing.expectEqual(wanted.len, fields.len);
+    inline for (fields, wanted) |one, other| try testing.expectEqualStrings(other, one);
+
+    const asked = provenanceWanted(.{
+        .max_object_bytes = 1,
+        .max_session_bytes = 2,
+        .provenance = .{ .required = true, .from = &.{"https://cache.nixos.org"} },
+    });
+    try testing.expect(asked.required);
+    try testing.expectEqualStrings("https://cache.nixos.org", asked.from[0]);
+    try testing.expect(!asked.asksNothing());
+
+    const nothing = provenanceWanted(.{ .max_object_bytes = 1, .max_session_bytes = 2 });
+    try testing.expect(nothing.asksNothing());
 }
 
 pub fn toolStagingDir(
@@ -8642,6 +8686,7 @@ const ProvisionToolRunner = struct {
         const answer = chock_nix.provision.resolve(self.arena, io, host.runner(), .{
             .program = program,
             .registry = settings.registry,
+            .provenance = settings.provenance,
         }) catch |err| {
             if (run_diag) |*fault| tty.print(.warn, "chock: {f}\n", .{fault});
             return err;
