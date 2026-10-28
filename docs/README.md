@@ -32,6 +32,10 @@ Start with [running.md](running.md) for a session end to end, and
   `AGENTS.md`, why they are never flattened, and how they differ from a note.
 - [using/skills.md](using/skills.md) - Agent Skills read off disk, the three
   layers and their defaults, and the four things a skill may never do.
+- [using/commands.md](using/commands.md) - a message saved under a name and run
+  with `/name`, its arguments, and why the agent cannot run one.
+- [using/hooks.md](using/hooks.md) - a program the project runs at a point in a
+  session, the four triggers, and why a hook can only narrow.
 
 ## Configuring a project
 

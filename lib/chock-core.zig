@@ -9,6 +9,9 @@ pub const prompt = @import("chock-core/prompt.zig");
 pub const Loop = @import("chock-core/Loop.zig");
 
 pub const constitution = @import("chock-core/constitution.zig");
+pub const commands = @import("chock-core/commands.zig");
+pub const frontmatter = @import("chock-core/frontmatter.zig");
+pub const hooks = @import("chock-core/hooks.zig");
 pub const index = @import("chock-core/index.zig");
 pub const instructions = @import("chock-core/instructions.zig");
 pub const memory = @import("chock-core/memory.zig");

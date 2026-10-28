@@ -36,6 +36,7 @@ const max_mcp_bytes: usize = 64 * 1024;
 pub fn read(arena: std.mem.Allocator, io: std.Io, project_root: []const u8) anyerror!Found {
     var sources: std.ArrayList(ReadSource) = .empty;
     var instructions: std.ArrayList(Source) = .empty;
+    var commands: std.ArrayList(Source) = .empty;
     var mcp_servers: std.ArrayList(McpServer) = .empty;
     var policy_hints: std.ArrayList(Hint) = .empty;
     var refused: std.ArrayList(Refusal) = .empty;
@@ -44,11 +45,13 @@ pub fn read(arena: std.mem.Allocator, io: std.Io, project_root: []const u8) anye
     try readSettings(arena, io, project_root, ".claude/settings.json", &sources, &policy_hints, &refused);
     try readSettings(arena, io, project_root, ".claude/settings.local.json", &sources, &policy_hints, &refused);
     try readMcp(arena, io, project_root, &sources, &mcp_servers, &refused);
+    try readCommands(arena, io, project_root, &commands, &refused);
     try refuseUncarriedDirectories(arena, io, project_root, &refused);
 
     return .{
         .sources = try sources.toOwnedSlice(arena),
         .instructions = try instructions.toOwnedSlice(arena),
+        .commands = try commands.toOwnedSlice(arena),
         .mcp_servers = try mcp_servers.toOwnedSlice(arena),
         .policy_hints = try policy_hints.toOwnedSlice(arena),
         .refused = try refused.toOwnedSlice(arena),
@@ -133,7 +136,10 @@ fn readSettings(
     if (parsed.hooks != null) {
         try refused.append(arena, .{
             .what = try std.fmt.allocPrint(arena, "hooks in {s}", .{rel}),
-            .reason = "a hook runs on the host with full developer privilege, and this build has no way to run one safely",
+            .reason = "a foreign hook is a shell line run on the host. A hook here is an argv " ++
+                "run in the sandbox, under the same exec policy as a tool call, so the two do " ++
+                "not mean the same thing. Write it as a hooks block, which " ++
+                "docs/using/hooks.md has the shape of.",
         });
     }
 
@@ -247,14 +253,37 @@ fn readMcp(
     }
 }
 
+const commands_dir = ".claude/commands";
+
+/// Claude Code keeps a prompt command in the same shape Chock reads, so the
+/// directory is carried by name. A file Chock would not read becomes one
+/// refusal naming that file.
+fn readCommands(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    commands: *std.ArrayList(Source),
+    refused: *std.ArrayList(Refusal),
+) !void {
+    if (!try exists(arena, io, project_root, commands_dir)) return;
+
+    const read_it = try migrate.readCommandDir(arena, io, project_root, commands_dir);
+    try refused.appendSlice(arena, read_it.refused);
+
+    if (read_it.carried) {
+        try commands.append(arena, .{ .path = commands_dir, .harness = harness_name });
+        return;
+    }
+    try refused.append(arena, .{
+        .what = commands_dir,
+        .reason = "it holds no file this build reads as a command",
+    });
+}
+
 const uncarried_dirs = [_]struct { path: []const u8, reason: []const u8 }{
     .{
         .path = ".claude/agents",
         .reason = "a sub agent runs as its own agent, and this build has no mechanism that runs one",
-    },
-    .{
-        .path = ".claude/commands",
-        .reason = "a slash command expands host side, and this build has no mechanism that runs one",
     },
     .{
         .path = ".claude/plugins",
@@ -543,7 +572,7 @@ test "additionalDirectories, bypassPermissions and disableBypassPermissionsMode 
     try testing.expectEqual(@as(usize, 3), found.refused.len);
 }
 
-test "hooks in settings.json are refused, and the four unsafe directories are each named" {
+test "hooks in settings.json are refused, and the three unsafe directories are each named" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -556,12 +585,59 @@ test "hooks in settings.json are refused, and the four unsafe directories are ea
         \\{"hooks": {"PreToolUse": []}}
     );
     try writeProjectFile(testing.io, project_root, ".claude/agents/reviewer.md", "# reviewer\n");
-    try writeProjectFile(testing.io, project_root, ".claude/commands/deploy.md", "# deploy\n");
+    try writeProjectFile(testing.io, project_root, ".claude/commands/deploy.md", "# deploy\\n");
     try writeProjectFile(testing.io, project_root, ".claude/plugins/example/plugin.json", "{}");
     try writeProjectFile(testing.io, project_root, ".claude/skills/reader/SKILL.md", "# reader\n");
 
     const found = try read(arena, testing.io, project_root);
 
-    // One for the hooks block, one for each of the four directories.
-    try testing.expectEqual(@as(usize, 5), found.refused.len);
+    // One for the hooks block, one for each of the three directories that are
+    // not carried, and two for the commands: the file with no frontmatter, and
+    // the directory left holding nothing this build reads.
+    try testing.expectEqual(@as(usize, 6), found.refused.len);
+    try testing.expectEqual(@as(usize, 0), found.commands.len);
+
+    var named_the_file = false;
+    for (found.refused) |one| {
+        if (std.mem.eql(u8, one.what, ".claude/commands/deploy.md")) named_the_file = true;
+    }
+    try testing.expect(named_the_file);
+}
+
+test "a commands directory this build reads is carried by name, and a file it cannot is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_root = try tmpProjectRoot(arena, &tmp);
+
+    try writeProjectFile(testing.io, project_root, ".claude/commands/review.md",
+        \\---
+        \\description: Review the diff.
+        \\argument-hint: <path>
+        \\---
+        \\Read $ARGUMENTS and say what it does.
+        \\
+    );
+    try writeProjectFile(testing.io, project_root, ".claude/commands/deploy.md", "# deploy\\n");
+
+    const found = try read(arena, testing.io, project_root);
+
+    try testing.expectEqual(@as(usize, 1), found.commands.len);
+    try testing.expectEqualStrings(".claude/commands", found.commands[0].path);
+    try testing.expectEqualStrings("claude-code", found.commands[0].harness);
+
+    var named_the_file = false;
+    for (found.refused) |one| {
+        if (std.mem.eql(u8, one.what, ".claude/commands/deploy.md")) named_the_file = true;
+    }
+    try testing.expect(named_the_file);
+
+    // The directory reaches chock.zon, so the project keeps one copy of each
+    // command rather than two.
+    const text = try migrate.render(arena, found, "test", "2026-10-28", &.{});
+    try testing.expect(std.mem.indexOf(u8, text, ".commands = .{") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\".claude/commands\"") != null);
 }

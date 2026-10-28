@@ -254,8 +254,12 @@ them as not built.
   `src/migrate.zig`. A foreign deny renders at `.deny`. A
   foreign allow renders at `.ask`, never `.allow`, because an allow read
   against one tool's threat model does not become an allow under this one. A
-  hook, a plugin, a skill and a slash command carry into no field: a reader
-  puts each in `Found.refused` with the reason instead. An environment
+  plugin and a skill carry into no field: a reader puts each in
+  `Found.refused` with the reason instead. A directory of commands does carry,
+  by name and never by copying, and every file in it that this build would not
+  read becomes one refusal naming that file. A foreign hook is refused and the
+  reason says what to write instead, because a hook here is an argv under the
+  same exec policy as a tool call and not a shell line on the host. An environment
   variable's value is never read, only its name, through `envName`. It never
   overwrites a `chock.zon` that is already there: it prints the rows it would
   have added and writes nothing instead.

@@ -117,10 +117,50 @@ pub const Refusal = struct {
 pub const Found = struct {
     sources: []const ReadSource = &.{}, // every file read, and the sha256 of its bytes
     instructions: []const Source = &.{}, // a path, plus which harness named it
+    commands: []const Source = &.{}, // a directory of commands, plus which harness named it
     mcp_servers: []const McpServer = &.{}, // name, command, args, env variable NAMES only
     policy_hints: []const Hint = &.{}, // action, what the source said, source file
     refused: []const Refusal = &.{}, // what was not carried and why
 };
+
+/// The commands of another harness that Chock reads, with one refusal for each
+/// file it does not. A directory is carried by name rather than copied, so the
+/// project keeps one copy of each command.
+pub const Commands = struct {
+    carried: bool = false,
+    refused: []const Refusal = &.{},
+};
+
+pub fn readCommandDir(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    dir: []const u8,
+) std.mem.Allocator.Error!Commands {
+    const path = try std.fs.path.join(arena, &.{ project_root, dir });
+    const found = try chock_core.commands.discover(arena, io, &.{.{
+        .layer = .project,
+        .path = path,
+    }});
+
+    var refused: std.ArrayList(Refusal) = .empty;
+    for (found.refused) |one| {
+        const name = if (std.mem.startsWith(u8, one.path, project_root) and
+            one.path.len > project_root.len + 1)
+            one.path[project_root.len + 1 ..]
+        else
+            one.path;
+        try refused.append(arena, .{
+            .what = try arena.dupe(u8, name),
+            .reason = try arena.dupe(u8, one.fault.sentence()),
+        });
+    }
+
+    return .{
+        .carried = found.commands.len != 0,
+        .refused = try refused.toOwnedSlice(arena),
+    };
+}
 
 const known_actions = [_][]const u8{
     "device.*",            "exec.devshell.*",  "exec.nix.store.*", "exec.path.*",
@@ -402,6 +442,17 @@ pub fn render(
         try text.appendSlice(arena, "    .instructions = .{\n");
         for (found.instructions) |one| {
             try text.print(arena, "        \"{f}\", // from {s}\n", .{ std.zig.fmtString(one.path), one.harness });
+        }
+        try text.appendSlice(arena, "    },\n");
+    }
+
+    if (found.commands.len != 0) {
+        try text.appendSlice(arena, "    .commands = .{\n");
+        for (found.commands) |one| {
+            try text.print(arena, "        \"{f}\", // from {s}\n", .{
+                std.zig.fmtString(one.path),
+                one.harness,
+            });
         }
         try text.appendSlice(arena, "    },\n");
     }

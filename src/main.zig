@@ -19,6 +19,7 @@ const cache_cmd = @import("cache.zig");
 const workspace_cmd = @import("workspace.zig");
 const usage_cmd = @import("usage.zig");
 const plan_cmd = @import("plan.zig");
+const commands_cmd = @import("commands.zig");
 const skills_cmd = @import("skills.zig");
 const sessions_cmd = @import("sessions.zig");
 const migrate_cmd = @import("migrate.zig");
@@ -56,6 +57,9 @@ pub fn exitFor(reason: chock_proto.event.SessionEndReason) Exit {
         .handed_over => .handed_over,
         .empty_response => .empty_response,
         .refused_by_model => .model_refused,
+        // The project's own check, not a policy rule, so there is nothing to
+        // ask for and the code is the one a refusal takes.
+        .refused_by_hook => .refused,
         .rate_limited => .rate_limited,
         // A reason a newer Chock wrote and this one does not know. Treated as
         // a fault, never as finished: an absent answer is never permissive.
@@ -188,6 +192,11 @@ pub const commands = [_]Command{
         .name = "skills",
         .summary = "Check a directory of skills against the format a session reads.",
         .run = skills_cmd.main,
+    },
+    .{
+        .name = "commands",
+        .summary = "List the commands a person can run by name, read one, or check a directory of them.",
+        .run = commands_cmd.main,
     },
     .{
         .name = "sessions",
@@ -362,6 +371,7 @@ test "each session end reason gets its own exit code, and none of them is zero e
         .handed_over,
         .empty_response,
         .refused_by_model,
+        .refused_by_hook,
         .{ .unknown = "some-newer-reason" },
     };
     for (not_finished) |reason| {
@@ -407,6 +417,7 @@ test "every session end reason has an exit code, so a new one cannot be forgotte
         .handed_over,
         .empty_response,
         .refused_by_model,
+        .refused_by_hook,
         .rate_limited,
         .{ .unknown = "" },
     };

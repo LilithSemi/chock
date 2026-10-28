@@ -1293,7 +1293,13 @@ fn stopReasonFor(reason: event.SessionEndReason) chock_acp.common.StopReason {
         .finished, .handed_over, .empty_response => .end_turn,
         .canceled_by_user => .cancelled,
         .turn_limit => .max_turn_requests,
-        .refused_by_model, .budget_reached, .no_progress, .rate_limited, .errored => .refusal,
+        .refused_by_model,
+        .refused_by_hook,
+        .budget_reached,
+        .no_progress,
+        .rate_limited,
+        .errored,
+        => .refusal,
         .unknown => .refusal,
     };
 }

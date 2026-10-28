@@ -197,7 +197,10 @@ fn scanConfigToml(
                     hooks_noted = true;
                     try refused.append(arena, .{
                         .what = "[hooks]",
-                        .reason = "a hook runs an arbitrary command on a session event; Chock has nothing that runs one safely",
+                        .reason = "a foreign hook is a shell line run on the host. A hook here is an argv " ++
+                            "run in the sandbox, under the same exec policy as a tool call, so the two do " ++
+                            "not mean the same thing. Write it as a hooks block, which " ++
+                            "docs/using/hooks.md has the shape of.",
                     });
                 }
             } else if (std.mem.eql(u8, header, "approval_policy") or std.mem.startsWith(u8, header, "approval_policy.")) {

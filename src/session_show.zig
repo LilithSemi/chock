@@ -75,6 +75,7 @@ pub const Filters = struct {
             .device_exposed,
             .secret_used,
             => self.sandbox,
+            .hook_run => self.tools,
             .network_summary => self.network,
             // Forward-compatible events must never disappear behind a filter the
             // installed Chock cannot name.
@@ -433,6 +434,13 @@ fn writeHuman(arena: std.mem.Allocator, envelope: event.Envelope, full: bool) !v
         }),
         .secret_used => |one| tty.out(.plain, "  {s} for {s}, bound by {s}\n", .{
             try inlineText(arena, one.name), try inlineText(arena, one.action), try inlineText(arena, one.bind),
+        }),
+        .hook_run => |one| tty.out(.plain, "  {s} at {s}: {s}{s}{s}\n", .{
+            try inlineText(arena, one.name),
+            try inlineText(arena, one.trigger),
+            try inlineText(arena, one.outcome),
+            if (one.errored) ", errored" else "",
+            if (one.refused) ", refused it" else "",
         }),
         .network_summary => |one| {
             tty.out(.plain, "  granted {d}, refused {d}\n", .{ one.granted, one.refused });

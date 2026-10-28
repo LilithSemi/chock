@@ -1,17 +1,30 @@
-//! The `skills` block of a project's own `chock.zon`: directories that hold
-//! skill directories. The block says only where to look; `skill.read.*` in
-//! the policy table says what an agent may do with what is found there.
+//! A block of a project's own `chock.zon` that names directories under the
+//! project: `skills` and `commands`. The block says only where to look. What
+//! may be done with what is found there is decided elsewhere, by `skill.read.*`
+//! in the policy table for a skill, and by a person typing its name for a
+//! command.
+//!
+//! Both blocks are read here, with one set of path checks, so a directory that
+//! is refused for one is refused for the other.
 
 const std = @import("std");
 const limits_mod = @import("limits.zig");
 
 pub const file_name = limits_mod.file_name;
 
-pub const block_name = "skills";
+pub const Which = enum {
+    skills,
+    commands,
+
+    /// The name the block has in the file, which is the name of the tag.
+    pub fn blockName(self: Which) []const u8 {
+        return @tagName(self);
+    }
+};
 
 pub const max_file_bytes = 1 << 20;
 
-/// Every entry costs a directory walk at session start.
+/// Every entry costs a directory walk where the block is read.
 pub const max_dirs: usize = 4;
 
 pub const Block = struct {
@@ -26,22 +39,23 @@ pub const Block = struct {
 
 pub const ParseError = error{
     OutOfMemory,
-    InvalidSkills,
+    InvalidBlock,
 };
 
 pub const LoadError = ParseError || error{
-    SkillsFileTooLarge,
+    FileTooLarge,
     ReadFailed,
 };
 
 pub const ResolveError = error{
     OutOfMemory,
-    SkillsLeaveProject,
-    SkillsUnreadable,
+    LeavesProject,
+    Unreadable,
 };
 
 pub const Diagnostic = struct {
     source: []const u8,
+    which: Which,
     fault: Fault,
 
     pub const Named = struct {
@@ -94,36 +108,36 @@ pub const Diagnostic = struct {
                 .{self.source},
             ),
             .not_a_list => try writer.print(
-                "{s}: the skills block must be a list of directories",
-                .{self.source},
+                "{s}: the {s} block must be a list of directories",
+                .{ self.source, self.which.blockName() },
             ),
             .entry_not_a_string => |at| try writer.print(
-                "{s}: skills directory {d} is not a string",
-                .{ self.source, at + 1 },
+                "{s}: {s} directory {d} is not a string",
+                .{ self.source, self.which.blockName(), at + 1 },
             ),
             .path_empty => |at| try writer.print(
-                "{s}: skills directory {d} is empty, and a path cannot be",
-                .{ self.source, at + 1 },
+                "{s}: {s} directory {d} is empty, and a path cannot be",
+                .{ self.source, self.which.blockName(), at + 1 },
             ),
             .path_not_relative => |name| try writer.print(
-                "{s}: the skills directory {s} must be a path under the project, not an absolute one",
-                .{ self.source, name },
+                "{s}: the {s} directory {s} must be a path under the project, not an absolute one",
+                .{ self.source, self.which.blockName(), name },
             ),
             .path_leaves_project => |name| try writer.print(
-                "{s}: the skills directory {s} reaches outside the project",
-                .{ self.source, name },
+                "{s}: the {s} directory {s} reaches outside the project",
+                .{ self.source, self.which.blockName(), name },
             ),
             .too_many_dirs => |limit| try writer.print(
-                "{s}: the skills block names more than {d} directories",
-                .{ self.source, limit },
+                "{s}: the {s} block names more than {d} directories",
+                .{ self.source, self.which.blockName(), limit },
             ),
             .leaves_project => |named| try writer.print(
-                "{s}: the skills directory {s} resolves to {s}, which is outside the project",
-                .{ self.source, named.name, named.text },
+                "{s}: the {s} directory {s} resolves to {s}, which is outside the project",
+                .{ self.source, self.which.blockName(), named.name, named.text },
             ),
             .unreadable => |named| try writer.print(
-                "{s}: the skills directory {s} could not be read: {s}",
-                .{ self.source, named.name, named.text },
+                "{s}: the {s} directory {s} could not be read: {s}",
+                .{ self.source, self.which.blockName(), named.name, named.text },
             ),
             .file_too_large => |limit| try writer.print(
                 "{s}: the file is larger than {d} bytes, so it was not read",
@@ -137,21 +151,32 @@ pub const Diagnostic = struct {
     }
 };
 
-fn note(out: ?*?Diagnostic, source: []const u8, fault: Diagnostic.Fault) bool {
+fn note(
+    out: ?*?Diagnostic,
+    source: []const u8,
+    which: Which,
+    fault: Diagnostic.Fault,
+) bool {
     const slot = out orelse return false;
     if (slot.* != null) return false;
-    slot.* = .{ .source = source, .fault = fault };
+    slot.* = .{ .source = source, .which = which, .fault = fault };
     return true;
 }
 
-pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) ParseError!Block {
-    return parseFrom(gpa, source, file_name, diag);
+pub fn parse(
+    gpa: std.mem.Allocator,
+    source: [:0]const u8,
+    which: Which,
+    diag: ?*?Diagnostic,
+) ParseError!Block {
+    return parseFrom(gpa, source, file_name, which, diag);
 }
 
 pub fn parseFrom(
     gpa: std.mem.Allocator,
     source: [:0]const u8,
     source_name: []const u8,
+    which: Which,
     diag: ?*?Diagnostic,
 ) ParseError!Block {
     var ast = std.zig.Ast.parse(gpa, source, .{ .mode = .zon }) catch |err| switch (err) {
@@ -173,26 +198,27 @@ pub fn parseFrom(
             .zoir = &zoir,
             .diagnostics = &zon_diag,
         }) catch {};
-        if (note(diag, source_name, .{ .file_not_zon = .{ .arena = arena, .diag = zon_diag } })) {
+        if (note(diag, source_name, which, .{ .file_not_zon = .{ .arena = arena, .diag = zon_diag } })) {
             arena_owned = false;
         }
-        return error.InvalidSkills;
+        return error.InvalidBlock;
     }
 
-    const node = try findBlock(zoir, source_name, diag) orelse return .{};
-    return readDirs(gpa, zoir, node, source_name, diag);
+    const node = try findBlock(zoir, source_name, which, diag) orelse return .{};
+    return readDirs(gpa, zoir, node, source_name, which, diag);
 }
 
 fn findBlock(
     zoir: std.zig.Zoir,
     source_name: []const u8,
+    which: Which,
     diag: ?*?Diagnostic,
 ) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
     switch (root.get(&zoir)) {
         .struct_literal => |fields| {
             for (fields.names, 0..) |name, at| {
-                if (std.mem.eql(u8, name.get(&zoir), block_name)) {
+                if (std.mem.eql(u8, name.get(&zoir), which.blockName())) {
                     return fields.vals.at(@intCast(at));
                 }
             }
@@ -200,8 +226,8 @@ fn findBlock(
         },
         .empty_literal => return null,
         else => {
-            _ = note(diag, source_name, .not_a_struct_literal);
-            return error.InvalidSkills;
+            _ = note(diag, source_name, which, .not_a_struct_literal);
+            return error.InvalidBlock;
         },
     }
 }
@@ -211,20 +237,21 @@ fn readDirs(
     zoir: std.zig.Zoir,
     node: std.zig.Zoir.Node.Index,
     source_name: []const u8,
+    which: Which,
     diag: ?*?Diagnostic,
 ) ParseError!Block {
     const items = switch (node.get(&zoir)) {
         .empty_literal => return .{},
         .array_literal => |list| list,
         else => {
-            _ = note(diag, source_name, .not_a_list);
-            return error.InvalidSkills;
+            _ = note(diag, source_name, which, .not_a_list);
+            return error.InvalidBlock;
         },
     };
 
     if (items.len > max_dirs) {
-        _ = note(diag, source_name, .{ .too_many_dirs = max_dirs });
-        return error.InvalidSkills;
+        _ = note(diag, source_name, which, .{ .too_many_dirs = max_dirs });
+        return error.InvalidBlock;
     }
 
     var out: std.ArrayList([]const u8) = .empty;
@@ -237,11 +264,11 @@ fn readDirs(
         const text = switch (items.at(@intCast(at)).get(&zoir)) {
             .string_literal => |text| text,
             else => {
-                _ = note(diag, source_name, .{ .entry_not_a_string = at });
-                return error.InvalidSkills;
+                _ = note(diag, source_name, which, .{ .entry_not_a_string = at });
+                return error.InvalidBlock;
             },
         };
-        try checkPath(gpa, text, at, source_name, diag);
+        try checkPath(gpa, text, at, source_name, which, diag);
         try out.append(gpa, try gpa.dupe(u8, text));
     }
 
@@ -254,21 +281,22 @@ fn checkPath(
     text: []const u8,
     at: usize,
     source_name: []const u8,
+    which: Which,
     diag: ?*?Diagnostic,
 ) ParseError!void {
     if (text.len == 0) {
-        _ = note(diag, source_name, .{ .path_empty = at });
-        return error.InvalidSkills;
+        _ = note(diag, source_name, which, .{ .path_empty = at });
+        return error.InvalidBlock;
     }
     if (std.fs.path.isAbsolute(text)) {
-        _ = note(diag, source_name, .{ .path_not_relative = try gpa.dupe(u8, text) });
-        return error.InvalidSkills;
+        _ = note(diag, source_name, which, .{ .path_not_relative = try gpa.dupe(u8, text) });
+        return error.InvalidBlock;
     }
     var walk = std.mem.splitScalar(u8, text, '/');
     while (walk.next()) |part| {
         if (std.mem.eql(u8, part, "..")) {
-            _ = note(diag, source_name, .{ .path_leaves_project = try gpa.dupe(u8, text) });
-            return error.InvalidSkills;
+            _ = note(diag, source_name, which, .{ .path_leaves_project = try gpa.dupe(u8, text) });
+            return error.InvalidBlock;
         }
     }
 }
@@ -277,6 +305,7 @@ pub fn load(
     gpa: std.mem.Allocator,
     io: std.Io,
     project_root: []const u8,
+    which: Which,
     diag: ?*?Diagnostic,
 ) LoadError!Block {
     const path = try std.fs.path.join(gpa, &.{ project_root, file_name });
@@ -292,18 +321,18 @@ pub fn load(
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.StreamTooLong => {
-            _ = note(diag, file_name, .{ .file_too_large = max_file_bytes });
-            return error.SkillsFileTooLarge;
+            _ = note(diag, file_name, which, .{ .file_too_large = max_file_bytes });
+            return error.FileTooLarge;
         },
         error.FileNotFound, error.NotDir => return .{},
         else => {
-            _ = note(diag, file_name, .{ .read_failed = err });
+            _ = note(diag, file_name, which, .{ .read_failed = err });
             return error.ReadFailed;
         },
     };
     defer gpa.free(source);
 
-    return parse(gpa, source, diag);
+    return parse(gpa, source, which, diag);
 }
 
 /// The directory on disk, with every link resolved. The caller owns the result.
@@ -311,6 +340,7 @@ pub fn resolve(
     gpa: std.mem.Allocator,
     io: std.Io,
     project_root: []const u8,
+    which: Which,
     name: []const u8,
     diag: ?*?Diagnostic,
 ) ResolveError![]u8 {
@@ -319,26 +349,26 @@ pub fn resolve(
 
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const length = std.Io.Dir.cwd().realPathFile(io, joined, &buffer) catch {
-        _ = note(diag, file_name, .{ .unreadable = .{
+        _ = note(diag, file_name, which, .{ .unreadable = .{
             .name = try gpa.dupe(u8, name),
             .text = try gpa.dupe(u8, "there is nothing readable at that path"),
         } });
-        return error.SkillsUnreadable;
+        return error.Unreadable;
     };
     const real = buffer[0..length];
 
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_length = std.Io.Dir.cwd().realPathFile(io, project_root, &root_buffer) catch {
-        return error.SkillsUnreadable;
+        return error.Unreadable;
     };
     const root = root_buffer[0..root_length];
 
     if (!isInside(real, root)) {
-        _ = note(diag, file_name, .{ .leaves_project = .{
+        _ = note(diag, file_name, which, .{ .leaves_project = .{
             .name = try gpa.dupe(u8, name),
             .text = try gpa.dupe(u8, real),
         } });
-        return error.SkillsLeaveProject;
+        return error.LeavesProject;
     }
 
     return gpa.dupe(u8, real);
@@ -355,17 +385,17 @@ const testing = std.testing;
 test "the block is a list of directories, and a file with none gets nothing" {
     const gpa = testing.allocator;
 
-    var block = try parse(gpa, ".{ .skills = .{ \".chock/skills\", \"docs/skills\" } }", null);
+    var block = try parse(gpa, ".{ .skills = .{ \".chock/skills\", \"docs/skills\" } }", .skills, null);
     defer block.deinit(gpa);
     try testing.expectEqual(@as(usize, 2), block.dirs.len);
     try testing.expectEqualStrings(".chock/skills", block.dirs[0]);
     try testing.expectEqualStrings("docs/skills", block.dirs[1]);
 
-    var none = try parse(gpa, ".{ .permissions = .{} }", null);
+    var none = try parse(gpa, ".{ .permissions = .{} }", .skills, null);
     defer none.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), none.dirs.len);
 
-    var empty = try parse(gpa, ".{ .skills = .{} }", null);
+    var empty = try parse(gpa, ".{ .skills = .{} }", .skills, null);
     defer empty.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), empty.dirs.len);
 }
@@ -376,16 +406,16 @@ test "an absolute path and one that climbs out are both refused by name" {
     var absolute: ?Diagnostic = null;
     defer if (absolute) |*d| d.deinit(gpa);
     try testing.expectError(
-        error.InvalidSkills,
-        parse(gpa, ".{ .skills = .{ \"/etc/skills\" } }", &absolute),
+        error.InvalidBlock,
+        parse(gpa, ".{ .skills = .{ \"/etc/skills\" } }", .skills, &absolute),
     );
     try testing.expectEqualStrings("/etc/skills", absolute.?.fault.path_not_relative);
 
     var climbing: ?Diagnostic = null;
     defer if (climbing) |*d| d.deinit(gpa);
     try testing.expectError(
-        error.InvalidSkills,
-        parse(gpa, ".{ .skills = .{ \"../../.ssh\" } }", &climbing),
+        error.InvalidBlock,
+        parse(gpa, ".{ .skills = .{ \"../../.ssh\" } }", .skills, &climbing),
     );
     try testing.expectEqualStrings("../../.ssh", climbing.?.fault.path_leaves_project);
 }
@@ -403,7 +433,7 @@ test "more directories than the bound is refused, and the message names the boun
 
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
-    try testing.expectError(error.InvalidSkills, parse(gpa, text, &diag));
+    try testing.expectError(error.InvalidBlock, parse(gpa, text, .skills, &diag));
 
     var rendered: std.ArrayList(u8) = .empty;
     defer rendered.deinit(gpa);
@@ -435,8 +465,8 @@ test "a link out of the project is refused even when the path itself reads as or
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
     try testing.expectError(
-        error.SkillsLeaveProject,
-        resolve(gpa, io, project, "skills", &diag),
+        error.LeavesProject,
+        resolve(gpa, io, project, .skills, "skills", &diag),
     );
     try testing.expectEqualStrings("skills", diag.?.fault.leaves_project.name);
 }
@@ -454,8 +484,34 @@ test "a directory inside the project resolves to its real path" {
     const project = try std.fs.path.join(gpa, &.{ root, "project" });
     defer gpa.free(project);
 
-    const resolved = try resolve(gpa, io, project, ".chock/skills", null);
+    const resolved = try resolve(gpa, io, project, .skills, ".chock/skills", null);
     defer gpa.free(resolved);
     try testing.expect(std.mem.startsWith(u8, resolved, project));
     try testing.expect(std.mem.endsWith(u8, resolved, "skills"));
+}
+
+test "the same reader takes the commands block, and the message names that block" {
+    const gpa = testing.allocator;
+
+    var block = try parse(gpa, ".{ .commands = .{ \".chock/commands\" } }", .commands, null);
+    defer block.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), block.dirs.len);
+    try testing.expectEqualStrings(".chock/commands", block.dirs[0]);
+
+    // The skills reader takes nothing from a file that names only commands.
+    var as_skills = try parse(gpa, ".{ .commands = .{ \".chock/commands\" } }", .skills, null);
+    defer as_skills.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), as_skills.dirs.len);
+
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidBlock,
+        parse(gpa, ".{ .commands = .{ \"/etc/commands\" } }", .commands, &diag),
+    );
+
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(gpa);
+    try rendered.print(gpa, "{f}", .{diag.?});
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "the commands directory") != null);
 }

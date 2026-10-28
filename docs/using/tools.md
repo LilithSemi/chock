@@ -16,6 +16,11 @@ the `.capabilities = .{ .images = true }` block of that instance in your
 configuration. The kind of file is read from the content and never from the
 name, so a text file called `plot.png` is refused. At most 3145728 bytes.
 
+A foreground `run_command` is stopped when it reaches the session's time limit.
+A call can ask for less with `timeout_ms`, and never for more: a number past
+the session's own limit changes nothing. Anything longer than a couple of
+minutes belongs in the background instead.
+
 `read_guidance` reads a document compiled into Chock, so it reaches nothing on
 the machine at all. `ask_user` puts one question to the person who started the
 session, and it grants nothing: a yes there permits no act. `set_title` names

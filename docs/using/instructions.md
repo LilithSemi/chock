@@ -59,6 +59,20 @@ be read stops the session, the same rule `--instructions` follows and for the
 same reason: a file the project asked for by name is not one a session should
 start without.
 
+## What the log records
+
+Every instruction file a session read reaches the session log, in the
+`instruction_files` field of the session's config event, as its layer, its
+path, and the SHA-256 of the file:
+
+```
+project AGENTS.md sha256:1b4f0e9851971998e732078544c96b36c3d01cedf7caa332359d6f1d83567014
+```
+
+The digest is of the whole file, even where only its front reached the prompt,
+so an edit past the bound shows. Two sessions of the same project can be
+compared by it: the same digest means the agent was told the same thing.
+
 ## Not the same thing as a note
 
 Two different things wear the name "memory file", and confusing them is the

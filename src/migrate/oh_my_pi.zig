@@ -62,6 +62,7 @@ const max_dir_entries: usize = 256;
 pub fn read(arena: std.mem.Allocator, io: std.Io, project_root: []const u8) anyerror!Found {
     var sources: std.ArrayList(ReadSource) = .empty;
     var instructions: std.ArrayList(Source) = .empty;
+    var commands: std.ArrayList(Source) = .empty;
     var mcp_servers: std.ArrayList(McpServer) = .empty;
     // Every oh-my-pi permission fact is a stance over its own tool names,
     // not an action this build defines, so it is always a Refusal: this
@@ -76,11 +77,13 @@ pub fn read(arena: std.mem.Allocator, io: std.Io, project_root: []const u8) anye
 
     try readMcp(arena, io, project_root, &sources, &mcp_servers, &refused);
     try readConfigYaml(arena, io, project_root, &sources, &refused);
+    try readCommands(arena, io, project_root, &commands, &refused);
     try refuseUncarriedDirectories(arena, io, project_root, &refused);
 
     return .{
         .sources = try sources.toOwnedSlice(arena),
         .instructions = try instructions.toOwnedSlice(arena),
+        .commands = try commands.toOwnedSlice(arena),
         .mcp_servers = try mcp_servers.toOwnedSlice(arena),
         .policy_hints = try policy_hints.toOwnedSlice(arena),
         .refused = try refused.toOwnedSlice(arena),
@@ -392,14 +395,37 @@ fn readConfigYaml(
     }
 }
 
+const commands_dir = ".omp/commands";
+
+/// A command of oh-my-pi's is a markdown file the same way Chock's is, so the
+/// directory is carried by name. A file Chock would not read becomes one
+/// refusal naming that file.
+fn readCommands(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    commands: *std.ArrayList(Source),
+    refused: *std.ArrayList(Refusal),
+) !void {
+    if (!try dirHasEntry(arena, io, project_root, commands_dir)) return;
+
+    const read_it = try migrate.readCommandDir(arena, io, project_root, commands_dir);
+    try refused.appendSlice(arena, read_it.refused);
+
+    if (read_it.carried) {
+        try commands.append(arena, .{ .path = commands_dir, .harness = harness_name });
+        return;
+    }
+    try refused.append(arena, .{
+        .what = commands_dir,
+        .reason = "it holds no file this build reads as a command",
+    });
+}
+
 const uncarried_dirs = [_]struct { path: []const u8, reason: []const u8 }{
     .{
         .path = ".omp/agents",
         .reason = "an agent definition runs as its own agent, and this build has no mechanism that runs one",
-    },
-    .{
-        .path = ".omp/commands",
-        .reason = "a command expands host side, and this build has no mechanism that runs one",
     },
     .{
         .path = ".omp/skills",
@@ -423,7 +449,10 @@ fn refuseUncarriedDirectories(
     if (has_hooks) {
         try refused.append(arena, .{
             .what = ".omp/hooks",
-            .reason = "a hook is an executable script run on a session event, and this build has no mechanism that runs one safely",
+            .reason = "a foreign hook is a shell line run on the host. A hook here is an argv " ++
+                "run in the sandbox, under the same exec policy as a tool call, so the two do " ++
+                "not mean the same thing. Write it as a hooks block, which " ++
+                "docs/using/hooks.md has the shape of.",
         });
     }
 }
@@ -605,6 +634,31 @@ test "rule and instruction files are read from .omp/rules and .omp/instructions,
     try testing.expectEqualStrings(".omp/rules/a-first.mdc", found.instructions[0].path);
     try testing.expectEqualStrings(".omp/rules/b-second.md", found.instructions[1].path);
     try testing.expectEqualStrings(".omp/instructions/only.md", found.instructions[2].path);
+}
+
+test "a commands directory this build reads is carried by name" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_root = try tmpProjectRoot(arena, &tmp);
+
+    try writeProjectFile(
+        testing.io,
+        project_root,
+        ".omp/commands/deploy.md",
+        "---\ndescription: Deploy it.\n---\nDeploy $ARGUMENTS.\n",
+    );
+
+    const found = try read(arena, testing.io, project_root);
+
+    try testing.expectEqual(@as(usize, 1), found.commands.len);
+    try testing.expectEqualStrings(".omp/commands", found.commands[0].path);
+    for (found.refused) |one| {
+        try testing.expect(!std.mem.eql(u8, one.what, ".omp/commands"));
+    }
 }
 
 test "agents, commands, skills and hooks are each refused only when present" {

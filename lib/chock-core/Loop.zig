@@ -23,6 +23,7 @@ const fetch_mod = @import("fetch.zig");
 const search_mod = @import("search.zig");
 const ask_mod = @import("ask.zig");
 const handback_mod = @import("handback.zig");
+const hooks_mod = @import("hooks.zig");
 const redact = @import("redact.zig");
 
 const event = chock_proto.event;
@@ -192,6 +193,10 @@ pub const Deps = struct {
     asker: ?ask_mod.Asker = null,
     handback: ?handback_mod.Handback = null,
     redact: redact.Policy = .{},
+    /// The project's lifecycle hooks, in the order it wrote them.
+    hooks: []const hooks_mod.Hook = &.{},
+    /// This session's own identifier, for a hook that asked for it.
+    session_id: []const u8 = "",
 };
 
 pub const budget_detail_prefix = "the session budget was reached";
@@ -235,6 +240,27 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, deps: Deps) Error!void {
         });
     }
 
+    {
+        var started = try fireHooks(allocator, io, &locked, &session, deps, .{
+            .trigger = .session_start,
+        });
+        defer started.deinit(allocator);
+
+        if (started.refused_by.len != 0) {
+            const detail = try std.fmt.allocPrint(
+                allocator,
+                "the session.start hook \"{s}\" refused this session",
+                .{started.refused_by},
+            );
+            defer allocator.free(detail);
+            _ = try appendAndApply(allocator, io, &locked, &session, deps, .{ .session_end = .{
+                .reason = .refused_by_hook,
+                .detail = detail,
+            } });
+            return recordAtTheEnd(allocator, io, &locked, &session, deps);
+        }
+    }
+
     var progress = Progress{};
     defer progress.deinit(allocator);
     var failing = Failing{};
@@ -271,6 +297,14 @@ fn recordAtTheEnd(
     try recordFinishedTasks(allocator, io, locked, session, deps, .record_only);
     if (deps.children) |table| table.waitAll();
     try recordFinishedChildren(allocator, io, locked, session, deps, .record_only);
+
+    // Last, after the children are waited for, so a hook that reads the
+    // workspace sees everything the session did. It can refuse nothing: the
+    // session has ended.
+    var ended = try fireHooks(allocator, io, locked, session, deps, .{
+        .trigger = .session_end,
+    });
+    ended.deinit(allocator);
 }
 
 const ContextWatch = struct {
@@ -1314,6 +1348,225 @@ fn gateRefusal(
     };
 }
 
+/// A hook's run is a `run_command` call of its own, so the call id says which
+/// hook asked for it rather than looking like something the model wanted.
+const hook_call_prefix = hooks_mod.call_id_prefix;
+
+/// What the hooks at one moment did between them.
+const Fired = struct {
+    /// The name of the first hook that refused, borrowed from the hook.
+    refused_by: []const u8 = "",
+    /// What the hooks told the agent, where their output reaches it.
+    note: ?[]u8 = null,
+
+    fn deinit(self: *Fired, allocator: std.mem.Allocator) void {
+        if (self.note) |owned| allocator.free(owned);
+        self.* = .{};
+    }
+};
+
+/// Runs every hook the moment matches, in the order the project wrote them.
+/// A refusal does not stop the ones after it: a project that declared two
+/// checks wants both answers in the log.
+fn fireHooks(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    locked: anytype,
+    session: *chock_proto.state.Session,
+    deps: Deps,
+    moment: hooks_mod.Moment,
+) Error!Fired {
+    var out = Fired{};
+    errdefer out.deinit(allocator);
+    if (!hooks_mod.anyFor(deps.hooks, moment.trigger)) return out;
+
+    var said: std.ArrayList(u8) = .empty;
+    errdefer said.deinit(allocator);
+
+    for (deps.hooks) |hook| {
+        if (!hook.matches(moment.trigger, moment.tool)) continue;
+
+        var one = try runOneHook(allocator, io, locked, session, deps, hook, moment);
+        defer one.deinit(allocator);
+
+        if (one.refused and out.refused_by.len == 0) out.refused_by = hook.name;
+        if (one.note) |text| {
+            if (said.items.len != 0) try said.append(allocator, '\n');
+            try said.print(allocator, "[chock: the {s} hook \"{s}\" says]\n{s}", .{
+                moment.trigger.wireName(),
+                hook.name,
+                text,
+            });
+        }
+    }
+
+    if (said.items.len != 0) out.note = try said.toOwnedSlice(allocator);
+    return out;
+}
+
+const HookSaid = struct {
+    refused: bool = false,
+    note: ?[]u8 = null,
+
+    fn deinit(self: *HookSaid, allocator: std.mem.Allocator) void {
+        if (self.note) |owned| allocator.free(owned);
+        self.* = .{};
+    }
+};
+
+/// One hook's run, through the gate and the runner every tool call goes
+/// through. A hook that cannot run refuses, where its output says refuse: a
+/// check that did not happen is not a check that passed.
+fn runOneHook(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    locked: anytype,
+    session: *chock_proto.state.Session,
+    deps: Deps,
+    hook: hooks_mod.Hook,
+    moment: hooks_mod.Moment,
+) Error!HookSaid {
+    const arguments = try hooks_mod.argumentsFor(allocator, hook, .{
+        .trigger = moment.trigger,
+        .tool = moment.tool,
+        .action = moment.action,
+        .session = deps.session_id,
+    });
+    defer allocator.free(arguments);
+
+    const call_id = try hooks_mod.callIdFor(allocator, hook.name, moment.aboutOr());
+    defer allocator.free(call_id);
+
+    const call = event.ToolCall{
+        .call_id = call_id,
+        .tool = run_command_tool_name,
+        .arguments = arguments,
+    };
+
+    var action_buffer: [gate_action_bytes]u8 = undefined;
+    var action: []const u8 = "";
+
+    if (try gateToolCall(allocator, io, locked, deps, call, &action_buffer, &action)) |refusal| {
+        allocator.free(refusal.call_id);
+        allocator.free(refusal.output);
+        try recordHookRun(allocator, io, locked, session, deps, hook, moment, action, .{
+            .outcome = "refused_by_policy",
+            .errored = true,
+            .refused = hook.output == .refuse,
+        });
+        return .{ .refused = hook.output == .refuse };
+    }
+
+    _ = try appendAndApply(allocator, io, locked, session, deps, .{ .tool_call = call });
+
+    const ran = deps.tool_runner.dispatch(allocator, io, call, action) catch {
+        try recordHookRun(allocator, io, locked, session, deps, hook, moment, action, .{
+            .outcome = "could_not_run",
+            .errored = true,
+            .refused = hook.output == .refuse,
+        });
+        return .{ .refused = hook.output == .refuse };
+    };
+    defer allocator.free(ran.call_id);
+    defer allocator.free(ran.output);
+    defer if (ran.note.len != 0) allocator.free(ran.note);
+    defer if (ran.image) |image| {
+        allocator.free(image.media_type);
+        allocator.free(image.content_hash);
+        allocator.free(image.data);
+    };
+
+    _ = try appendAndApply(allocator, io, locked, session, deps, .{ .tool_result = ran });
+
+    const refused = ran.is_error and hook.output == .refuse;
+    try recordHookRun(allocator, io, locked, session, deps, hook, moment, action, .{
+        .outcome = "ran",
+        .errored = ran.is_error,
+        .refused = refused,
+    });
+
+    return .{
+        .refused = refused,
+        .note = if (hook.output == .note and ran.output.len != 0)
+            try allocator.dupe(u8, ran.output[0..@min(ran.output.len, hooks_mod.max_note_bytes)])
+        else
+            null,
+    };
+}
+
+/// The tool's own output with what the hooks said after it. Null where no
+/// hook said anything, so an ordinary call allocates nothing.
+fn withHookNotes(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    before: ?[]const u8,
+    after: ?[]const u8,
+) Error!?[]u8 {
+    if (before == null and after == null) return null;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, output);
+    for ([_]?[]const u8{ before, after }) |maybe| {
+        const text = maybe orelse continue;
+        if (out.items.len != 0) try out.appendSlice(allocator, "\n\n");
+        try out.appendSlice(allocator, text);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+/// The action name a call would be gated under, for a hook that asked for it
+/// at `tool.before`, where the gate has not run yet. This derives the name and
+/// decides nothing: the gate still decides, straight after.
+fn actionNameFor(
+    allocator: std.mem.Allocator,
+    deps: Deps,
+    call: event.ToolCall,
+    buffer: []u8,
+) Error![]const u8 {
+    const tool = std.meta.stringToEnum(tools.Tool, call.tool) orelse return "";
+
+    var argv0_owned: ?[]u8 = null;
+    defer if (argv0_owned) |owned| allocator.free(owned);
+    if (tool == .run_command) argv0_owned = try tools.firstArgvIn(allocator, call.arguments);
+
+    return tool.actionInto(
+        buffer,
+        argv0_owned,
+        deps.project_root,
+        deps.store_closure,
+    ) orelse "";
+}
+
+const HookOutcome = struct {
+    outcome: []const u8,
+    errored: bool,
+    refused: bool,
+};
+
+fn recordHookRun(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    locked: anytype,
+    session: *chock_proto.state.Session,
+    deps: Deps,
+    hook: hooks_mod.Hook,
+    moment: hooks_mod.Moment,
+    action: []const u8,
+    outcome: HookOutcome,
+) Error!void {
+    _ = try appendAndApply(allocator, io, locked, session, deps, .{ .hook_run = .{
+        .name = hook.name,
+        .trigger = moment.trigger.wireName(),
+        .tool = moment.tool,
+        .action = action,
+        .outcome = outcome.outcome,
+        .errored = outcome.errored,
+        .refused = outcome.refused,
+    } });
+}
+
 fn runTool(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1334,16 +1587,41 @@ fn runTool(
     var gated_action_buffer: [gate_action_bytes]u8 = undefined;
     var gated_action: []const u8 = "";
 
-    const dispatched = if (!deps.role.holdsTools())
-        event.ToolResult{
+    var before_action_buffer: [gate_action_bytes]u8 = undefined;
+    var before = try fireHooks(allocator, io, locked, session, deps, .{
+        .trigger = .tool_before,
+        .tool = call.tool,
+        .about = call.call_id,
+        .action = if (hooks_mod.anyFor(deps.hooks, .tool_before))
+            try actionNameFor(allocator, deps, call, &before_action_buffer)
+        else
+            "",
+    });
+    defer before.deinit(allocator);
+
+    // Nothing ran in the three branches that refuse, which is what a
+    // `tool.after` hook has to be able to tell: it is about a call that
+    // happened.
+    var never_ran = false;
+    const dispatched = if (before.refused_by.len != 0) refused: {
+        never_ran = true;
+        break :refused try gateRefusal(
+            allocator,
+            call,
+            try hooks_mod.refusalText(allocator, before.refused_by, .tool_before),
+        );
+    } else if (!deps.role.holdsTools()) held: {
+        never_ran = true;
+        break :held event.ToolResult{
             .call_id = try allocator.dupe(u8, call.call_id),
             .output = try allocator.dupe(u8, tools.arbitrator_holds_no_tool),
             .is_error = true,
             .truncated = false,
-        }
-    else if (try gateToolCall(allocator, io, locked, deps, call, &gated_action_buffer, &gated_action)) |refusal|
-        refusal
-    else if (std.mem.eql(u8, call.tool, spawn_tool_name))
+        };
+    } else if (try gateToolCall(allocator, io, locked, deps, call, &gated_action_buffer, &gated_action)) |refusal| gated: {
+        never_ran = true;
+        break :gated refusal;
+    } else if (std.mem.eql(u8, call.tool, spawn_tool_name))
         try runSpawn(allocator, io, locked, session, deps, call)
     else if (std.mem.eql(u8, call.tool, plan_tool_name))
         try runPlanUpdate(allocator, io, locked, session, deps, call)
@@ -1393,6 +1671,24 @@ fn runTool(
     var result = dispatched;
     if (note) |owned| result.output = owned;
 
+    // A call that never ran leaves nothing for a tool.after hook to be about,
+    // whether a hook refused it, the policy refused it, or this agent holds no
+    // tools at all.
+    var after = if (!never_ran)
+        try fireHooks(allocator, io, locked, session, deps, .{
+            .trigger = .tool_after,
+            .tool = call.tool,
+            .about = call.call_id,
+            .action = gated_action,
+        })
+    else
+        Fired{};
+    defer after.deinit(allocator);
+
+    const with_hooks = try withHookNotes(allocator, result.output, before.note, after.note);
+    defer if (with_hooks) |owned| allocator.free(owned);
+    if (with_hooks) |owned| result.output = owned;
+
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .tool_result = result });
 
     try noteRead(allocator, telling, result, call);
@@ -1421,6 +1717,8 @@ fn runTool(
 }
 
 pub const spawn_tool_name = @tagName(tools.Tool.spawn_agent);
+
+const run_command_tool_name = @tagName(tools.Tool.run_command);
 
 pub const spawn_has_no_spawner_detail = "no subagent was started: the limits in chock.zon allow " ++
     "one, and this session was started with no way to run a child process. Do the work yourself.";
@@ -9555,4 +9853,556 @@ test "a serve_port call that names no usable port is refused before anybody is a
     const text = said orelse return error.TestUnexpectedResult;
     defer allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "\"port\"") != null);
+}
+
+/// Answers a hook's own call differently from the agent's, which is what a
+/// hook test has to tell apart.
+const HookToolRunner = struct {
+    hook_fails: bool = false,
+    hook_output: []const u8 = "",
+    hook_calls: usize = 0,
+    agent_calls: usize = 0,
+
+    fn dispatch(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        call: event.ToolCall,
+        action: []const u8,
+    ) DispatchError!event.ToolResult {
+        _ = action;
+        _ = io;
+        const self: *HookToolRunner = @ptrCast(@alignCast(ptr));
+        const is_hook = std.mem.startsWith(u8, call.call_id, hook_call_prefix);
+        if (is_hook) self.hook_calls += 1 else self.agent_calls += 1;
+
+        return .{
+            .call_id = try allocator.dupe(u8, call.call_id),
+            .output = try allocator.dupe(u8, if (is_hook) self.hook_output else "the tool ran"),
+            .is_error = is_hook and self.hook_fails,
+            .truncated = false,
+        };
+    }
+
+    fn runner(self: *HookToolRunner) ToolRunner {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = ToolRunner.VTable{ .dispatch = dispatch };
+};
+
+fn oneToolCallThenDone() FakeClient {
+    return .{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = "write_file",
+            .arguments = "{}",
+        } }} },
+        .{ .deltas = &.{.{ .text = "done" }} },
+    } };
+}
+
+const Seen = struct {
+    hook_runs: usize = 0,
+    refused: usize = 0,
+    outcome: []const u8 = "",
+    tool_result: []const u8 = "",
+    tool_errored: bool = false,
+    end_reason: []const u8 = "",
+    hook_call_ids: usize = 0,
+};
+
+/// Every string is copied into `arena`: a replayed event is freed at the end
+/// of its own iteration, so keeping a slice of one reads freed bytes.
+fn seenInLog(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    store: chock_proto.storage.Storage,
+    into: *Seen,
+) !void {
+    var replay = try store.replay(arena, io, 0);
+    defer replay.deinit();
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .hook_run => |one| {
+                into.hook_runs += 1;
+                if (one.refused) into.refused += 1;
+                into.outcome = try arena.dupe(u8, one.outcome);
+            },
+            .tool_call => |one| {
+                if (std.mem.startsWith(u8, one.call_id, hook_call_prefix)) into.hook_call_ids += 1;
+            },
+            .tool_result => |one| {
+                if (std.mem.startsWith(u8, one.call_id, hook_call_prefix)) continue;
+                into.tool_result = try arena.dupe(u8, one.output);
+                into.tool_errored = one.is_error;
+            },
+            .session_end => |one| into.end_reason = try arena.dupe(u8, one.reason.wireName()),
+            else => {},
+        }
+    }
+}
+
+test "a tool.before hook that ends with an error refuses the call, and the tool never runs" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKREFUSE");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = oneToolCallThenDone();
+    var fake_tools = HookToolRunner{ .hook_fails = true, .hook_output = "the tree is dirty" };
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "clean-tree",
+        .trigger = .tool_before,
+        .argv = &.{"./check"},
+        .output = .refuse,
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 1), fake_tools.hook_calls);
+    try testing.expectEqual(@as(usize, 0), fake_tools.agent_calls);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    var seen = Seen{};
+    try seenInLog(seen_arena.allocator(), io, store, &seen);
+    try testing.expectEqual(@as(usize, 1), seen.hook_runs);
+    try testing.expectEqual(@as(usize, 1), seen.refused);
+    try testing.expectEqualStrings("ran", seen.outcome);
+    try testing.expect(seen.tool_errored);
+    try testing.expect(std.mem.indexOf(u8, seen.tool_result, "clean-tree") != null);
+    try testing.expect(std.mem.indexOf(u8, seen.tool_result, "nothing to ask") != null);
+}
+
+test "a tool.before hook that passes lets the call run" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKPASS");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = oneToolCallThenDone();
+    var fake_tools = HookToolRunner{};
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "clean-tree",
+        .trigger = .tool_before,
+        .argv = &.{"./check"},
+        .output = .refuse,
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 1), fake_tools.hook_calls);
+    try testing.expectEqual(@as(usize, 1), fake_tools.agent_calls);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    var seen = Seen{};
+    try seenInLog(seen_arena.allocator(), io, store, &seen);
+    try testing.expectEqual(@as(usize, 0), seen.refused);
+    try testing.expect(!seen.tool_errored);
+    try testing.expectEqualStrings("the tool ran", seen.tool_result);
+}
+
+test "a hook's own run is in the log as a call of its own, under the hook's name" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKLOG");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = oneToolCallThenDone();
+    var fake_tools = HookToolRunner{};
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "watch",
+        .trigger = .tool_before,
+        .argv = &.{"./watch"},
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    var seen = Seen{};
+    try seenInLog(seen_arena.allocator(), io, store, &seen);
+    // The program it ran is a tool call with its own id, so an auditor reads
+    // the same machinery as for anything else the session ran.
+    try testing.expectEqual(@as(usize, 1), seen.hook_call_ids);
+    try testing.expectEqual(@as(usize, 1), seen.hook_runs);
+}
+
+test "what a tool.after hook wrote reaches the agent with the tool's own output" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKNOTE");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = oneToolCallThenDone();
+    var fake_tools = HookToolRunner{ .hook_output = "the formatter changed two files" };
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "formatter",
+        .trigger = .tool_after,
+        .tool = "write_file",
+        .argv = &.{"./fmt"},
+        .output = .note,
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    var seen = Seen{};
+    try seenInLog(seen_arena.allocator(), io, store, &seen);
+    try testing.expect(std.mem.indexOf(u8, seen.tool_result, "the tool ran") != null);
+    try testing.expect(std.mem.indexOf(u8, seen.tool_result, "formatter") != null);
+    try testing.expect(
+        std.mem.indexOf(u8, seen.tool_result, "the formatter changed two files") != null,
+    );
+}
+
+test "a hook named for one tool does not fire for another" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKOTHER");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = oneToolCallThenDone();
+    var fake_tools = HookToolRunner{ .hook_fails = true };
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "only-commands",
+        .trigger = .tool_before,
+        .tool = "run_command",
+        .argv = &.{"./check"},
+        .output = .refuse,
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    // The call was write_file, so the hook never ran and never refused it.
+    try testing.expectEqual(@as(usize, 0), fake_tools.hook_calls);
+    try testing.expectEqual(@as(usize, 1), fake_tools.agent_calls);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    var seen = Seen{};
+    try seenInLog(seen_arena.allocator(), io, store, &seen);
+    try testing.expectEqual(@as(usize, 0), seen.hook_runs);
+}
+
+test "a session.start hook that ends with an error ends the session before any turn" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKSTART");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = oneToolCallThenDone();
+    var fake_tools = HookToolRunner{ .hook_fails = true };
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "needs-a-clean-tree",
+        .trigger = .session_start,
+        .argv = &.{"./check"},
+        .output = .refuse,
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    // The model was never asked anything.
+    try testing.expectEqual(@as(usize, 0), fake_client.calls);
+    try testing.expectEqual(@as(usize, 0), fake_tools.agent_calls);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    var seen = Seen{};
+    try seenInLog(seen_arena.allocator(), io, store, &seen);
+    try testing.expectEqualStrings("refused_by_hook", seen.end_reason);
+    try testing.expectEqual(@as(usize, 1), seen.refused);
+}
+
+test "a session.end hook runs once the session is over, and refuses nothing" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKEND");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{.{ .deltas = &.{.{ .text = "done" }} }} };
+    var fake_tools = HookToolRunner{ .hook_fails = true };
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "say-so",
+        .trigger = .session_end,
+        .argv = &.{"./say"},
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 1), fake_tools.hook_calls);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    var seen = Seen{};
+    try seenInLog(seen_arena.allocator(), io, store, &seen);
+    try testing.expectEqual(@as(usize, 1), seen.hook_runs);
+    try testing.expectEqual(@as(usize, 0), seen.refused);
+    try testing.expectEqualStrings("finished", seen.end_reason);
+}
+
+test "a hook whose own program the policy refuses refuses what it fired on" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKGATED");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = oneToolCallThenDone();
+    var fake_tools = HookToolRunner{};
+    var judge = TestArbiter{ .answer = .{
+        .permitted = false,
+        .outcome = "refused_by_policy",
+    } };
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "cannot-run",
+        .trigger = .tool_before,
+        .argv = &.{"./check"},
+        .output = .refuse,
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    // Nothing ran: the hook's program was refused, and the call it was about
+    // is refused with it, because a check that did not happen is not a check
+    // that passed.
+    try testing.expectEqual(@as(usize, 0), fake_tools.hook_calls);
+    try testing.expectEqual(@as(usize, 0), fake_tools.agent_calls);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    var seen = Seen{};
+    try seenInLog(seen_arena.allocator(), io, store, &seen);
+    try testing.expectEqualStrings("refused_by_policy", seen.outcome);
+    try testing.expectEqual(@as(usize, 1), seen.refused);
+    try testing.expect(seen.tool_errored);
+}
+
+test "a hook that only watches changes nothing about the call it watched" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKWATCH");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = oneToolCallThenDone();
+    var fake_tools = HookToolRunner{ .hook_fails = true, .hook_output = "I did not like it" };
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "watch",
+        .trigger = .tool_before,
+        .argv = &.{"./watch"},
+        .output = .ignore,
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 1), fake_tools.agent_calls);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    var seen = Seen{};
+    try seenInLog(seen_arena.allocator(), io, store, &seen);
+    // The log holds that it failed, and the session carried on.
+    try testing.expectEqual(@as(usize, 0), seen.refused);
+    try testing.expectEqualStrings("the tool ran", seen.tool_result);
+    try testing.expect(!seen.tool_errored);
+}
+
+test "a tool.before hook is told the action the call would be gated under" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKACTION");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = oneToolCallThenDone();
+    var fake_tools = HookToolRunner{};
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "watch",
+        .trigger = .tool_before,
+        .inputs = &.{ .trigger, .tool, .action },
+        .argv = &.{"./watch"},
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    const arena = seen_arena.allocator();
+
+    var replay = try store.replay(arena, io, 0);
+    defer replay.deinit();
+    var hook_arguments: []const u8 = "";
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .tool_call => |one| {
+                if (!std.mem.startsWith(u8, one.call_id, hook_call_prefix)) continue;
+                hook_arguments = try arena.dupe(u8, one.arguments);
+            },
+            else => {},
+        }
+    }
+
+    // The name is the one the gate itself will use for this call, so a check
+    // reads the same action a policy rule is written against.
+    try testing.expect(
+        std.mem.indexOf(u8, hook_arguments, "\"--action\",\"call.write_file\"") != null,
+    );
+    try testing.expect(std.mem.indexOf(u8, hook_arguments, "\"--tool\",\"write_file\"") != null);
+    try testing.expect(std.mem.indexOf(u8, hook_arguments, "\"--trigger\",\"tool.before\"") != null);
+}
+
+test "one hook firing on two calls writes two call ids, so nothing keyed on one collides" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKTWICE");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = "write_file",
+            .arguments = "{}",
+        } }} },
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call2",
+            .name = "write_file",
+            .arguments = "{}",
+        } }} },
+        .{ .deltas = &.{.{ .text = "done" }} },
+    } };
+    var fake_tools = HookToolRunner{};
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "watch",
+        .trigger = .tool_before,
+        .argv = &.{"./watch"},
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 2), fake_tools.hook_calls);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    const arena = seen_arena.allocator();
+
+    var replay = try store.replay(arena, io, 0);
+    defer replay.deinit();
+    var ids: std.ArrayList([]const u8) = .empty;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .tool_call => |one| {
+                if (!std.mem.startsWith(u8, one.call_id, hook_call_prefix)) continue;
+                try ids.append(arena, try arena.dupe(u8, one.call_id));
+            },
+            else => {},
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 2), ids.items.len);
+    try testing.expect(!std.mem.eql(u8, ids.items[0], ids.items[1]));
+    // The id says which hook, and which call it was about.
+    try testing.expectEqualStrings("hook:watch:call1", ids.items[0]);
+    try testing.expectEqualStrings("hook:watch:call2", ids.items[1]);
+    try testing.expectEqualStrings("watch", hooks_mod.nameInCallId(ids.items[0]).?);
+}
+
+test "a tool.after hook does not fire for a call the policy refused" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01HOOKAFTERNO");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = oneToolCallThenDone();
+    var fake_tools = HookToolRunner{};
+    var judge = TestArbiter{ .answer = .{
+        .permitted = false,
+        .outcome = "refused_by_policy",
+    } };
+
+    const hooks = [_]hooks_mod.Hook{.{
+        .name = "formatter",
+        .trigger = .tool_after,
+        .argv = &.{"./fmt"},
+        .output = .note,
+    }};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    deps.hooks = &hooks;
+    try run(allocator, io, deps);
+
+    // The write never happened, so there was nothing for the hook to be about.
+    try testing.expectEqual(@as(usize, 0), fake_tools.agent_calls);
+    try testing.expectEqual(@as(usize, 0), fake_tools.hook_calls);
+
+    var seen_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seen_arena.deinit();
+    var seen = Seen{};
+    try seenInLog(seen_arena.allocator(), io, store, &seen);
+    try testing.expectEqual(@as(usize, 0), seen.hook_runs);
 }

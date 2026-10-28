@@ -199,6 +199,10 @@ what a project cannot take back. [actions.md](actions.md) has both.
   may be given without the agent ever seeing it.
 - [skills.md](../using/skills.md) for the `skills` block, which says which
   directories of this project hold skills.
+- [commands.md](../using/commands.md) for the `commands` block, which says which
+  directories of this project hold the messages a person can run by name.
+- [hooks.md](../using/hooks.md) for the `hooks` block, which says what this
+  project runs at a point in a session.
 - [org.md](org.md) for the bundle an organisation puts above the project.
 - [subagents.md](../using/subagents.md) for the subagent limits.
 - [plugins.md](../extend/plugins.md) for the plugin list.
@@ -217,6 +221,44 @@ be under the project and must not climb out of it:
 There can be at most four. Leave the block out and the project ships none,
 which is what every project does today. [skills.md](../using/skills.md) has
 the format and the three layers.
+
+### The project's own commands
+
+The `commands` block names directories that hold a project's commands, and it
+is read by the same reader with the same path checks:
+
+```zon
+.{
+    .commands = .{ ".chock/commands" },
+}
+```
+
+A command is a message a person runs with `chock run /<name>`, so this block
+adds nothing to what the agent may do.
+[commands.md](../using/commands.md) has the format and the arguments.
+
+### The project's own hooks
+
+The `hooks` block names programs this project runs at a point in a session:
+
+```zon
+.{
+    .hooks = .{
+        .{
+            .name = "tests-pass",
+            .on = "tool.before",
+            .tool = "request_action",
+            .run = .{ "zig", "build", "test" },
+            .output = "refuse",
+        },
+    },
+}
+```
+
+A hook runs through the gate a tool call goes through, so it narrows what a
+session may do and never widens it. There can be at most eight.
+[hooks.md](../using/hooks.md) has the triggers, the fields and what the log
+holds.
 
 ### Which way of sandboxing a session uses
 

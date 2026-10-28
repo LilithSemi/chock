@@ -738,6 +738,9 @@ fn exitWithAudit(session_exit: Exit, report: *const ShippingReport) Exit {
 const Started = struct {
     exe_path: []const u8,
     project_root: []const u8,
+    /// The first message an interface is primed with, with a command already
+    /// expanded. A session with no interface takes its message another way.
+    first_message: []const u8 = "",
     paths: session_paths.Paths,
     session_id: []const u8,
     workspace: chock_workspace.Workspace,
@@ -751,6 +754,7 @@ const Started = struct {
     own_guest: ?*OwnGuest,
     read_only_mounts: []const chock_core.tools.ToolchainMount,
     skills: chock_core.skills.Found,
+    hooks: []const chock_core.hooks.Hook,
     tool_env: *std.process.Environ.Map,
     provisioning: ?Provisioning,
     nix_build: ?NixBuild,
@@ -899,12 +903,22 @@ fn sessionConfig(
     dev_shell_name: ?[]const u8,
     context_tokens: ?u64,
     sandbox_config: palisade.Sandbox.Config,
+    read_instructions: []const chock_core.instructions.ReadFile,
 ) std.mem.Allocator.Error!chock_proto.event.SessionConfig {
     var rules: std.ArrayList([]const u8) = .empty;
     for (options.policy_rules) |rule| {
         try rules.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{
             rule.action orelse "*",
             @tagName(rule.decision),
+        }));
+    }
+
+    var files: std.ArrayList([]const u8) = .empty;
+    for (read_instructions) |one| {
+        try files.append(arena, try std.fmt.allocPrint(arena, "{t} {s} sha256:{s}", .{
+            one.layer,
+            one.path,
+            one.hash,
         }));
     }
 
@@ -915,6 +929,7 @@ fn sessionConfig(
             null,
         .sandbox_hash = try std.fmt.allocPrint(arena, "{x}", .{chock_net.shapeHash(sandbox_config)}),
         .instructions = options.instructions,
+        .instruction_files = files.items,
         .policy_rules = rules.items,
         .dev_shell = dev_shell_name orelse "",
         .allow_dirty = options.allow_dirty,
@@ -1088,6 +1103,24 @@ fn start(
     const config_dir = chock_auth.paths.configDir(arena, env) catch |err| {
         tty.print(.err, "chock run: the configuration directory is unknown: {s}\n", .{@errorName(err)});
         return error.Reported;
+    };
+
+    // The message is read and a command in it expanded before any session
+    // state exists, so a name that is not a command costs no workspace. An
+    // interface takes the same expansion, so `/review` typed there means what
+    // it means on the command line.
+    const display_first = if (options.display) |one|
+        try expandCommand(arena, io, config_dir, project_root, one.first_message)
+    else
+        "";
+
+    const first_message: ?[]const u8 = if (options.adopt or options.display != null) null else blk: {
+        const typed = try readMessage(arena, io, options);
+        if (typed.len == 0) {
+            tty.print(.err, "chock run: the message is empty, so there is nothing to ask.\n", .{});
+            return error.Reported;
+        }
+        break :blk try expandCommand(arena, io, config_dir, project_root, typed);
     };
     const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| {
         tty.print(.err, "chock run: the data directory is unknown: {s}\n", .{@errorName(err)});
@@ -1783,6 +1816,9 @@ fn start(
         flake_inputs,
     );
 
+    const project_hooks = try projectHooks(arena, io, project_root);
+    reportHooks(project_hooks);
+
     const found_skills = try skillsFor(arena, io, config_dir, project_root, toolchain.store_paths);
     const skill_mounts = try placeSkills(
         arena,
@@ -1868,13 +1904,8 @@ fn start(
         prompt_sources,
     ) catch return error.OutOfMemory;
 
-    if (!options.adopt and options.display == null) {
-        const message_text = try readMessage(arena, io, options);
-        if (message_text.len == 0) {
-            tty.print(.err, "chock run: the message is empty, so there is nothing to ask.\n", .{});
-            return error.Reported;
-        }
-        appendUserMessage(gpa, io, storage, message_text) catch |err| {
+    if (first_message) |text| {
+        appendUserMessage(gpa, io, storage, text) catch |err| {
             tty.print(.err, "chock run: the message could not be written to the log: {s}\n", .{@errorName(err)});
             return error.Reported;
         };
@@ -1883,6 +1914,7 @@ fn start(
     const started: Started = .{
         .exe_path = exe_path,
         .project_root = project_root,
+        .first_message = display_first,
         .paths = paths,
         .session_id = id,
         .workspace = workspace,
@@ -1896,6 +1928,7 @@ fn start(
         .toolchain = toolchain,
         .read_only_mounts = read_only_mounts,
         .skills = found_skills,
+        .hooks = project_hooks,
         .tool_env = tool_env,
         .provisioning = provisioning,
         .nix_build = nix_build,
@@ -1928,6 +1961,7 @@ fn start(
             dev_shell_name,
             instance.context_tokens,
             sandbox_config,
+            loaded_instructions.files,
         ),
         .model = model,
         .model_alias = instance.name,
@@ -4770,6 +4804,107 @@ fn skillsFor(
     return chock_core.skills.discover(arena, io, roots.items);
 }
 
+/// The hooks a project declared, read the way every other block of its
+/// `chock.zon` is read. A file that cannot be read stops the session, because
+/// a hook that was meant to refuse something and is quietly absent is the
+/// worst of the three outcomes.
+fn projectHooks(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+) StartError![]const chock_core.hooks.Hook {
+    var diag: ?chock_core.hooks.Diagnostic = null;
+    defer if (diag) |*one| one.deinit(arena);
+
+    const block = chock_core.hooks.load(arena, io, project_root, &diag) catch |err| {
+        if (diag) |*one| {
+            tty.print(.err, "chock run: the hooks block in chock.zon could not be read: {f}\n", .{one});
+        } else {
+            tty.print(.err, "chock run: the hooks block in chock.zon could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
+    return block.hooks;
+}
+
+fn reportHooks(hooks: []const chock_core.hooks.Hook) void {
+    for (hooks) |one| {
+        tty.detail("chock: hook {s} at {s}, output {s}\n", .{
+            one.name,
+            one.trigger.wireName(),
+            one.output.wireName(),
+        });
+    }
+    if (hooks.len != 0) {
+        tty.print(.plain, "chock: {d} hook{s} from this project\n", .{
+            hooks.len,
+            if (hooks.len == 1) "" else "s",
+        });
+    }
+}
+
+fn commandsFor(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    config_dir: ?[]const u8,
+    project_root: []const u8,
+) StartError!chock_core.commands.Found {
+    var roots: std.ArrayList(chock_core.commands.Root) = .empty;
+
+    if (config_dir) |dir| try roots.append(arena, .{
+        .layer = .operator,
+        .path = try std.fs.path.join(arena, &.{ dir, chock_core.commands.operator_dir_name }),
+    });
+
+    for (try projectDirs(arena, io, project_root, .commands)) |path| {
+        try roots.append(arena, .{ .layer = .project, .path = path });
+    }
+
+    return chock_core.commands.discover(arena, io, roots.items);
+}
+
+/// A message that names a command becomes that command's text. Every other
+/// message is the person's own words and reaches the model unchanged, so a
+/// session that uses no command reads no command directory either.
+fn expandCommand(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    config_dir: ?[]const u8,
+    project_root: []const u8,
+    typed: []const u8,
+) StartError![]const u8 {
+    const named = chock_core.commands.invocationIn(typed) orelse return typed;
+
+    const found = try commandsFor(arena, io, config_dir, project_root);
+    for (found.refused) |one| {
+        tty.print(.warn, "chock: {s} is not a command: {s}\n", .{ one.path, one.fault.sentence() });
+    }
+
+    const one = chock_core.commands.findIn(found.commands, named.name) orelse {
+        tty.print(.err, "chock run: there is no command named {s}.\n", .{named.name});
+        reportCommandNames(found.commands);
+        return error.Reported;
+    };
+
+    // The path reads as a person wrote it, under the project, rather than as
+    // the absolute path the block resolved to.
+    const shown = underneath(one.path, project_root) orelse one.path;
+    tty.print(.plain, "chock: command {s} ({t}, {s})\n", .{ one.name, one.layer, shown });
+    return chock_core.commands.expand(arena, one, named.rest) catch return error.OutOfMemory;
+}
+
+fn reportCommandNames(commands: []const chock_core.commands.Command) void {
+    if (commands.len == 0) {
+        tty.print(.plain, "chock: this project and your own configuration hold no commands.\n", .{});
+        return;
+    }
+    tty.print(.plain, "chock: the commands you have are", .{});
+    for (commands, 0..) |one, at| {
+        tty.print(.plain, "{s} {s}", .{ if (at == 0) "" else ",", one.name });
+    }
+    tty.print(.plain, "\n", .{});
+}
+
 fn placeSkills(
     arena: std.mem.Allocator,
     found: []chock_core.skills.Skill,
@@ -4815,30 +4950,58 @@ fn projectSkillDirs(
     io: std.Io,
     project_root: []const u8,
 ) StartError![]const []const u8 {
-    var diag: ?chock_policy.skills.Diagnostic = null;
+    return projectDirs(arena, io, project_root, .skills);
+}
+
+/// The directories one block of `chock.zon` names, each resolved to its real
+/// path under the project. A block that names none gets an empty list.
+fn projectDirs(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    which: chock_policy.dirs.Which,
+) StartError![]const []const u8 {
+    var diag: ?chock_policy.dirs.Diagnostic = null;
     defer if (diag) |*d| d.deinit(arena);
 
-    const block = chock_policy.skills.load(arena, io, project_root, &diag) catch |err| {
-        if (diag) |*d| {
-            tty.print(.err, "chock run: the skills block in chock.zon could not be read: {f}\n", .{d});
-        } else {
-            tty.print(.err, "chock run: the skills block in chock.zon could not be read: {t}\n", .{err});
-        }
+    const block = chock_policy.dirs.load(arena, io, project_root, which, &diag) catch |err| {
+        reportBlockFault(which, if (diag) |*one| one else null, err);
         return error.Reported;
     };
 
     const resolved = try arena.alloc([]const u8, block.dirs.len);
     for (block.dirs, 0..) |name, at| {
-        resolved[at] = chock_policy.skills.resolve(arena, io, project_root, name, &diag) catch |err| {
-            if (diag) |*d| {
-                tty.print(.err, "chock run: the skills block in chock.zon could not be read: {f}\n", .{d});
-            } else {
-                tty.print(.err, "chock run: the skills block in chock.zon could not be read: {t}\n", .{err});
-            }
+        resolved[at] = chock_policy.dirs.resolve(
+            arena,
+            io,
+            project_root,
+            which,
+            name,
+            &diag,
+        ) catch |err| {
+            reportBlockFault(which, if (diag) |*one| one else null, err);
             return error.Reported;
         };
     }
     return resolved;
+}
+
+fn reportBlockFault(
+    which: chock_policy.dirs.Which,
+    diag: ?*const chock_policy.dirs.Diagnostic,
+    err: anyerror,
+) void {
+    if (diag) |one| {
+        tty.print(.err, "chock run: the {s} block in chock.zon could not be read: {f}\n", .{
+            which.blockName(),
+            one,
+        });
+    } else {
+        tty.print(.err, "chock run: the {s} block in chock.zon could not be read: {t}\n", .{
+            which.blockName(),
+            err,
+        });
+    }
 }
 
 fn reportSkills(found: chock_core.skills.Found) void {
@@ -10825,7 +10988,7 @@ fn runSession(
                 chock_policy.apply.integrate_action,
             },
         );
-        if (options.display.?.first_message.len != 0) one.prime(options.display.?.first_message);
+        if (started.first_message.len != 0) one.prime(started.first_message);
     }
 
     const wall = clock.Real{
@@ -11075,6 +11238,8 @@ fn runSession(
         .searcher = if (searcher) |*one| one.searcher() else null,
         .asker = if (screen != null) display_asker.asker() else question_prompt.asker(),
         .redact = started.redact,
+        .hooks = started.hooks,
+        .session_id = started.session_id,
     };
     deps.max_turns = options.max_turns;
 
@@ -11549,7 +11714,16 @@ const Printer = struct {
             .tool_call => |call| {
                 self.open(.dim);
                 defer self.close(.dim);
-                self.write("\n$ ");
+                // A hook's own run reaches the log as a call like any other,
+                // so the line says who asked for it rather than leaving a
+                // person to read it as the model's.
+                if (chock_core.hooks.nameInCallId(call.call_id)) |name| {
+                    self.write("\nhook ");
+                    self.write(name);
+                    self.write(": ");
+                } else {
+                    self.write("\n$ ");
+                }
                 self.write(call.tool);
                 self.write(" ");
                 self.write(call.arguments);
@@ -14330,7 +14504,7 @@ test "the line about a mode the policy took away is said again once the display 
 test "the display is told what the session is, then filled from the log, then asked for a message" {
     const described = try callAt("\n        one.describe(.{");
     const replayed = try callAt("\n        replayInto(gpa, io, started.storage, one);");
-    const primed = try callAt("\n        if (options.display.?.first_message.len != 0) one.prime(");
+    const primed = try callAt("\n        if (started.first_message.len != 0) one.prime(");
 
     try testing.expect(described < replayed);
     try testing.expect(replayed < primed);
@@ -20594,4 +20768,108 @@ test "a project that names no port under net.serve is offered no way to publish 
     );
     defer chock_policy.table.Table.destroy(gpa, denied);
     try std.testing.expect(!mayServe(denied, "main", "m"));
+}
+
+test "a message that names a command becomes that command's text" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Held, because what this prints would otherwise reach the test runner's
+    // own stdout protocol.
+    var said: tty.Capture = undefined;
+    said.start(io, std.testing.allocator);
+    defer said.stop(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "project/.chock/commands");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "project/chock.zon",
+        .data = ".{ .commands = .{ \".chock/commands\" } }\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "project/.chock/commands/review.md",
+        .data = "---\ndescription: Review it.\n---\nRead $1 and say what it does.\n",
+    });
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const project = try std.fs.path.join(arena, &.{ root, "project" });
+
+    const text = try expandCommand(arena, io, null, project, "/review src/main.zig");
+    try std.testing.expect(std.mem.indexOf(u8, text, "Read src/main.zig and say what it does.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "command `review`") != null);
+
+    // The person is told which file the text came from, under the project.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        said.err(),
+        "command review (project, .chock/commands/review.md)",
+    ) != null);
+
+    // Everything else is the person's own words, unchanged.
+    const plain = try expandCommand(arena, io, null, project, "read the parser");
+    try std.testing.expectEqualStrings("read the parser", plain);
+}
+
+test "a command this project does not have stops the session rather than reaching the model" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var said: tty.Capture = undefined;
+    said.start(io, std.testing.allocator);
+    defer said.stop(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project");
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const project = try std.fs.path.join(arena, &.{ root, "project" });
+
+    try std.testing.expectError(
+        error.Reported,
+        expandCommand(arena, io, null, project, "/review the diff"),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "no command named review") != null);
+}
+
+test "a project whose commands block names a directory outside it is refused" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var said: tty.Capture = undefined;
+    said.start(io, std.testing.allocator);
+    defer said.stop(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "project/chock.zon",
+        .data = ".{ .commands = .{ \"../elsewhere\" } }\n",
+    });
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const project = try std.fs.path.join(arena, &.{ root, "project" });
+
+    try std.testing.expectError(
+        error.Reported,
+        expandCommand(arena, io, null, project, "/review it"),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        said.err(),
+        "reaches outside the project",
+    ) != null);
 }

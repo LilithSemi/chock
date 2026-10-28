@@ -2,6 +2,7 @@
 //! with the layer it came from.
 
 const std = @import("std");
+const frontmatter = @import("frontmatter.zig");
 const index = @import("index.zig");
 
 pub const file_name = "SKILL.md";
@@ -19,6 +20,9 @@ pub const max_compatibility_bytes: usize = 500;
 pub const max_file_bytes: usize = 64 * 1024;
 
 pub const max_metadata_entries: usize = 32;
+
+/// The one frontmatter key whose indented lines belong to it.
+const nests = "metadata";
 
 pub const Layer = enum {
     operator,
@@ -59,10 +63,7 @@ pub const Layer = enum {
     }
 };
 
-pub const Pair = struct {
-    key: []const u8,
-    value: []const u8,
-};
+pub const Pair = frontmatter.Pair;
 
 pub const Skill = struct {
     layer: Layer,
@@ -167,9 +168,9 @@ pub fn parse(
 ) Error!Read {
     const owned_dir = try allocator.dupe(u8, dir);
 
-    const split = frontmatterOf(bytes) orelse return .{ .refused = .{
+    const split = frontmatter.split(bytes) orelse return .{ .refused = .{
         .dir = owned_dir,
-        .fault = if (opensFrontmatter(bytes)) .frontmatter_not_closed else .no_frontmatter,
+        .fault = if (frontmatter.opens(bytes)) .frontmatter_not_closed else .no_frontmatter,
     } };
 
     var fields = Fields{};
@@ -177,37 +178,21 @@ pub fn parse(
     errdefer metadata.deinit(allocator);
     var left_out: usize = 0;
 
-    var metadata_indent: ?usize = null;
-    var lines = std.mem.splitScalar(u8, split.frontmatter, '\n');
-    while (lines.next()) |raw_line| {
-        const raw = std.mem.trimEnd(u8, raw_line, "\r");
-        const trimmed = std.mem.trim(u8, raw, " \t");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        const indent = indentOf(raw);
-
-        if (metadata_indent) |under| {
-            if (indent > under) {
-                const pair = splitPair(trimmed) orelse continue;
-                if (metadata.items.len >= max_metadata_entries) {
-                    left_out += 1;
-                    continue;
-                }
-                try metadata.append(allocator, .{
-                    .key = try allocator.dupe(u8, pair.key),
-                    .value = try allocator.dupe(u8, pair.value),
-                });
+    var items = frontmatter.walk(bytes, split.frontmatter, nests);
+    while (items.next()) |item| {
+        const pair = item.pair orelse continue;
+        if (item.nested) {
+            if (metadata.items.len >= max_metadata_entries) {
+                left_out += 1;
                 continue;
             }
-            metadata_indent = null;
-        }
-
-        if (indent != 0) continue;
-        const pair = splitPair(trimmed) orelse continue;
-
-        if (std.mem.eql(u8, pair.key, "metadata")) {
-            if (pair.value.len == 0) metadata_indent = indent;
+            try metadata.append(allocator, .{
+                .key = try allocator.dupe(u8, pair.key),
+                .value = try allocator.dupe(u8, pair.value),
+            });
             continue;
         }
+        if (item.nests) continue;
         fields.put(pair.key, pair.value);
     }
 
@@ -221,7 +206,7 @@ pub fn parse(
         .fault = .name_too_long,
         .detail = try cut(allocator, name),
     } };
-    if (!isTheShape(name)) return .{ .refused = .{
+    if (!frontmatter.isTheShape(name)) return .{ .refused = .{
         .dir = owned_dir,
         .fault = .name_not_the_shape,
         .detail = try cut(allocator, name),
@@ -505,47 +490,32 @@ pub fn notesIn(allocator: std.mem.Allocator, bytes: []const u8) Error![]const No
     var out: std.ArrayList(Noted) = .empty;
     errdefer out.deinit(allocator);
 
-    const split = frontmatterOf(bytes) orelse return out.toOwnedSlice(allocator);
-    var at = lineOf(bytes, split.frontmatter);
+    const split = frontmatter.split(bytes) orelse return out.toOwnedSlice(allocator);
 
-    var metadata_indent: ?usize = null;
-    var lines = std.mem.splitScalar(u8, split.frontmatter, '\n');
-    while (lines.next()) |raw_line| : (at += 1) {
-        const raw = std.mem.trimEnd(u8, raw_line, "\r");
-        const trimmed = std.mem.trim(u8, raw, " \t");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        const indent = indentOf(raw);
-
-        if (metadata_indent) |under| {
-            if (indent > under) continue;
-            metadata_indent = null;
-        }
-
-        const pair = if (indent == 0) splitPair(trimmed) else null;
-        const named = pair orelse {
+    var items = frontmatter.walk(bytes, split.frontmatter, nests);
+    while (items.next()) |item| {
+        if (item.nested) continue;
+        const named = item.pair orelse {
             try out.append(allocator, .{
                 .note = .line_not_read,
-                .line = at,
-                .detail = try cut(allocator, trimmed),
+                .line = item.line,
+                .detail = try cut(allocator, item.text),
             });
             continue;
         };
+        if (item.nests) continue;
 
-        if (std.mem.eql(u8, named.key, "metadata")) {
-            if (named.value.len == 0) metadata_indent = indent;
-            continue;
-        }
         if (!namedByTheFormat(named.key)) {
             try out.append(allocator, .{
                 .note = .field_not_in_the_format,
-                .line = at,
+                .line = item.line,
                 .detail = try cut(allocator, named.key),
             });
             continue;
         }
-        if (isBlockMarker(named.value)) try out.append(allocator, .{
+        if (frontmatter.isBlockMarker(named.value)) try out.append(allocator, .{
             .note = .value_is_a_block_marker,
-            .line = at,
+            .line = item.line,
             .detail = try cut(allocator, named.key),
         });
     }
@@ -575,100 +545,13 @@ const Fields = struct {
     }
 };
 
-const Split = struct {
-    frontmatter: []const u8,
-    body: []const u8,
-};
-
-const fence = "---";
-
-fn opensFrontmatter(bytes: []const u8) bool {
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |raw| {
-        const trimmed = std.mem.trim(u8, raw, " \t\r");
-        if (trimmed.len == 0) continue;
-        return std.mem.eql(u8, trimmed, fence);
-    }
-    return false;
-}
-
-fn frontmatterOf(bytes: []const u8) ?Split {
-    var at: usize = 0;
-    while (nextLine(bytes, &at)) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0) continue;
-        if (!std.mem.eql(u8, trimmed, fence)) return null;
-        break;
-    }
-
-    const starts = at;
-    while (true) {
-        const before = at;
-        const line = nextLine(bytes, &at) orelse return null;
-        if (!std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), fence)) continue;
-        return .{ .frontmatter = bytes[starts..before], .body = bytes[at..] };
-    }
-}
-
-fn nextLine(bytes: []const u8, at: *usize) ?[]const u8 {
-    if (at.* >= bytes.len) return null;
-    const rest = bytes[at.*..];
-    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse {
-        at.* = bytes.len;
-        return rest;
-    };
-    at.* += end + 1;
-    return rest[0..end];
-}
-
-fn isTheShape(name: []const u8) bool {
-    if (name.len == 0) return false;
-    if (name[0] == '-' or name[name.len - 1] == '-') return false;
-    for (name, 0..) |byte, at| {
-        switch (byte) {
-            'a'...'z', '0'...'9' => {},
-            '-' => if (at != 0 and name[at - 1] == '-') return false,
-            else => return false,
-        }
-    }
-    return true;
-}
-
-fn indentOf(raw: []const u8) usize {
-    var count: usize = 0;
-    while (count < raw.len and raw[count] == ' ') count += 1;
-    return count;
-}
-
-fn splitPair(trimmed: []const u8) ?Pair {
-    const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return null;
-    const key = unquote(std.mem.trim(u8, trimmed[0..colon], " \t"));
-    if (key.len == 0) return null;
-    return .{ .key = key, .value = unquote(std.mem.trim(u8, trimmed[colon + 1 ..], " \t")) };
-}
-
-fn unquote(value: []const u8) []const u8 {
-    if (value.len < 2) return value;
-    const first = value[0];
-    if (first != '"' and first != '\'') return value;
-    if (value[value.len - 1] != first) return value;
-    return value[1 .. value.len - 1];
-}
-
 fn dupeMaybe(allocator: std.mem.Allocator, value: ?[]const u8) Error!?[]const u8 {
     const it = value orelse return null;
     return try allocator.dupe(u8, it);
 }
 
 fn cut(allocator: std.mem.Allocator, value: []const u8) Error![]const u8 {
-    if (value.len <= max_detail_bytes) return try allocator.dupe(u8, value);
-    return try std.fmt.allocPrint(allocator, "{s}...", .{value[0..max_detail_bytes]});
-}
-
-/// The 1 based line in `bytes` that `part` starts on.
-fn lineOf(bytes: []const u8, part: []const u8) usize {
-    const offset = @intFromPtr(part.ptr) - @intFromPtr(bytes.ptr);
-    return 1 + std.mem.count(u8, bytes[0..offset], "\n");
+    return frontmatter.cut(allocator, value, max_detail_bytes);
 }
 
 fn namedByTheFormat(key: []const u8) bool {
@@ -676,18 +559,6 @@ fn namedByTheFormat(key: []const u8) bool {
         if (std.mem.eql(u8, key, one)) return true;
     }
     return false;
-}
-
-/// A YAML value that is only `|` or `>` with its indicators. YAML folds the lines
-/// under it into the value, and the reader here keeps the marker instead.
-fn isBlockMarker(value: []const u8) bool {
-    if (value.len == 0) return false;
-    if (value[0] != '|' and value[0] != '>') return false;
-    for (value[1..]) |byte| switch (byte) {
-        '-', '+', '0'...'9' => {},
-        else => return false,
-    };
-    return true;
 }
 
 const testing = std.testing;
@@ -750,20 +621,20 @@ test "the spec's example with optional fields keeps every one of them" {
 }
 
 test "every name the spec calls invalid is refused, and every valid one reads" {
-    try testing.expect(isTheShape("pdf-processing"));
-    try testing.expect(isTheShape("data-analysis"));
-    try testing.expect(isTheShape("code-review"));
-    try testing.expect(isTheShape("a"));
-    try testing.expect(isTheShape("a1"));
+    try testing.expect(frontmatter.isTheShape("pdf-processing"));
+    try testing.expect(frontmatter.isTheShape("data-analysis"));
+    try testing.expect(frontmatter.isTheShape("code-review"));
+    try testing.expect(frontmatter.isTheShape("a"));
+    try testing.expect(frontmatter.isTheShape("a1"));
 
-    try testing.expect(!isTheShape("PDF-Processing"));
-    try testing.expect(!isTheShape("-pdf"));
-    try testing.expect(!isTheShape("pdf-"));
-    try testing.expect(!isTheShape("pdf--processing"));
-    try testing.expect(!isTheShape(""));
-    try testing.expect(!isTheShape("pdf_processing"));
-    try testing.expect(!isTheShape("pdf processing"));
-    try testing.expect(!isTheShape("pdf.processing"));
+    try testing.expect(!frontmatter.isTheShape("PDF-Processing"));
+    try testing.expect(!frontmatter.isTheShape("-pdf"));
+    try testing.expect(!frontmatter.isTheShape("pdf-"));
+    try testing.expect(!frontmatter.isTheShape("pdf--processing"));
+    try testing.expect(!frontmatter.isTheShape(""));
+    try testing.expect(!frontmatter.isTheShape("pdf_processing"));
+    try testing.expect(!frontmatter.isTheShape("pdf processing"));
+    try testing.expect(!frontmatter.isTheShape("pdf.processing"));
 }
 
 test "a name that is not the directory's own name is refused" {
@@ -1307,10 +1178,10 @@ test "every field the format names is one the reader keeps" {
     try testing.expect(!namedByTheFormat("version"));
     try testing.expect(!namedByTheFormat(""));
 
-    try testing.expect(isBlockMarker("|"));
-    try testing.expect(isBlockMarker(">-"));
-    try testing.expect(isBlockMarker("|2+"));
-    try testing.expect(!isBlockMarker("|one"));
-    try testing.expect(!isBlockMarker("a description"));
-    try testing.expect(!isBlockMarker(""));
+    try testing.expect(frontmatter.isBlockMarker("|"));
+    try testing.expect(frontmatter.isBlockMarker(">-"));
+    try testing.expect(frontmatter.isBlockMarker("|2+"));
+    try testing.expect(!frontmatter.isBlockMarker("|one"));
+    try testing.expect(!frontmatter.isBlockMarker("a description"));
+    try testing.expect(!frontmatter.isBlockMarker(""));
 }

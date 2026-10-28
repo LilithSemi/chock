@@ -63,6 +63,10 @@ pub const ReadFile = struct {
     layer: Layer,
     path: []const u8,
     bytes: usize,
+    /// SHA-256 of the whole file, lower case hex, even where only its front
+    /// reached the prompt. A digest of the front alone would call a file
+    /// unchanged after an edit past the bound.
+    hash: [64]u8 = @splat('0'),
 };
 
 pub const Loaded = struct {
@@ -113,7 +117,7 @@ pub fn load(
                 .text = read.text,
                 .truncated = read.truncated,
             };
-            try files.append(allocator, .{ .layer = .operator, .path = path, .bytes = read.total_bytes });
+            try files.append(allocator, .{ .layer = .operator, .path = path, .bytes = read.total_bytes, .hash = read.hash });
         } else {
             allocator.free(path);
         }
@@ -133,7 +137,7 @@ pub fn load(
                 .text = read.text,
                 .truncated = read.truncated,
             };
-            try files.append(allocator, .{ .layer = .given, .path = path, .bytes = read.total_bytes });
+            try files.append(allocator, .{ .layer = .given, .path = path, .bytes = read.total_bytes, .hash = read.hash });
         }
         loaded.given = blocks;
     }
@@ -148,7 +152,7 @@ pub fn load(
                 .text = read.text,
                 .truncated = read.truncated,
             };
-            try files.append(allocator, .{ .layer = .project, .path = file_name, .bytes = read.total_bytes });
+            try files.append(allocator, .{ .layer = .project, .path = file_name, .bytes = read.total_bytes, .hash = read.hash });
         }
     }
 
@@ -166,7 +170,7 @@ pub fn load(
                 .text = read.text,
                 .truncated = read.truncated,
             };
-            try files.append(allocator, .{ .layer = .project, .path = path, .bytes = read.total_bytes });
+            try files.append(allocator, .{ .layer = .project, .path = path, .bytes = read.total_bytes, .hash = read.hash });
         }
         loaded.project_named = blocks;
     }
@@ -183,6 +187,7 @@ const BoundedRead = struct {
     text: []u8,
     truncated: bool,
     total_bytes: usize,
+    hash: [64]u8,
 };
 
 fn readBounded(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!?BoundedRead {
@@ -191,7 +196,18 @@ fn readBounded(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error
         error.StreamTooLong => return try readFront(allocator, io, path),
         else => return null,
     };
-    return .{ .text = whole, .truncated = false, .total_bytes = whole.len };
+    return .{
+        .text = whole,
+        .truncated = false,
+        .total_bytes = whole.len,
+        .hash = hashOf(whole),
+    };
+}
+
+fn hashOf(bytes: []const u8) [64]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn readFront(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!?BoundedRead {
@@ -214,10 +230,24 @@ fn readFront(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!?
     }
     if (filled != text.len) text = try allocator.realloc(text, filled);
 
+    // The rest of the file reaches no prompt and still reaches the digest, so
+    // an edit past the bound shows.
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(text);
+    var rest: [4096]u8 = undefined;
+    while (true) {
+        const n = file.readStreaming(io, &.{&rest}) catch break;
+        if (n == 0) break;
+        hasher.update(rest[0..n]);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+
     return .{
         .text = text,
         .truncated = true,
         .total_bytes = if (total > filled) total else filled,
+        .hash = std.fmt.bytesToHex(digest, .lower),
     };
 }
 
@@ -274,7 +304,7 @@ fn scanSubtrees(
 
         const description = try index.oneLine(allocator, index.firstMeaningfulLine(read.text));
         try entries.append(allocator, .{ .name = relative, .description = description });
-        try files.append(allocator, .{ .layer = .subtree, .path = relative, .bytes = read.total_bytes });
+        try files.append(allocator, .{ .layer = .subtree, .path = relative, .bytes = read.total_bytes, .hash = read.hash });
     }
 
     std.mem.sort(index.Entry, entries.items, {}, lessThanName);
@@ -613,4 +643,61 @@ fn repeated(comptime piece: []const u8, comptime times: usize) [piece.len * time
     var out: [piece.len * times]u8 = undefined;
     for (0..times) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
     return out;
+}
+
+test "every instruction file read carries the digest of the whole file" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = "project rules\n" });
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const loaded = try load(arena_state.allocator(), io, null, root, &.{}, null, &.{}, null);
+    try testing.expectEqual(@as(usize, 1), loaded.files.len);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("project rules\n", &digest, .{});
+    try testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), &loaded.files[0].hash);
+}
+
+test "a file longer than the bound is digested whole, so an edit past the bound shows" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const body = try gpa.alloc(u8, max_block_bytes + 64);
+    defer gpa.free(body);
+    @memset(body, 'a');
+    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = body });
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+
+    var first_state = std.heap.ArenaAllocator.init(gpa);
+    defer first_state.deinit();
+    const first = try load(first_state.allocator(), io, null, root, &.{}, null, &.{}, null);
+    try testing.expect(first.project.?.truncated);
+
+    var expected: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &expected, .{});
+    try testing.expectEqualStrings(&std.fmt.bytesToHex(expected, .lower), &first.files[0].hash);
+
+    // The part that reaches the prompt is the same, and the digest is not.
+    body[body.len - 1] = 'b';
+    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = body });
+
+    var second_state = std.heap.ArenaAllocator.init(gpa);
+    defer second_state.deinit();
+    const second = try load(second_state.allocator(), io, null, root, &.{}, null, &.{}, null);
+    try testing.expectEqualStrings(first.project.?.text, second.project.?.text);
+    try testing.expect(!std.mem.eql(u8, &first.files[0].hash, &second.files[0].hash));
 }

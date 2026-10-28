@@ -1053,6 +1053,7 @@ fn requiredFieldNames(comptime T: type) []const u8 {
 const RunCommandArgs = struct {
     argv: []const []const u8,
     background: ?bool = null,
+    timeout_ms: ?i64 = null,
 
     pub const docs = .{
         .argv = "The program name, resolved on PATH, followed by its arguments.",
@@ -1061,8 +1062,21 @@ const RunCommandArgs = struct {
             "as a full build or a test suite: a foreground command is stopped when it reaches " ++
             "the time limit. The output goes to a file you can read and cannot write, and you " ++
             "are told when the command finishes.",
+        .timeout_ms = "Give up on the command after this many milliseconds. It can only ask " ++
+            "for less time than the session's own limit, never more, and a foreground command " ++
+            "takes the shorter of the two.",
     };
 };
+
+/// The limit a foreground command runs under: the session's, or a shorter one
+/// the call asked for. A call can only narrow it, so a number past the
+/// session's own limit changes nothing.
+fn timeoutFor(asked_ms: ?i64, session_ns: u64) u64 {
+    const asked = asked_ms orelse return session_ns;
+    if (asked <= 0) return session_ns;
+    const wanted: u64 = @as(u64, @intCast(asked)) * std.time.ns_per_ms;
+    return @min(wanted, session_ns);
+}
 
 const ReadFileArgs = struct {
     path: []const u8,
@@ -1619,7 +1633,10 @@ fn runCommand(
         .argv = parsed.value.argv,
         .extra_mounts = extra_mounts.items,
         .extra_rules = extra_rules.items,
-        .timeout_ns = if (in_background) tasks.default_timeout_ns else context.timeout_ns,
+        .timeout_ns = if (in_background)
+            tasks.default_timeout_ns
+        else
+            timeoutFor(parsed.value.timeout_ms, context.timeout_ns),
         .background = if (in_background) context.tasks else null,
         .idle = if (in_background) null else if (credential_chain.seam != null)
             credential_chain.idle()
@@ -5951,4 +5968,17 @@ test "serve_port is offered only where a port could be published" {
     var buffer: [Tool.max_action_bytes]u8 = undefined;
     const action = Tool.serve_port.actionInto(&buffer, null, "/work", &.{}).?;
     try std.testing.expectEqualStrings("call.serve_port", action);
+}
+
+test "a command may ask for less time than the session's limit, and never for more" {
+    const session = 120 * std.time.ns_per_s;
+
+    try std.testing.expectEqual(session, timeoutFor(null, session));
+    try std.testing.expectEqual(5 * std.time.ns_per_s, timeoutFor(5000, session));
+
+    // A number past the session's own limit changes nothing, so the field
+    // cannot widen what a session allows.
+    try std.testing.expectEqual(session, timeoutFor(600_000, session));
+    try std.testing.expectEqual(session, timeoutFor(0, session));
+    try std.testing.expectEqual(session, timeoutFor(-1, session));
 }

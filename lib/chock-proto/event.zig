@@ -125,6 +125,7 @@ pub const Kind = enum {
     device_exposed,
     secret_used,
     network_summary,
+    hook_run,
     unknown,
 
     pub fn wireName(self: Kind) []const u8 {
@@ -173,6 +174,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .device_exposed = "device.exposed",
     .secret_used = "secret.used",
     .network_summary = "network.summary",
+    .hook_run = "hook.run",
     .unknown = "unknown",
 });
 
@@ -241,6 +243,9 @@ pub const SessionConfig = struct {
     /// SHA-256 of what this sandbox lets a tool call reach; differs means a different sandbox.
     sandbox_hash: []const u8 = "",
     instructions: []const []const u8 = &.{},
+    /// Every instruction file read, as `<layer> <path> sha256:<hex>`, so a
+    /// replay can tell whether a project's own instructions changed.
+    instruction_files: []const []const u8 = &.{},
     policy_rules: []const []const u8 = &.{},
     /// The `devShells` attribute read, from `--dev-shell` or the `nix` block.
     dev_shell: []const u8 = "",
@@ -266,6 +271,10 @@ pub const SessionConfig = struct {
         if (self.instructions.len != 0) {
             try jw.objectField("instructions");
             try jw.write(self.instructions);
+        }
+        if (self.instruction_files.len != 0) {
+            try jw.objectField("instruction_files");
+            try jw.write(self.instruction_files);
         }
         if (self.policy_rules.len != 0) {
             try jw.objectField("policy_rules");
@@ -299,6 +308,8 @@ pub const SessionEndReason = union(enum) {
     empty_response,
     /// `stop_reason` `refusal`: Chock never retries, swaps model, or rewords it.
     refused_by_model,
+    /// A `session.start` hook the project declared ended with an error.
+    refused_by_hook,
     rate_limited,
     unknown: []const u8,
 
@@ -1020,6 +1031,30 @@ pub const SecretUsed = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
+/// A hook the project declared, and what its run did to the session. The
+/// program it ran is a tool call of its own in this same log, gated by the
+/// `action` below, so this row says who asked for that call and why.
+pub const HookRun = struct {
+    name: []const u8,
+    /// `session.start`, `session.end`, `tool.before` or `tool.after`.
+    trigger: []const u8,
+    /// The tool the moment was about, where there was one.
+    tool: []const u8 = "",
+    /// The action the hook's own program was gated under.
+    action: []const u8 = "",
+    /// `ran`, `refused_by_policy` or `could_not_run`.
+    outcome: []const u8,
+    /// Whether the program ended with anything but success.
+    errored: bool = false,
+    /// Whether this refused what it fired on.
+    refused: bool = false,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 pub const NetworkSummary = struct {
     granted: u64 = 0,
     refused: u64 = 0,
@@ -1164,6 +1199,7 @@ pub const Event = union(Kind) {
     device_exposed: DeviceExposed,
     secret_used: SecretUsed,
     network_summary: NetworkSummary,
+    hook_run: HookRun,
     unknown: UnknownEvent,
 
     pub fn jsonStringify(self: Event, jw: *std.json.Stringify) std.json.Stringify.Error!void {
