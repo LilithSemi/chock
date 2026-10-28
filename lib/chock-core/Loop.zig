@@ -439,7 +439,7 @@ fn runTurn(
             const detail = try std.fmt.allocPrint(
                 allocator,
                 "the model backend answered with status {d} ({s}): {s}",
-                .{ @intFromEnum(status_error.status), @tagName(class), status_error.body },
+                .{ @backingInt(status_error.status), @tagName(class), status_error.body },
             );
             defer allocator.free(detail);
             _ = try appendAndApply(allocator, io, locked, session, deps, .{
@@ -719,7 +719,7 @@ fn givingUpDetail(
             allocator,
             "the model backend refused {d} attempts at the same request, and the last one " ++
                 "answered with status {d}: {s}",
-            .{ attempts, @intFromEnum(refusal.status), refusal.body },
+            .{ attempts, @backingInt(refusal.status), refusal.body },
         ),
         .wait_too_long => std.fmt.allocPrint(
             allocator,
@@ -728,7 +728,7 @@ fn givingUpDetail(
             .{
                 refusal.retry_after_s orelse 0,
                 attempts,
-                @intFromEnum(refusal.status),
+                @backingInt(refusal.status),
                 refusal.body,
             },
         ),
@@ -1122,7 +1122,7 @@ fn askForSummary(
             return .{ .stand_in_reason = try std.fmt.allocPrint(
                 arena,
                 "the model backend answered the compaction call with status {d}: {s}",
-                .{ @intFromEnum(status_error.status), status_error.body },
+                .{ @backingInt(status_error.status), status_error.body },
             ) };
         },
         .failed => |failed| {
@@ -1232,6 +1232,25 @@ fn gateToolCall(
         );
     }
 
+    if (tool == .serve_port) {
+        const port = tools.servedPortIn(allocator, call.arguments) orelse return try gateRefusal(
+            allocator,
+            call,
+            try allocator.dupe(u8, tools.serve_port_unnamed_detail),
+        );
+        const action = chock_policy.table.serveActionInto(action_buffer, port) orelse
+            return try gateRefusal(allocator, call, try allocator.dupe(u8, gate_unnamed_detail));
+        action_out.* = action;
+
+        const answer = try decideAction(allocator, io, locked, deps, call, action);
+        if (answer.permitted) return null;
+        return try gateRefusal(
+            allocator,
+            call,
+            try arbiter_mod.refusalText(allocator, call.tool, answer),
+        );
+    }
+
     const action = tool.actionInto(
         action_buffer,
         argv0_owned,
@@ -1274,7 +1293,10 @@ fn writeInto(buffer: []u8, text: []const u8) ?[]const u8 {
     return buffer[0..text.len];
 }
 
-const gate_action_bytes = @max(tools.Tool.max_action_bytes, nix_action.max_action_bytes);
+const gate_action_bytes = @max(
+    @max(tools.Tool.max_action_bytes, nix_action.max_action_bytes),
+    chock_policy.table.max_serve_action_bytes,
+);
 
 const gate_unnamed_detail = "nothing ran: this call could not be named for a policy check, " ++
     "so it was not run. Try something else.";
@@ -9431,4 +9453,106 @@ test "a plan longer than the bound is refused whole, and leaves the list it had"
     try testing.expectEqual(@as(usize, 1), outcome.events);
     try testing.expectEqual(@as(usize, 1), session.plan.steps.items.len);
     try testing.expectEqualStrings("the one real step", session.plan.steps.items[0].subject);
+}
+
+test "a serve_port call is gated under the port it names, and a bad port never reaches a tool" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01SERVEGATE1");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = @tagName(tools.Tool.serve_port),
+            .arguments = "{\"port\":3000}",
+        } }} },
+        .{ .deltas = &.{.{ .text = "done" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "published" };
+    var judge = ActionArbiter{};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    // The port is in the action, so a rule and a person answer that port alone.
+    try testing.expectEqual(@as(usize, 1), judge.calls);
+    try testing.expectEqualStrings("net.serve.3000", judge.sawAt(0));
+    try testing.expectEqual(@as(usize, 1), fake_tools.calls);
+}
+
+test "a serve_port call the arbiter refuses never reaches the runner" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01SERVEGATE2");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = @tagName(tools.Tool.serve_port),
+            .arguments = "{\"port\":8080}",
+        } }} },
+        .{ .deltas = &.{.{ .text = "done" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "never reached" };
+    var judge = ActionArbiter{ .refuse_prefix = "net.serve" };
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 1), judge.calls);
+    try testing.expectEqualStrings("net.serve.8080", judge.sawAt(0));
+    try testing.expectEqual(@as(usize, 0), fake_tools.calls);
+}
+
+test "a serve_port call that names no usable port is refused before anybody is asked" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01SERVEGATE3");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = @tagName(tools.Tool.serve_port),
+            .arguments = "{\"port\":0}",
+        } }} },
+        .{ .deltas = &.{.{ .text = "done" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "never reached" };
+    var judge = ActionArbiter{};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    // Nothing is asked about a port that cannot exist, and the agent is told
+    // which field to send.
+    try testing.expectEqual(@as(usize, 0), judge.calls);
+    try testing.expectEqual(@as(usize, 0), fake_tools.calls);
+
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    var said: ?[]const u8 = null;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .tool_result) continue;
+        try testing.expect(parsed.value.event.tool_result.is_error);
+        said = try allocator.dupe(u8, parsed.value.event.tool_result.output);
+    }
+    const text = said orelse return error.TestUnexpectedResult;
+    defer allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "\"port\"") != null);
 }

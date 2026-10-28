@@ -28,6 +28,7 @@ pub const net_broker = @import("chock-net/linux/netbroker.zig");
 pub const nftables = @import("chock-net/linux/nftables.zig");
 pub const router = @import("chock-net/linux/router.zig");
 pub const net_router = @import("chock-net/linux/routerlink.zig");
+pub const net_serve = @import("chock-net/linux/servelink.zig");
 pub const devicelink = @import("chock-net/linux/devicelink.zig");
 pub const roles = @import("chock-net/linux/roles.zig");
 
@@ -49,4 +50,5 @@ pub const vm_driver = @import("chock-net/vm/driver.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = net_serve;
 }

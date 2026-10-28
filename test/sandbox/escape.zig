@@ -186,7 +186,7 @@ const mount_setup_fault_line = "sandbox: the mount call failed: NOENT\n";
 
 /// Signal 0 sends nothing. The kernel only checks that the process exists.
 fn processIsAlive(pid: linux.pid_t) bool {
-    const rc = linux.kill(pid, @enumFromInt(0));
+    const rc = linux.kill(pid, @fromBackingInt(@intCast(0)));
     return linux.errno(rc) == .SUCCESS;
 }
 
@@ -584,6 +584,16 @@ test "a session with no device source forks no helper, counted at the process ta
 }
 
 // The network router tests. The first one stops the rest being vacuous.
+
+test "a server a program runs inside the sandbox answers a connection the host made" {
+    // The whole inbound path: a port published on the host, a connection it
+    // accepted, the helper that carries it in, and the bytes back out.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-served-port", scratch.path());
+    try skipIfNothingMeasured(term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
 
 test "a program that knows nothing about chock resolves a permitted host and reaches it" {
     // The program names nothing of Chock's and holds no descriptor on number 3.

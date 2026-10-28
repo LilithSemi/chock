@@ -922,6 +922,66 @@ fn sessionConfig(
     };
 }
 
+/// Whether this project could ever publish a port, which decides both whether
+/// the tool that asks for one is offered and whether a background call carries
+/// the channel a port needs. An existence question and never a permission: the
+/// gate still answers each port on its own.
+fn mayServe(
+    policy: *const chock_policy.table.Table,
+    agent_kind: []const u8,
+    model: []const u8,
+) bool {
+    return policy.permitsSomethingUnder(.{
+        .agent_kind = agent_kind,
+        .model = model,
+        .tool = @tagName(chock_core.tools.Tool.serve_port),
+        .action = chock_policy.table.serve_action_prefix,
+    });
+}
+
+/// Opens a listener for each port this project published and says where each
+/// one is. Answers how many are open, because a session with none needs no
+/// helper inside the sandbox at all.
+fn publishPorts(
+    serve: *chock_broker.serve.Serve,
+    policy: *const chock_policy.table.Table,
+    agent_kind: []const u8,
+    model: []const u8,
+) usize {
+    var wanted: [chock_broker.serve.max_ports]u16 = undefined;
+    const ports = policy.servedPorts(.{
+        .agent_kind = agent_kind,
+        .model = model,
+        // A server runs in a background command, so that is the tool a rule
+        // has to answer for.
+        .tool = "run_command",
+        .action = "",
+    }, &wanted);
+    if (ports.len == 0) return 0;
+
+    var open: usize = 0;
+    for (ports) |port| {
+        switch (serve.publish(port)) {
+            .opened => {
+                open += 1;
+                tty.print(
+                    .plain,
+                    "chock: http://127.0.0.1:{d} reaches port {d} of a background command\n",
+                    .{ port, port },
+                );
+            },
+            .already => {},
+            .refused => |fault| {
+                var text: [256]u8 = undefined;
+                const said = chock_broker.serve.explain(&text, fault) catch
+                    "a published port could not be opened";
+                tty.print(.warn, "chock: {s}\n", .{said});
+            },
+        }
+    }
+    return open;
+}
+
 fn reportGivenRules(rules: []const chock_policy.table.Rule) void {
     for (rules) |rule| {
         tty.print(
@@ -1742,6 +1802,7 @@ fn start(
         .provider = .{ .images = instance.capabilities.images },
         .memory = memory_ready,
         .provisioning = provisioning != null,
+        .serve = chock_broker.serve.supported and mayServe(policy, options.agent_kind, model),
         .nix_build = nix_build != null,
         .skills = found_skills.skills.len != 0,
         .nix_eval = true,
@@ -8544,6 +8605,84 @@ fn reportPluginOffers(session: *const chock_core.plugin.Session) void {
     }
 }
 
+/// `serve_port` publishes a port the agent asked for. The gate has already put
+/// `net.serve.<port>` to the policy and, where that says so, to a person, so
+/// what is left here is opening the listener and saying where it is.
+const ServePortRunner = struct {
+    inner: chock_core.Loop.ToolRunner,
+    serve: ?*chock_broker.serve.Serve,
+
+    fn runner(self: *ServePortRunner) chock_core.Loop.ToolRunner {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.Loop.ToolRunner.VTable{ .dispatch = dispatchFn };
+
+    fn dispatchFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+        action: []const u8,
+    ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
+        const self: *ServePortRunner = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, call.tool, @tagName(chock_core.tools.Tool.serve_port))) {
+            return self.inner.dispatch(gpa, io, call, action);
+        }
+
+        const answer = try self.publish(gpa, call);
+        return .{
+            .call_id = try gpa.dupe(u8, call.call_id),
+            .output = answer.text,
+            .is_error = answer.refused,
+            .truncated = false,
+        };
+    }
+
+    const Said = struct { text: []u8, refused: bool };
+
+    fn publish(
+        self: *ServePortRunner,
+        gpa: std.mem.Allocator,
+        call: chock_proto.event.ToolCall,
+    ) std.mem.Allocator.Error!Said {
+        const serve = self.serve orelse return .{
+            .text = try gpa.dupe(u8, chock_core.tools.serve_needs_a_session),
+            .refused = true,
+        };
+        const port = chock_core.tools.servedPortIn(gpa, call.arguments) orelse return .{
+            .text = try gpa.dupe(u8, chock_core.tools.serve_port_unnamed_detail),
+            .refused = true,
+        };
+
+        switch (serve.publish(port)) {
+            // The answer carries the address, which the terminal shows with every
+            // other tool result. A line of its own here would reach a test
+            // runner's own stream as well.
+            .opened => {
+                return .{ .text = try std.fmt.allocPrint(
+                    gpa,
+                    "http://127.0.0.1:{d} now reaches port {d} inside this session's background " ++
+                        "commands. A server in a foreground call is not reachable, because that " ++
+                        "call ends before anybody can open the page. Tell the user the address.",
+                    .{ port, port },
+                ), .refused = false };
+            },
+            .already => return .{ .text = try std.fmt.allocPrint(
+                gpa,
+                "http://127.0.0.1:{d} already reaches port {d}, so nothing changed.",
+                .{ port, port },
+            ), .refused = false },
+            .refused => |fault| {
+                var text: [320]u8 = undefined;
+                const said = chock_broker.serve.explain(&text, fault) catch
+                    "the port could not be published";
+                return .{ .text = try gpa.dupe(u8, said), .refused = true };
+            },
+        }
+    }
+};
+
 const ProvisionToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
     settings: ?Provisioning,
@@ -10355,6 +10494,9 @@ fn runSession(
     var syscall_audit: palisade.Sandbox.SyscallAudit = .{};
     defer logSyscallAudit(gpa, io, started.storage, &syscall_audit);
 
+    var serve = chock_broker.serve.Serve{};
+    defer serve.deinit();
+
     var context = chock_core.tools.Context{
         .devices = if (started.device_source) |host| host.deviceSource() else null,
         .device_tree = started.device_tree,
@@ -10371,6 +10513,22 @@ fn runSession(
     context.read_only_mounts = started.read_only_mounts;
     context.provisioning = started.provisioning != null;
     context.role = agentRole(options);
+    if (mayServe(started.policy, options.agent_kind, started.model)) {
+        if (chock_broker.serve.supported) {
+            serve.init(io) catch {};
+            if (serve.epoll_fd >= 0) {
+                context.serve = serve.source();
+                _ = publishPorts(&serve, started.policy, options.agent_kind, started.model);
+            }
+        } else {
+            tty.print(
+                .warn,
+                "chock: a published port needs a network namespace, and this platform has " ++
+                    "none, so no port is open in this session.\n",
+                .{},
+            );
+        }
+    }
 
     var guest_arena = std.heap.ArenaAllocator.init(gpa);
     defer guest_arena.deinit();
@@ -10569,8 +10727,13 @@ fn runSession(
         mcp_prompt,
     );
 
-    var mcp_aware = McpToolRunner{
+    var serving = ServePortRunner{
         .inner = provisioning.runner(),
+        .serve = if (context.serve == null) null else &serve,
+    };
+
+    var mcp_aware = McpToolRunner{
+        .inner = serving.runner(),
         .state = &mcp_state,
     };
 
@@ -20276,4 +20439,159 @@ fn repeated(comptime piece: []const u8, comptime times: usize) [piece.len * time
     var out: [piece.len * times]u8 = undefined;
     for (0..times) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
     return out;
+}
+
+/// Counts what reaches it and answers nothing of its own: the serve runner is
+/// what these tests are about.
+const PassedToolRunner = struct {
+    calls: usize = 0,
+
+    fn runner(self: *PassedToolRunner) chock_core.Loop.ToolRunner {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.Loop.ToolRunner.VTable{ .dispatch = dispatchFn };
+
+    fn dispatchFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+        action: []const u8,
+    ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
+        _ = .{ io, action };
+        const self: *PassedToolRunner = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        return .{
+            .call_id = try gpa.dupe(u8, call.call_id),
+            .output = try gpa.dupe(u8, "passed through"),
+            .is_error = false,
+            .truncated = false,
+        };
+    }
+};
+
+test "a serve_port call opens the port, says the address, and says what is already open" {
+    if (!chock_broker.serve.supported) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var serve = chock_broker.serve.Serve{};
+    try serve.init(io);
+    defer serve.deinit();
+
+    var inner = PassedToolRunner{};
+    var serving = ServePortRunner{ .inner = inner.runner(), .serve = &serve };
+
+    // A port this machine will give up, found and then let go, so the call
+    // under test is the one that opens it.
+    var at: u16 = 20000;
+    const port = while (at < 20100) : (at += 1) {
+        if (serve.publish(at) != .opened) continue;
+        _ = serve.withdraw(at);
+        break at;
+    } else return error.SkipZigTest;
+
+    var arguments: [32]u8 = undefined;
+    const named = try std.fmt.bufPrint(&arguments, "{{\"port\":{d}}}", .{port});
+
+    const opened = try serving.runner().dispatch(gpa, io, .{
+        .call_id = "call1",
+        .tool = "serve_port",
+        .arguments = named,
+    }, "net.serve.x");
+    defer gpa.free(opened.call_id);
+    defer gpa.free(opened.output);
+
+    try std.testing.expect(!opened.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, opened.output, "127.0.0.1") != null);
+    try std.testing.expect(serve.holds(port));
+    try std.testing.expectEqual(@as(usize, 0), inner.calls);
+
+    const again = try serving.runner().dispatch(gpa, io, .{
+        .call_id = "call2",
+        .tool = "serve_port",
+        .arguments = named,
+    }, "net.serve.x");
+    defer gpa.free(again.call_id);
+    defer gpa.free(again.output);
+    try std.testing.expect(!again.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, again.output, "already") != null);
+}
+
+test "a serve_port call for a port this session cannot publish is an error with the reason" {
+    if (!chock_broker.serve.supported) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var serve = chock_broker.serve.Serve{};
+    try serve.init(io);
+    defer serve.deinit();
+
+    var inner = PassedToolRunner{};
+    var serving = ServePortRunner{ .inner = inner.runner(), .serve = &serve };
+
+    const low = try serving.runner().dispatch(gpa, io, .{
+        .call_id = "call1",
+        .tool = "serve_port",
+        .arguments = "{\"port\":80}",
+    }, "net.serve.80");
+    defer gpa.free(low.call_id);
+    defer gpa.free(low.output);
+    try std.testing.expect(low.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, low.output, "1024") != null);
+
+    // A session that was started without the path a port needs says that,
+    // rather than opening a listener nothing would carry connections from.
+    var without = ServePortRunner{ .inner = inner.runner(), .serve = null };
+    const none = try without.runner().dispatch(gpa, io, .{
+        .call_id = "call2",
+        .tool = "serve_port",
+        .arguments = "{\"port\":3000}",
+    }, "net.serve.3000");
+    defer gpa.free(none.call_id);
+    defer gpa.free(none.output);
+    try std.testing.expect(none.is_error);
+    try std.testing.expectEqualStrings(chock_core.tools.serve_needs_a_session, none.output);
+}
+
+test "every other tool goes past the serve runner untouched" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var inner = PassedToolRunner{};
+    var serving = ServePortRunner{ .inner = inner.runner(), .serve = null };
+
+    const passed = try serving.runner().dispatch(gpa, io, .{
+        .call_id = "call1",
+        .tool = "read_file",
+        .arguments = "{\"path\":\"README.md\"}",
+    }, "call.read_file");
+    defer gpa.free(passed.call_id);
+    defer gpa.free(passed.output);
+    try std.testing.expectEqual(@as(usize, 1), inner.calls);
+}
+
+test "a project that names no port under net.serve is offered no way to publish one" {
+    const gpa = std.testing.allocator;
+
+    const quiet = try chock_policy.table.Table.parse(gpa, ".{}", null);
+    defer chock_policy.table.Table.destroy(gpa, quiet);
+    try std.testing.expect(!mayServe(quiet, "main", "m"));
+
+    const asking = try chock_policy.table.Table.parse(
+        gpa,
+        ".{ .policy = .{ .rules = .{ .{ .action = \"net.serve.3000\", .decision = .ask } } } }",
+        null,
+    );
+    defer chock_policy.table.Table.destroy(gpa, asking);
+    try std.testing.expect(mayServe(asking, "main", "m"));
+
+    const denied = try chock_policy.table.Table.parse(
+        gpa,
+        ".{ .policy = .{ .rules = .{ .{ .action = \"net.serve.*\", .decision = .deny } } } }",
+        null,
+    );
+    defer chock_policy.table.Table.destroy(gpa, denied);
+    try std.testing.expect(!mayServe(denied, "main", "m"));
 }

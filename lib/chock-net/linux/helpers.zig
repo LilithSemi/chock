@@ -14,6 +14,7 @@ const router = @import("router.zig");
 const devicelink = @import("devicelink.zig");
 const nftables = @import("nftables.zig");
 const roles = @import("roles.zig");
+const servelink = @import("servelink.zig");
 
 const Channel = palisade.Sandbox.Channel;
 const Helper = palisade.Sandbox.Helper;
@@ -245,6 +246,85 @@ pub fn reportRouterCounts(control_fd: i32, stderr_fd: i32) void {
 }
 
 /// The host pushes device changes in: nothing inside the sandbox asks for one.
+/// The serve helper carries a connection the host accepted to a server the
+/// agent runs inside the sandbox. It is a helper of its own, and not work the
+/// router does, because `roles.router_calls` refuses the router `socket` and
+/// `connect` so that it can reach nothing it was not handed.
+pub const Serve = struct {
+    source: links.ServeSource,
+    wakeup_fd: i32 = -1,
+    instance: servelink.Server = undefined,
+    /// SIGTERM, as a descriptor. See `watchTermination`.
+    stop_fd: i32 = -1,
+
+    pub fn channel(self: *Serve) Channel {
+        self.wakeup_fd = self.source.vtable.wakeup(self.source.ptr);
+        return .{
+            .ptr = self,
+            .wakeup = .{ .fd = self.wakeup_fd, .drain = drainFn },
+            // The descriptors this hands over reach the helper and never the
+            // sandboxed program, which is what that flag is about.
+            .hands_host_descriptor = false,
+        };
+    }
+
+    pub fn helper(self: *Serve, index: usize) Helper {
+        return .{
+            .ptr = self,
+            .prepare = prepareFn,
+            .run = runFn,
+            .allowed = roles.serve_calls,
+            .channel = index,
+        };
+    }
+
+    fn drainFn(ptr: *anyopaque, channel_fd: i32) Channel.ServeResult {
+        const self: *Serve = @ptrCast(@alignCast(ptr));
+        while (self.source.vtable.next(self.source.ptr)) |inbound| {
+            defer _ = linux.close(inbound.handle);
+            servelink.send(channel_fd, inbound.port, inbound.handle) catch return .done;
+        }
+        return .more;
+    }
+
+    fn prepareFn(ptr: *anyopaque, channel_fd: ?i32, stderr_fd: i32) bool {
+        const self: *Serve = @ptrCast(@alignCast(ptr));
+        _ = stderr_fd;
+        const fd = channel_fd orelse return false;
+
+        // The channel arrives blocking, and a blocking read of it would hold the
+        // helper in `recvmsg` while a connection it already took waits for its
+        // bytes to be relayed.
+        const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+        if (linux.errno(flags) != .SUCCESS) return false;
+        const set = linux.fcntl(fd, linux.F.SETFL, flags | @as(usize, 1 << @bitOffsetOf(linux.O, "NONBLOCK")));
+        if (linux.errno(set) != .SUCCESS) return false;
+
+        self.instance = .{ .channel_fd = fd };
+        self.stop_fd = watchTermination();
+        return true;
+    }
+
+    fn runFn(ptr: *anyopaque, channel_fd: ?i32, stderr_fd: i32) u8 {
+        const self: *Serve = @ptrCast(@alignCast(ptr));
+        _ = .{ channel_fd, stderr_fd };
+
+        while (!stopWasAsked(self.stop_fd) and !self.instance.peer_gone) {
+            self.instance.step(monotonicMilliseconds(), idle_step_ms) catch return 1;
+        }
+
+        // The same drain the router does, and for the same reason: a browser is
+        // waiting on bytes the server has already written.
+        const deadline = monotonicMilliseconds() + drain_budget_ms;
+        while (!self.instance.relay.drained()) {
+            const now = monotonicMilliseconds();
+            if (now >= deadline) break;
+            self.instance.step(now, drain_step_ms) catch break;
+        }
+        return 0;
+    }
+};
+
 pub const Devices = struct {
     source: links.DeviceSource,
     tree: links.DeviceTree,
@@ -497,8 +577,9 @@ pub const Lowered = struct {
     broker: Broker = undefined,
     router: Router = undefined,
     devices: Devices = undefined,
+    serve: Serve = undefined,
     channels: [palisade.Sandbox.max_channels]Channel = undefined,
-    helpers: [2]Helper = undefined,
+    helpers: [3]Helper = undefined,
     /// The host end of the router's control socket. Chock reads the counts off
     /// it and closes it after the call.
     router_control_fd: i32 = -1,
@@ -573,6 +654,14 @@ pub const Lowered = struct {
             }
         }
 
+        if (set.serve_source) |source| {
+            self.serve = .{ .source = source };
+            self.channels[channels] = self.serve.channel();
+            self.helpers[helpers] = self.serve.helper(channels);
+            channels += 1;
+            helpers += 1;
+        }
+
         config.channels = self.channels[0..channels];
         config.helpers = self.helpers[0..helpers];
     }
@@ -608,7 +697,7 @@ test "SIGTERM reaches the router helper as a descriptor and not as the end of it
     var arrived: linux.signalfd_siginfo = undefined;
     const bytes = std.mem.asBytes(&arrived);
     try testing.expectEqual(bytes.len, linux.read(fd, bytes.ptr, bytes.len));
-    try testing.expectEqual(@intFromEnum(linux.SIG.TERM), arrived.signo);
+    try testing.expectEqual(@backingInt(linux.SIG.TERM), arrived.signo);
 
     var wanted = linux.sigemptyset();
     linux.sigaddset(&wanted, .TERM);

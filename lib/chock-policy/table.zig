@@ -584,6 +584,40 @@ pub const Table = struct {
         };
     }
 
+    /// The ports a project published, which are the ones a rule names one by one
+    /// and answers `allow` for. A pattern such as `net.serve.*` publishes
+    /// nothing: a listener is opened on the host for each of these, so the port
+    /// has to be a number somebody wrote, not every port a pattern could match.
+    ///
+    /// Each candidate goes back through the ordinary answer, so a `deny` further
+    /// in, or an org ceiling, still decides.
+    pub fn servedPorts(self: *const Table, key: Key, into: []u16) []const u16 {
+        var count: usize = 0;
+        for ([_][]const Rule{ self.given, self.policy.rules }) |rules| {
+            for (rules) |rule| {
+                if (count == into.len) break;
+                const action = rule.action orelse continue;
+                const port = portNamedBy(action) orelse continue;
+                if (!patternMatches(rule.tool, key.tool)) continue;
+                if (!patternMatches(rule.model, key.model)) continue;
+                if (!patternMatches(rule.agent_kind, key.agent_kind)) continue;
+
+                var held = false;
+                for (into[0..count]) |one| {
+                    if (one == port) held = true;
+                }
+                if (held) continue;
+
+                var asked = key;
+                asked.action = action;
+                if (self.evaluateKindAlone(asked) != .allow) continue;
+                into[count] = port;
+                count += 1;
+            }
+        }
+        return into[0..count];
+    }
+
     /// An existence question: no caller may read a `true` here as a
     /// permission. A `deny` rule is skipped, or a refusal would resolve a host.
     pub fn permitsSomethingUnder(self: *const Table, key: Key) bool {
@@ -713,6 +747,31 @@ fn winnerFor(rules: []const Rule, key: Key) ?Rule {
         if (ruleBeats(rule, best)) winner = rule;
     }
     return winner;
+}
+
+pub const serve_action_prefix = "net.serve";
+
+pub const max_serve_action_bytes: usize = serve_action_prefix.len + 1 + 5;
+
+/// The action one port is answered under. The parser below reads this back, and
+/// a test holds the two together.
+pub fn serveActionInto(buffer: []u8, port: u16) ?[]const u8 {
+    if (port == 0) return null;
+    return std.fmt.bufPrint(buffer, serve_action_prefix ++ ".{d}", .{port}) catch null;
+}
+
+/// The port a `net.serve.3000` rule names, or null for anything else, a pattern
+/// included. Nothing but digits is read: `net.serve.3000.extra` names no port.
+pub fn portNamedBy(action: []const u8) ?u16 {
+    if (!std.mem.startsWith(u8, action, serve_action_prefix ++ ".")) return null;
+    const tail = action[serve_action_prefix.len + 1 ..];
+    if (tail.len == 0) return null;
+    for (tail) |byte| {
+        if (!std.ascii.isDigit(byte)) return null;
+    }
+    const port = std.fmt.parseInt(u16, tail, 10) catch return null;
+    if (port == 0) return null;
+    return port;
 }
 
 fn rulesPermitBelow(rules: []const Rule, prefix: []const u8) bool {
@@ -2667,4 +2726,104 @@ test "a table says whether a chock.zon was read, so an absent file is not an emp
     try std.testing.expect(read.hasFile());
 
     try std.testing.expectEqualSlices(u8, &empty.sourceHash(), &read.sourceHash());
+}
+
+test "a port is published by a rule that names it and answers allow, and by nothing else" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "net.serve.3000", .decision = .allow },
+        \\            .{ .action = "net.serve.8080", .decision = .ask },
+        \\            .{ .action = "net.serve.9999", .decision = .deny },
+        \\            .{ .action = "net.serve.*", .decision = .allow },
+        \\            .{ .action = "net.connect.com.example.443", .decision = .allow },
+        \\        },
+        \\    },
+        \\}
+    ;
+    const parsed = try Table.parse(gpa, source, null);
+    defer Table.destroy(gpa, parsed);
+
+    const key = Key{ .agent_kind = "main", .model = "m", .tool = "run_command", .action = "" };
+    var buffer: [8]u16 = undefined;
+    const ports = parsed.servedPorts(key, &buffer);
+
+    try std.testing.expectEqual(@as(usize, 1), ports.len);
+    try std.testing.expectEqual(@as(u16, 3000), ports[0]);
+}
+
+test "the port a serve action names is read from digits alone" {
+    try std.testing.expectEqual(@as(?u16, 3000), portNamedBy("net.serve.3000"));
+    try std.testing.expectEqual(@as(?u16, 65535), portNamedBy("net.serve.65535"));
+
+    try std.testing.expectEqual(@as(?u16, null), portNamedBy("net.serve.*"));
+    try std.testing.expectEqual(@as(?u16, null), portNamedBy("net.serve"));
+    try std.testing.expectEqual(@as(?u16, null), portNamedBy("net.serve."));
+    try std.testing.expectEqual(@as(?u16, null), portNamedBy("net.serve.3000.extra"));
+    try std.testing.expectEqual(@as(?u16, null), portNamedBy("net.serve.0"));
+    try std.testing.expectEqual(@as(?u16, null), portNamedBy("net.serve.99999"));
+    try std.testing.expectEqual(@as(?u16, null), portNamedBy("net.connect.3000"));
+    try std.testing.expectEqual(@as(?u16, null), portNamedBy("net.serve.80a"));
+}
+
+test "a published port is counted once, and the list stops at what the caller can hold" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "net.serve.3000", .decision = .allow },
+        \\            .{ .action = "net.serve.3000", .decision = .allow },
+        \\            .{ .action = "net.serve.4000", .decision = .allow },
+        \\            .{ .action = "net.serve.5000", .decision = .allow },
+        \\        },
+        \\    },
+        \\}
+    ;
+    const parsed = try Table.parse(gpa, source, null);
+    defer Table.destroy(gpa, parsed);
+
+    const key = Key{ .agent_kind = "main", .model = "m", .tool = "run_command", .action = "" };
+    var all: [8]u16 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), parsed.servedPorts(key, &all).len);
+
+    var two: [2]u16 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), parsed.servedPorts(key, &two).len);
+}
+
+test "a rule for another tool or agent publishes nothing for this one" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "net.serve.3000", .decision = .allow, .tool = "nix_build" },
+        \\            .{ .action = "net.serve.4000", .decision = .allow, .agent_kind = "reviewer" },
+        \\            .{ .action = "net.serve.5000", .decision = .allow },
+        \\        },
+        \\    },
+        \\}
+    ;
+    const parsed = try Table.parse(gpa, source, null);
+    defer Table.destroy(gpa, parsed);
+
+    const key = Key{ .agent_kind = "main", .model = "m", .tool = "run_command", .action = "" };
+    var buffer: [8]u16 = undefined;
+    const ports = parsed.servedPorts(key, &buffer);
+    try std.testing.expectEqual(@as(usize, 1), ports.len);
+    try std.testing.expectEqual(@as(u16, 5000), ports[0]);
+}
+
+test "the action a port is answered under reads back as that port" {
+    var buffer: [max_serve_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("net.serve.3000", serveActionInto(&buffer, 3000).?);
+    try std.testing.expectEqualStrings("net.serve.65535", serveActionInto(&buffer, 65535).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), serveActionInto(&buffer, 0));
+
+    for ([_]u16{ 1024, 3000, 8080, 65535 }) |port| {
+        const action = serveActionInto(&buffer, port).?;
+        try std.testing.expectEqual(port, portNamedBy(action).?);
+    }
 }

@@ -78,6 +78,9 @@ pub const Support = struct {
     nix_eval: bool = false,
     nix_build: bool = false,
     skills: bool = false,
+    /// True when this project's policy could permit a port to be published, so
+    /// the tool that asks for one is worth offering.
+    serve: bool = false,
     role: Role = .worker,
 
     pub fn offers(self: Support, capability: Capability) bool {
@@ -121,7 +124,7 @@ pub const ImageKind = enum {
 const carried_image_types_text = blk: {
     var text: []const u8 = "";
     for (@typeInfo(ImageKind).@"enum".field_names, @typeInfo(ImageKind).@"enum".field_values, 0..) |_, field_value, i| {
-        const kind: ImageKind = @enumFromInt(field_value);
+        const kind: ImageKind = @fromBackingInt(@intCast(field_value));
         if (i != 0) text = text ++ ", ";
         text = text ++ kind.mediaType();
     }
@@ -204,6 +207,7 @@ pub const Tool = enum {
     spawn_agent,
     update_plan,
     provide_tool,
+    serve_port,
     nix_eval,
     nix_build,
     restrict_self,
@@ -230,6 +234,7 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            .serve_port,
             .nix_eval,
             .nix_build,
             .restrict_self,
@@ -249,6 +254,7 @@ pub const Tool = enum {
             .read_memory, .write_memory => support.memory,
             .read_skill => support.skills,
             .provide_tool => support.provisioning,
+            .serve_port => support.serve,
             .nix_eval => support.nix_eval,
             .nix_build => support.nix_build,
             .read_file,
@@ -433,6 +439,7 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            .serve_port,
             .nix_eval,
             .restrict_self,
             .fetch_url,
@@ -459,6 +466,7 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            .serve_port,
             .nix_eval,
             .nix_build,
             .restrict_self,
@@ -486,6 +494,7 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            .serve_port,
             .nix_eval,
             .nix_build,
             .restrict_self,
@@ -609,6 +618,14 @@ pub const Tool = enum {
                 "is the package \"ripgrep\". The program is there for every call after this one, " ++
                 "and for this session only. Resolving takes seconds and can take minutes, so ask " ++
                 "for a program you are going to use.",
+            .serve_port => "Make a port of yours reachable from the user's own machine, so " ++
+                "they can open the page you are serving in their browser. Start the server in " ++
+                "a background command first, then call this with the port it is listening on. " ++
+                "The user reaches it at the same number on 127.0.0.1. **You are not deciding " ++
+                "this**: the request goes to the project's policy, and where that says so it " ++
+                "goes to a person, so a session with nobody at a keyboard gets a refusal. A " ++
+                "server in a foreground command cannot be published, because that call holds " ++
+                "the turn until it ends. Say the address in your answer once it is open.",
             .nix_eval => "Evaluate one Nix expression and read the answer. Use it to find out " ++
                 "what a package set or a flake really says: the value of an attribute, the " ++
                 "names in a set, the derivation path of a package. **Nothing is built.** A " ++
@@ -722,6 +739,7 @@ pub const Tool = enum {
             .spawn_agent => SpawnAgentArgs,
             .update_plan => UpdatePlanArgs,
             .provide_tool => ProvideToolArgs,
+            .serve_port => ServePortArgs,
             .nix_eval => NixEvalArgs,
             .nix_build => NixBuildArgs,
             .restrict_self => RestrictSelfArgs,
@@ -762,7 +780,7 @@ pub const Registry = struct {
         errdefer list.deinit(allocator);
 
         inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |field_name, field_value| {
-            const tool: Tool = @enumFromInt(field_value);
+            const tool: Tool = @fromBackingInt(@intCast(field_value));
             if (tool.offeredBy(support)) {
                 try list.append(allocator, .{
                     .name = field_name,
@@ -856,6 +874,7 @@ pub const Registry = struct {
             .spawn_agent => toolErrorResult(allocator, call, try allocator.dupe(u8, spawn_needs_a_session)),
             .update_plan => toolErrorResult(allocator, call, try allocator.dupe(u8, plan_needs_a_session)),
             .provide_tool => toolErrorResult(allocator, call, try allocator.dupe(u8, provision_needs_a_session)),
+            .serve_port => toolErrorResult(allocator, call, try allocator.dupe(u8, serve_needs_a_session)),
             .nix_eval => toolErrorResult(allocator, call, try allocator.dupe(u8, nix_eval_needs_a_session)),
             .nix_build => toolErrorResult(allocator, call, try allocator.dupe(u8, nix_build_needs_a_session)),
             .restrict_self => toolErrorResult(allocator, call, try allocator.dupe(u8, restrict_needs_a_session)),
@@ -882,6 +901,9 @@ pub const plan_needs_a_session = "the task list was not changed: a task list is 
 pub const restrict_needs_a_session = "nothing was promised: a promise is kept in the session " ++
     "log, and this tool call was run without a session. Say what you will not do in your answer " ++
     "instead.";
+
+pub const serve_needs_a_session = "no port was published: a published port belongs to a whole " ++
+    "session, and this tool call was run without one.";
 
 pub const provision_needs_a_session = "no program was provisioned: a program is added to the " ++
     "toolchain of a whole session, and this tool call was run without one. Do the work with a " ++
@@ -1002,6 +1024,10 @@ pub const Context = struct {
     role: Role = .worker,
     devices: ?chock_net.DeviceSource = null,
     device_tree: ?chock_net.DeviceTree = null,
+    /// The host's published ports. A background call gets this, because a
+    /// server runs for longer than the call that started it, and a foreground
+    /// call holds the turn until it ends.
+    serve: ?chock_net.links.ServeSource = null,
     supervisor_audit: ?*palisade.Sandbox.SupervisorAudit = null,
     syscall_audit: ?*palisade.Sandbox.SyscallAudit = null,
 };
@@ -1203,6 +1229,16 @@ pub const UpdatePlanArgs = struct {
     };
 };
 
+pub const ServePortArgs = struct {
+    port: i64,
+
+    pub const docs = .{
+        .port = "The port a server of yours is listening on inside the sandbox, such as 3000. " ++
+            "The same number is what a person reaches on their own machine. A port under 1024 " ++
+            "cannot be published.",
+    };
+};
+
 pub const ProvideToolArgs = struct {
     program: []const u8,
 
@@ -1378,7 +1414,12 @@ fn runCommand(
 
         if (background) |router| {
             config.config.network = .{ .isolated = chock_net.netns.params };
-            config.links = .{ .net_router = router };
+            config.links = .{ .net_router = router, .serve_source = context.serve };
+        } else if (context.serve) |serve| {
+            // A published port is carried into a namespace of this call's own,
+            // so a call that reaches no host still needs one to be served from.
+            config.config.network = .{ .isolated = chock_net.netns.params };
+            config.links = .{ .serve_source = serve };
         } else {
             config.config.network = .none;
             config.links = .{};
@@ -1750,7 +1791,7 @@ fn backgroundRun(
         },
         .signal => |number| .{
             .status = .signaled,
-            .code = @intFromEnum(number),
+            .code = @backingInt(number),
             .output = output,
             .truncated = captured.truncated,
         },
@@ -2060,6 +2101,21 @@ pub fn writtenPathIn(
     if (!tool.writesAProjectFile()) return null;
     return readPathIn(allocator, arguments);
 }
+
+/// The port a `serve_port` call names, or null when it names none this session
+/// could publish. A port is a number here and not text, so nothing of the
+/// agent's reaches an action name but digits.
+pub fn servedPortIn(allocator: std.mem.Allocator, arguments: []const u8) ?u16 {
+    const parsed = std.json.parseFromSlice(ServePortArgs, allocator, arguments, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    if (parsed.value.port < 1 or parsed.value.port > 65535) return null;
+    return @intCast(parsed.value.port);
+}
+
+pub const serve_port_unnamed_detail = "no port was published: this call takes one field, " ++
+    "\"port\", holding the number a server of yours is listening on, from 1 to 65535.";
 
 pub fn firstArgvIn(allocator: std.mem.Allocator, arguments: []const u8) std.mem.Allocator.Error!?[]u8 {
     const parsed = std.json.parseFromSlice(RunCommandArgs, allocator, arguments, .{
@@ -3628,7 +3684,7 @@ fn releaseRunningSlot(slot: ?usize) void {
 pub fn cancelRunningTool() void {
     for (&running_tool_handles) |*slot| {
         const handle = slot.load(.monotonic) orelse continue;
-        handle.signal(@intFromEnum(std.os.linux.SIG.KILL)) catch {};
+        handle.signal(@backingInt(std.os.linux.SIG.KILL)) catch {};
     }
 }
 
@@ -3824,7 +3880,7 @@ fn drainCapture(
                 }
                 timed_out = true;
                 if (spawn_thread.middle.pid() != null) {
-                    spawn_thread.middle.signal(@intFromEnum(std.os.linux.SIG.TERM)) catch {};
+                    spawn_thread.middle.signal(@backingInt(std.os.linux.SIG.TERM)) catch {};
                     signal_sent = true;
                 }
                 continue;
@@ -3918,7 +3974,7 @@ test "a cancel through a slot whose call has ended reaches nobody" {
     const slot = takeRunningSlot(&middle).?;
     defer releaseRunningSlot(slot);
 
-    try std.testing.expectError(error.Gone, middle.signal(@intFromEnum(std.os.linux.SIG.KILL)));
+    try std.testing.expectError(error.Gone, middle.signal(@backingInt(std.os.linux.SIG.KILL)));
 
     cancelRunningTool();
 
@@ -4192,6 +4248,7 @@ const full_support = Support{
     .nix_eval = true,
     .nix_build = true,
     .skills = true,
+    .serve = true,
 };
 
 test "every tool in the enum is offered, and each one is named exactly once" {
@@ -4212,12 +4269,12 @@ test "every tool in the enum is offered, and each one is named exactly once" {
     }
 
     const expected = [_][]const u8{
-        "read_file",     "read_image",    "list_directory", "glob",
-        "grep",          "write_file",    "edit_file",      "run_command",
-        "read_guidance", "read_skill",    "read_memory",    "write_memory",
-        "spawn_agent",   "update_plan",   "provide_tool",   "nix_eval",
-        "nix_build",     "restrict_self", "fetch_url",      "web_search",
-        "ask_user",      "set_title",     "request_action",
+        "read_file",     "read_image",  "list_directory", "glob",
+        "grep",          "write_file",  "edit_file",      "run_command",
+        "read_guidance", "read_skill",  "read_memory",    "write_memory",
+        "spawn_agent",   "update_plan", "provide_tool",   "serve_port",
+        "nix_eval",      "nix_build",   "restrict_self",  "fetch_url",
+        "web_search",    "ask_user",    "set_title",      "request_action",
     };
     try std.testing.expectEqual(expected.len, defs.len);
     for (expected, defs) |name, def| try std.testing.expectEqualStrings(name, def.name);
@@ -4234,7 +4291,7 @@ test "an arbitrator is offered no tool at all, and a name it invented runs nothi
     const defs = try Registry.definitions(arena, everything);
     try std.testing.expectEqual(@as(usize, 0), defs.len);
     inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |_, field_value| {
-        const tool: Tool = @enumFromInt(field_value);
+        const tool: Tool = @fromBackingInt(@intCast(field_value));
         try std.testing.expect(!tool.offeredBy(everything));
         try std.testing.expect(tool.offeredBy(full_support));
     }
@@ -4282,11 +4339,12 @@ test "a session with no knowledgebase, no Nix, no vision and no skills is offere
     const arena = arena_state.allocator();
 
     const defs = try Registry.definitions(arena, plain_support);
-    try std.testing.expectEqual(@typeInfo(Tool).@"enum".field_names.len - 7, defs.len);
+    try std.testing.expectEqual(@typeInfo(Tool).@"enum".field_names.len - 8, defs.len);
     for (defs) |def| {
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_memory"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "write_memory"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "provide_tool"));
+        try std.testing.expect(!std.mem.eql(u8, def.name, "serve_port"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "nix_eval"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "nix_build"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_image"));
@@ -4332,7 +4390,7 @@ test "a tool's schema names the fields its own parser reads, and no others" {
     const defs = try Registry.definitions(arena, full_support);
 
     inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values, 0..) |_, field_value, index| {
-        const tool: Tool = @enumFromInt(field_value);
+        const tool: Tool = @fromBackingInt(@intCast(field_value));
         const Args = Tool.Args(tool);
         const schema = defs[index].parameters.object;
 
@@ -4431,7 +4489,7 @@ test "both gates must pass before a tool is offered, and a silent provider fails
     const claims_vision = ProviderCapabilities{ .images = true };
 
     inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".field_names, @typeInfo(chock_provider.Client.Adapter).@"enum".field_values) |_, field_value| {
-        const adapter: chock_provider.Client.Adapter = @enumFromInt(field_value);
+        const adapter: chock_provider.Client.Adapter = @fromBackingInt(@intCast(field_value));
 
         try std.testing.expect(Support.offers(.{ .adapter = adapter }, .tool_calls));
         try std.testing.expect(!Support.offers(.{ .adapter = adapter }, .image_results));
@@ -4460,7 +4518,7 @@ test "every carried kind is recognised from its own first bytes" {
     try std.testing.expectEqual(ImageKind.webp, sniffImage("RIFF\x24\x00\x00\x00WEBPVP8 ").carried);
 
     inline for (@typeInfo(ImageKind).@"enum".field_names, @typeInfo(ImageKind).@"enum".field_values) |_, field_value| {
-        const kind: ImageKind = @enumFromInt(field_value);
+        const kind: ImageKind = @fromBackingInt(@intCast(field_value));
         try std.testing.expect(std.mem.startsWith(u8, kind.mediaType(), "image/"));
     }
 }
@@ -4512,7 +4570,7 @@ test "the tool is offered only where both halves of the gate say yes" {
     try std.testing.expectEqual(Capability.image_results, Tool.read_image.needs());
 
     inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".field_names, @typeInfo(chock_provider.Client.Adapter).@"enum".field_values) |_, field_value| {
-        const adapter: chock_provider.Client.Adapter = @enumFromInt(field_value);
+        const adapter: chock_provider.Client.Adapter = @fromBackingInt(@intCast(field_value));
 
         try std.testing.expect(!Tool.read_image.offeredBy(.{ .adapter = adapter }));
         try std.testing.expect(Tool.read_image.offeredBy(.{
@@ -4534,7 +4592,7 @@ test "the bound read_image carries sits under what one provider request takes" {
     try std.testing.expect(std.mem.indexOf(u8, Tool.read_image.description(), max_image_bytes_text) != null);
 
     inline for (@typeInfo(ImageKind).@"enum".field_names, @typeInfo(ImageKind).@"enum".field_values) |_, field_value| {
-        const kind: ImageKind = @enumFromInt(field_value);
+        const kind: ImageKind = @fromBackingInt(@intCast(field_value));
         try std.testing.expect(
             std.mem.indexOf(u8, Tool.read_image.description(), kind.mediaType()) != null,
         );
@@ -4548,7 +4606,7 @@ test "no tool this build offers needs anything the session cannot do" {
     const arena = arena_state.allocator();
 
     inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".field_names, @typeInfo(chock_provider.Client.Adapter).@"enum".field_values) |_, field_value| {
-        const support = Support{ .adapter = @enumFromInt(field_value) };
+        const support = Support{ .adapter = @fromBackingInt(@intCast(field_value)) };
         const defs = try Registry.definitions(arena, support);
         for (defs) |def| {
             const tool = std.meta.stringToEnum(Tool, def.name).?;
@@ -4570,7 +4628,7 @@ test "every offered tool is one dispatch knows, and every tool dispatch knows is
 test "a tool with no argument to read is named after itself, once each" {
     var buffer: [Tool.max_action_bytes]u8 = undefined;
     inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |f_name, f_value| {
-        const tool: Tool = @enumFromInt(f_value);
+        const tool: Tool = @fromBackingInt(@intCast(f_value));
         if (tool == .run_command) continue;
         if (tool == .nix_build or tool == .read_skill) {
             try std.testing.expect(tool.actionInto(&buffer, null, "", &.{}) == null);
@@ -4825,7 +4883,7 @@ test "a name too long for the buffer is a refusal, and never a truncated key" {
 
 test "every tool has an action name, and every name reaches the table" {
     inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |_, f_value| {
-        const tool: Tool = @enumFromInt(f_value);
+        const tool: Tool = @fromBackingInt(@intCast(f_value));
         if (tool == .nix_build or tool == .read_skill) continue;
         var buffer: [Tool.max_action_bytes]u8 = undefined;
         const action = tool.actionInto(&buffer, null, "", &.{}) orelse
@@ -5193,7 +5251,7 @@ test "a mount that covers the answer cancels it, so a call never runs a differen
 comptime {
     const forbidden = [_][]const u8{ "command", "argv", "args", "cmd", "shell", "script" };
     for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |field_name, field_value| {
-        const tool: Tool = @enumFromInt(field_value);
+        const tool: Tool = @fromBackingInt(@intCast(field_value));
         if (tool == .run_command) continue;
         for (@typeInfo(Tool.Args(tool)).@"struct".field_names) |arg_name| {
             for (forbidden) |bad| {
@@ -5211,7 +5269,7 @@ test "exactly one tool takes a command, and it is the one named after it" {
 
     var commanding: usize = 0;
     inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |_, field_value| {
-        const tool: Tool = @enumFromInt(field_value);
+        const tool: Tool = @fromBackingInt(@intCast(field_value));
         var takes_command = false;
         inline for (@typeInfo(Tool.Args(tool)).@"struct".field_names, @typeInfo(Tool.Args(tool)).@"struct".field_types) |arg_name, _| {
             for (forbidden) |bad| {
@@ -5250,7 +5308,7 @@ test "every tool that writes a project file names the file it wrote" {
     try std.testing.expect(try writtenPathIn(gpa, "write_file", "{\"path\":\"\"}") == null);
 
     inline for (@typeInfo(Tool).@"enum".field_names, @typeInfo(Tool).@"enum".field_values) |_, field_value| {
-        const tool: Tool = @enumFromInt(field_value);
+        const tool: Tool = @fromBackingInt(@intCast(field_value));
         if (comptime tool.writesAProjectFile()) {
             try std.testing.expect(@hasField(Tool.Args(tool), "path"));
             try std.testing.expectEqual(
@@ -5845,4 +5903,52 @@ test "a background call is given its own router, and a foreground call's is unto
     try std.testing.expectEqual(@as(usize, 1), seam_state.background_calls);
 
     _ = foreground;
+}
+
+test "a serve_port call with no session behind it publishes nothing and says so" {
+    const allocator = std.testing.allocator;
+    var env = try std.testing.environ.createMap(allocator);
+    defer env.deinit();
+
+    const result = try Registry.dispatch(allocator, std.testing.io, &env, unreached_config, .{
+        .call_id = "call1",
+        .tool = "serve_port",
+        .arguments = "{\"port\":3000}",
+    });
+    defer allocator.free(result.call_id);
+    defer allocator.free(result.output);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings(serve_needs_a_session, result.output);
+}
+
+test "the port a serve_port call names is read as a number, and a port outside the range is none" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(?u16, 3000), servedPortIn(allocator, "{\"port\":3000}"));
+    try std.testing.expectEqual(@as(?u16, 65535), servedPortIn(allocator, "{\"port\":65535}"));
+    try std.testing.expectEqual(@as(?u16, 1), servedPortIn(allocator, "{\"port\":1}"));
+
+    try std.testing.expectEqual(@as(?u16, null), servedPortIn(allocator, "{\"port\":0}"));
+    try std.testing.expectEqual(@as(?u16, null), servedPortIn(allocator, "{\"port\":65536}"));
+    try std.testing.expectEqual(@as(?u16, null), servedPortIn(allocator, "{\"port\":-1}"));
+    // A model that quotes the number still names a port, which is the reader
+    // this build has rather than a choice made here.
+    try std.testing.expectEqual(@as(?u16, 3000), servedPortIn(allocator, "{\"port\":\"3000\"}"));
+    try std.testing.expectEqual(@as(?u16, null), servedPortIn(allocator, "{\"port\":\"three\"}"));
+    try std.testing.expectEqual(@as(?u16, null), servedPortIn(allocator, "{}"));
+    try std.testing.expectEqual(@as(?u16, null), servedPortIn(allocator, "not json"));
+}
+
+test "serve_port is offered only where a port could be published" {
+    var with = plain_support;
+    with.serve = true;
+    try std.testing.expect(Tool.serve_port.offeredBy(with));
+    try std.testing.expect(!Tool.serve_port.offeredBy(plain_support));
+
+    // It is a call like any other at the gate, and the port is what the gate
+    // puts to the policy. See `Loop.gateToolCall`.
+    var buffer: [Tool.max_action_bytes]u8 = undefined;
+    const action = Tool.serve_port.actionInto(&buffer, null, "/work", &.{}).?;
+    try std.testing.expectEqualStrings("call.serve_port", action);
 }

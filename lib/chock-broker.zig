@@ -22,6 +22,8 @@ pub const review = @import("chock-broker/review.zig");
 
 pub const network = @import("chock-broker/network.zig");
 
+pub const serve = @import("chock-broker/serve.zig");
+
 pub const fetch = @import("chock-broker/fetch.zig");
 
 pub const search = @import("chock-broker/search.zig");

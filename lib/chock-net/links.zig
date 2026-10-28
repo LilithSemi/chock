@@ -87,6 +87,28 @@ pub const DeviceSource = struct {
     };
 };
 
+/// The host side of the inbound path: the ports a project published, and the
+/// connections they accepted. The descriptor rides with each one, because a
+/// connection cannot be named the way a device path can.
+pub const ServeSource = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const Inbound = struct {
+        /// The port inside the sandbox the connection is for. Never zero.
+        port: u16,
+        /// The accepted connection. The receiver owns it and closes it.
+        handle: std.posix.fd_t,
+    };
+
+    pub const VTable = struct {
+        /// One descriptor that is readable when any published port has a
+        /// connection waiting. Palisade polls it.
+        wakeup: *const fn (ptr: *anyopaque) i32,
+        next: *const fn (ptr: *anyopaque) ?Inbound,
+    };
+};
+
 pub const DeviceTree = struct {
     host: []const u8,
     inside: []const u8,
@@ -100,6 +122,7 @@ pub const Set = struct {
     net_router: ?NetRouter = null,
     device_source: ?DeviceSource = null,
     device_tree: ?DeviceTree = null,
+    serve_source: ?ServeSource = null,
 };
 
 /// What Chock hands a driver for one call: palisade's config, the links the call

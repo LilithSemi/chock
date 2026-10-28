@@ -45,6 +45,67 @@ comptime {
     }
 }
 
+/// The serve helper carries an inbound connection to a server the agent runs.
+/// It is the one helper that may open a socket, because `router_calls` refuses
+/// the router that power on purpose. What it can reach is loopback inside the
+/// sandbox's own namespace, where the agent's server is the only listener.
+pub const serve_calls = blk: {
+    var list: []const linux.SYS = &.{
+        .socket,
+        .connect,
+        .recvmsg,
+        .read,
+        .sendto,
+        .shutdown,
+        .close,
+        .fcntl,
+        .clock_gettime,
+        .exit_group,
+        .exit,
+        .rt_sigreturn,
+        .restart_syscall,
+    };
+    list = list ++ seccomp.wait_calls;
+    break :blk list;
+};
+
+comptime {
+    for (serve_calls) |call| {
+        const refused = switch (call) {
+            .bind,
+            .listen,
+            .accept4,
+            .socketpair,
+            .openat,
+            .execve,
+            .execveat,
+            .kill,
+            .ptrace,
+            .setns,
+            .unshare,
+            => true,
+            else => false,
+        };
+        if (refused) @compileError(
+            "the serve helper may dial a server in this namespace and nothing else: it cannot " ++
+                "listen, open a file, or start a program. See serve_calls.",
+        );
+    }
+}
+
+comptime {
+    // The two lists are deliberately different, and the difference is the whole
+    // reason the serve helper is a process of its own.
+    var dials = false;
+    for (serve_calls) |call| {
+        if (call == .connect) dials = true;
+    }
+    if (!dials) @compileError("the serve helper cannot dial, so it cannot carry a connection in.");
+    for (router_calls) |call| {
+        if (call == .connect) @compileError("the router may not dial. See router_calls.");
+    }
+}
+
 /// The device helper holds CAP_SYS_ADMIN for the mounts it makes inside its own
 /// namespace. It names no path of its own: a path arrives over the channel.
 /// It waits with `ppoll` directly, so `wait_calls` would widen it for nothing.

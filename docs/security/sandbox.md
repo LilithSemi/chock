@@ -64,6 +64,32 @@ So a program that opens a socket in a tool call fails. `ping` answers
 boundary working, not a fault in the command. Chock says so in a line of its
 own beside the result, because the program's own words do not.
 
+### A port the host can reach
+
+Nothing above lets a connection in: a tool call has no interface the host can
+route to, and the relay carries connections one way only. A project that wants
+the server its agent runs to be reachable publishes a port, which
+[actions.md](../configure/actions.md#netserveport) covers, and that opens one
+path inward:
+
+- The listener is on the host, on `127.0.0.1`, and Chock owns it. The sandbox
+  cannot ask for one: it has no call that binds a host port.
+- Each connection the listener accepts is handed in as a descriptor, over a
+  channel of its own, with the port it was for and nothing else.
+- A helper inside the namespace dials that port on loopback and relays. It is
+  the one helper allowed `socket` and `connect`, and `roles.serve_calls` refuses
+  it everything else, `bind` and `listen` included. Where it can reach is
+  loopback in that namespace, and what listens there is the agent's own server.
+
+So the agent gains nothing it did not have: it could already listen inside its
+own namespace and talk to itself. What changes is that a person at this machine
+can open the page. A port is published by a rule naming that exact number, so a
+project cannot publish a port by pattern, and the agent cannot widen it.
+
+This is Linux only, for the same reason the layers above it are. A session on
+macOS has no network namespace to carry a connection into, so it opens no
+listener and says so.
+
 ## Landlock
 
 Landlock is the kernel deciding which paths a tool call may open. The rule

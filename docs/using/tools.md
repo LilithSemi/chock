@@ -1,6 +1,6 @@
 # The tools
 
-The agent has 23 tools, and every one that touches the machine goes through the
+The agent has 24 tools, and every one that touches the machine goes through the
 sandbox: `read_file`, `list_directory`, `glob`, `grep`, `write_file`,
 `edit_file`, `run_command`, `read_memory` and `write_memory`. Only
 `run_command` takes a command. The rest name a path, a pattern, or the text to
@@ -26,11 +26,12 @@ disk at session start. It is offered only to a session that found at least one,
 and the answer says who wrote it, because a skill from a repository or a package
 is a stranger's writing. [skills.md](skills.md) is the whole of it.
 
-The last nine are described here or on a page of their own:
+The last ten are described here or on a page of their own:
 
 | Tool | What it asks for | Page |
 |---|---|---|
 | `provide_tool` | a program the session has not got | below |
+| `serve_port` | a port of its own, reachable from your machine | below |
 | `nix_eval` | what one Nix expression says | [nix.md](nix.md) |
 | `nix_build` | one attribute of a flake, built | [nix.md](nix.md) |
 | `spawn_agent` | a subagent | [subagents.md](subagents.md) |
@@ -151,6 +152,34 @@ nixpkgs build. `.from` is a statement about the tool.
 Your own `chock.zon` and the project's are read the way every other field in
 the nix block is read: the project's block wins when it has one. An org bundle
 cannot set this.
+
+### A port you can open in a browser
+
+A web project's agent starts a dev server and the person wants to look at the
+page. `serve_port` asks for that: the agent starts the server in a background
+`run_command`, then names the port it is listening on.
+
+```
+$ run_command {"argv":["npm","run","dev"],"background":true}
+  started in the background
+$ serve_port {"port":3000}
+  http://127.0.0.1:3000 now reaches port 3000 inside this session's background
+  commands.
+```
+
+The port is answered under `net.serve.3000`, so the project's policy decides,
+and where it says `ask` a person does.
+[actions.md](../configure/actions.md#netserveport) has the rule and what a
+refusal says. The tool is offered only where a rule could permit a port, the
+same way `provide_tool` appears only where `nix.build` is answered: a project
+that says nothing about serving is not offered it at all.
+
+A server in a foreground call cannot be published. That call holds the turn
+until the command ends, so there is no moment at which the page exists and
+somebody could open it.
+
+The tool is Linux only. On macOS a session says that no port is open, because
+the path inward is a network namespace the platform does not have.
 
 ### What it costs
 

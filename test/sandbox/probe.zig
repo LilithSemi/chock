@@ -870,6 +870,35 @@ fn routedEscape(
     };
 }
 
+const served_request = "GET /from-the-host HTTP/1.1\r\n\r\n";
+
+const served_token = "the-agent-served-this";
+
+/// Spawns a sandbox whose only link is the inbound one, with no router: a
+/// server that listens inside needs nothing of the network outside.
+fn servedEscape(
+    arena: std.mem.Allocator,
+    root: []const u8,
+    op: []const u8,
+    inside_port: u16,
+    serve: *chock_broker.serve.Serve,
+) !std.process.Child.Term {
+    const base = try baseEscapeConfig(arena);
+    const port_text = try std.fmt.allocPrint(arena, "{d}", .{inside_port});
+
+    return chock_net.Driver.native_driver.spawn(arena, .{
+        .config = .{
+            .root = root,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .{ .isolated = chock_net.netns.params },
+        },
+        .links = .{ .serve_source = serve.source() },
+    }, &.{ "/probe", op, port_text }, .{});
+}
+
 const dns_type_a: u16 = 1;
 
 const Resolved = union(enum) {
@@ -1053,7 +1082,7 @@ fn askToDeleteRuleset() ?linux.E {
         // `NLMSG_ERROR` is 2 and carries a negative errno, zero meaning taken.
         if (kind == 2 and offset + 20 <= got) {
             const code = std.mem.readInt(i32, reply[offset + 16 ..][0..4], .little);
-            if (code != 0) return @enumFromInt(if (code < 0) -code else code);
+            if (code != 0) return @fromBackingInt(@intCast(if (code < 0) -code else code));
             acknowledged = true;
         }
         offset += (length + 3) & ~@as(usize, 3);
@@ -1477,7 +1506,7 @@ const LimitOutcome = enum(u8) {
 };
 
 fn limitOutcome(term: std.process.Child.Term, cap: u8, named: bool) u8 {
-    return @intFromEnum(switch (term) {
+    return @backingInt(switch (term) {
         .exited => |code| blk: {
             if (code >= cap) break :blk LimitOutcome.not_stopped;
             break :blk if (named) LimitOutcome.stopped_legibly else LimitOutcome.stopped_quietly;
@@ -1681,7 +1710,7 @@ const ThreadedSpawn = struct {
     /// Through the handle, which reaches the middle process only and still ends the whole call.
     fn killCall(self: *ThreadedSpawn) void {
         if (self.middle.pid() == null) return;
-        self.middle.signal(@intFromEnum(linux.SIG.KILL)) catch {};
+        self.middle.signal(@backingInt(linux.SIG.KILL)) catch {};
     }
 
     /// Only after `spawn` has returned. See `palisade.Sandbox.Handle`.
@@ -1889,6 +1918,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         std.mem.eql(u8, args[1], "spawn-group-press") or
         std.mem.startsWith(u8, args[1], "spawn-filtered-") or
         std.mem.startsWith(u8, args[1], "spawn-routed-") or
+        std.mem.eql(u8, args[1], "spawn-served-port") or
         std.mem.eql(u8, args[1], "spawn-device-place") or
         std.mem.eql(u8, args[1], "spawn-device-hidden-denied") or
         std.mem.eql(u8, args[1], "spawn-device-with-broker") or
@@ -1922,6 +1952,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         std.mem.eql(u8, args[1], "spawned-open-fd-set") or
         std.mem.startsWith(u8, args[1], "spawned-filtered-") or
         std.mem.startsWith(u8, args[1], "routed-") or
+        std.mem.eql(u8, args[1], "serve-inside") or
         std.mem.eql(u8, args[1], "session-keyring-fresh");
 
     const expected_args: usize = 2 +
@@ -2822,7 +2853,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         var tries: usize = 0;
         while (tries < 2000) : (tries += 1) {
-            const exists_rc = linux.kill(orphan_pid, @enumFromInt(0));
+            const exists_rc = linux.kill(orphan_pid, @fromBackingInt(@intCast(0)));
             if (linux.errno(exists_rc) == .SRCH) return 0;
             if (linux.errno(exists_rc) != .SUCCESS) return 10;
             var pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
@@ -2870,7 +2901,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .it_interval = .{ .sec = 0, .nsec = 0 },
             .it_value = .{ .sec = 10, .nsec = 0 },
         };
-        if (linux.errno(linux.setitimer(@intFromEnum(linux.ITIMER.REAL), &alarm, null)) != .SUCCESS)
+        if (linux.errno(linux.setitimer(@backingInt(linux.ITIMER.REAL), &alarm, null)) != .SUCCESS)
             return 9;
 
         if (linux.errno(linux.kill(reader_pid_in_namespace, std.posix.SIG.KILL)) != .SUCCESS) return 6;
@@ -2915,7 +2946,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // `capget` would read the cleared effective/permitted/inheritable sets, not `CapBnd`, so this reads `PR_CAPBSET_READ` instead.
         var cap: usize = 0;
         while (cap <= linux.CAP.LAST_CAP) : (cap += 1) {
-            const rc = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+            const rc = linux.prctl(@backingInt(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
             const cap_errno = linux.errno(rc);
             if (cap_errno == .INVAL) break; // A kernel older than CAP.LAST_CAP: nothing above this exists.
             if (cap_errno != .SUCCESS) return 5;
@@ -3721,7 +3752,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         // A machine with no cgroup v2 tree is one this project supports, so say so before reading the outcome.
         if (cgroup_only and !report.cgroup.applied()) {
-            return @intFromEnum(LimitOutcome.no_cgroup);
+            return @backingInt(LimitOutcome.no_cgroup);
         }
 
         const named = report.killed_by != null or report.events.fork_refusals > 0;
@@ -3785,6 +3816,67 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     if (std.mem.eql(u8, args[1], "spawn-routed-trust-store")) {
         return routedTrustStore(arena, root_arg);
     }
+    if (std.mem.eql(u8, args[1], "spawn-served-port")) {
+        var io_impl: std.Io.Threaded = .init_single_threaded;
+        var serve = chock_broker.serve.Serve{};
+        serve.init(io_impl.io()) catch {
+            std.debug.print("the published port watcher could not be opened\n", .{});
+            return 3;
+        };
+        defer serve.deinit();
+
+        // One port, which is what the feature means: 127.0.0.1:N on this
+        // machine reaches port N inside. The kernel hands out a number free
+        // here, and inside its own namespace nothing holds it either.
+        const chosen = (try listenLoopback());
+        const host_port = chosen.port;
+        const inside_port = host_port;
+        _ = linux.close(chosen.fd);
+
+        if (serve.publish(host_port) != .opened) {
+            std.debug.print("the host port could not be published\n", .{});
+            return 3;
+        }
+
+        // Connected before the sandbox starts, so the request is already in
+        // the backlog when the helper comes up. Nothing here runs on a
+        // second thread.
+        const client = connectLoopback(host_port) catch {
+            std.debug.print("a published port refused a connection on this machine\n", .{});
+            return 3;
+        };
+        defer _ = linux.close(client);
+        const sent = linux.write(client, served_request, served_request.len);
+        if (linux.errno(sent) != .SUCCESS or sent != served_request.len) {
+            std.debug.print("the request could not be written\n", .{});
+            return 3;
+        }
+
+        const term = try servedEscape(arena, root_arg, "serve-inside", inside_port, &serve);
+        if (term != .exited or term.exited != 0) {
+            std.debug.print(
+                "the host published {d} and accepted {d} connections for port {d}\n",
+                .{ host_port, serve.accepted, inside_port },
+            );
+            return reportChildTerm(term);
+        }
+
+        var buffer: [128]u8 = undefined;
+        const got = readToEnd(client, &buffer);
+        if (!std.mem.eql(u8, got, served_token)) {
+            std.debug.print(
+                "the host read {d} bytes from the server inside, and not its answer\n",
+                .{got.len},
+            );
+            return 5;
+        }
+        if (serve.accepted != 1) {
+            std.debug.print("the host accepted {d} connections\n", .{serve.accepted});
+            return 5;
+        }
+        return 0;
+    }
+
     if (std.mem.startsWith(u8, args[1], "spawn-routed-")) {
         const granted = listenLoopback() catch |err| {
             std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
@@ -4447,7 +4539,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             else => return 4,
         }
         if (audit.paths.readers_absent != 0 or audit.paths.readers_unreported != 0) return 5;
-        const openat_slot = @intFromEnum(palisade.linux.seccomp.TrapCall.openat);
+        const openat_slot = @backingInt(palisade.linux.seccomp.TrapCall.openat);
         if (audit.counts().calls[openat_slot] != 0) return 6;
         return 0;
     }
@@ -4473,7 +4565,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             else => return 4,
         }
 
-        const slot = @intFromEnum(palisade.linux.seccomp.TrapCall.openat);
+        const slot = @backingInt(palisade.linux.seccomp.TrapCall.openat);
         const seen = &audit.paths.seen;
         if (!auditing) {
             if (seen.kept != 0) return 5;
@@ -4536,7 +4628,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             else => return 4,
         }
 
-        const slot = @intFromEnum(palisade.linux.seccomp.TrapCall.openat);
+        const slot = @backingInt(palisade.linux.seccomp.TrapCall.openat);
         const seen = &audit.paths.seen;
         if (audit.paths.readers_absent != 0) return 5;
         if (audit.paths.readers_unreported != 0) return 6;
@@ -4584,7 +4676,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .it_interval = .{ .sec = 0, .nsec = 0 },
             .it_value = .{ .sec = 3, .nsec = 0 },
         };
-        if (linux.errno(linux.setitimer(@intFromEnum(linux.ITIMER.REAL), &alarm, null)) != .SUCCESS)
+        if (linux.errno(linux.setitimer(@backingInt(linux.ITIMER.REAL), &alarm, null)) != .SUCCESS)
             return 11;
 
         const base = try baseEscapeConfig(arena);
@@ -4635,10 +4727,10 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         }
 
         const counts = audit.counts();
-        const opens = counts.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.openat)];
-        const execs = counts.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.execve)];
-        const dirs = counts.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.getdents64)];
-        const connects = counts.calls[@intFromEnum(palisade.linux.seccomp.TrapCall.connect)];
+        const opens = counts.calls[@backingInt(palisade.linux.seccomp.TrapCall.openat)];
+        const execs = counts.calls[@backingInt(palisade.linux.seccomp.TrapCall.execve)];
+        const dirs = counts.calls[@backingInt(palisade.linux.seccomp.TrapCall.getdents64)];
+        const connects = counts.calls[@backingInt(palisade.linux.seccomp.TrapCall.connect)];
 
         if (!watching) {
             if (counts.observed != 0 or counts.unobserved != 0) return 5;
@@ -5104,7 +5196,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             return 3;
         }
 
-        ctx.middle.signal(@intFromEnum(linux.SIG.TERM)) catch |err| {
+        ctx.middle.signal(@backingInt(linux.SIG.TERM)) catch |err| {
             std.debug.print("spawn-signal-middle-handled: could not signal the middle process: {s}\n", .{@errorName(err)});
             ctx.killCall();
             return 3;
@@ -5265,6 +5357,70 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         };
         if (bundle.map.count() == 0) {
             std.debug.print("the trust store parsed and holds no certificate\n", .{});
+            return 5;
+        }
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "serve-inside")) {
+        const port = std.fmt.parseInt(u16, id_arg, 10) catch {
+            std.debug.print("no port was named for the server to listen on\n", .{});
+            return 3;
+        };
+
+        const fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(fd) != .SUCCESS) {
+            std.debug.print("the sandboxed program could not open a socket\n", .{});
+            return 3;
+        }
+        const listener: i32 = @intCast(fd);
+        defer _ = linux.close(listener);
+
+        var address = linux.sockaddr.in{
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        };
+        if (linux.errno(linux.bind(listener, @ptrCast(&address), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+            std.debug.print("the sandboxed program could not bind loopback\n", .{});
+            return 3;
+        }
+        if (linux.errno(linux.listen(listener, 8)) != .SUCCESS) {
+            std.debug.print("the sandboxed program could not listen\n", .{});
+            return 3;
+        }
+
+        // The helper dials once the host hands it the connection. Waiting with a
+        // deadline rather than for ever: nothing arriving is this test failing,
+        // not this test hanging.
+        var watched = [1]linux.pollfd{.{ .fd = listener, .events = linux.POLL.IN, .revents = 0 }};
+        var deadline: linux.timespec = .{ .sec = 20, .nsec = 0 };
+        const ready = linux.ppoll(&watched, watched.len, &deadline, null);
+        if (linux.errno(ready) != .SUCCESS or ready == 0) {
+            std.debug.print("nothing reached the server inside the sandbox\n", .{});
+            return 5;
+        }
+
+        const taken = linux.accept4(listener, null, null, linux.SOCK.CLOEXEC);
+        if (linux.errno(taken) != .SUCCESS) {
+            std.debug.print("the connection could not be accepted inside\n", .{});
+            return 5;
+        }
+        const served: i32 = @intCast(taken);
+        defer _ = linux.close(served);
+
+        var buffer: [256]u8 = undefined;
+        const read = linux.read(served, &buffer, buffer.len);
+        if (linux.errno(read) != .SUCCESS or read == 0) {
+            std.debug.print("the connection carried no request\n", .{});
+            return 5;
+        }
+        if (!std.mem.eql(u8, buffer[0..read], served_request)) {
+            std.debug.print("the request was not the one the host sent\n", .{});
+            return 5;
+        }
+
+        const wrote = linux.write(served, served_token, served_token.len);
+        if (linux.errno(wrote) != .SUCCESS or wrote != served_token.len) {
+            std.debug.print("the answer could not be written\n", .{});
             return 5;
         }
         return 0;

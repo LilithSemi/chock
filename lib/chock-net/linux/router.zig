@@ -141,14 +141,14 @@ fn note(diag: ?*?Diagnostic, step: Step, errno: i32) void {
 }
 
 fn classify(step: Step, errno: i32) Error {
-    if (errno == @intFromEnum(linux.E.ADDRINUSE)) return error.AddressInUse;
-    if (errno == @intFromEnum(linux.E.ACCES)) {
+    if (errno == @backingInt(linux.E.ADDRINUSE)) return error.AddressInUse;
+    if (errno == @backingInt(linux.E.ACCES)) {
         return switch (step) {
             .resolver_bind => error.PrivilegedPort,
             else => error.NotPermitted,
         };
     }
-    if (errno == @intFromEnum(linux.E.PERM)) return error.NotPermitted;
+    if (errno == @backingInt(linux.E.PERM)) return error.NotPermitted;
     return error.Refused;
 }
 
@@ -385,7 +385,7 @@ pub fn buildReply(
 
     @memcpy(out[0..query.question_end], source[0..query.question_end]);
 
-    var flags: u16 = 0x8000 | @as(u16, @intFromEnum(rcode));
+    var flags: u16 = 0x8000 | @as(u16, @backingInt(rcode));
     flags |= @as(u16, query.opcode) << 11;
     if (query.recursion_desired) flags |= 0x0100;
     flags |= 0x0080;
@@ -400,7 +400,7 @@ pub fn buildReply(
         out[at] = 0xc0;
         out[at + 1] = 0x0c;
         at += 2;
-        std.mem.writeInt(u16, out[at..][0..2], @intFromEnum(found.kind), .big);
+        std.mem.writeInt(u16, out[at..][0..2], @backingInt(found.kind), .big);
         at += 2;
         std.mem.writeInt(u16, out[at..][0..2], class_internet, .big);
         at += 2;
@@ -419,7 +419,7 @@ pub fn buildFormatError(out: []u8, source: []const u8) ?usize {
     if (source.len < dns_header_bytes or out.len < dns_header_bytes) return null;
     @memset(out[0..dns_header_bytes], 0);
     @memcpy(out[0..2], source[0..2]);
-    const flags: u16 = 0x8000 | 0x0080 | @as(u16, @intFromEnum(Rcode.format_error));
+    const flags: u16 = 0x8000 | 0x0080 | @as(u16, @backingInt(Rcode.format_error));
     std.mem.writeInt(u16, out[2..4], flags, .big);
     return dns_header_bytes;
 }
@@ -541,8 +541,8 @@ pub const Router = struct {
 
         _ = posix.poll(fds[0..used], timeout_ms) catch |err| {
             note(diag, .poll, switch (err) {
-                error.SystemResources => @intFromEnum(linux.E.NOMEM),
-                error.NetworkDown => @intFromEnum(linux.E.NETDOWN),
+                error.SystemResources => @backingInt(linux.E.NOMEM),
+                error.NetworkDown => @backingInt(linux.E.NETDOWN),
                 else => 0,
             });
             return error.PollFailed;
@@ -677,6 +677,19 @@ pub const Router = struct {
         peer_len: posix.socklen_t,
     ) void {
         _ = linux.sendto(self.resolver_fd, bytes.ptr, bytes.len, linux.MSG.NOSIGNAL, @ptrCast(peer), peer_len);
+    }
+
+    /// Takes two connected descriptors as one link and relays between them.
+    /// `inside` reaches a server in the sandbox's namespace and `outside` is the
+    /// connection the host accepted for it. A caller with no listener of its own
+    /// is the user of this: see `servelink.zig`.
+    pub fn adopt(self: *Router, inside: posix.fd_t, outside: posix.fd_t) bool {
+        const link = self.freeLink() orelse return false;
+        makeNonBlocking(inside);
+        makeNonBlocking(outside);
+        link.* = .{ .inside = inside, .outside = outside, .live = true };
+        self.counts.linked += 1;
+        return true;
     }
 
     fn freeLink(self: *Router) ?*Link {
@@ -866,8 +879,8 @@ fn openRelay(diag: ?*?Diagnostic) Error!posix.fd_t {
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         else => |e| {
-            note(diag, .relay_socket, @intFromEnum(e));
-            return classify(.relay_socket, @intFromEnum(e));
+            note(diag, .relay_socket, @backingInt(e));
+            return classify(.relay_socket, @backingInt(e));
         },
     }
     const fd: posix.fd_t = @intCast(rc);
@@ -875,14 +888,14 @@ fn openRelay(diag: ?*?Diagnostic) Error!posix.fd_t {
 
     const off = std.mem.toBytes(@as(c_int, 0));
     posix.setsockopt(fd, linux.SOL.IPV6, linux.IPV6.V6ONLY, &off) catch {
-        note(diag, .relay_dual_stack, @intFromEnum(linux.E.INVAL));
+        note(diag, .relay_dual_stack, @backingInt(linux.E.INVAL));
         return error.Refused;
     };
 
     // Avoids waiting out a previous socket's lingering close on restart.
     const on = std.mem.toBytes(@as(c_int, 1));
     posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, &on) catch {
-        note(diag, .relay_reuse, @intFromEnum(linux.E.INVAL));
+        note(diag, .relay_reuse, @backingInt(linux.E.INVAL));
         return error.Refused;
     };
 
@@ -896,15 +909,15 @@ fn openRelay(diag: ?*?Diagnostic) Error!posix.fd_t {
     switch (linux.errno(linux.bind(fd, @ptrCast(&any), @sizeOf(linux.sockaddr.in6)))) {
         .SUCCESS => {},
         else => |e| {
-            note(diag, .relay_bind, @intFromEnum(e));
-            return classify(.relay_bind, @intFromEnum(e));
+            note(diag, .relay_bind, @backingInt(e));
+            return classify(.relay_bind, @backingInt(e));
         },
     }
     switch (linux.errno(linux.listen(fd, 64))) {
         .SUCCESS => {},
         else => |e| {
-            note(diag, .relay_listen, @intFromEnum(e));
-            return classify(.relay_listen, @intFromEnum(e));
+            note(diag, .relay_listen, @backingInt(e));
+            return classify(.relay_listen, @backingInt(e));
         },
     }
     return fd;
@@ -923,8 +936,8 @@ fn openResolver(address: Address, diag: ?*?Diagnostic) Error!posix.fd_t {
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         else => |e| {
-            note(diag, .resolver_socket, @intFromEnum(e));
-            return classify(.resolver_socket, @intFromEnum(e));
+            note(diag, .resolver_socket, @backingInt(e));
+            return classify(.resolver_socket, @backingInt(e));
         },
     }
     const fd: posix.fd_t = @intCast(rc);
@@ -953,8 +966,8 @@ fn openResolver(address: Address, diag: ?*?Diagnostic) Error!posix.fd_t {
     switch (errno) {
         .SUCCESS => {},
         else => |e| {
-            note(diag, .resolver_bind, @intFromEnum(e));
-            return classify(.resolver_bind, @intFromEnum(e));
+            note(diag, .resolver_bind, @backingInt(e));
+            return classify(.resolver_bind, @backingInt(e));
         },
     }
     return fd;
@@ -1174,7 +1187,7 @@ fn attemptConnect(address: [4]u8, port: u16, budget_ms: i32) Attempt {
     const started = nowMs();
     const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(rc) != .SUCCESS) {
-        return .{ .fd = -1, .errno = @intFromEnum(linux.errno(rc)), .waited_ms = 0 };
+        return .{ .fd = -1, .errno = @backingInt(linux.errno(rc)), .waited_ms = 0 };
     }
     const fd: posix.fd_t = @intCast(rc);
     var target = socketAddress4(address, port);
@@ -1193,7 +1206,7 @@ fn attemptConnect(address: [4]u8, port: u16, budget_ms: i32) Attempt {
                 code = reason;
             }
         },
-        else => |e| code = @intFromEnum(e),
+        else => |e| code = @backingInt(e),
     }
     return .{ .fd = fd, .errno = code, .waited_ms = @intCast(nowMs() - started) };
 }
@@ -1282,7 +1295,7 @@ const Measurement = extern struct {
 };
 
 fn fail(record: *Measurement, stage: Stage, step: u32, errno: i32) void {
-    record.stage = @intFromEnum(stage);
+    record.stage = @backingInt(stage);
     record.failed_step = step;
     record.failed_errno = errno;
 }
@@ -1325,7 +1338,7 @@ fn measureInChild(record: *Measurement, pair: [2]posix.fd_t) void {
         .answer_ttl_s = probe_ttl_s,
     }, &diag) catch {
         if (diag) |d| {
-            fail(record, .router_open, @intFromEnum(d.step), d.errno);
+            fail(record, .router_open, @backingInt(d.step), d.errno);
         } else {
             fail(record, .router_open, Measurement.no_failure, 0);
         }
@@ -1343,7 +1356,7 @@ fn measureInChild(record: *Measurement, pair: [2]posix.fd_t) void {
     var query: [query_capacity]u8 = undefined;
     var reply: [query_capacity]u8 = undefined;
 
-    var length = buildQuery(&query, 0x1234, permitted_name, @intFromEnum(RecordKind.a));
+    var length = buildQuery(&query, 0x1234, permitted_name, @backingInt(RecordKind.a));
     var got = ask(&router, client_fd, &server, query[0..length], &reply, now);
     if (got >= dns_header_bytes) {
         record.permit_rcode = replyRcode(reply[0..got]);
@@ -1362,7 +1375,7 @@ fn measureInChild(record: *Measurement, pair: [2]posix.fd_t) void {
         record.permit_element_timeout_ms = element.timeout_ms;
     }
 
-    length = buildQuery(&query, 0x1235, permitted_name, @intFromEnum(RecordKind.aaaa));
+    length = buildQuery(&query, 0x1235, permitted_name, @backingInt(RecordKind.aaaa));
     got = ask(&router, client_fd, &server, query[0..length], &reply, now);
     if (got >= dns_header_bytes) {
         record.empty_rcode = replyRcode(reply[0..got]);
@@ -1370,7 +1383,7 @@ fn measureInChild(record: *Measurement, pair: [2]posix.fd_t) void {
     }
 
     const resolves_before = host.resolve_calls;
-    length = buildQuery(&query, 0x1236, refused_name, @intFromEnum(RecordKind.a));
+    length = buildQuery(&query, 0x1236, refused_name, @backingInt(RecordKind.a));
     got = ask(&router, client_fd, &server, query[0..length], &reply, now);
     if (got >= dns_header_bytes) {
         record.refuse_rcode = replyRcode(reply[0..got]);
@@ -1388,7 +1401,7 @@ fn measureInChild(record: *Measurement, pair: [2]posix.fd_t) void {
         record.type_ancount = replyAnswerCount(reply[0..got]);
     }
 
-    length = buildQuery(&query, 0x1238, walled_name, @intFromEnum(RecordKind.a));
+    length = buildQuery(&query, 0x1238, walled_name, @backingInt(RecordKind.a));
     got = ask(&router, client_fd, &server, query[0..length], &reply, now);
     if (got >= dns_header_bytes) {
         record.walled_rcode = replyRcode(reply[0..got]);
@@ -1465,7 +1478,7 @@ fn measureInChild(record: *Measurement, pair: [2]posix.fd_t) void {
 
 fn recordNetnsFailure(record: *Measurement, diag: ?netns.Diagnostic) void {
     if (diag) |d| {
-        fail(record, .netns_configure, @intFromEnum(d.step), d.errno);
+        fail(record, .netns_configure, @backingInt(d.step), d.errno);
     } else {
         fail(record, .netns_configure, Measurement.no_failure, 0);
     }
@@ -1473,7 +1486,7 @@ fn recordNetnsFailure(record: *Measurement, diag: ?netns.Diagnostic) void {
 
 fn recordNftablesFailure(record: *Measurement, diag: ?nftables.Diagnostic) void {
     if (diag) |d| {
-        fail(record, .nftables_install, @intFromEnum(d.step), d.errno);
+        fail(record, .nftables_install, @backingInt(d.step), d.errno);
     } else {
         fail(record, .nftables_install, Measurement.no_failure, 0);
     }
@@ -1539,7 +1552,7 @@ fn measuredNothing(record: Measurement) bool {
         .netns_configure => blk: {
             const step = std.enums.fromInt(netns.Step, record.failed_step) orelse break :blk false;
             break :blk switch (step) {
-                .dummy_create => record.failed_errno == @intFromEnum(linux.E.OPNOTSUPP),
+                .dummy_create => record.failed_errno == @backingInt(linux.E.OPNOTSUPP),
                 .open_socket => true,
                 else => false,
             };
@@ -1604,7 +1617,7 @@ test "the pre-nat destination is read out of the sockaddr the kernel fills" {
 
 test "a query names one thing and the parser refuses everything else" {
     var bytes: [query_capacity]u8 = undefined;
-    const length = buildQuery(&bytes, 0xbeef, "Registry.NPMJS.test", @intFromEnum(RecordKind.a));
+    const length = buildQuery(&bytes, 0xbeef, "Registry.NPMJS.test", @backingInt(RecordKind.a));
 
     const query = try parseQuery(bytes[0..length]);
     try testing.expectEqual(@as(u16, 0xbeef), query.id);
@@ -1676,7 +1689,7 @@ test "a name longer than the table can hold is refused rather than cut short" {
 
 test "a reply echoes the question it was asked and carries one answer" {
     var bytes: [query_capacity]u8 = undefined;
-    const length = buildQuery(&bytes, 0x4321, "Registry.NPMJS.test", @intFromEnum(RecordKind.a));
+    const length = buildQuery(&bytes, 0x4321, "Registry.NPMJS.test", @backingInt(RecordKind.a));
     const query = try parseQuery(bytes[0..length]);
 
     var out: [query_capacity]u8 = undefined;
@@ -1699,14 +1712,14 @@ test "a reply echoes the question it was asked and carries one answer" {
     try testing.expectEqualSlices(u8, bytes[dns_header_bytes..length], out[dns_header_bytes..length]);
 
     const found = readRecord(out[0..written], length) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@intFromEnum(RecordKind.a), found.rtype);
+    try testing.expectEqual(@backingInt(RecordKind.a), found.rtype);
     try testing.expectEqual(@as(u32, 10), found.ttl);
     try testing.expectEqual(@as(u16, 4), found.rdlength);
     try testing.expectEqualSlices(u8, &permitted_ipv4, found.rdata[0..4]);
     try testing.expectEqual(@as(u8, 0xc0), out[length]);
     try testing.expectEqual(@as(u8, 0x0c), out[length + 1]);
 
-    const six = buildQuery(&bytes, 1, "example.test", @intFromEnum(RecordKind.aaaa));
+    const six = buildQuery(&bytes, 1, "example.test", @backingInt(RecordKind.aaaa));
     const query6 = try parseQuery(bytes[0..six]);
     const literal: [16]u8 = .{ 0x20, 0x01, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     const written6 = buildReply(&out, bytes[0..six], &query6, .no_error, .{
@@ -1714,7 +1727,7 @@ test "a reply echoes the question it was asked and carries one answer" {
         .address = .{ .ipv6 = literal },
     }, 30) orelse return error.TestUnexpectedResult;
     const found6 = readRecord(out[0..written6], six) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@intFromEnum(RecordKind.aaaa), found6.rtype);
+    try testing.expectEqual(@backingInt(RecordKind.aaaa), found6.rtype);
     try testing.expectEqual(@as(u16, 16), found6.rdlength);
     try testing.expectEqualSlices(u8, &literal, &found6.rdata);
 
@@ -1726,7 +1739,7 @@ test "a reply echoes the question it was asked and carries one answer" {
 
 test "a refusal carries no answer section and no address at all" {
     var bytes: [query_capacity]u8 = undefined;
-    const length = buildQuery(&bytes, 0x0101, refused_name, @intFromEnum(RecordKind.a));
+    const length = buildQuery(&bytes, 0x0101, refused_name, @backingInt(RecordKind.a));
     const query = try parseQuery(bytes[0..length]);
 
     var out: [query_capacity]u8 = undefined;
@@ -1735,9 +1748,9 @@ test "a refusal carries no answer section and no address at all" {
 
     try testing.expectEqual(length, written);
     try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, out[6..8], .big));
-    try testing.expectEqual(@as(u16, @intFromEnum(Rcode.refused)), std.mem.readInt(u16, out[2..4], .big) & 0xf);
+    try testing.expectEqual(@as(u16, @backingInt(Rcode.refused)), std.mem.readInt(u16, out[2..4], .big) & 0xf);
 
-    try testing.expect(@intFromEnum(Rcode.refused) != @intFromEnum(Rcode.name_error));
+    try testing.expect(@backingInt(Rcode.refused) != @backingInt(Rcode.name_error));
 
     const empty = buildReply(&out, bytes[0..length], &query, .no_error, null, 10) orelse
         return error.TestUnexpectedResult;
@@ -1754,7 +1767,7 @@ test "a datagram that cannot be parsed still gets an answer" {
     try testing.expectEqual(@as(u16, 0xabcd), std.mem.readInt(u16, out[0..2], .big));
     try testing.expectEqual(@as(u16, 0x8000), std.mem.readInt(u16, out[2..4], .big) & 0x8000);
     try testing.expectEqual(
-        @as(u16, @intFromEnum(Rcode.format_error)),
+        @as(u16, @backingInt(Rcode.format_error)),
         std.mem.readInt(u16, out[2..4], .big) & 0xf,
     );
     try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, out[4..6], .big));
@@ -1809,46 +1822,46 @@ test "the name table is bounded, expires, and keeps the newest name" {
 }
 
 test "a refusal names the call the kernel would not take" {
-    try testing.expectEqual(error.PrivilegedPort, classify(.resolver_bind, @intFromEnum(linux.E.ACCES)));
-    try testing.expectEqual(error.NotPermitted, classify(.relay_bind, @intFromEnum(linux.E.ACCES)));
-    try testing.expectEqual(error.NotPermitted, classify(.relay_socket, @intFromEnum(linux.E.PERM)));
-    try testing.expectEqual(error.AddressInUse, classify(.relay_bind, @intFromEnum(linux.E.ADDRINUSE)));
-    try testing.expectEqual(error.AddressInUse, classify(.resolver_bind, @intFromEnum(linux.E.ADDRINUSE)));
-    try testing.expectEqual(error.Refused, classify(.relay_listen, @intFromEnum(linux.E.INVAL)));
-    try testing.expectEqual(error.Refused, classify(.resolver_socket, @intFromEnum(linux.E.AFNOSUPPORT)));
+    try testing.expectEqual(error.PrivilegedPort, classify(.resolver_bind, @backingInt(linux.E.ACCES)));
+    try testing.expectEqual(error.NotPermitted, classify(.relay_bind, @backingInt(linux.E.ACCES)));
+    try testing.expectEqual(error.NotPermitted, classify(.relay_socket, @backingInt(linux.E.PERM)));
+    try testing.expectEqual(error.AddressInUse, classify(.relay_bind, @backingInt(linux.E.ADDRINUSE)));
+    try testing.expectEqual(error.AddressInUse, classify(.resolver_bind, @backingInt(linux.E.ADDRINUSE)));
+    try testing.expectEqual(error.Refused, classify(.relay_listen, @backingInt(linux.E.INVAL)));
+    try testing.expectEqual(error.Refused, classify(.resolver_socket, @backingInt(linux.E.AFNOSUPPORT)));
 }
 
 test "a refusal that is not a missing module fails the test rather than skipping it" {
     try testing.expect(measuredNothing(failedAt(
         .netns_configure,
-        @intFromEnum(netns.Step.dummy_create),
-        @intFromEnum(linux.E.OPNOTSUPP),
+        @backingInt(netns.Step.dummy_create),
+        @backingInt(linux.E.OPNOTSUPP),
     )));
     try testing.expect(measuredNothing(failedAt(
         .nftables_install,
-        @intFromEnum(nftables.Step.batch_begin),
-        @intFromEnum(linux.E.OPNOTSUPP),
+        @backingInt(nftables.Step.batch_begin),
+        @backingInt(linux.E.OPNOTSUPP),
     )));
 
     try testing.expect(!measuredNothing(failedAt(
         .netns_configure,
-        @intFromEnum(netns.Step.route4_add),
-        @intFromEnum(linux.E.OPNOTSUPP),
+        @backingInt(netns.Step.route4_add),
+        @backingInt(linux.E.OPNOTSUPP),
     )));
     try testing.expect(!measuredNothing(failedAt(
         .nftables_install,
-        @intFromEnum(nftables.Step.relay_rule),
-        @intFromEnum(linux.E.NOENT),
+        @backingInt(nftables.Step.relay_rule),
+        @backingInt(linux.E.NOENT),
     )));
     try testing.expect(!measuredNothing(failedAt(
         .router_open,
-        @intFromEnum(Step.resolver_bind),
-        @intFromEnum(linux.E.ACCES),
+        @backingInt(Step.resolver_bind),
+        @backingInt(linux.E.ACCES),
     )));
     try testing.expect(!measuredNothing(failedAt(
         .router_open,
-        @intFromEnum(Step.relay_bind),
-        @intFromEnum(linux.E.ADDRINUSE),
+        @backingInt(Step.relay_bind),
+        @backingInt(linux.E.ADDRINUSE),
     )));
 
     var clean = std.mem.zeroes(Measurement);
@@ -1858,7 +1871,7 @@ test "a refusal that is not a missing module fails the test rather than skipping
 
 fn failedAt(stage: Stage, step: u32, errno: i32) Measurement {
     var record = std.mem.zeroes(Measurement);
-    record.stage = @intFromEnum(stage);
+    record.stage = @backingInt(stage);
     record.failed_step = step;
     record.failed_errno = errno;
     return record;
@@ -1869,9 +1882,9 @@ test "a permitted name resolves and its address lands in the allow set" {
     if (measuredNothing(record)) return error.SkipZigTest;
     try testing.expectEqual(Measurement.no_failure, record.stage);
 
-    try testing.expectEqual(@as(u32, @intFromEnum(Rcode.no_error)), record.permit_rcode);
+    try testing.expectEqual(@as(u32, @backingInt(Rcode.no_error)), record.permit_rcode);
     try testing.expectEqual(@as(u32, 1), record.permit_ancount);
-    try testing.expectEqual(@as(u32, @intFromEnum(RecordKind.a)), record.permit_rtype);
+    try testing.expectEqual(@as(u32, @backingInt(RecordKind.a)), record.permit_rtype);
     try testing.expectEqual(@as(u32, 4), record.permit_rdlength);
     try testing.expectEqualSlices(u8, &permitted_ipv4, record.permit_rdata[0..4]);
     try testing.expectEqual(@as(u32, 0x1234), record.permit_id);
@@ -1882,7 +1895,7 @@ test "a permitted name resolves and its address lands in the allow set" {
 
     try testing.expect(@as(u64, record.permit_ttl) * 1000 < record.permit_element_timeout_ms);
 
-    try testing.expectEqual(@as(u32, @intFromEnum(Rcode.no_error)), record.empty_rcode);
+    try testing.expectEqual(@as(u32, @backingInt(Rcode.no_error)), record.empty_rcode);
     try testing.expectEqual(@as(u32, 0), record.empty_ancount);
 }
 
@@ -1891,7 +1904,7 @@ test "a name the policy refuses answers REFUSED and never reaches the host" {
     if (measuredNothing(record)) return error.SkipZigTest;
     try testing.expectEqual(Measurement.no_failure, record.stage);
 
-    try testing.expectEqual(@as(u32, @intFromEnum(Rcode.refused)), record.refuse_rcode);
+    try testing.expectEqual(@as(u32, @backingInt(Rcode.refused)), record.refuse_rcode);
     try testing.expectEqual(@as(u32, 0), record.refuse_ancount);
 
     try testing.expectEqual(@as(u32, 0), record.refuse_element_found);
@@ -1904,7 +1917,7 @@ test "a record type this resolver does not answer is refused and not implemented
     if (measuredNothing(record)) return error.SkipZigTest;
     try testing.expectEqual(Measurement.no_failure, record.stage);
 
-    try testing.expectEqual(@as(u32, @intFromEnum(Rcode.refused)), record.type_rcode);
+    try testing.expectEqual(@as(u32, @backingInt(Rcode.refused)), record.type_rcode);
     try testing.expectEqual(@as(u32, 0), record.type_ancount);
 }
 
@@ -1913,7 +1926,7 @@ test "an address the kernel would not take is never answered" {
     if (measuredNothing(record)) return error.SkipZigTest;
     try testing.expectEqual(Measurement.no_failure, record.stage);
 
-    try testing.expectEqual(@as(u32, @intFromEnum(Rcode.server_failure)), record.walled_rcode);
+    try testing.expectEqual(@as(u32, @backingInt(Rcode.server_failure)), record.walled_rcode);
     try testing.expectEqual(@as(u32, 0), record.walled_ancount);
     try testing.expectEqual(@as(u32, 0), record.walled_element_found);
 }
@@ -1973,7 +1986,7 @@ test "a connection to an address that was never handed out never reaches the rel
     try testing.expectEqual(@as(u64, 0), record.blocked_accepted);
 
     try testing.expect(record.blocked_errno != timed_out);
-    try testing.expectEqual(@intFromEnum(linux.E.CONNREFUSED), record.blocked_errno);
+    try testing.expectEqual(@backingInt(linux.E.CONNREFUSED), record.blocked_errno);
     try testing.expect(record.blocked_waited_ms < 1000);
 }
 
@@ -1983,7 +1996,7 @@ test "a connection with the relay gone is refused rather than left waiting" {
     try testing.expectEqual(Measurement.no_failure, record.stage);
 
     try testing.expect(record.dead_errno != timed_out);
-    try testing.expectEqual(@intFromEnum(linux.E.CONNREFUSED), record.dead_errno);
+    try testing.expectEqual(@backingInt(linux.E.CONNREFUSED), record.dead_errno);
     try testing.expect(record.dead_waited_ms < 1000);
 }
 
@@ -2037,4 +2050,79 @@ test "a descriptor from the host seam is made ready for a loop that polls" {
 fn flagsOf(fd: posix.fd_t) linux.O {
     const flags = linux.fcntl(fd, linux.F.GETFL, 0);
     return @bitCast(@as(u32, @truncate(flags)));
+}
+
+/// Steps the relay until the descriptor has something, or gives up. Both ends
+/// of a test pair are non-blocking, so a relay that never moves a byte fails
+/// the test rather than holding it.
+fn relayed(instance: *Router, fd: posix.fd_t, into: []u8) !usize {
+    for (0..100) |_| {
+        const rc = linux.read(fd, into.ptr, into.len);
+        if (linux.errno(rc) == .SUCCESS and rc != 0) return rc;
+        try instance.step(0, 10, null);
+    }
+    return error.NothingRelayed;
+}
+
+fn testPair() ![2]i32 {
+    var pair: [2]i32 = undefined;
+    const made = linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
+        0,
+        &pair,
+    );
+    if (linux.errno(made) != .SUCCESS) return error.SocketFailed;
+    return pair;
+}
+
+test "a relay with no listener of its own carries the links it is given" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var instance: Router = .{
+        .relay_fd = -1,
+        .resolver_fd = -1,
+        .policy = undefined,
+        .host = undefined,
+        .allow_timeout_ms = 0,
+        .answer_ttl_s = 0,
+        .names = .{},
+        .links = @splat(.{}),
+        .counts = .{},
+    };
+
+    const left = try testPair();
+    const right = try testPair();
+    defer _ = linux.close(left[0]);
+    defer _ = linux.close(right[0]);
+
+    try testing.expect(instance.adopt(left[1], right[1]));
+    try testing.expectEqual(@as(u64, 1), instance.counts.linked);
+    try testing.expectEqual(@as(u64, 0), instance.counts.accepted);
+
+    // What the host sends reaches the server, and what the server answers
+    // reaches the host, over the one relay the egress path already uses.
+    var heard: [64]u8 = undefined;
+    const asked = "GET / HTTP/1.1\r\n\r\n";
+    try testing.expectEqual(asked.len, linux.write(right[0], asked.ptr, asked.len));
+    try testing.expectEqual(asked.len, try relayed(&instance, left[0], &heard));
+    try testing.expectEqualStrings(asked, heard[0..asked.len]);
+
+    const answered = "HTTP/1.1 200 OK\r\n\r\nhello";
+    try testing.expectEqual(answered.len, linux.write(left[0], answered.ptr, answered.len));
+    try testing.expectEqual(answered.len, try relayed(&instance, right[0], &heard));
+    try testing.expectEqualStrings(answered, heard[0..answered.len]);
+
+    // Every slot taken means the next connection is refused rather than given a
+    // link that overwrote a live one.
+    var pairs: [max_links][2]i32 = undefined;
+    var taken: usize = 1;
+    while (taken < max_links) : (taken += 1) {
+        pairs[taken] = try testPair();
+        try testing.expect(instance.adopt(pairs[taken][0], pairs[taken][1]));
+    }
+    const spare = try testPair();
+    defer _ = linux.close(spare[0]);
+    defer _ = linux.close(spare[1]);
+    try testing.expect(!instance.adopt(spare[0], spare[1]));
 }

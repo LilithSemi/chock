@@ -18,6 +18,7 @@ no `chock.zon` at all runs them without a prompt.
 | `exec.path.*` | a bare name looked up on `PATH` | `allow` |
 | `exec.unparsed` | a path Chock would not resolve | none, so `ask` |
 | `net.connect.*` | the sandbox opening a socket | none, so `ask` |
+| `net.serve.<port>` | a port of a background command, reachable from this machine | none, so `ask` |
 | `net.fetch.*` | the `fetch_url` tool | none, so `ask` |
 | `web.search` | the `web_search` tool | `ask` |
 | `skill.read.<layer>` | reading a skill of that layer | `allow` for yours, `ask` for the rest |
@@ -105,6 +106,65 @@ and never wherever it forwards you.
 A rule in `chock.zon` still reads a host with no question at all, which is
 what you want for a host the agent visits often. The refusal on your screen
 names the rule to add, and the block it goes in.
+
+## `net.serve.<port>`
+
+A web project wants the server the agent just started to be reachable from the
+browser on this machine. `net.serve.3000` is that port, and a rule that names
+it and answers `allow` publishes it:
+
+```zon
+.{
+    .policy = .{
+        .rules = .{
+            .{ .action = "net.serve.3000", .decision = .allow },
+        },
+    },
+}
+```
+
+`http://127.0.0.1:3000` then reaches port 3000 inside the sandbox of a
+background `run_command`, which is where a dev server runs: a foreground call
+holds the turn until it ends, so a server started there would hold the session.
+The listener is on `127.0.0.1` and nowhere else, so a published port is for the
+person at this machine, and a sandbox is not a way to put a service on a
+network.
+
+The port has to be a number a person wrote. `net.serve.*` publishes nothing: a
+listener is opened on the host for each published port, and a pattern names no
+port to open. A `deny` further in, or an org ceiling, still refuses one of
+these the way it refuses anything else.
+
+A port can also be asked for while a session runs. `serve_port` is a tool the
+agent calls once it has started a server and knows the port, and the answer to
+`net.serve.<port>` is what decides, so `ask` there reaches a person with that
+exact number in the question. The tool is offered only where some rule could
+permit a port: a project that names none is not offered it at all, the same way
+`provide_tool` appears only where `nix.build` is answered.
+
+```zon
+.{
+    .policy = .{
+        .rules = .{
+            .{ .action = "net.serve.3000", .decision = .allow },
+            .{ .action = "net.serve.*", .decision = .ask },
+        },
+    },
+}
+```
+
+Three things are reported rather than guessed at: a port under 1024, which
+needs privilege this session does not have, a port something on this machine is
+already listening on, and more ports than one session may publish. Each says
+which port and why.
+
+A published port is Linux only. The path inward is a network namespace and a
+helper that dials loopback in it, and macOS has neither, so a session there
+says that no port is open and runs on without one.
+
+What carries a connection in is a helper of its own inside the sandbox, with
+one power the router is refused: it may dial, and only loopback in that
+namespace. [sandbox.md](../security/sandbox.md#the-network) says why.
 
 ### Whether a session has a network at all
 
