@@ -43,18 +43,9 @@ pub fn actionInto(buffer: []u8, host: []const u8) ?[]const u8 {
     if (!chock_net.net_broker.hostBytesAreUsable(host)) return null;
 
     @memcpy(buffer[0..action_prefix.len], action_prefix);
-    var written: usize = action_prefix.len;
-
-    var end = host.len;
-    while (end > 0) {
-        const start = if (std.mem.lastIndexOfScalar(u8, host[0..end], '.')) |dot| dot + 1 else 0;
-        const label = host[start..end];
-        buffer[written] = '.';
-        written += 1;
-        for (label, buffer[written..][0..label.len]) |from, *to| to.* = std.ascii.toLower(from);
-        written += label.len;
-        end = if (start == 0) 0 else start - 1;
-    }
+    // The one writer, so this key and an MCP destination key cannot disagree
+    // about what a host looks like in an action name.
+    const written = table.hostIntoReversed(buffer, action_prefix.len, host) orelse return null;
     return buffer[0..written];
 }
 

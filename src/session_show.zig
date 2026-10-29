@@ -76,7 +76,7 @@ pub const Filters = struct {
             .secret_used,
             => self.sandbox,
             .hook_run => self.tools,
-            .network_summary => self.network,
+            .network_summary, .mcp_request => self.network,
             // Forward-compatible events must never disappear behind a filter the
             // installed Chock cannot name.
             .unknown => true,
@@ -441,6 +441,11 @@ fn writeHuman(arena: std.mem.Allocator, envelope: event.Envelope, full: bool) !v
             try inlineText(arena, one.outcome),
             if (one.errored) ", errored" else "",
             if (one.refused) ", refused it" else "",
+        }),
+        .mcp_request => |one| tty.out(.plain, "  {s} asked {s} of {s}, status {d}, {s}\n", .{
+            try inlineText(arena, one.server),  try inlineText(arena, one.about),
+            try inlineText(arena, one.host),    one.status,
+            try inlineText(arena, one.outcome),
         }),
         .network_summary => |one| {
             tty.out(.plain, "  granted {d}, refused {d}\n", .{ one.granted, one.refused });

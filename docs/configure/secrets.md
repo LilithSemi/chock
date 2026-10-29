@@ -29,8 +29,8 @@ entry that gives a project's tools something new.
 |---|---|
 | `name` | The secret, under the name the credential store knows it by. |
 | `to` | The action name this secret may be given to. |
-| `bind` | How it arrives: `env`, or `file`. `env` is the default. |
-| `as` | The variable it arrives under. Left out, the secret's own name. |
+| `bind` | How it arrives: `env`, `file`, or `header`. `env` is the default. |
+| `as` | The variable or header it arrives under. Left out, the secret's own name. |
 
 `to` is an action name pattern, read by the same table every other permission
 uses. See [actions.md](actions.md). So `exec.path.gh` reaches one program, and
@@ -146,6 +146,39 @@ The slot that keeps a server's secret out of the log is its own, and it stays
 filled for the whole session. A tool call's slot is cleared when that call
 ends.
 
+## Arriving as a header
+
+A server the project named by `url` is one somebody else runs, so it has no
+environment to read. Its credential binds as a header instead:
+
+```zon
+.{
+    .secrets = .{
+        .{ .name = "NOTION_TOKEN", .to = "mcp.notion.*", .bind = "header" },
+    },
+}
+```
+
+`Authorization` carries `Bearer ` before the value, because that is what the
+scheme means. A server wanting its own header names it with `as`, and that
+header carries the value by itself:
+
+```zon
+.{ .name = "KEY", .to = "mcp.probe.*", .bind = "header", .as = "X-Api-Key" },
+```
+
+A header name holds letters, digits and hyphen, which an environment variable
+cannot, so the rule for `as` is the rule of the bind it is written beside.
+
+A value holding a byte a header cannot carry, such as a line break, is not
+sent. Chock says so and the server reaches its destination with no credential,
+rather than writing a header nobody asked for.
+
+The two other binds reach a remote server with nothing, and the one that
+reaches a local one is `env`. Chock says which to write instead of leaving a
+server quietly without its credential. [remote-mcp.md](../using/remote-mcp.md)
+has the destination rules that go beside this.
+
 ## What is written down
 
 Each use appends a `secret.used` event to the session log: the secret's name,
@@ -155,6 +188,9 @@ The value is not in the event, and there is no field it could travel in.
 ```json
 {"kind":"secret.used","name":"GITHUB_TOKEN","action":"exec.path.gh","bind":"env","variable":"GITHUB_TOKEN"}
 ```
+
+For a header the `variable` field holds the header's name, which is the place
+it arrived in.
 
 ## What this does not do yet
 

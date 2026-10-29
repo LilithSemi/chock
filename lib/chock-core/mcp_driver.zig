@@ -4,16 +4,11 @@ const std = @import("std");
 
 const helper = @import("helper.zig");
 const mcp = @import("mcp.zig");
-
-pub const protocol_version = "2025-06-18";
-
-pub const client_name = "chock";
+const message = @import("mcp_message.zig");
 
 pub const max_inbox_bytes = 4 << 20;
 
 const read_chunk_bytes = 4096;
-
-const empty_object = struct {}{};
 
 pub const Protocol = struct {
     gpa: std.mem.Allocator,
@@ -42,35 +37,16 @@ pub const Protocol = struct {
     ) mcp.Error![]const mcp.Declared {
         try self.handshake(arena, io, channel, deadline);
 
-        const reply = try self.request(arena, io, channel, deadline, .{
-            .jsonrpc = "2.0",
-            .id = self.nextId(),
-            .method = "tools/list",
-            .params = empty_object,
-        });
-
-        const result = objectField(reply, "result") orelse return &.{};
-        const declared = result.get("tools") orelse return &.{};
-        if (declared != .array) return &.{};
-
-        var out: std.ArrayList(mcp.Declared) = .empty;
-        for (declared.array.items) |item| {
-            if (item != .object) continue;
-            const name = item.object.get("name") orelse continue;
-            if (name != .string) continue;
-            const description = blk: {
-                const raw = item.object.get("description") orelse break :blk "";
-                if (raw != .string) break :blk "";
-                break :blk raw.string;
-            };
-            const schema = item.object.get("inputSchema") orelse std.json.Value.null;
-            try out.append(arena, .{
-                .name = name.string,
-                .description = description,
-                .schema = schema,
-            });
-        }
-        return out.toOwnedSlice(arena);
+        const id = self.nextId();
+        const reply = try self.request(
+            arena,
+            io,
+            channel,
+            deadline,
+            try message.listBody(arena, id),
+            id,
+        );
+        return message.declaredFrom(arena, reply);
     }
 
     pub fn call(
@@ -84,60 +60,16 @@ pub const Protocol = struct {
     ) mcp.Error!mcp.Outcome {
         try self.handshake(arena, io, channel, deadline);
 
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments, .{}) catch
-            std.json.Value.null;
-        const args: std.json.Value = if (parsed == .object)
-            parsed
-        else
-            std.json.parseFromSliceLeaky(std.json.Value, arena, "{}", .{}) catch
-                return error.OutOfMemory;
-
-        const reply = try self.request(arena, io, channel, deadline, .{
-            .jsonrpc = "2.0",
-            .id = self.nextId(),
-            .method = "tools/call",
-            .params = .{ .name = name, .arguments = args },
-        });
-
-        if (objectField(reply, "error")) |failure| {
-            const message = failure.get("message") orelse std.json.Value.null;
-            const text = if (message == .string) message.string else "the server refused the call";
-            return .{ .text = text, .is_error = true };
-        }
-
-        const result = objectField(reply, "result") orelse
-            return .{ .text = "the server answered nothing", .is_error = true };
-
-        var text: std.ArrayList(u8) = .empty;
-        if (result.get("content")) |content| {
-            if (content == .array) {
-                for (content.array.items) |part| {
-                    if (part != .object) continue;
-                    const kind = part.object.get("type") orelse std.json.Value.null;
-                    const kind_name = if (kind == .string) kind.string else "";
-                    const body = part.object.get("text") orelse std.json.Value.null;
-                    if (body == .string and std.mem.eql(u8, kind_name, "text")) {
-                        if (text.items.len != 0) try text.append(arena, '\n');
-                        try text.appendSlice(arena, body.string);
-                        continue;
-                    }
-                    if (text.items.len != 0) try text.append(arena, '\n');
-                    const named = try std.fmt.allocPrint(
-                        arena,
-                        "[chock: the server sent a {s} part, which this build does not carry]",
-                        .{if (kind_name.len != 0) kind_name else "content"},
-                    );
-                    try text.appendSlice(arena, named);
-                }
-            }
-        }
-
-        const failed = blk: {
-            const raw = result.get("isError") orelse break :blk false;
-            if (raw != .bool) break :blk false;
-            break :blk raw.bool;
-        };
-        return .{ .text = try text.toOwnedSlice(arena), .is_error = failed };
+        const id = self.nextId();
+        const reply = try self.request(
+            arena,
+            io,
+            channel,
+            deadline,
+            try message.callBody(arena, id, name, arguments),
+            id,
+        );
+        return message.outcomeFrom(arena, reply);
     }
 
     fn nextId(self: *Protocol) i64 {
@@ -156,25 +88,12 @@ pub const Protocol = struct {
 
         if (self.handshake_id == null) {
             const id = self.nextId();
-            try self.send(arena, io, channel, deadline, .{
-                .jsonrpc = "2.0",
-                .id = id,
-                .method = "initialize",
-                .params = .{
-                    .protocolVersion = protocol_version,
-                    .capabilities = empty_object,
-                    .clientInfo = .{ .name = client_name, .version = "1" },
-                },
-            });
+            try self.send(arena, io, channel, deadline, try message.initializeBody(arena, id));
             self.handshake_id = id;
         }
         _ = try self.awaitReply(arena, io, channel, deadline, self.handshake_id.?);
 
-        try self.send(arena, io, channel, deadline, .{
-            .jsonrpc = "2.0",
-            .method = "notifications/initialized",
-            .params = empty_object,
-        });
+        try self.send(arena, io, channel, deadline, try message.initializedBody(arena));
 
         self.ready = true;
     }
@@ -185,22 +104,23 @@ pub const Protocol = struct {
         io: std.Io,
         channel: *helper.Channel,
         deadline: std.Io.Clock.Timestamp,
-        message: anytype,
+        body: []const u8,
+        id: i64,
     ) mcp.Error!std.json.Value {
-        try self.send(arena, io, channel, deadline, message);
-        return self.awaitReply(arena, io, channel, deadline, self.last_id);
+        try self.send(arena, io, channel, deadline, body);
+        return self.awaitReply(arena, io, channel, deadline, id);
     }
 
+    /// One line a message, which is the whole framing. There is no header.
     fn send(
         self: *Protocol,
         arena: std.mem.Allocator,
         io: std.Io,
         channel: *helper.Channel,
         deadline: std.Io.Clock.Timestamp,
-        message: anytype,
+        body: []const u8,
     ) mcp.Error!void {
         _ = self;
-        const body = try std.json.Stringify.valueAlloc(arena, message, .{});
         const framed = try std.fmt.allocPrint(arena, "{s}\n", .{body});
         channel.writeAll(io, framed, deadline) catch |err| return switch (err) {
             error.Late, error.HelperGone => error.Gone,
@@ -216,23 +136,9 @@ pub const Protocol = struct {
         id: i64,
     ) mcp.Error!std.json.Value {
         while (true) {
-            const message = try self.receive(arena, io, channel, deadline);
-            if (message != .object) continue;
-            const object = message.object;
-
-            if (object.get("method")) |method| {
-                if (method == .string and
-                    std.mem.eql(u8, method.string, "notifications/tools/list_changed"))
-                {
-                    self.list_changed += 1;
-                }
-                continue;
-            }
-
-            const answered = object.get("id") orelse continue;
-            if (answered != .integer or answered.integer != id) continue;
-            if (object.get("result") == null and object.get("error") == null) continue;
-            return message;
+            const answered = try self.receive(arena, io, channel, deadline);
+            if (message.isListChanged(answered)) self.list_changed += 1;
+            if (message.replyFor(answered, id)) |reply| return reply;
         }
     }
 
@@ -277,7 +183,6 @@ pub const Protocol = struct {
         return line;
     }
 };
-
 pub const Driver = struct {
     gpa: std.mem.Allocator,
 
@@ -358,13 +263,6 @@ pub const Driver = struct {
         };
     }
 };
-
-fn objectField(message: std.json.Value, name: []const u8) ?std.json.ObjectMap {
-    if (message != .object) return null;
-    const field = message.object.get(name) orelse return null;
-    if (field != .object) return null;
-    return field.object;
-}
 
 const testing = std.testing;
 const chock_io = @import("chock-io");

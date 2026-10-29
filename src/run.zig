@@ -5672,7 +5672,7 @@ const ToolNetwork = struct {
 
 const GiveLockedToAll = struct {
     network: *ToolNetwork,
-    mcp: *chock_core.mcp.Session,
+    mcp: *McpState,
     plugins: *chock_core.plugin.Session,
     git: *GitToolRunner,
     nix: *NixBuildToolRunner,
@@ -5689,19 +5689,20 @@ const GiveLockedToAll = struct {
         const self: *GiveLockedToAll = @ptrCast(@alignCast(ptr));
         ToolNetwork.giveFn(self.network, locked);
         giveLockedToAskers(self.mcp, self.plugins, self.git, self.nix, self.secrets, locked);
+        self.mcp.giveLocked(locked);
         self.server_secrets.giveLocked(locked);
     }
 };
 
 fn giveLockedToAskers(
-    mcp_session: *chock_core.mcp.Session,
+    mcp_state: *McpState,
     plugin_session: *chock_core.plugin.Session,
     git_runner: *GitToolRunner,
     nix_runner: *NixBuildToolRunner,
     secret_runner: *ToolSecrets,
     locked: *chock_core.arbiter.Locked,
 ) void {
-    mcp_session.giveLocked(locked);
+    mcp_state.session.giveLocked(locked);
     plugin_session.giveLocked(locked);
     git_runner.giveLocked(locked);
     nix_runner.giveLocked(locked);
@@ -7682,6 +7683,19 @@ const ToolSecrets = struct {
         entry: chock_policy.secrets.Entry,
         held: *Held,
     ) std.mem.Allocator.Error!?[]u8 {
+        // A header reaches a server this host talks to over the network, and
+        // a tool call has none. Nothing is read and nothing is asked.
+        if (entry.bind == .header) {
+            tty.print(
+                .warn,
+                "chock: the secrets block binds {s} as a header, which reaches a remote MCP " ++
+                    "server and not a program, so {s} was not given it. Bind it as env for a " ++
+                    "tool call.\n",
+                .{ entry.name, action },
+            );
+            return null;
+        }
+
         switch (try self.permitted(gpa, io, call, entry)) {
             .permitted => {},
             .refused => |text| return text,
@@ -7725,6 +7739,8 @@ const ToolSecrets = struct {
                 try held.files.append(self.gpa, .{ .variable = variable, .value = value });
                 break :file value;
             },
+            // Refused above, before the value was read.
+            .header => unreachable,
         };
 
         self.slots[self.filled].value = anchor;
@@ -7931,6 +7947,16 @@ const ServerSecrets = struct {
                 );
                 continue;
             }
+            if (one.bind == .header) {
+                tty.print(
+                    .warn,
+                    "chock: the secrets block binds {s} as a header, which a server this host " ++
+                        "runs itself does not read, so the MCP server {s} was not given it. " ++
+                        "Bind it as env, or give that server a url.\n",
+                    .{ one.name, server },
+                );
+                continue;
+            }
             if (try self.permitted(keep, policy, server, one)) |named| {
                 try given.append(self.gpa, named);
             }
@@ -7940,31 +7966,38 @@ const ServerSecrets = struct {
         return chock_core.credentials.environment(keep, base, given.items);
     }
 
-    fn permitted(
+    /// False is a refusal already said on the terminal, never a silent one.
+    fn allowed(
         self: *ServerSecrets,
-        keep: std.mem.Allocator,
         policy: *TablePolicy,
         server: []const u8,
         entry: chock_policy.secrets.Entry,
-    ) std.mem.Allocator.Error!?[]const u8 {
+    ) std.mem.Allocator.Error!bool {
         const action = try chock_policy.secrets.actionFor(self.gpa, entry.name);
         defer self.gpa.free(action);
 
         const decision = policy.answer(server, action);
-        if (decision != .allow) {
-            tty.print(
-                .warn,
-                "chock: the MCP server {s} was not given the secret {s}, because {s} reads as " ++
-                    "{t} and a server starts with nobody to ask. Write a rule that allows it.\n",
-                .{ server, entry.name, action, decision },
-            );
-            return null;
-        }
+        if (decision == .allow) return true;
 
+        tty.print(
+            .warn,
+            "chock: the MCP server {s} was not given the secret {s}, because {s} reads as " ++
+                "{t} and a server starts with nobody to ask. Write a rule that allows it.\n",
+            .{ server, entry.name, action, decision },
+        );
+        return false;
+    }
+
+    /// The caller wipes and frees what comes back.
+    fn read(
+        self: *ServerSecrets,
+        server: []const u8,
+        entry: chock_policy.secrets.Entry,
+    ) ?[]u8 {
         var diag: ?chock_auth.store.Diagnostic = null;
         defer if (diag) |*d| d.deinit(self.gpa);
 
-        const value = self.store.secrets.get(self.gpa, self.io, entry.name, &diag) catch |err| {
+        return self.store.secrets.get(self.gpa, self.io, entry.name, &diag) catch |err| {
             if (diag) |*d| {
                 tty.print(.err, "chock: the secret {s} could not be read: {f}\n", .{ entry.name, d });
             } else {
@@ -7980,6 +8013,92 @@ const ServerSecrets = struct {
             );
             return null;
         };
+    }
+
+    /// The header a remote server's requests carry, or null when no entry
+    /// names it and nothing is sent.
+    fn headerForServer(
+        self: *ServerSecrets,
+        keep: std.mem.Allocator,
+        policy: *TablePolicy,
+        server: []const u8,
+    ) std.mem.Allocator.Error!?chock_broker.mcp_remote.Header {
+        if (self.block.entries.len == 0) return null;
+
+        var buffer: [chock_core.mcp.max_action_bytes]u8 = undefined;
+        const namespace = chock_core.mcp.namespaceInto(&buffer, server) orelse return null;
+
+        for (self.block.entries) |one| {
+            if (!reaches(one.to, namespace)) continue;
+            if (one.bind != .header) {
+                tty.print(
+                    .warn,
+                    "chock: the secrets block binds {s} as {t}, and a remote MCP server takes a " ++
+                        "header, so the server {s} was not given it. Bind it as header.\n",
+                    .{ one.name, one.bind, server },
+                );
+                continue;
+            }
+            if (self.records == self.kept.len or self.filled == self.slots.len) {
+                tty.print(
+                    .warn,
+                    "chock: the MCP server {s} is granted more secrets than this session keeps " ++
+                        "slots for, so {s} was not given to it.\n",
+                    .{ server, one.name },
+                );
+                continue;
+            }
+            if (!try self.allowed(policy, server, one)) continue;
+
+            const value = self.read(server, one) orelse continue;
+            defer wipeAndFree(self.gpa, value);
+
+            if (!chock_policy.secrets.headerValueIsSendable(value)) {
+                tty.print(
+                    .warn,
+                    "chock: the secret {s} holds bytes a header cannot carry, such as a line " ++
+                        "break, so the MCP server {s} was not given it and reaches that server " ++
+                        "with no credential.\n",
+                    .{ one.name, server },
+                );
+                continue;
+            }
+
+            const name = one.header();
+            const carried = if (one.carriesBearer())
+                try std.fmt.allocPrint(keep, chock_policy.secrets.bearer_prefix ++ "{s}", .{value})
+            else
+                try keep.dupe(u8, value);
+
+            // The slot holds the secret itself and not the scheme before it,
+            // so the value is masked wherever it shows up.
+            self.slots[self.filled].value = if (one.carriesBearer())
+                carried[chock_policy.secrets.bearer_prefix.len..]
+            else
+                carried;
+            self.filled += 1;
+
+            self.kept[self.records] = .{
+                .name = one.name,
+                .action = one.to,
+                .variable = name,
+            };
+            self.records += 1;
+            return .{ .name = name, .value = carried };
+        }
+        return null;
+    }
+
+    fn permitted(
+        self: *ServerSecrets,
+        keep: std.mem.Allocator,
+        policy: *TablePolicy,
+        server: []const u8,
+        entry: chock_policy.secrets.Entry,
+    ) std.mem.Allocator.Error!?[]const u8 {
+        if (!try self.allowed(policy, server, entry)) return null;
+
+        const value = self.read(server, entry) orelse return null;
         defer wipeAndFree(self.gpa, value);
 
         const variable = entry.variable();
@@ -8112,19 +8231,248 @@ const McpToolRunner = struct {
     }
 };
 
+/// A server this host does not run. Null is a destination this session will
+/// not reach, said on the terminal, and the server is left out.
+fn startRemote(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    state: *McpState,
+    secrets: *ServerSecrets,
+    policy: *TablePolicy,
+    one: chock_core.mcp.Settings,
+) std.mem.Allocator.Error!void {
+    const keep = state.arena.allocator();
+
+    var diag: ?chock_core.mcp.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+    const remote = try chock_core.mcp.remoteOf(keep, one, &diag) orelse {
+        if (diag) |*d| {
+            tty.print(.warn, "chock: the MCP server {s}: {f}\n", .{ one.name, d });
+        }
+        return;
+    };
+
+    state.io = io;
+    const index = state.remotes_used;
+    state.remotes[index] = .{
+        .gpa = gpa,
+        .server = try keep.dupe(u8, one.name),
+        .host = remote.host,
+        .url = try keep.dupe(u8, remote.url),
+        .port = remote.port,
+    };
+    state.remotes_used += 1;
+
+    var buffer: [chock_core.mcp.max_host_action_bytes]u8 = undefined;
+    const action = chock_core.mcp.hostActionInto(&buffer, one.name, remote.host).?;
+    const decision = policy.answer(one.name, action);
+    if (decision != .allow) {
+        state.remotes[index].note(
+            McpRemoteBridge.discover_about,
+            0,
+            .refused_by_policy,
+        );
+        tty.print(
+            .warn,
+            "chock: the MCP server {s} was not reached, because this project's policy answers " ++
+                "\"{t}\" for {s}. Only \"allow\" reaches a host, since a server starts with " ++
+                "nobody to ask. The rule that would permit it is " ++
+                ".{{ .action = \"{s}\", .decision = .allow }} in the .policy.rules block of " ++
+                "chock.zon.\n",
+            .{ one.name, decision, action, action },
+        );
+        return;
+    }
+
+    state.remotes[index].header = try secrets.headerForServer(keep, policy, one.name);
+
+    const slot = state.count;
+    state.bridges[slot] = .{ .session = &state.remotes[index] };
+    state.https[slot] = chock_core.mcp_http.Driver.init(gpa, state.bridges[slot].exchange());
+    state.hosts[slot] = .{
+        .bridge = &state.bridges[slot],
+        .inner = state.https[slot].host(),
+    };
+    state.kinds[slot] = .remote;
+    state.records[slot] = .{
+        .name = one.name,
+        .host = state.hosts[slot].host(),
+    };
+    state.count += 1;
+
+    tty.detail("chock: the MCP server {s} is reached at {s}\n", .{ one.name, remote.host });
+}
+
+/// Carries an exchange to the broker's socket and nothing else: the address
+/// check and the credential header are the broker's own.
+const McpRemoteBridge = struct {
+    session: *chock_broker.mcp_remote.Session,
+    /// What the exchange in flight is about, which the record names.
+    about: []const u8 = discover_about,
+
+    const discover_about = "discover";
+
+    fn exchange(self: *McpRemoteBridge) chock_core.mcp_http.Exchange {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.mcp_http.Exchange.VTable{ .post = postFn };
+
+    fn postFn(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        io: std.Io,
+        one: chock_core.mcp_http.Post,
+    ) chock_core.mcp_http.Error!chock_core.mcp_http.Reply {
+        const self: *McpRemoteBridge = @ptrCast(@alignCast(ptr));
+        const posted = self.session.post(
+            arena,
+            io,
+            one.body,
+            one.session_id,
+            one.protocol_version,
+        ) catch |err| {
+            self.session.note(self.about, 0, outcomeFor(err));
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.Gone;
+        };
+
+        self.session.note(
+            self.about,
+            posted.status,
+            if (answered(posted.status)) .answered else .no_answer,
+        );
+        return .{
+            .status = posted.status,
+            .kind = switch (posted.kind) {
+                .json => .json,
+                .event_stream => .event_stream,
+                .other => .other,
+            },
+            .session_id = posted.session_id,
+            .body = if (posted.live) |live| bodyOf(live) else null,
+        };
+    }
+
+    fn answered(status: u16) bool {
+        return status == 200 or status == 202;
+    }
+
+    fn outcomeFor(err: anyerror) chock_broker.mcp_remote.Outcome {
+        return switch (err) {
+            error.AddressNotPermitted => .refused_by_address,
+            error.Redirected => .redirected,
+            else => .no_answer,
+        };
+    }
+
+    fn bodyOf(live: *chock_broker.mcp_remote.Live) chock_core.mcp_http.Body {
+        return .{ .ptr = live, .vtable = &body_vtable };
+    }
+
+    const body_vtable = chock_core.mcp_http.Body.VTable{ .read = readFn, .close = closeFn };
+
+    fn readFn(
+        ptr: *anyopaque,
+        io: std.Io,
+        into: []u8,
+        deadline: std.Io.Clock.Timestamp,
+    ) chock_core.mcp_http.ReadError!usize {
+        const live: *chock_broker.mcp_remote.Live = @ptrCast(@alignCast(ptr));
+        return live.read(io, into, deadline);
+    }
+
+    fn closeFn(ptr: *anyopaque, io: std.Io) void {
+        _ = io;
+        const live: *chock_broker.mcp_remote.Live = @ptrCast(@alignCast(ptr));
+        live.close();
+    }
+};
+
+/// The host a remote server answers through. It tells the bridge which
+/// question is in flight, so a record names the tool and not the destination
+/// alone.
+const McpRemoteHost = struct {
+    bridge: *McpRemoteBridge,
+    inner: chock_core.mcp.Host,
+
+    fn host(self: *McpRemoteHost) chock_core.mcp.Host {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.mcp.Host.VTable{ .list = listFn, .call = callFn };
+
+    fn listFn(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        io: std.Io,
+        budget_ns: u64,
+    ) chock_core.mcp.Error![]const chock_core.mcp.Declared {
+        const self: *McpRemoteHost = @ptrCast(@alignCast(ptr));
+        self.bridge.about = McpRemoteBridge.discover_about;
+        return self.inner.list(arena, io, budget_ns);
+    }
+
+    fn callFn(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        io: std.Io,
+        name: []const u8,
+        arguments: []const u8,
+        budget_ns: u64,
+    ) chock_core.mcp.Error!chock_core.mcp.Outcome {
+        const self: *McpRemoteHost = @ptrCast(@alignCast(ptr));
+        self.bridge.about = name;
+        return self.inner.call(arena, io, name, arguments, budget_ns);
+    }
+};
+
 const McpState = struct {
     session: chock_core.mcp.Session,
     arena: std.heap.ArenaAllocator,
+    /// Set when a remote server starts, which is the only thing that records.
+    io: ?std.Io = null,
 
     helpers: [chock_core.mcp.max_servers]chock_core.helper.Helper = undefined,
     drivers: [chock_core.mcp.max_servers]chock_core.mcp_driver.Driver = undefined,
     networks: [chock_core.mcp.max_servers]chock_broker.network.Network = undefined,
     transports: [chock_core.mcp.max_servers]chock_broker.network.System = undefined,
     records: [chock_core.mcp.max_servers]chock_core.mcp.Server = undefined,
+    kinds: [chock_core.mcp.max_servers]Kind = undefined,
     count: usize = 0,
+
+    remotes: [chock_core.mcp.max_servers]chock_broker.mcp_remote.Session = undefined,
+    bridges: [chock_core.mcp.max_servers]McpRemoteBridge = undefined,
+    https: [chock_core.mcp.max_servers]chock_core.mcp_http.Driver = undefined,
+    hosts: [chock_core.mcp.max_servers]McpRemoteHost = undefined,
+    /// Counts the destinations a session held, which is one more than the
+    /// servers it started whenever a destination was refused.
+    remotes_used: usize = 0,
+
+    const Kind = enum { local, remote };
 
     fn init(gpa: std.mem.Allocator) McpState {
         return .{ .session = .init(gpa), .arena = .init(gpa) };
+    }
+
+    /// The records wait for the session's own log lock, the way a used secret
+    /// does: a server is reached before the loop holds one.
+    fn giveLocked(self: *McpState, locked: *chock_core.arbiter.Locked) void {
+        const gpa = self.arena.child_allocator;
+        const io = self.io orelse return;
+        const time_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+
+        for (self.remotes[0..self.remotes_used]) |*one| {
+            for (one.taken()) |record| {
+                _ = locked.append(gpa, io, .{ .mcp_request = .{
+                    .server = one.server,
+                    .host = one.host,
+                    .about = record.about,
+                    .status = record.status,
+                    .outcome = record.outcome.text(),
+                } }, time_ms) catch return;
+            }
+            one.forget();
+        }
     }
 
     fn deinit(self: *McpState, io: std.Io) void {
@@ -8132,6 +8480,11 @@ const McpState = struct {
 
         var index: usize = 0;
         while (index < self.count) : (index += 1) {
+            if (self.kinds[index] == .remote) {
+                self.https[index].deinit();
+                continue;
+            }
+
             self.helpers[index].deinit(io);
             self.drivers[index].deinit();
 
@@ -8311,6 +8664,11 @@ fn startMcp(
     for (settings) |one| {
         std.debug.assert(state.count < chock_core.mcp.max_servers);
 
+        if (one.isRemote()) {
+            try startRemote(gpa, io, state, secrets, &policy, one);
+            continue;
+        }
+
         const prepared = blk: {
             const with_store = chock_core.tools.withStore(
                 keep,
@@ -8365,6 +8723,7 @@ fn startMcp(
             );
         }
 
+        state.kinds[index] = .local;
         state.helpers[index] = chock_core.helper.Helper.init(std.heap.page_allocator);
         state.drivers[index] = chock_core.mcp_driver.Driver.init(
             gpa,
@@ -11107,7 +11466,7 @@ fn runSession(
 
     var give_locked = GiveLockedToAll{
         .network = &tool_network,
-        .mcp = &mcp_state.session,
+        .mcp = &mcp_state,
         .plugins = &plugin_state.session,
         .git = &git_aware,
         .nix = &nix_build,
@@ -17432,7 +17791,7 @@ test "one locked handle reaches every asker, and one that missed it runs nothing
     try std.testing.expect(tool_secrets.asker.?.locked == null);
 
     giveLockedToAskers(
-        &mcp_state.session,
+        &mcp_state,
         &plugin_state.session,
         &git_aware,
         &nix_build,
@@ -20872,4 +21231,367 @@ test "a project whose commands block names a directory outside it is refused" {
         said.err(),
         "reaches outside the project",
     ) != null);
+}
+
+fn remoteStateFor(gpa: std.mem.Allocator) McpState {
+    return McpState.init(gpa);
+}
+
+test "a destination the policy does not allow reaches nothing, and the line names the rule" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    for ([_]struct { decision: []const u8, says: []const u8 }{
+        .{ .decision = ".deny", .says = "deny" },
+        .{ .decision = ".ask", .says = "ask" },
+    }) |one| {
+        var said: tty.Capture = undefined;
+        said.start(io, gpa);
+        defer said.stop(io);
+
+        const source = try std.fmt.allocPrintSentinel(gpa,
+            \\.{{ .policy = .{{
+            \\    .agents = .{{ .{{ .kind = "main" }} }},
+            \\    .rules = .{{ .{{ .action = "mcp.probe.host.*", .decision = {s} }} }},
+            \\}} }}
+        , .{one.decision}, 0);
+        defer gpa.free(source);
+
+        const table = try serverSecretsPolicyFor(gpa, source);
+        defer chock_policy.table.Table.destroy(gpa, table);
+
+        const chain = [_][]const u8{"main"};
+        var policy = TablePolicy{
+            .policy = table,
+            .chain = &chain,
+            .agent_kind = "main",
+            .model = "a-model",
+        };
+
+        var block = chock_policy.secrets.Block{};
+        var slots = @as([1]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
+        var held = FakeSecretStore{ .held = &.{} };
+        var secrets = ServerSecrets{
+            .gpa = gpa,
+            .io = io,
+            .store = held.store(),
+            .block = block,
+            .slots = &slots,
+        };
+        defer block.deinit(gpa);
+
+        var state = remoteStateFor(gpa);
+        defer state.deinit(io);
+
+        try startRemote(gpa, io, &state, &secrets, &policy, .{
+            .name = "probe",
+            .url = "https://mcp.example.com/mcp",
+        });
+
+        // No server, so the model is never offered a tool from it.
+        try testing.expectEqual(@as(usize, 0), state.count);
+        const text = said.err();
+        try testing.expect(std.mem.indexOf(u8, text, "mcp.probe.host.com.example.mcp") != null);
+        try testing.expect(std.mem.indexOf(u8, text, one.says) != null);
+
+        // The refusal is in the log, with the destination it was about.
+        var log = try PermittingLog.init(gpa);
+        defer log.deinit(io);
+        try log.arm(io);
+        state.giveLocked(&log.locked);
+        const written = log.backing.bytes.items;
+        try testing.expect(std.mem.indexOf(u8, written, "mcp.request") != null);
+        try testing.expect(std.mem.indexOf(u8, written, "refused_by_policy") != null);
+        try testing.expect(std.mem.indexOf(u8, written, "mcp.example.com") != null);
+    }
+}
+
+test "an allowed destination starts a server whose transport is the remote one" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    const table = try serverSecretsPolicyFor(gpa,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{ .{ .action = "mcp.probe.host.*", .decision = .allow } },
+        \\} }
+    );
+    defer chock_policy.table.Table.destroy(gpa, table);
+
+    const chain = [_][]const u8{"main"};
+    var policy = TablePolicy{
+        .policy = table,
+        .chain = &chain,
+        .agent_kind = "main",
+        .model = "a-model",
+    };
+
+    var block = chock_policy.secrets.Block{};
+    defer block.deinit(gpa);
+    var slots = @as([1]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
+    var held = FakeSecretStore{ .held = &.{} };
+    var secrets = ServerSecrets{
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .slots = &slots,
+    };
+
+    var state = remoteStateFor(gpa);
+    defer state.deinit(io);
+
+    try startRemote(gpa, io, &state, &secrets, &policy, .{
+        .name = "probe",
+        .url = "https://mcp.example.com/mcp",
+    });
+
+    try testing.expectEqual(@as(usize, 1), state.count);
+    try testing.expectEqual(McpState.Kind.remote, state.kinds[0]);
+    try testing.expectEqualStrings("probe", state.records[0].name);
+    try testing.expectEqualStrings("mcp.example.com", state.remotes[0].host);
+    try testing.expectEqual(@as(u16, 443), state.remotes[0].port);
+    // No entry names a credential, so none is sent.
+    try testing.expect(state.remotes[0].header == null);
+}
+
+test "a credential bound as a header reaches the request, and the slot holds the value alone" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"PROBE_TOKEN\", .to = \"mcp.probe.*\", " ++
+            ".bind = \"header\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    const table = try serverSecretsPolicyFor(gpa,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{
+        \\        .{ .action = "mcp.probe.host.*", .decision = .allow },
+        \\        .{ .action = "secret.use.PROBE_TOKEN", .decision = .allow },
+        \\    },
+        \\} }
+    );
+    defer chock_policy.table.Table.destroy(gpa, table);
+
+    const value = "sk_not_a_real_token_0123456789";
+    var held = FakeSecretStore{ .held = &.{.{ .name = "PROBE_TOKEN", .value = value }} };
+    var slots = @as([1]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
+
+    const chain = [_][]const u8{"main"};
+    var policy = TablePolicy{
+        .policy = table,
+        .chain = &chain,
+        .agent_kind = "main",
+        .model = "a-model",
+    };
+    var secrets = ServerSecrets{
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .slots = &slots,
+    };
+
+    var state = remoteStateFor(gpa);
+    defer state.deinit(io);
+
+    try startRemote(gpa, io, &state, &secrets, &policy, .{
+        .name = "probe",
+        .url = "https://mcp.example.com/mcp",
+    });
+
+    const header = state.remotes[0].header orelse return error.TestExpectedHeader;
+    try testing.expectEqualStrings("Authorization", header.name);
+    try testing.expectEqualStrings("Bearer " ++ value, header.value);
+    // The scheme is not the secret, so the slot holds the value by itself.
+    try testing.expectEqualStrings(value, slots[0].value);
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+    secrets.giveLocked(&log.locked);
+    const written = log.backing.bytes.items;
+    try testing.expect(std.mem.indexOf(u8, written, "secret.used") != null);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, written, value));
+}
+
+test "a header a project named carries the value with no scheme before it" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"PROBE_TOKEN\", .to = \"mcp.probe.*\", " ++
+            ".bind = \"header\", .as = \"X-Api-Key\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    const table = try serverSecretsPolicyFor(gpa,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{
+        \\        .{ .action = "mcp.probe.host.*", .decision = .allow },
+        \\        .{ .action = "secret.use.PROBE_TOKEN", .decision = .allow },
+        \\    },
+        \\} }
+    );
+    defer chock_policy.table.Table.destroy(gpa, table);
+
+    const value = "key_0123456789";
+    var held = FakeSecretStore{ .held = &.{.{ .name = "PROBE_TOKEN", .value = value }} };
+    var slots = @as([1]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
+
+    const chain = [_][]const u8{"main"};
+    var policy = TablePolicy{
+        .policy = table,
+        .chain = &chain,
+        .agent_kind = "main",
+        .model = "a-model",
+    };
+    var secrets = ServerSecrets{
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .slots = &slots,
+    };
+
+    var state = remoteStateFor(gpa);
+    defer state.deinit(io);
+
+    try startRemote(gpa, io, &state, &secrets, &policy, .{
+        .name = "probe",
+        .url = "https://mcp.example.com/mcp",
+    });
+
+    const header = state.remotes[0].header orelse return error.TestExpectedHeader;
+    try testing.expectEqualStrings("X-Api-Key", header.name);
+    try testing.expectEqualStrings(value, header.value);
+}
+
+test "a credential that would write a header of its own is not sent, and the server still starts" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"PROBE_TOKEN\", .to = \"mcp.probe.*\", " ++
+            ".bind = \"header\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    const table = try serverSecretsPolicyFor(gpa,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{
+        \\        .{ .action = "mcp.probe.host.*", .decision = .allow },
+        \\        .{ .action = "secret.use.PROBE_TOKEN", .decision = .allow },
+        \\    },
+        \\} }
+    );
+    defer chock_policy.table.Table.destroy(gpa, table);
+
+    var held = FakeSecretStore{
+        .held = &.{.{ .name = "PROBE_TOKEN", .value = "good\r\nX-Other: bad" }},
+    };
+    var slots = @as([1]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
+
+    const chain = [_][]const u8{"main"};
+    var policy = TablePolicy{
+        .policy = table,
+        .chain = &chain,
+        .agent_kind = "main",
+        .model = "a-model",
+    };
+    var secrets = ServerSecrets{
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .slots = &slots,
+    };
+
+    var state = remoteStateFor(gpa);
+    defer state.deinit(io);
+
+    try startRemote(gpa, io, &state, &secrets, &policy, .{
+        .name = "probe",
+        .url = "https://mcp.example.com/mcp",
+    });
+
+    try testing.expectEqual(@as(usize, 1), state.count);
+    try testing.expect(state.remotes[0].header == null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "line break") != null);
+}
+
+test "a destination this reader cannot use says so, and starts nothing" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    const table = try serverSecretsPolicyFor(gpa,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{ .{ .action = "mcp.*", .decision = .allow } },
+        \\} }
+    );
+    defer chock_policy.table.Table.destroy(gpa, table);
+
+    const chain = [_][]const u8{"main"};
+    var policy = TablePolicy{
+        .policy = table,
+        .chain = &chain,
+        .agent_kind = "main",
+        .model = "a-model",
+    };
+
+    var block = chock_policy.secrets.Block{};
+    defer block.deinit(gpa);
+    var slots = @as([1]chock_core.redact.Secret, @splat(.{ .value = "", .source = .credential }));
+    var held = FakeSecretStore{ .held = &.{} };
+    var secrets = ServerSecrets{
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .slots = &slots,
+    };
+
+    var state = remoteStateFor(gpa);
+    defer state.deinit(io);
+
+    try startRemote(gpa, io, &state, &secrets, &policy, .{
+        .name = "probe",
+        .url = "http://mcp.example.com/mcp",
+    });
+
+    try testing.expectEqual(@as(usize, 0), state.count);
+    try testing.expectEqual(@as(usize, 0), state.remotes_used);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "https") != null);
 }

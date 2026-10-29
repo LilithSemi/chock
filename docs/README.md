@@ -36,6 +36,9 @@ Start with [running.md](running.md) for a session end to end, and
   with `/name`, its arguments, and why the agent cannot run one.
 - [using/hooks.md](using/hooks.md) - a program the project runs at a point in a
   session, the four triggers, and why a hook can only narrow.
+- [using/remote-mcp.md](using/remote-mcp.md) - reaching an MCP server somebody
+  else runs: the three rules, the credential as a header, and the five things
+  it refuses to do.
 
 ## Configuring a project
 

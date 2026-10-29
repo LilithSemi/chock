@@ -1077,7 +1077,7 @@ const not_pinned: ?*std.http.Client.Connection = null;
 ///
 /// Only IPv4 can be pinned: `HostName.validate` refuses a colon, so an
 /// IPv6-only answer stays unpinned rather than refuse an IPv6/NAT64 network.
-fn pinnedConnection(
+pub fn pinnedConnection(
     gpa: std.mem.Allocator,
     io: std.Io,
     client: *std.http.Client,

@@ -15,6 +15,33 @@
   pkgs,
 }:
 let
+  # A reference MCP server over streamable HTTP, for test/core/mcp_remote_real.zig.
+  # The transport is the mcp package's own, so the framing under test is not one
+  # Chock wrote. The dev shell holds it and the package build does not, so
+  # `nix build` skips that test the way it skips the stdio one.
+  mcp-probe-http =
+    pkgs.writers.writePython3Bin "mcp-probe-http"
+      {
+        libraries = [ pkgs.python3Packages.mcp ];
+        flakeIgnore = [ "E501" ];
+      }
+      ''
+        import sys
+
+        from mcp.server.fastmcp import FastMCP
+
+        mcp = FastMCP("probe", host="127.0.0.1", port=int(sys.argv[1]))
+
+
+        @mcp.tool()
+        def echo(text: str) -> str:
+            "Give back the text it was given."
+            return text
+
+
+        mcp.run(transport="streamable-http")
+      '';
+
   androidEnv = pkgs.callPackage "${pkgs.path}/pkgs/development/mobile/androidenv" {
     inherit pkgs;
     licenseAccepted = true;
@@ -76,6 +103,7 @@ stdenv.mkDerivation (finalAttrs: {
       zls
       typescript
       mcp-server-time
+      mcp-probe-http
       pkg-config
       vulkan-loader
     ]

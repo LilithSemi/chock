@@ -1504,6 +1504,39 @@ pub fn build(b: *std.Build) void {
     run_mcp_real_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_mcp_real_tests.step);
 
+    // The **real streamable HTTP transport** against a real server. See
+    // test/core/mcp_remote_real.zig for what it covers and what it does not:
+    // the server runs on loopback over plain http, so TLS is not here, and the
+    // address check has its own test where the real one refuses a loopback
+    // answer.
+    //
+    // **Not Linux only**, like the stdio suite above: a remote server needs no
+    // sandbox at all.
+    const mcp_probe_path_options = b.addOptions();
+    // Found here and never at test time, and null is an ordinary answer. The
+    // dev shell puts it on this PATH; pkgs/chock/default.nix names it.
+    mcp_probe_path_options.addOption(
+        ?[]const u8,
+        "mcp_probe_http_path",
+        b.findProgram(.{ .names = &.{"mcp-probe-http"} }),
+    );
+
+    const mcp_remote_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/core/mcp_remote_real.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chock-core", .module = chock_core },
+                .{ .name = "chock-broker", .module = chock_broker },
+                .{ .name = "mcp_probe_path", .module = mcp_probe_path_options.createModule() },
+            },
+        }),
+    });
+    const run_mcp_remote_tests = b.addRunArtifact(mcp_remote_tests);
+    run_mcp_remote_tests.skip_foreign_checks = true;
+    test_step.dependOn(&run_mcp_remote_tests.step);
+
     // One subagent, as a real second process with a log of its own. A
     // subagent that is not a process is not a subagent: `Sandbox.spawn` calls
     // `fork`, and `fork` carries only the calling thread, so an agent tree

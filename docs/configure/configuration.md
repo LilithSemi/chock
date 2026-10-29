@@ -203,6 +203,8 @@ what a project cannot take back. [actions.md](actions.md) has both.
   directories of this project hold the messages a person can run by name.
 - [hooks.md](../using/hooks.md) for the `hooks` block, which says what this
   project runs at a point in a session.
+- [remote-mcp.md](../using/remote-mcp.md) for an `mcp_servers` entry that names
+  a `url` rather than a `command`, and the rules above it.
 - [org.md](org.md) for the bundle an organisation puts above the project.
 - [subagents.md](../using/subagents.md) for the subagent limits.
 - [plugins.md](../extend/plugins.md) for the plugin list.

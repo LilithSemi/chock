@@ -20,7 +20,18 @@ pub const Bind = enum {
     /// In a file, with the environment naming its path, for a program that
     /// will not read an environment variable.
     file,
+    /// In a request header, for a server this host reaches over the network
+    /// rather than runs.
+    header,
 };
+
+pub const default_header = "Authorization";
+
+/// `Authorization` names a scheme before the value, and that scheme is what
+/// the specification of every server this reaches asks for.
+pub const bearer_prefix = "Bearer ";
+
+pub const max_header_bytes: usize = 64;
 
 pub const Entry = struct {
     name: []const u8,
@@ -32,6 +43,18 @@ pub const Entry = struct {
 
     pub fn variable(self: Entry) []const u8 {
         return self.as orelse self.name;
+    }
+
+    /// The header this arrives under, which is `Authorization` unless the
+    /// entry names another.
+    pub fn header(self: Entry) []const u8 {
+        return self.as orelse default_header;
+    }
+
+    /// Only the default header carries a scheme. A header the author named
+    /// takes the value alone, which is what an API key header wants.
+    pub fn carriesBearer(self: Entry) bool {
+        return self.as == null;
     }
 };
 
@@ -95,6 +118,30 @@ pub fn variableIsWellFormed(name: []const u8) bool {
     return !(name[0] >= '0' and name[0] <= '9');
 }
 
+/// A header name holds what a header name may, so a name cannot close the
+/// header and open another one.
+pub fn headerIsWellFormed(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_header_bytes) return false;
+    if (name[0] == '-' or name[name.len - 1] == '-') return false;
+    for (name) |byte| {
+        const ok = (byte >= 'A' and byte <= 'Z') or (byte >= 'a' and byte <= 'z') or
+            (byte >= '0' and byte <= '9') or byte == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Whether a value may be written into a header at all. A credential holding
+/// a line break would write a header of its own, so one that does is not sent.
+pub fn headerValueIsSendable(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| {
+        // Visible ASCII and the space, which is what a header value holds.
+        if (byte < 0x20 or byte > 0x7e) return false;
+    }
+    return true;
+}
+
 pub const ParseError = error{
     OutOfMemory,
     InvalidSecrets,
@@ -120,6 +167,7 @@ pub const Diagnostic = struct {
         bind_unknown: []const u8,
         as_not_a_string,
         as_not_well_formed: []const u8,
+        as_not_a_header: []const u8,
         file_too_large: usize,
         read_failed: anyerror,
     };
@@ -131,6 +179,7 @@ pub const Diagnostic = struct {
             .to_not_well_formed,
             .bind_unknown,
             .as_not_well_formed,
+            .as_not_a_header,
             => |text| gpa.free(text),
             else => {},
         }
@@ -185,7 +234,7 @@ pub const Diagnostic = struct {
                 .{self.source},
             ),
             .bind_unknown => |text| try writer.print(
-                "{s}: an entry binds as \"{s}\", and this reader knows env and file",
+                "{s}: an entry binds as \"{s}\", and this reader knows env, file and header",
                 .{ self.source, text },
             ),
             .as_not_a_string => try writer.print(
@@ -195,6 +244,11 @@ pub const Diagnostic = struct {
             .as_not_well_formed => |text| try writer.print(
                 "{s}: \"{s}\" cannot name an environment variable. A name holds letters, digits " ++
                     "and underscore, and does not begin with a digit.",
+                .{ self.source, text },
+            ),
+            .as_not_a_header => |text| try writer.print(
+                "{s}: \"{s}\" cannot name a header. A name holds letters, digits and hyphen, " ++
+                    "and does not begin or end with one.",
                 .{ self.source, text },
             ),
             .file_too_large => |bound| try writer.print(
@@ -412,8 +466,15 @@ fn readEntry(
         return error.InvalidSecrets;
     }
 
+    // The rule for `as` is the bind's rule: a header name holds a hyphen,
+    // which an environment variable cannot.
     if (as) |named| {
-        if (!variableIsWellFormed(named)) {
+        if (bind == .header) {
+            if (!headerIsWellFormed(named)) {
+                _ = note(diag, source_name, .{ .as_not_a_header = try gpa.dupe(u8, named) });
+                return error.InvalidSecrets;
+            }
+        } else if (!variableIsWellFormed(named)) {
             _ = note(diag, source_name, .{ .as_not_well_formed = try gpa.dupe(u8, named) });
             return error.InvalidSecrets;
         }
@@ -662,4 +723,75 @@ test "the block comes off the disk, and a project with no file grants nothing" {
 
 test "a name a project could write cannot reach a name chock keeps for itself" {
     try testing.expect(!nameIsWellFormed("chock:signing"));
+}
+
+test "a secret may arrive in a header, and only the default header names a scheme" {
+    const gpa = testing.allocator;
+
+    var block = try parse(
+        gpa,
+        ".{ .secrets = .{ " ++
+            ".{ .name = \"NOTION_TOKEN\", .to = \"mcp.notion.*\", .bind = \"header\" }, " ++
+            ".{ .name = \"KEY\", .to = \"mcp.other.*\", .bind = \"header\", .as = \"X-Api-Key\" } " ++
+            "} }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    try testing.expectEqual(Bind.header, block.entries[0].bind);
+    try testing.expectEqualStrings("Authorization", block.entries[0].header());
+    try testing.expect(block.entries[0].carriesBearer());
+
+    try testing.expectEqualStrings("X-Api-Key", block.entries[1].header());
+    try testing.expect(!block.entries[1].carriesBearer());
+}
+
+test "the rule for as is the bind's own rule, so a hyphen is a header and never a variable" {
+    const gpa = testing.allocator;
+
+    var env_diag: ?Diagnostic = null;
+    defer if (env_diag) |*d| d.deinit(gpa);
+    try testing.expectError(error.InvalidSecrets, parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"A\", .to = \"exec.*\", .as = \"X-Api-Key\" } } }",
+        &env_diag,
+    ));
+    try testing.expect(env_diag.?.fault == .as_not_well_formed);
+
+    var header_diag: ?Diagnostic = null;
+    defer if (header_diag) |*d| d.deinit(gpa);
+    try testing.expectError(error.InvalidSecrets, parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"A\", .to = \"mcp.a.*\", .bind = \"header\", " ++
+            ".as = \"-leading\" } } }",
+        &header_diag,
+    ));
+    try testing.expect(header_diag.?.fault == .as_not_a_header);
+
+    var bind_diag: ?Diagnostic = null;
+    defer if (bind_diag) |*d| d.deinit(gpa);
+    try testing.expectError(error.InvalidSecrets, parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"A\", .to = \"mcp.a.*\", .bind = \"nope\" } } }",
+        &bind_diag,
+    ));
+    try testing.expect(bind_diag.?.fault == .bind_unknown);
+}
+
+test "a header name holds only what a header name may, and a value with a break is not sent" {
+    try testing.expect(headerIsWellFormed("Authorization"));
+    try testing.expect(headerIsWellFormed("X-Api-Key"));
+    try testing.expect(!headerIsWellFormed(""));
+    try testing.expect(!headerIsWellFormed("-leading"));
+    try testing.expect(!headerIsWellFormed("trailing-"));
+    try testing.expect(!headerIsWellFormed("has space"));
+    try testing.expect(!headerIsWellFormed("has:colon"));
+    try testing.expect(!headerIsWellFormed("under_score"));
+
+    try testing.expect(headerValueIsSendable("sk-abc123"));
+    try testing.expect(headerValueIsSendable("with a space"));
+    try testing.expect(!headerValueIsSendable(""));
+    try testing.expect(!headerValueIsSendable("a\r\nX-Other: b"));
+    try testing.expect(!headerValueIsSendable("a\nb"));
+    try testing.expect(!headerValueIsSendable("tab\there"));
 }

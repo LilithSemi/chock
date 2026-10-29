@@ -869,6 +869,28 @@ pub fn labelIsUsable(bytes: []const u8) bool {
     return true;
 }
 
+/// Writes `.<label>` for every label of `host`, the last label first, into
+/// `buffer` after `written` bytes. So a rule about a domain is a prefix of a
+/// rule about every name under it, and `net.fetch.com.example.*` reads as one.
+/// Null is a host this does not put in an action name, and the caller then has
+/// no key rather than a key that means something else.
+pub fn hostIntoReversed(buffer: []u8, written: usize, host: []const u8) ?usize {
+    var at = written;
+    var end = host.len;
+    while (end > 0) {
+        const start = if (std.mem.lastIndexOfScalar(u8, host[0..end], '.')) |dot| dot + 1 else 0;
+        const label = host[start..end];
+        if (!labelIsUsable(label)) return null;
+        if (at + 1 + label.len > buffer.len) return null;
+        buffer[at] = '.';
+        at += 1;
+        for (label, buffer[at..][0..label.len]) |from, *to| to.* = std.ascii.toLower(from);
+        at += label.len;
+        end = if (start == 0) 0 else start - 1;
+    }
+    return at;
+}
+
 const exact_score: u64 = 1 << 32;
 
 fn patternScore(pattern: ?[]const u8) u64 {

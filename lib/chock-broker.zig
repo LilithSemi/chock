@@ -25,6 +25,7 @@ pub const network = @import("chock-broker/network.zig");
 pub const serve = @import("chock-broker/serve.zig");
 
 pub const fetch = @import("chock-broker/fetch.zig");
+pub const mcp_remote = @import("chock-broker/mcp_remote.zig");
 
 pub const search = @import("chock-broker/search.zig");
 

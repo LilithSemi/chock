@@ -126,6 +126,7 @@ pub const Kind = enum {
     secret_used,
     network_summary,
     hook_run,
+    mcp_request,
     unknown,
 
     pub fn wireName(self: Kind) []const u8 {
@@ -175,6 +176,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .secret_used = "secret.used",
     .network_summary = "network.summary",
     .hook_run = "hook.run",
+    .mcp_request = "mcp.request",
     .unknown = "unknown",
 });
 
@@ -1017,6 +1019,26 @@ pub const DeviceExposed = struct {
 };
 
 /// A secret reached a tool call; the value is never recorded, only which secret, which tool, and when.
+/// One exchange with a remote MCP server: what was asked of it, where that
+/// went, and what came back. A local server speaks over pipes and writes none.
+pub const McpRequest = struct {
+    server: []const u8,
+    /// The host the request went to, as the policy approved it.
+    host: []const u8 = "",
+    /// `discover`, or the tool the call was about.
+    about: []const u8 = "",
+    /// Zero for an exchange that reached no server.
+    status: u16 = 0,
+    /// `answered`, `refused_by_policy`, `refused_by_address`, `redirected` or
+    /// `no_answer`.
+    outcome: []const u8,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 pub const SecretUsed = struct {
     name: []const u8,
     action: []const u8,
@@ -1200,6 +1222,7 @@ pub const Event = union(Kind) {
     secret_used: SecretUsed,
     network_summary: NetworkSummary,
     hook_run: HookRun,
+    mcp_request: McpRequest,
     unknown: UnknownEvent,
 
     pub fn jsonStringify(self: Event, jw: *std.json.Stringify) std.json.Stringify.Error!void {
@@ -2445,6 +2468,36 @@ test "a secret use records what reached which tool and never the value" {
     inline for (@typeInfo(SecretUsed).@"struct".field_names, @typeInfo(SecretUsed).@"struct".field_types) |field_name, _| {
         try std.testing.expect(!std.mem.eql(u8, field_name, "value"));
         try std.testing.expect(!std.mem.eql(u8, field_name, "secret"));
+    }
+}
+
+test "a remote MCP exchange records the destination beside what was asked of it" {
+    const gpa = std.testing.allocator;
+
+    const asked = Event{ .mcp_request = .{
+        .server = "notion",
+        .host = "mcp.notion.com",
+        .about = "search",
+        .status = 200,
+        .outcome = "answered",
+    } };
+
+    const text = try std.json.Stringify.valueAlloc(gpa, asked, .{});
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mcp.request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mcp.notion.com") != null);
+
+    const back = try std.json.parseFromSlice(Event, gpa, text, .{});
+    defer back.deinit();
+    try std.testing.expectEqualStrings("notion", back.value.mcp_request.server);
+    try std.testing.expectEqualStrings("answered", back.value.mcp_request.outcome);
+    try std.testing.expectEqual(@as(u16, 200), back.value.mcp_request.status);
+
+    // Asserts the shape holds no field a credential could travel in.
+    inline for (@typeInfo(McpRequest).@"struct".field_names, @typeInfo(McpRequest).@"struct".field_types) |field_name, _| {
+        try std.testing.expect(!std.mem.eql(u8, field_name, "header"));
+        try std.testing.expect(!std.mem.eql(u8, field_name, "secret"));
+        try std.testing.expect(!std.mem.eql(u8, field_name, "url"));
     }
 }
 

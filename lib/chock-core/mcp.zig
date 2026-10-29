@@ -39,14 +39,26 @@ pub const tool_segment = "tool";
 
 pub const network_segment = "network";
 
+pub const host_segment = "host";
+
+pub const max_host_bytes = 255;
+
 pub const Settings = struct {
     name: []const u8,
-    command: []const []const u8,
+    /// Empty for a server this host does not run.
+    command: []const []const u8 = &.{},
+    /// Empty for a server this host runs itself.
+    url: []const u8 = "",
+
+    pub fn isRemote(self: Settings) bool {
+        return self.url.len != 0;
+    }
 };
 
 const WireServer = struct {
     name: []const u8 = "",
     command: []const []const u8 = &.{},
+    url: []const u8 = "",
 };
 
 pub const ParseError = error{
@@ -65,7 +77,11 @@ pub const Diagnostic = union(enum) {
     not_a_struct_literal,
     too_many_servers: usize,
     server_name_unusable,
-    empty_command,
+    no_command_and_no_url,
+    command_and_url,
+    url_scheme_not_https,
+    url_carries_user_information,
+    url_not_usable,
     duplicate_server,
     file_too_large: usize,
     read_failed: anyerror,
@@ -109,8 +125,33 @@ pub const Diagnostic = union(enum) {
                     "it becomes part of a policy action.",
                 .{ file_name, max_name_bytes },
             ),
-            .empty_command => try writer.print(
-                "{s}: an mcp_servers entry names no command to run",
+            .no_command_and_no_url => try writer.print(
+                "{s}: an mcp_servers entry names neither a command nor a url, so there is no " ++
+                    "server to reach",
+                .{file_name},
+            ),
+            .command_and_url => try writer.print(
+                "{s}: an mcp_servers entry names both a command and a url, and an entry is one " ++
+                    "server or the other",
+                .{file_name},
+            ),
+            .url_scheme_not_https => try writer.print(
+                "{s}: an mcp_servers entry names a url whose scheme is not https. Only https " ++
+                    "reaches a remote server, because a credential and a tool result must not " ++
+                    "cross a network in the clear. A server on this machine is a command, and " ++
+                    "never a url.",
+                .{file_name},
+            ),
+            .url_carries_user_information => try writer.print(
+                "{s}: an mcp_servers entry names a url carrying user information before the " ++
+                    "host, which would send an Authorization header. Put the credential in the " ++
+                    "secrets block instead, with bind = \"header\".",
+                .{file_name},
+            ),
+            .url_not_usable => try writer.print(
+                "{s}: an mcp_servers entry names a url this reader cannot use. Give a whole " ++
+                    "URL, scheme first, such as \"https://example.com/mcp\", whose host holds " ++
+                    "letters, digits and hyphen.",
                 .{file_name},
             ),
             .duplicate_server => try writer.print(
@@ -146,9 +187,15 @@ pub fn shadowsBuiltIn(name: []const u8) bool {
 }
 
 comptime {
-    if (std.mem.eql(u8, tool_segment, network_segment)) @compileError(
-        "tool_segment and network_segment are the same word, so a tool a server names could " ++
-            "land on the rule about that server's network",
+    for (.{ network_segment, host_segment }) |other| {
+        if (std.mem.eql(u8, tool_segment, other)) @compileError(
+            "tool_segment and another segment are the same word, so a tool a server names " ++
+                "could land on a rule about that server itself",
+        );
+    }
+    if (std.mem.eql(u8, network_segment, host_segment)) @compileError(
+        "network_segment and host_segment are the same word, so the rule about a server's own " ++
+            "network and the rule about the host this reaches would be one rule",
     );
 
     for (@typeInfo(tools.Tool).@"enum".field_names, @typeInfo(tools.Tool).@"enum".field_values) |field_name, _| {
@@ -180,6 +227,78 @@ pub fn networkActionInto(buffer: []u8, server: []const u8) ?[]const u8 {
 
 pub const max_action_bytes = action_prefix.len + 1 + max_name_bytes + 1 +
     @max(tool_segment.len, network_segment.len) + 1 + max_name_bytes;
+
+/// A host reaches the action name one label at a time, so the bound is the
+/// host itself plus the dot each label already carries.
+pub const max_host_action_bytes = action_prefix.len + 1 + max_name_bytes + 1 +
+    host_segment.len + 1 + max_host_bytes;
+
+/// `mcp.<server>.host.<host, last label first>`, so a rule about a domain is a
+/// rule about every name under it. Null is a destination this builds no key
+/// for, and the caller then has no key rather than a key that means something
+/// else.
+pub fn hostActionInto(buffer: []u8, server: []const u8, host: []const u8) ?[]const u8 {
+    if (!nameIsUsable(server)) return null;
+    if (host.len == 0 or host.len > max_host_bytes) return null;
+
+    const opening = std.fmt.bufPrint(buffer, action_prefix ++ ".{s}." ++ host_segment, .{
+        server,
+    }) catch return null;
+    // The one writer, so this key and `net.fetch.<host>` cannot disagree about
+    // what a host looks like in an action name.
+    const written = chock_policy.table.hostIntoReversed(buffer, opening.len, host) orelse
+        return null;
+    return buffer[0..written];
+}
+
+pub const Remote = struct {
+    url: []const u8,
+    host: []const u8,
+    port: u16,
+};
+
+/// The destination an entry names, or null with the reason in `out`.
+pub fn remoteOf(
+    arena: std.mem.Allocator,
+    settings: Settings,
+    out: ?*?Diagnostic,
+) std.mem.Allocator.Error!?Remote {
+    const uri = std.Uri.parse(settings.url) catch {
+        _ = note(out, .url_not_usable);
+        return null;
+    };
+    if (!std.mem.eql(u8, uri.scheme, "https")) {
+        _ = note(out, .url_scheme_not_https);
+        return null;
+    }
+    if (uri.user != null or uri.password != null) {
+        _ = note(out, .url_carries_user_information);
+        return null;
+    }
+
+    const named = uri.host orelse {
+        _ = note(out, .url_not_usable);
+        return null;
+    };
+    const host = try named.toRawMaybeAlloc(arena);
+    if (host.len == 0 or host.len > max_host_bytes) {
+        _ = note(out, .url_not_usable);
+        return null;
+    }
+    // Checked here so a destination that could never take a policy key is a
+    // read fault, and never a server that starts and reaches nothing.
+    var buffer: [max_host_action_bytes]u8 = undefined;
+    if (hostActionInto(&buffer, settings.name, host) == null) {
+        _ = note(out, .url_not_usable);
+        return null;
+    }
+
+    return .{
+        .url = settings.url,
+        .host = host,
+        .port = uri.port orelse 443,
+    };
+}
 
 pub const Declared = struct {
     name: []const u8,
@@ -586,9 +705,19 @@ pub fn parse(
             _ = note(diag, .server_name_unusable);
             return error.InvalidMcpServers;
         }
-        if (one.command.len == 0) {
-            _ = note(diag, .empty_command);
+        if (one.command.len == 0 and one.url.len == 0) {
+            _ = note(diag, .no_command_and_no_url);
             return error.InvalidMcpServers;
+        }
+        if (one.command.len != 0 and one.url.len != 0) {
+            _ = note(diag, .command_and_url);
+            return error.InvalidMcpServers;
+        }
+        if (one.url.len != 0) {
+            const settings = Settings{ .name = one.name, .url = one.url };
+            if (try remoteOf(arena.allocator(), settings, diag) == null) {
+                return error.InvalidMcpServers;
+            }
         }
         for (wire[index + 1 ..]) |other| {
             if (!std.mem.eql(u8, one.name, other.name)) continue;
@@ -604,6 +733,7 @@ pub fn parse(
             gpa.free(one.name);
             for (one.command) |part| gpa.free(part);
             gpa.free(one.command);
+            gpa.free(one.url);
         }
         gpa.free(out);
     }
@@ -611,6 +741,7 @@ pub fn parse(
         slot.* = .{
             .name = try gpa.dupe(u8, one.name),
             .command = try copyStrings(gpa, one.command),
+            .url = try gpa.dupe(u8, one.url),
         };
         made += 1;
     }
@@ -954,11 +1085,107 @@ test "a block this host cannot honour is refused when the file is read, not on t
     try testing.expectEqualStrings("a_1-b", good[0].name);
 }
 
+test "an entry names a url instead of a command, and says which destination that is" {
+    const gpa = testing.allocator;
+
+    const settings = (try parse(
+        gpa,
+        \\.{
+        \\    .mcp_servers = .{
+        \\        .{ .name = "notion", .url = "https://mcp.notion.com/mcp" },
+        \\        .{ .name = "ported", .url = "https://mcp.example.com:8443/rpc" },
+        \\    },
+        \\}
+    ,
+        null,
+    )).?;
+    defer freeSettings(gpa, settings);
+
+    try testing.expect(settings[0].isRemote());
+    try testing.expectEqual(@as(usize, 0), settings[0].command.len);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const first = (try remoteOf(arena, settings[0], null)).?;
+    try testing.expectEqualStrings("mcp.notion.com", first.host);
+    try testing.expectEqual(@as(u16, 443), first.port);
+
+    const second = (try remoteOf(arena, settings[1], null)).?;
+    try testing.expectEqualStrings("mcp.example.com", second.host);
+    try testing.expectEqual(@as(u16, 8443), second.port);
+}
+
+test "a destination this host will not reach is refused when the file is read" {
+    const gpa = testing.allocator;
+
+    const cases = [_]struct { source: [:0]const u8, want: Diagnostic }{
+        .{
+            .source = ".{ .mcp_servers = .{ .{ .name = \"a\", .url = \"http://x.example.com/mcp\" } } }",
+            .want = .url_scheme_not_https,
+        },
+        .{
+            .source = ".{ .mcp_servers = .{ .{ .name = \"a\", " ++
+                ".url = \"https://who:what@x.example.com/mcp\" } } }",
+            .want = .url_carries_user_information,
+        },
+        .{
+            .source = ".{ .mcp_servers = .{ .{ .name = \"a\", .url = \"not a url\" } } }",
+            .want = .url_not_usable,
+        },
+        .{
+            .source = ".{ .mcp_servers = .{ .{ .name = \"a\", .url = \"https:///mcp\" } } }",
+            .want = .url_not_usable,
+        },
+        .{
+            .source = ".{ .mcp_servers = .{ .{ .name = \"a\", .command = .{\"p\"}, " ++
+                ".url = \"https://x.example.com/mcp\" } } }",
+            .want = .command_and_url,
+        },
+        .{
+            .source = ".{ .mcp_servers = .{ .{ .name = \"a\" } } }",
+            .want = .no_command_and_no_url,
+        },
+    };
+
+    for (cases) |one| {
+        var diag: ?Diagnostic = null;
+        defer if (diag) |*d| d.deinit(gpa);
+        try testing.expectError(error.InvalidMcpServers, parse(gpa, one.source, &diag));
+        const said = diag orelse return error.TestExpectedDiagnostic;
+        try testing.expectEqual(std.meta.activeTag(one.want), std.meta.activeTag(said));
+    }
+}
+
+test "a destination reaches the policy table as a host written last label first" {
+    var buffer: [max_host_action_bytes]u8 = undefined;
+
+    const action = hostActionInto(&buffer, "notion", "mcp.notion.com").?;
+    try testing.expectEqualStrings("mcp.notion.host.com.notion.mcp", action);
+    try testing.expect(chock_policy.table.patternIsWellFormed(action));
+
+    // A rule about the domain covers every name under it.
+    try testing.expect(chock_policy.table.patternMatches("mcp.notion.host.com.notion.*", action));
+    // It is not the rule about another server, nor about a tool.
+    try testing.expect(!chock_policy.table.patternMatches("mcp.other.*", action));
+
+    var second: [max_host_action_bytes]u8 = undefined;
+    const upper = hostActionInto(&second, "notion", "MCP.Notion.COM").?;
+    try testing.expectEqualStrings(action, upper);
+
+    try testing.expect(hostActionInto(&buffer, "a.b", "mcp.notion.com") == null);
+    try testing.expect(hostActionInto(&buffer, "notion", "") == null);
+    try testing.expect(hostActionInto(&buffer, "notion", "under_score.example.com") != null);
+    try testing.expect(hostActionInto(&buffer, "notion", "has space.example.com") == null);
+}
+
 fn freeSettings(gpa: std.mem.Allocator, settings: []const Settings) void {
     for (settings) |one| {
         gpa.free(one.name);
         for (one.command) |part| gpa.free(part);
         gpa.free(one.command);
+        gpa.free(one.url);
     }
     gpa.free(settings);
 }

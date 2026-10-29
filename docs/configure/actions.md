@@ -28,7 +28,7 @@ no `chock.zon` at all runs them without a prompt.
 | `git.<subcommand>` | one git subcommand | `allow` where it changes only the workspace |
 | `lsp.*` | starting a language server | `allow` |
 | `device.*` | a USB or serial device | none, so `ask` |
-| `mcp.*` | an MCP server and its tools | none, so `ask` |
+| `mcp.*` | an MCP server, its tools, and the host a remote one is reached at | none, so `ask` |
 | `plugin.*` | a plugin and its tools | none, so `ask` |
 
 A shipped default is read only when nothing in the project's own rules matches
@@ -504,6 +504,19 @@ the very next call.
 The `tool` segment is there so that a tool a third party names `network` cannot
 become a rule about `mcp.<server>.network`, which is a separate key about
 whether that server's process reaches a host at all.
+
+A server the project named by `url` instead of `command` is one somebody else
+runs, and the host Chock reaches it at is its own key:
+
+```zon
+.{ .action = "mcp.notion.host.com.notion.*", .decision = .allow },    // that domain, for that server
+```
+
+The host is written last label first, as it is in `net.fetch.<host>`, so a rule
+about a domain is a rule about every name under it. Only `allow` reaches a
+host, because a server starts before anybody can be asked. The key holds the
+server name, so a rule cannot authorise a host for a server it was not written
+for. [remote-mcp.md](../using/remote-mcp.md) has the rest of it.
 
 A plugin tool is also priced against each capability it declares, under that
 capability's own ordinary action name such as `fs.write`. A capability has to
