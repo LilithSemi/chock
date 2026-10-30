@@ -39,6 +39,8 @@ Start with [running.md](running.md) for a session end to end, and
 - [using/remote-mcp.md](using/remote-mcp.md) - reaching an MCP server somebody
   else runs: the three rules, the credential as a header, and the five things
   it refuses to do.
+- [using/style.md](using/style.md) - a tree-sitter query plus one bound, the
+  write it refuses before a byte lands, and why the project writes the rules.
 
 ## Configuring a project
 

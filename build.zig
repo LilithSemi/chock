@@ -215,6 +215,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_lock_tests = b.addRunArtifact(lock_tests);
     run_lock_tests.skip_foreign_checks = true;
+    // Run every time, for the reason the docs suite does: one of these tests
+    // reads every source file in the tree when it runs, so a file this binary
+    // does not import keeps the last answer it was given. A line that names
+    // standard error then passes here and fails in CI.
+    run_lock_tests.has_side_effects = true;
     test_step.dependOn(&run_lock_tests.step);
 
     // The daemon's control protocol over a real socket, carrying a real log.
@@ -1537,6 +1542,41 @@ pub fn build(b: *std.Build) void {
     run_mcp_remote_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_mcp_remote_tests.step);
 
+    // The **real tree-sitter command** against a real grammar, driven by the
+    // production argument list and the production reader. See
+    // test/core/ast_real.zig for the half a captured output sample cannot keep
+    // honest.
+    //
+    // **Not Linux only**: the test runs the program plainly, because a sandbox
+    // cannot nest inside CI, and the command needs none to parse a file.
+    //
+    // All three are found here and never at test time, and null is an
+    // ordinary answer: the dev shell puts the command on this PATH and both
+    // directories in this environment, and the package build has none of
+    // them. pkgs/chock/default.nix names them.
+    const tree_sitter_path = b.findProgram(.{ .names = &.{"tree-sitter"} });
+    const parsers_dir = b.graph.environ_map.get("TREE_SITTER_PARSERS");
+    const ast_module_dir = b.graph.environ_map.get("CHOCK_PARSER_MODULES");
+
+    const ast_real_path_options = b.addOptions();
+    ast_real_path_options.addOption(?[]const u8, "tree_sitter_path", tree_sitter_path);
+    ast_real_path_options.addOption(?[]const u8, "parsers_dir", parsers_dir);
+
+    const ast_real_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/core/ast_real.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chock-core", .module = chock_core },
+                .{ .name = "ast_real_path", .module = ast_real_path_options.createModule() },
+            },
+        }),
+    });
+    const run_ast_real_tests = b.addRunArtifact(ast_real_tests);
+    run_ast_real_tests.skip_foreign_checks = true;
+    test_step.dependOn(&run_ast_real_tests.step);
+
     // One subagent, as a real second process with a log of its own. A
     // subagent that is not a process is not a subagent: `Sandbox.spawn` calls
     // `fork`, and `fork` carries only the calling thread, so an agent tree
@@ -1677,9 +1717,10 @@ pub fn build(b: *std.Build) void {
     //
     // **What that must not cost, and does not:**
     //
-    // * `src/plugin-host.zig` is still the one and only file in this project
-    //   that names an engine. Nothing else imports `vulcan-wasm`, and the
-    //   `chock` binary reaches it through that file alone.
+    // * `src/plugin-host.zig` and `src/ast_engine.zig` are the only files in
+    //   this project that name an engine: a plugin gets a process of its own
+    //   and a style rule's parser runs in this one. Nothing else imports
+    //   `vulcan-wasm`.
     // * `chock-core` still compiles with no engine at all, on every target.
     //   It holds every rule a plugin is held to, over the `plugin_engine.Engine`
     //   seam, and it does not import this.
@@ -1928,6 +1969,46 @@ pub fn build(b: *std.Build) void {
             null,
     });
     b.installArtifact(exe);
+
+    // Both parsers over one file, which needs the module the dev shell builds.
+    // The module directory is the gate, the way the kernel path gates the
+    // guest: a shell without it does not build this test, because the engine
+    // compiles every function in the module before the first answer, and that
+    // is minutes for a debug build.
+    if (ast_module_dir) |module_dir| {
+        const ast_agree_path_options = b.addOptions();
+        ast_agree_path_options.addOption(?[]const u8, "tree_sitter_path", tree_sitter_path);
+        ast_agree_path_options.addOption(?[]const u8, "parsers_dir", parsers_dir);
+        ast_agree_path_options.addOption([]const u8, "module_dir", module_dir);
+        // The engine, in the one test that puts it beside the command. This is
+        // the same file `chock` builds, so the two parsers under test are the
+        // shipped ones.
+        const ast_engine_module = b.createModule(.{
+            .root_source_file = b.path("src/ast_engine.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chock-core", .module = chock_core },
+                .{ .name = "vulcan-wasm", .module = vulcan.module("vulcan-wasm") },
+            },
+        });
+        const ast_agree_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/core/ast_agree.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "chock-core", .module = chock_core },
+                    .{ .name = "chock-policy", .module = chock_policy },
+                    .{ .name = "ast_engine", .module = ast_engine_module },
+                    .{ .name = "ast_real_path", .module = ast_agree_path_options.createModule() },
+                },
+            }),
+        });
+        const run_ast_agree_tests = b.addRunArtifact(ast_agree_tests);
+        run_ast_agree_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_ast_agree_tests.step);
+    }
 
     // The tests of `src/vmm.zig` are the drift guard: they name every Mirage
     // declaration this file's copy of the setup reaches, so an upgrade that moves
@@ -2250,6 +2331,12 @@ pub fn build(b: *std.Build) void {
     // They read this machine's own checkout, so a build for another machine
     // has nothing to read.
     run_docs_tests.skip_foreign_checks = true;
+    // **Run every time, because the pages are not inputs the build can see.**
+    // They are read when this runs and not when it is built, so a doc edit
+    // leaves this binary alone: without this, the build has nothing to
+    // re-run and an edited page keeps the last answer it was given. The
+    // suite reads a few files and takes no time worth saving.
+    run_docs_tests.has_side_effects = true;
     test_step.dependOn(&run_docs_tests.step);
 
     // test/broker/askpass.zig drives the askpass helper with the git on this

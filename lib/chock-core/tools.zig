@@ -20,6 +20,9 @@ const tool_secrets_mod = @import("tool_secrets.zig");
 const scratchpad = @import("scratchpad.zig");
 const tasks = @import("tasks.zig");
 const handback = @import("handback.zig");
+const ast = @import("ast.zig");
+const style_mod = @import("style.zig");
+const ast_command = @import("ast_command.zig");
 
 pub const Definition = chock_provider.message.ToolDefinition;
 
@@ -864,8 +867,8 @@ pub const Registry = struct {
             .list_directory => listDirectory(allocator, io, env, config, call, timeout_ns),
             .glob => globFiles(allocator, io, env, config, call, timeout_ns),
             .grep => grepFiles(allocator, io, env, config, call, timeout_ns),
-            .write_file => writeFile(allocator, io, env, config, call, timeout_ns),
-            .edit_file => editFile(allocator, io, env, config, call, timeout_ns),
+            .write_file => writeFile(allocator, io, env, config, call, timeout_ns, context),
+            .edit_file => editFile(allocator, io, env, config, call, timeout_ns, context),
             .run_command => runCommand(allocator, io, env, config, call, context),
             .read_guidance => readGuidance(allocator, call),
             .read_skill => readSkill(allocator, call, context),
@@ -1028,6 +1031,9 @@ pub const Context = struct {
     /// server runs for longer than the call that started it, and a foreground
     /// call holds the turn until it ends.
     serve: ?chock_net.links.ServeSource = null,
+    /// The project's style rules and the parser that answers them. Null leaves
+    /// every write alone.
+    style: ?*StyleGate = null,
     supervisor_audit: ?*palisade.Sandbox.SupervisorAudit = null,
     syscall_audit: ?*palisade.Sandbox.SyscallAudit = null,
 };
@@ -2372,6 +2378,7 @@ fn writeFile(
     workspace_config: chock_net.Call,
     call: ToolCall,
     timeout_ns: u64,
+    context: Context,
 ) Error!ToolResult {
     const parsed = std.json.parseFromSlice(WriteFileArgs, allocator, call.arguments, .{
         .ignore_unknown_fields = true,
@@ -2396,6 +2403,7 @@ fn writeFile(
         env,
         workspace_config,
         call,
+        context,
         .{
             .path = parsed.value.path,
             .content = parsed.value.content,
@@ -2416,6 +2424,7 @@ fn editFile(
     workspace_config: chock_net.Call,
     call: ToolCall,
     timeout_ns: u64,
+    context: Context,
 ) Error!ToolResult {
     const parsed = std.json.parseFromSlice(EditFileArgs, allocator, call.arguments, .{
         .ignore_unknown_fields = true,
@@ -2521,6 +2530,7 @@ fn editFile(
         env,
         workspace_config,
         call,
+        context,
         .{
             .path = args.path,
             .content = edited,
@@ -2534,6 +2544,301 @@ fn editFile(
     );
 }
 
+/// Where a rule's outcome is recorded. The session owns the log, so the gate
+/// hands it a row and never writes one itself.
+pub const StyleNote = struct {
+    ptr: *anyopaque,
+    record: *const fn (ptr: *anyopaque, checked: chock_proto.event.StyleCheck) void,
+
+    pub fn write(self: StyleNote, checked: chock_proto.event.StyleCheck) void {
+        self.record(self.ptr, checked);
+    }
+};
+
+/// What the gate needs to answer a write. The session holds one, because the
+/// block is read once and a parser can keep a warm module.
+pub const StyleGate = struct {
+    block: chock_policy.style.Block,
+    parser: ast.Parser,
+    /// Set when a language had no grammar on this host, so the session can
+    /// name it once.
+    missing: bool = false,
+    /// False when `style.parse` is not allowed, which leaves every write alone.
+    permitted: bool = true,
+    /// Where a rule reads its query from.
+    project_root: []const u8 = "",
+    note: ?StyleNote = null,
+};
+
+/// What the gate says about a write, and whether the write still happens.
+const Said = struct {
+    text: []u8,
+    refuses: bool,
+};
+
+/// Which writes a rule can refuse. A note the agent keeps for itself is not
+/// the project's source, so `write_memory` reaches no rule.
+fn gateFor(tool_name: []const u8, context: Context) ?*StyleGate {
+    const gate = context.style orelse return null;
+    if (!gate.permitted) return null;
+    const tool = std.meta.stringToEnum(Tool, tool_name) orelse return null;
+    return switch (tool) {
+        .write_file, .edit_file => gate,
+        else => null,
+    };
+}
+
+/// Run every rule over the content the write would leave behind. A rule that
+/// refuses answers at once, because a model fixes one thing a turn, and a rule
+/// that only reports is collected and the write goes on.
+///
+/// A rule that gets no answer refuses. A write Chock could not check is a
+/// write it cannot say anything about.
+fn styleSaid(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    gate: *StyleGate,
+    tool_name: []const u8,
+    path: []const u8,
+    content: []const u8,
+    timeout_ns: u64,
+) Error!?Said {
+    if (gate.block.rules.len == 0) return null;
+    const language = gate.block.languageFor(path) orelse return null;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const deadline = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{
+        .raw = .fromNanoseconds(@intCast(timeout_ns)),
+        .clock = .awake,
+    });
+    const file_lines = style_mod.linesIn(content);
+
+    var reported: std.ArrayList(u8) = .empty;
+    defer reported.deinit(allocator);
+
+    for (gate.block.rules) |rule| {
+        const query_text = queryText(arena, io, gate.project_root, rule.query) catch |err| {
+            if (gate.note) |note| note.write(.{
+                .rule = rule.name,
+                .path = path,
+                .language = language,
+                .outcome = "no_query",
+            });
+            return .{ .refuses = true, .text = try std.fmt.allocPrint(
+                allocator,
+                "{s} was not written: the style rule {s} reads its query from {s}, and that " ++
+                    "file could not be read ({s}). A write Chock cannot check is a write it " ++
+                    "will not make. Tell the user.",
+                .{ tool_name, rule.name, rule.query, @errorName(err) },
+            ) };
+        };
+
+        const matches = gate.parser.run(arena, io, .{
+            .language = language,
+            .source = content,
+            .query_text = query_text,
+            .deadline = deadline,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // No grammar for this language is a rule that did not run, and a
+            // write Chock never checked is not a write it caught breaking a
+            // rule. The row says so and the session says it once.
+            error.LanguageNotKnown => {
+                gate.missing = true;
+                if (gate.note) |note| note.write(.{
+                    .rule = rule.name,
+                    .path = path,
+                    .language = language,
+                    .outcome = "no_parser",
+                });
+                continue;
+            },
+            else => {
+                if (gate.note) |note| note.write(.{
+                    .rule = rule.name,
+                    .path = path,
+                    .language = language,
+                    .outcome = "no_answer",
+                });
+                return .{ .refuses = true, .text = try std.fmt.allocPrint(
+                    allocator,
+                    "{s} was not written: the style rule {s} did not finish its check ({s}). " ++
+                        "A write Chock cannot check is a write it will not make. Tell the user.",
+                    .{ tool_name, rule.name, @errorName(err) },
+                ) };
+            },
+        };
+
+        const verdict = try style_mod.verdictFor(arena, rule, matches, file_lines);
+        if (gate.note) |note| note.write(.{
+            .rule = rule.name,
+            .path = path,
+            .language = language,
+            .count = @intCast(matches.len),
+            .line = verdict.first_line,
+            .outcome = if (verdict.permitted)
+                "permitted"
+            else if (verdict.lands)
+                "reported"
+            else
+                "refused",
+        });
+        if (verdict.permitted) continue;
+
+        const said = try style_mod.saidAbout(arena, tool_name, rule, verdict);
+        if (!verdict.lands) return .{ .refuses = true, .text = try allocator.dupe(u8, said) };
+        try reported.appendSlice(allocator, said);
+        try reported.append(allocator, '\n');
+    }
+
+    if (reported.items.len == 0) return null;
+    return .{ .refuses = false, .text = try reported.toOwnedSlice(allocator) };
+}
+
+fn queryText(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    query: []const u8,
+) ![]const u8 {
+    const at = if (project_root.len == 0)
+        query
+    else
+        try std.fs.path.join(arena, &.{ project_root, query });
+    return std.Io.Dir.cwd().readFileAlloc(io, at, arena, .limited(ast.max_query_bytes));
+}
+
+/// Where a staged file is bound for the parser program, under the one prefix
+/// Chock owns inside the sandbox.
+pub const style_in_dir = chock_net.runtime_prefix ++ "/style-in";
+
+/// The source, the query and an empty configuration.
+pub const max_style_staged: usize = 3;
+
+/// The command parser's two needs, answered with the machinery every other
+/// tool program runs through: a file staged on the host and bound read only,
+/// and a program run confined.
+pub const StyleSpawn = struct {
+    gpa: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    config: chock_net.Call,
+    /// Bound read only, so the grammar a rule names is the only one the
+    /// command can load.
+    parsers_dir: []const u8 = "",
+    held: [max_style_staged]Held = undefined,
+    count: usize = 0,
+
+    const Held = struct {
+        staged: Staged,
+        inside: []u8,
+    };
+
+    pub fn spawn(self: *StyleSpawn) ast_command.Spawn {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn deinit(self: *StyleSpawn, io: std.Io) void {
+        self.release(io);
+        self.* = undefined;
+    }
+
+    const vtable = ast_command.Spawn.VTable{ .stage = stageFn, .run = runFn };
+
+    fn release(self: *StyleSpawn, io: std.Io) void {
+        for (self.held[0..self.count]) |*one| {
+            one.staged.deinit(self.gpa, io);
+            self.gpa.free(one.inside);
+        }
+        self.count = 0;
+    }
+
+    fn stageFn(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        io: std.Io,
+        bytes: []const u8,
+    ) ast_command.Error![]const u8 {
+        _ = arena;
+        const self: *StyleSpawn = @ptrCast(@alignCast(ptr));
+        if (self.count == max_style_staged) return error.Staging;
+
+        var staged = stageContent(self.gpa, io, self.env, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.StagingFailed => return error.Staging,
+        };
+        errdefer staged.deinit(self.gpa, io);
+
+        const inside = if (palisade.Sandbox.expresses.moved_paths)
+            try std.fmt.allocPrint(self.gpa, style_in_dir ++ "/{d}", .{self.count})
+        else
+            try self.gpa.dupe(u8, staged.host_path);
+
+        self.held[self.count] = .{ .staged = staged, .inside = inside };
+        self.count += 1;
+        return inside;
+    }
+
+    fn runFn(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        io: std.Io,
+        argv: []const []const u8,
+        deadline: std.Io.Clock.Timestamp,
+    ) ast_command.Error!ast_command.Output {
+        const self: *StyleSpawn = @ptrCast(@alignCast(ptr));
+        // The staged files are this one run's, so they go when it ends.
+        defer self.release(io);
+
+        var mounts: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
+        var rules: std.ArrayList(palisade.Sandbox.Rule) = .empty;
+        for (self.held[0..self.count]) |one| {
+            try mounts.append(arena, .{ .bind = .{
+                .source = one.staged.host_path,
+                .target = one.inside,
+                .read_only = true,
+            } });
+            try rules.append(arena, .{
+                .path = one.inside,
+                .access = palisade.linux.landlock.AccessFs.read_only_file,
+            });
+        }
+        if (self.parsers_dir.len != 0) {
+            try mounts.append(arena, .{ .bind = .{
+                .source = self.parsers_dir,
+                .target = self.parsers_dir,
+                .read_only = true,
+            } });
+            try rules.append(arena, .{
+                .path = self.parsers_dir,
+                .access = palisade.linux.landlock.AccessFs.read_only,
+            });
+        }
+
+        const captured = (fixedProgram(self.gpa, io, self.env, self.config, .{
+            .argv = argv,
+            .extra_mounts = mounts.items,
+            .extra_rules = rules.items,
+            .keep_bytes = ast_command.max_output_bytes,
+            .timeout_ns = leftUntil(io, deadline),
+        }) catch return error.ParserFailed) orelse return error.ParserFailed;
+        defer self.gpa.free(captured.output);
+
+        return .{
+            .text = try arena.dupe(u8, captured.output),
+            .ok = isSuccess(captured, null),
+            .timed_out = captured.timed_out,
+        };
+    }
+};
+
+fn leftUntil(io: std.Io, deadline: std.Io.Clock.Timestamp) u64 {
+    const now = std.Io.Clock.Timestamp.now(io, .awake);
+    if (!now.compare(.lt, deadline)) return 0;
+    return @intCast(@max(0, now.durationTo(deadline).raw.toNanoseconds()));
+}
 const Put = struct {
     path: []const u8,
     content: []const u8,
@@ -2548,6 +2853,7 @@ fn putContent(
     env: *const std.process.Environ.Map,
     workspace_config: chock_net.Call,
     call: ToolCall,
+    context: Context,
     put: Put,
     owned_note: []u8,
 ) Error!ToolResult {
@@ -2555,6 +2861,16 @@ fn putContent(
     const content = put.content;
     const timeout_ns = put.timeout_ns;
     defer allocator.free(owned_note);
+
+    // Before anything is staged, so a refusal has nothing to undo.
+    var reported_text: ?[]u8 = null;
+    defer if (reported_text) |text| allocator.free(text);
+    if (gateFor(call.tool, context)) |gate| {
+        if (try styleSaid(allocator, io, gate, call.tool, path, content, timeout_ns)) |said| {
+            if (said.refuses) return toolErrorResult(allocator, call, said.text);
+            reported_text = said.text;
+        }
+    }
 
     var staged = stageContent(allocator, io, env, content) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -2607,7 +2923,10 @@ fn putContent(
     allocator.free(copied.output);
     return .{
         .call_id = try allocator.dupe(u8, call.call_id),
-        .output = try allocator.dupe(u8, owned_note),
+        .output = if (reported_text) |said|
+            try std.fmt.allocPrint(allocator, "{s}{s}", .{ owned_note, said })
+        else
+            try allocator.dupe(u8, owned_note),
         .is_error = false,
         .truncated = false,
     };
@@ -2867,6 +3186,7 @@ fn writeMemory(
         env,
         workspace_config,
         call,
+        context,
         .{
             .path = in_sandbox,
             .content = text,
@@ -5981,4 +6301,294 @@ test "a command may ask for less time than the session's limit, and never for mo
     try std.testing.expectEqual(session, timeoutFor(600_000, session));
     try std.testing.expectEqual(session, timeoutFor(0, session));
     try std.testing.expectEqual(session, timeoutFor(-1, session));
+}
+
+const FakeParser = struct {
+    answer: ast.Error!ast.Matches,
+    asked: usize = 0,
+    language: []const u8 = "",
+
+    fn answerFor(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        io: std.Io,
+        query: ast.Query,
+    ) ast.Error!ast.Matches {
+        _ = arena;
+        _ = io;
+        const self: *FakeParser = @ptrCast(@alignCast(ptr));
+        self.asked += 1;
+        self.language = query.language;
+        return self.answer;
+    }
+
+    fn parser(self: *FakeParser) ast.Parser {
+        return .{ .ptr = self, .vtable = &.{ .run = answerFor } };
+    }
+};
+
+const StyleRows = struct {
+    gpa: std.mem.Allocator,
+    rows: std.ArrayList(chock_proto.event.StyleCheck) = .empty,
+
+    fn deinit(self: *StyleRows) void {
+        self.rows.deinit(self.gpa);
+    }
+
+    fn record(ptr: *anyopaque, checked: chock_proto.event.StyleCheck) void {
+        const self: *StyleRows = @ptrCast(@alignCast(ptr));
+        self.rows.append(self.gpa, checked) catch {};
+    }
+
+    fn note(self: *StyleRows) StyleNote {
+        return .{ .ptr = self, .record = record };
+    }
+};
+
+const StyleFixture = struct {
+    tmp: std.testing.TmpDir,
+    root: []u8,
+
+    fn init(gpa: std.mem.Allocator) !StyleFixture {
+        var tmp = std.testing.tmpDir(.{});
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = "comments.scm",
+            .data = "(comment) @c\n",
+        });
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const length = try tmp.dir.realPath(std.testing.io, &buffer);
+        return .{ .tmp = tmp, .root = try gpa.dupe(u8, buffer[0..length]) };
+    }
+
+    fn deinit(self: *StyleFixture, gpa: std.mem.Allocator) void {
+        gpa.free(self.root);
+        self.tmp.cleanup();
+    }
+};
+
+fn zigBlock(rules: []const chock_policy.style.Rule) chock_policy.style.Block {
+    return .{
+        .grammars = &.{.{ .language = "zig", .extensions = &.{".zig"} }},
+        .rules = rules,
+    };
+}
+
+test "a rule the content breaks refuses the write before anything is staged" {
+    const allocator = std.testing.allocator;
+    var fixture = try StyleFixture.init(allocator);
+    defer fixture.deinit(allocator);
+
+    var rows = StyleRows{ .gpa = allocator };
+    defer rows.deinit();
+
+    const eleven = [_]ast.Match{.{
+        .capture = "c",
+        .start_line = 0,
+        .start_column = 0,
+        .end_line = 10,
+        .end_column = 1,
+    }};
+    var fake = FakeParser{ .answer = &eleven };
+
+    var gate = StyleGate{
+        .block = zigBlock(&.{.{
+            .name = "comment-block",
+            .query = "comments.scm",
+            .bound = .{ .max_lines = 10 },
+        }}),
+        .parser = fake.parser(),
+        .project_root = fixture.root,
+        .note = rows.note(),
+    };
+
+    const said = (try styleSaid(
+        allocator,
+        std.testing.io,
+        &gate,
+        "write_file",
+        "src/main.zig",
+        "one\ntwo\n",
+        std.time.ns_per_s,
+    )).?;
+    defer allocator.free(said.text);
+
+    try std.testing.expect(said.refuses);
+    try std.testing.expect(std.mem.indexOf(u8, said.text, "comment-block") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.text, "11 lines") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.text, "first at line 1") != null);
+    // The query reached the parser under the language the extension names.
+    try std.testing.expectEqualStrings("zig", fake.language);
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    try std.testing.expectEqualStrings("refused", rows.rows.items[0].outcome);
+}
+
+test "a reported rule lets the write land and still names the rule" {
+    const allocator = std.testing.allocator;
+    var fixture = try StyleFixture.init(allocator);
+    defer fixture.deinit(allocator);
+
+    var rows = StyleRows{ .gpa = allocator };
+    defer rows.deinit();
+
+    const eleven = [_]ast.Match{.{
+        .capture = "c",
+        .start_line = 4,
+        .start_column = 0,
+        .end_line = 14,
+        .end_column = 1,
+    }};
+    var fake = FakeParser{ .answer = &eleven };
+
+    var gate = StyleGate{
+        .block = zigBlock(&.{.{
+            .name = "comment-block",
+            .query = "comments.scm",
+            .bound = .{ .max_lines = 10 },
+            .decision = .report,
+        }}),
+        .parser = fake.parser(),
+        .project_root = fixture.root,
+        .note = rows.note(),
+    };
+
+    const said = (try styleSaid(
+        allocator,
+        std.testing.io,
+        &gate,
+        "write_file",
+        "src/main.zig",
+        "one\ntwo\n",
+        std.time.ns_per_s,
+    )).?;
+    defer allocator.free(said.text);
+
+    try std.testing.expect(!said.refuses);
+    try std.testing.expect(std.mem.indexOf(u8, said.text, "broke the style rule comment-block") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.text, "first at line 5") != null);
+    try std.testing.expectEqualStrings("reported", rows.rows.items[0].outcome);
+}
+
+test "a parser that will not answer refuses the write rather than passing it" {
+    const allocator = std.testing.allocator;
+    var fixture = try StyleFixture.init(allocator);
+    defer fixture.deinit(allocator);
+
+    var rows = StyleRows{ .gpa = allocator };
+    defer rows.deinit();
+
+    var fake = FakeParser{ .answer = error.Late };
+    var gate = StyleGate{
+        .block = zigBlock(&.{.{
+            .name = "comment-block",
+            .query = "comments.scm",
+            .bound = .{ .max_lines = 10 },
+        }}),
+        .parser = fake.parser(),
+        .project_root = fixture.root,
+        .note = rows.note(),
+    };
+
+    const said = (try styleSaid(
+        allocator,
+        std.testing.io,
+        &gate,
+        "write_file",
+        "src/main.zig",
+        "one\n",
+        std.time.ns_per_s,
+    )).?;
+    defer allocator.free(said.text);
+
+    try std.testing.expect(said.refuses);
+    try std.testing.expect(std.mem.indexOf(u8, said.text, "did not finish") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.text, "Late") != null);
+    try std.testing.expectEqualStrings("no_answer", rows.rows.items[0].outcome);
+}
+
+test "a rule whose query cannot be read refuses the write too" {
+    const allocator = std.testing.allocator;
+    var fixture = try StyleFixture.init(allocator);
+    defer fixture.deinit(allocator);
+
+    var fake = FakeParser{ .answer = &.{} };
+    var gate = StyleGate{
+        .block = zigBlock(&.{.{
+            .name = "comment-block",
+            .query = "nowhere.scm",
+            .bound = .{ .max_lines = 10 },
+        }}),
+        .parser = fake.parser(),
+        .project_root = fixture.root,
+    };
+
+    const said = (try styleSaid(
+        allocator,
+        std.testing.io,
+        &gate,
+        "write_file",
+        "src/main.zig",
+        "one\n",
+        std.time.ns_per_s,
+    )).?;
+    defer allocator.free(said.text);
+
+    try std.testing.expect(said.refuses);
+    try std.testing.expect(std.mem.indexOf(u8, said.text, "nowhere.scm") != null);
+    try std.testing.expectEqual(@as(usize, 0), fake.asked);
+}
+
+test "a file no grammar covers is written with no rule counted" {
+    const allocator = std.testing.allocator;
+    var fixture = try StyleFixture.init(allocator);
+    defer fixture.deinit(allocator);
+
+    var rows = StyleRows{ .gpa = allocator };
+    defer rows.deinit();
+
+    var fake = FakeParser{ .answer = &.{} };
+    var gate = StyleGate{
+        .block = zigBlock(&.{.{
+            .name = "comment-block",
+            .query = "comments.scm",
+            .bound = .{ .max_lines = 10 },
+        }}),
+        .parser = fake.parser(),
+        .project_root = fixture.root,
+        .note = rows.note(),
+    };
+
+    try std.testing.expect(null == try styleSaid(
+        allocator,
+        std.testing.io,
+        &gate,
+        "write_file",
+        "notes.md",
+        "one\n",
+        std.time.ns_per_s,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), fake.asked);
+    try std.testing.expectEqual(@as(usize, 0), rows.rows.items.len);
+}
+
+test "write_memory is not a project file, so no rule applies to it" {
+    var fake = FakeParser{ .answer = &.{} };
+    var gate = StyleGate{
+        .block = zigBlock(&.{.{
+            .name = "comment-block",
+            .query = "comments.scm",
+            .bound = .{ .max_lines = 10 },
+        }}),
+        .parser = fake.parser(),
+    };
+
+    // The three callers of putContent, and only the two that write the
+    // project's own files reach a rule.
+    try std.testing.expect(gateFor("write_file", .{ .style = &gate }) != null);
+    try std.testing.expect(gateFor("edit_file", .{ .style = &gate }) != null);
+    try std.testing.expectEqual(@as(?*StyleGate, null), gateFor("write_memory", .{ .style = &gate }));
+
+    // A session with no block, and a session whose policy refuses the action.
+    try std.testing.expectEqual(@as(?*StyleGate, null), gateFor("write_file", .{}));
+    gate.permitted = false;
+    try std.testing.expectEqual(@as(?*StyleGate, null), gateFor("write_file", .{ .style = &gate }));
 }

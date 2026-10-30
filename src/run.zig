@@ -20,6 +20,7 @@ const vmm = @import("chock-vmm");
 const subagent = chock_core.subagent;
 
 const approval = @import("approval.zig");
+const ast_engine = @import("ast_engine.zig");
 const clock = @import("clock.zig");
 const sessions_cmd = @import("sessions.zig");
 const tty = @import("tty.zig");
@@ -761,6 +762,7 @@ const Started = struct {
     nix_caps: chock_policy.nix.Resolved,
     search: chock_policy.search.Search,
     secrets: chock_policy.secrets.Block,
+    style: chock_policy.style.Block,
     store: chock_auth.store.Store,
     search_credential: ?[]const u8,
     backing: *chock_proto.storage.JsonLines,
@@ -1400,6 +1402,7 @@ fn start(
     const search_credential = try loadSearchCredential(arena, io, store, search);
 
     const project_secrets = try resolveSecrets(arena, io, project_root);
+    const project_style = try resolveStyle(arena, io, project_root);
 
     const redaction = try redactionFor(
         arena,
@@ -1935,6 +1938,7 @@ fn start(
         .nix_caps = nix_caps,
         .search = search,
         .secrets = project_secrets,
+        .style = project_style,
         .store = store,
         .search_credential = search_credential,
         .backing = backing,
@@ -2538,6 +2542,24 @@ fn resolveSecrets(
     };
 }
 
+fn resolveStyle(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+) StartError!chock_policy.style.Block {
+    var diag: ?chock_policy.style.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+
+    return chock_policy.style.load(arena, io, project_root, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (diag) |*d| {
+            tty.print(.err, "chock run: the style block could not be read: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the style block could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
+}
 fn resolveSearch(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -5673,6 +5695,8 @@ const ToolNetwork = struct {
 const GiveLockedToAll = struct {
     network: *ToolNetwork,
     mcp: *McpState,
+    style: *StyleState,
+    io: std.Io,
     plugins: *chock_core.plugin.Session,
     git: *GitToolRunner,
     nix: *NixBuildToolRunner,
@@ -5691,6 +5715,7 @@ const GiveLockedToAll = struct {
         giveLockedToAskers(self.mcp, self.plugins, self.git, self.nix, self.secrets, locked);
         self.mcp.giveLocked(locked);
         self.server_secrets.giveLocked(locked);
+        self.style.giveLocked(locked, self.io);
     }
 };
 
@@ -8639,6 +8664,302 @@ fn policyChain(
     return chain;
 }
 
+/// The project's style rules for a session: the block, the parser that answers
+/// them, and the rows each write left behind.
+const StyleState = struct {
+    gpa: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    rows: std.ArrayList(Row) = .empty,
+    spawn: chock_core.tools.StyleSpawn = undefined,
+    command: chock_core.ast_command.Session = undefined,
+    wasm: ast_engine.Session = undefined,
+    gate: chock_core.tools.StyleGate = undefined,
+    /// Which parser was built, which is the only thing with anything to
+    /// release.
+    engine: ?chock_policy.style.Which = null,
+    /// Set once the session has named a language it has no grammar for.
+    said_missing: bool = false,
+
+    /// The rule's name and the language live as long as the block, and the
+    /// outcome is a word this build owns. The path came in with a tool call,
+    /// so it is the one thing a row has to keep.
+    const Row = struct {
+        rule: []const u8,
+        path: []u8,
+        language: []const u8,
+        count: u32,
+        line: u32,
+        outcome: []const u8,
+    };
+
+    fn init(gpa: std.mem.Allocator) StyleState {
+        return .{ .gpa = gpa, .arena = .init(gpa) };
+    }
+
+    fn deinit(self: *StyleState, io: std.Io) void {
+        for (self.rows.items) |one| self.gpa.free(one.path);
+        self.rows.deinit(self.gpa);
+        if (self.engine) |which| switch (which) {
+            .command => self.spawn.deinit(io),
+            .wasm => self.wasm.deinit(),
+        };
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    fn note(self: *StyleState) chock_core.tools.StyleNote {
+        return .{ .ptr = self, .record = recordFn };
+    }
+
+    fn recordFn(ptr: *anyopaque, checked: chock_proto.event.StyleCheck) void {
+        const self: *StyleState = @ptrCast(@alignCast(ptr));
+        const path = self.gpa.dupe(u8, checked.path) catch return;
+        self.rows.append(self.gpa, .{
+            .rule = checked.rule,
+            .path = path,
+            .language = checked.language,
+            .count = checked.count,
+            .line = checked.line,
+            .outcome = checked.outcome,
+        }) catch self.gpa.free(path);
+    }
+
+    /// The rows wait for the session's own log lock, the way a used secret
+    /// does: a rule answers inside a tool call, before the loop holds one.
+    fn giveLocked(self: *StyleState, locked: *chock_core.arbiter.Locked, io: std.Io) void {
+        const time_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+        for (self.rows.items) |one| {
+            _ = locked.append(self.gpa, io, .{ .style_check = .{
+                .rule = one.rule,
+                .path = one.path,
+                .language = one.language,
+                .count = one.count,
+                .line = one.line,
+                .outcome = one.outcome,
+            } }, time_ms) catch {};
+            self.gpa.free(one.path);
+        }
+        self.rows.clearRetainingCapacity();
+        self.sayWhatDidNotRun();
+    }
+
+    /// A rule that could not run is said once a session, because a line a
+    /// write is worth nothing to the person reading.
+    fn sayWhatDidNotRun(self: *StyleState) void {
+        if (self.engine == null or self.said_missing) return;
+        if (!self.gate.missing) return;
+        self.said_missing = true;
+        tty.print(
+            .warn,
+            "chock: a style rule did not run, because this host has no grammar for a language " ++
+                "this project writes. Those writes were not checked. `chock sessions show` " ++
+                "names each one.\n",
+            .{},
+        );
+    }
+};
+
+/// Whether any rule may run, which is one action in the policy table for the
+/// whole block rather than one a rule.
+fn stylePermitted(
+    arena: std.mem.Allocator,
+    policy: *const chock_policy.table.Table,
+    chain_links: []const chock_proto.event.SpawnLink,
+    agent_kind: []const u8,
+    model: []const u8,
+    rules: usize,
+) std.mem.Allocator.Error!bool {
+    const chain = try arena.alloc([]const u8, chain_links.len + 1);
+    defer arena.free(chain);
+    for (chain_links, chain[0..chain_links.len]) |link, *slot| slot.* = link.agent_kind;
+    chain[chain_links.len] = agent_kind;
+
+    var fault: ?chock_policy.table.ChainFault = null;
+    const decision = policy.evaluateChain(chain, .{
+        .agent_kind = agent_kind,
+        .model = model,
+        .tool = chock_core.style.policy_tool,
+        .action = chock_core.style.parse_action,
+    }, &fault);
+    if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
+
+    if (decision == .allow) return true;
+    tty.print(
+        .warn,
+        "chock: this project's {d} style rules are off, because its policy answers {t} for " ++
+            "{s}. A write is not checked against a rule in this session.\n",
+        .{ rules, decision, chock_core.style.parse_action },
+    );
+    return false;
+}
+
+/// The directory of grammars the block's variable names. The paths change
+/// between setups, so a project names a variable and the shell names the path.
+fn parsersDirFor(
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    variable: []const u8,
+) ?[]const u8 {
+    const path = env.get(variable) orelse {
+        tty.print(
+            .warn,
+            "chock: this project's style rules are off, because {s} names no directory in this " ++
+                "shell. A dev shell exports it, and the grammars under it are one file a " ++
+                "language.\n",
+            .{variable},
+        );
+        return null;
+    };
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch {
+        tty.print(
+            .warn,
+            "chock: this project's style rules are off, because {s} names {s}, and that is not " ++
+                "a directory this host has.\n",
+            .{ variable, path },
+        );
+        return null;
+    };
+    dir.close(io);
+    return path;
+}
+
+/// The wasm parser for one language, under the directory the project's
+/// `module` variable names. One module carries one grammar, so a session
+/// takes the first language this project names that has one.
+fn moduleFor(
+    keep: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    variable: []const u8,
+    grammars: []const chock_policy.style.Grammar,
+) std.mem.Allocator.Error!?struct { path: []const u8, language: []const u8 } {
+    const dir = env.get(variable) orelse {
+        tty.print(
+            .warn,
+            "chock: this project asks for the wasm parser, and {s} names no directory in this " ++
+                "shell. Its style rules are off.\n",
+            .{variable},
+        );
+        return null;
+    };
+    for (grammars) |one| {
+        if (!chock_policy.style.languageIsWellFormed(one.language)) continue;
+        const path = try std.fmt.allocPrint(keep, "{s}/{s}.wasm", .{ dir, one.language });
+        _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch continue;
+        return .{ .path = path, .language = one.language };
+    }
+    tty.print(
+        .warn,
+        "chock: this project asks for the wasm parser, and {s} holds a module for none of the " ++
+            "{d} grammars it names. Its style rules are off.\n",
+        .{ variable, grammars.len },
+    );
+    return null;
+}
+
+/// One command a parse, in the same sandbox a tool call runs in.
+fn commandParser(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    started: *Started,
+    context: *const chock_core.tools.Context,
+    state: *StyleState,
+    keep: std.mem.Allocator,
+) std.mem.Allocator.Error!?chock_core.ast.Parser {
+    const parsers_dir = parsersDirFor(io, started.tool_env, started.style.parsers) orelse
+        return null;
+
+    const config = try chock_core.tools.withStore(
+        keep,
+        io,
+        .{ .config = started.sandbox_config },
+        context.store_paths,
+        context.read_only_mounts,
+    );
+
+    state.spawn = .{
+        .gpa = gpa,
+        .env = started.tool_env,
+        .config = config,
+        .parsers_dir = parsers_dir,
+    };
+    state.command = .{ .parsers_dir = parsers_dir, .spawn = state.spawn.spawn() };
+
+    tty.detail(
+        "chock: {d} style rules check a write, parsed by {s}\n",
+        .{ started.style.rules.len, chock_core.ast_command.program },
+    );
+    return state.command.parser();
+}
+
+/// One module a session, compiled in this process at the first parse. The
+/// first write waits for that, and no write after it does.
+fn wasmParser(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    started: *Started,
+    state: *StyleState,
+    keep: std.mem.Allocator,
+) std.mem.Allocator.Error!?chock_core.ast.Parser {
+    const variable = if (started.style.modules.len == 0)
+        chock_policy.style.default_modules_variable
+    else
+        started.style.modules;
+    const found = try moduleFor(
+        keep,
+        io,
+        started.tool_env,
+        variable,
+        started.style.grammars,
+    ) orelse return null;
+
+    state.wasm = .{ .gpa = gpa, .path = found.path, .language = found.language };
+
+    tty.detail(
+        "chock: {d} style rules check a write, parsed by a wasm module for {s}. The engine " ++
+            "compiles it at the first write, which takes about a minute.\n",
+        .{ started.style.rules.len, found.language },
+    );
+    return state.wasm.parser();
+}
+
+/// Give the session a gate over its writes, or say in one line why it has
+/// none. A project with no rule of its own needs neither.
+fn startStyle(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    started: *Started,
+    options: Options,
+    context: *chock_core.tools.Context,
+    state: *StyleState,
+) std.mem.Allocator.Error!void {
+    if (started.style.rules.len == 0) return;
+
+    const keep = state.arena.allocator();
+    if (!try stylePermitted(
+        keep,
+        started.policy,
+        started.spawn_chain,
+        options.agent_kind,
+        started.model,
+        started.style.rules.len,
+    )) return;
+
+    const parser = switch (started.style.engine) {
+        .command => try commandParser(gpa, io, started, context, state, keep),
+        .wasm => try wasmParser(gpa, io, started, state, keep),
+    } orelse return;
+
+    state.gate = .{
+        .block = started.style,
+        .parser = parser,
+        .project_root = started.project_root,
+        .note = state.note(),
+    };
+    state.engine = started.style.engine;
+    context.style = &state.gate;
+}
+
 fn startMcp(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -11234,6 +11555,10 @@ fn runSession(
         &server_secrets,
     );
 
+    var style_state = StyleState.init(gpa);
+    defer style_state.deinit(io);
+    try startStyle(gpa, io, started, options, &context, &style_state);
+
     var plugin_state = PluginState.init(gpa);
     defer plugin_state.deinit(io);
 
@@ -11467,6 +11792,8 @@ fn runSession(
     var give_locked = GiveLockedToAll{
         .network = &tool_network,
         .mcp = &mcp_state,
+        .style = &style_state,
+        .io = io,
         .plugins = &plugin_state.session,
         .git = &git_aware,
         .nix = &nix_build,
@@ -21594,4 +21921,154 @@ test "a destination this reader cannot use says so, and starts nothing" {
     try testing.expectEqual(@as(usize, 0), state.count);
     try testing.expectEqual(@as(usize, 0), state.remotes_used);
     try testing.expect(std.mem.indexOf(u8, said.err(), "https") != null);
+}
+
+test "style.parse that is not allowed leaves every write alone, and says so once" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A project with no rule of its own answers ask for an action nobody named.
+    const empty: [:0]const u8 = ".{}";
+    const policy = try chock_policy.table.Table.parse(gpa, empty, null);
+    defer chock_policy.table.Table.destroy(gpa, policy);
+
+    try testing.expect(!try stylePermitted(arena, policy, &.{}, "main", "test-model", 2));
+    const warned = said.err();
+    try testing.expect(std.mem.indexOf(u8, warned, chock_core.style.parse_action) != null);
+    try testing.expect(std.mem.indexOf(u8, warned, "2 style rules") != null);
+
+    const naming: [:0]const u8 =
+        \\.{ .policy = .{ .rules = .{ .{ .action = "style.parse", .decision = .allow } } } }
+    ;
+    const allowing = try chock_policy.table.Table.parse(gpa, naming, null);
+    defer chock_policy.table.Table.destroy(gpa, allowing);
+    try testing.expect(try stylePermitted(arena, allowing, &.{}, "main", "test-model", 2));
+}
+
+test "the parsers directory comes from a variable, and a path that is not there is refused" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+
+    try testing.expectEqual(@as(?[]const u8, null), parsersDirFor(io, &env, "TREE_SITTER_PARSERS"));
+    try testing.expect(std.mem.indexOf(u8, said.err(), "TREE_SITTER_PARSERS") != null);
+
+    try env.put("TREE_SITTER_PARSERS", "/nowhere/chock/parsers");
+    try testing.expectEqual(@as(?[]const u8, null), parsersDirFor(io, &env, "TREE_SITTER_PARSERS"));
+    try testing.expect(std.mem.indexOf(u8, said.err(), "/nowhere/chock/parsers") != null);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    try env.put("TREE_SITTER_PARSERS", real);
+    try testing.expectEqualStrings(real, parsersDirFor(io, &env, "TREE_SITTER_PARSERS").?);
+}
+
+test "the wasm parser is one module a language, and a missing one is named" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "zig.wasm", .data = "stands in for a module" });
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real = buffer[0..try tmp.dir.realPath(io, &buffer)];
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put(chock_policy.style.default_modules_variable, real);
+
+    const grammars = [_]chock_policy.style.Grammar{
+        .{ .language = "nix", .extensions = &.{".nix"} },
+        .{ .language = "zig", .extensions = &.{".zig"} },
+    };
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    // The nix grammar has no module here, so the session takes the one that
+    // has, rather than refusing every write of either language.
+    const found = (try moduleFor(
+        arena,
+        io,
+        &env,
+        chock_policy.style.default_modules_variable,
+        &grammars,
+    )).?;
+    try testing.expectEqualStrings("zig", found.language);
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(arena, "{s}/zig.wasm", .{real}),
+        found.path,
+    );
+
+    try testing.expectEqual(@as(?@TypeOf(found), null), try moduleFor(
+        arena,
+        io,
+        &env,
+        chock_policy.style.default_modules_variable,
+        &.{.{ .language = "rust", .extensions = &.{".rs"} }},
+    ));
+    try testing.expect(std.mem.indexOf(u8, said.err(), "module for none") != null);
+
+    var empty: std.process.Environ.Map = .init(gpa);
+    defer empty.deinit();
+    try testing.expectEqual(@as(?@TypeOf(found), null), try moduleFor(
+        arena,
+        io,
+        &empty,
+        chock_policy.style.default_modules_variable,
+        &grammars,
+    ));
+    try testing.expect(std.mem.indexOf(u8, said.err(), "names no directory") != null);
+}
+
+test "a style row reaches the log under the session's own lock" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var state = StyleState.init(gpa);
+    defer state.deinit(io);
+
+    state.note().write(.{
+        .rule = "comment-block",
+        .path = "src/main.zig",
+        .language = "zig",
+        .count = 1,
+        .line = 7,
+        .outcome = "refused",
+    });
+    // Nothing is written before the loop hands the lock over.
+    try testing.expectEqual(@as(usize, 1), state.rows.items.len);
+
+    state.giveLocked(&log.locked, io);
+    try testing.expectEqual(@as(usize, 0), state.rows.items.len);
+
+    const written = log.backing.bytes.items;
+    try testing.expect(std.mem.indexOf(u8, written, "style.check") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "comment-block") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "src/main.zig") != null);
 }

@@ -75,7 +75,7 @@ pub const Filters = struct {
             .device_exposed,
             .secret_used,
             => self.sandbox,
-            .hook_run => self.tools,
+            .hook_run, .style_check => self.tools,
             .network_summary, .mcp_request => self.network,
             // Forward-compatible events must never disappear behind a filter the
             // installed Chock cannot name.
@@ -441,6 +441,12 @@ fn writeHuman(arena: std.mem.Allocator, envelope: event.Envelope, full: bool) !v
             try inlineText(arena, one.outcome),
             if (one.errored) ", errored" else "",
             if (one.refused) ", refused it" else "",
+        }),
+        .style_check => |one| tty.out(.plain, "  {s} on {s}: {d} matches, {s}\n", .{
+            try inlineText(arena, one.rule),
+            try inlineText(arena, one.path),
+            one.count,
+            try inlineText(arena, one.outcome),
         }),
         .mcp_request => |one| tty.out(.plain, "  {s} asked {s} of {s}, status {d}, {s}\n", .{
             try inlineText(arena, one.server),  try inlineText(arena, one.about),

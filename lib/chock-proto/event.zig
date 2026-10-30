@@ -127,6 +127,7 @@ pub const Kind = enum {
     network_summary,
     hook_run,
     mcp_request,
+    style_check,
     unknown,
 
     pub fn wireName(self: Kind) []const u8 {
@@ -177,6 +178,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .network_summary = "network.summary",
     .hook_run = "hook.run",
     .mcp_request = "mcp.request",
+    .style_check = "style.check",
     .unknown = "unknown",
 });
 
@@ -1039,6 +1041,27 @@ pub const McpRequest = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
+/// One style rule run over one file, before the write it was asked about. The
+/// query text and the matched source are both left out: the rule's name says
+/// which query ran, and the matched text is the file itself.
+pub const StyleCheck = struct {
+    rule: []const u8,
+    path: []const u8 = "",
+    language: []const u8 = "",
+    /// Matches the query found, and zero for a rule that got no answer.
+    count: u32 = 0,
+    /// The first line the rule names, counted from one. Zero when the rule holds.
+    line: u32 = 0,
+    /// `permitted`, `refused`, `reported`, `no_parser`, `no_answer` or
+    /// `no_query`.
+    outcome: []const u8,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 pub const SecretUsed = struct {
     name: []const u8,
     action: []const u8,
@@ -1223,6 +1246,7 @@ pub const Event = union(Kind) {
     network_summary: NetworkSummary,
     hook_run: HookRun,
     mcp_request: McpRequest,
+    style_check: StyleCheck,
     unknown: UnknownEvent,
 
     pub fn jsonStringify(self: Event, jw: *std.json.Stringify) std.json.Stringify.Error!void {
@@ -2498,6 +2522,36 @@ test "a remote MCP exchange records the destination beside what was asked of it"
         try std.testing.expect(!std.mem.eql(u8, field_name, "header"));
         try std.testing.expect(!std.mem.eql(u8, field_name, "secret"));
         try std.testing.expect(!std.mem.eql(u8, field_name, "url"));
+    }
+}
+
+test "a style check says which rule refused which file" {
+    const gpa = std.testing.allocator;
+
+    const checked = Event{ .style_check = .{
+        .rule = "comment-block",
+        .path = "src/main.zig",
+        .language = "zig",
+        .count = 11,
+        .line = 1,
+        .outcome = "refused",
+    } };
+
+    const text = try std.json.Stringify.valueAlloc(gpa, checked, .{});
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "style.check") != null);
+
+    const back = try std.json.parseFromSlice(Event, gpa, text, .{});
+    defer back.deinit();
+    try std.testing.expectEqualStrings("comment-block", back.value.style_check.rule);
+    try std.testing.expectEqualStrings("refused", back.value.style_check.outcome);
+    try std.testing.expectEqual(@as(u32, 11), back.value.style_check.count);
+
+    // Asserts the shape holds no field the checked source could travel in.
+    inline for (@typeInfo(StyleCheck).@"struct".field_names, @typeInfo(StyleCheck).@"struct".field_types) |field_name, _| {
+        try std.testing.expect(!std.mem.eql(u8, field_name, "content"));
+        try std.testing.expect(!std.mem.eql(u8, field_name, "text"));
+        try std.testing.expect(!std.mem.eql(u8, field_name, "query"));
     }
 }
 

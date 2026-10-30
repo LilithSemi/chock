@@ -14,6 +14,7 @@ pub const dirs = @import("chock-policy/dirs.zig");
 pub const search = @import("chock-policy/search.zig");
 pub const sandbox = @import("chock-policy/sandbox.zig");
 pub const secrets = @import("chock-policy/secrets.zig");
+pub const style = @import("chock-policy/style.zig");
 pub const nix = @import("chock-policy/nix.zig");
 pub const workspace = @import("chock-policy/workspace.zig");
 

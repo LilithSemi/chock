@@ -250,11 +250,17 @@ const stdout_buffer_size = 8 * 1024;
 
 const plugin_host_verb = chock_core.plugin_host.verb;
 
+/// The verbs a person never types. Each one writes its own wire on standard
+/// output, so each is answered before anything else buffers that descriptor.
+const hidden_verbs = [_][]const u8{plugin_host_verb};
+
 comptime {
     for (commands) |entry| {
-        if (std.mem.eql(u8, entry.name, plugin_host_verb)) @compileError("chock " ++
-            entry.name ++ " is both a command in the table and the hidden plugin host verb, " ++
-            "so the command could never run. Rename the command.");
+        for (hidden_verbs) |verb| {
+            if (std.mem.eql(u8, entry.name, verb)) @compileError("chock " ++
+                entry.name ++ " is both a command in the table and a hidden host verb, " ++
+                "so the command could never run. Rename the command.");
+        }
     }
 }
 
@@ -501,21 +507,25 @@ test "the edit distance helper counts the three edits it says it counts" {
     try testing.expectEqual(@as(usize, 3), editDistance("plan", "plugin"));
 }
 
-test "a person cannot reach the plugin host verb by mistyping a word chock answers to" {
-    for (commands) |entry| {
-        try testing.expect(editDistance(entry.name, plugin_host_verb) >= 3);
-    }
-    for (own_words) |word| {
-        try testing.expect(editDistance(word, plugin_host_verb) >= 3);
+test "a person cannot reach a hidden host verb by mistyping a word chock answers to" {
+    for (hidden_verbs) |verb| {
+        for (commands) |entry| {
+            try testing.expect(editDistance(entry.name, verb) >= 3);
+        }
+        for (own_words) |word| {
+            try testing.expect(editDistance(word, verb) >= 3);
+        }
     }
 }
 
-test "the plugin host verb is in no command table and in no usage text" {
-    for (commands) |entry| {
-        try testing.expect(!std.mem.eql(u8, entry.name, plugin_host_verb));
-    }
-    for (own_words) |word| {
-        try testing.expect(!std.mem.eql(u8, word, plugin_host_verb));
+test "a hidden host verb is in no command table and in no usage text" {
+    for (hidden_verbs) |verb| {
+        for (commands) |entry| {
+            try testing.expect(!std.mem.eql(u8, entry.name, verb));
+        }
+        for (own_words) |word| {
+            try testing.expect(!std.mem.eql(u8, word, verb));
+        }
     }
 }
 

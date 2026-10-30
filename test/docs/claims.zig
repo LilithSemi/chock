@@ -1,5 +1,10 @@
 //! Reads documentation claims off disk and checks each one against the code,
 //! so the truth is never duplicated into a second list here.
+//!
+//! The pages are read when this runs and not when it is built, so the build
+//! cannot see a doc edit. `build.zig` marks this run as having side effects
+//! for that reason, which makes it run every time rather than answer from a
+//! page it was given once.
 
 const std = @import("std");
 const chock_main = @import("chock_main");
@@ -20,8 +25,15 @@ const max_source_bytes = 4 * 1024 * 1024;
 /// Words the documentation shows after `chock` on purpose that name no command.
 const refused_examples = [_][]const u8{ "fix", "rnu" };
 
-/// Options the documentation names that belong to another program.
-const foreign_options = [_][]const u8{ "--jitless", "--offline" };
+/// Options the documentation names that belong to another program. The last
+/// three are `tree-sitter query`'s own, written by the style gate.
+const foreign_options = [_][]const u8{
+    "--jitless",
+    "--offline",
+    "--config-path",
+    "--lib-path",
+    "--lang-name",
+};
 
 const Doc = struct {
     path: []const u8,

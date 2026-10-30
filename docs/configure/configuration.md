@@ -262,6 +262,38 @@ session may do and never widens it. There can be at most eight.
 [hooks.md](../using/hooks.md) has the triggers, the fields and what the log
 holds.
 
+### The project's own style rules
+
+The `style` block names which grammars this project has and which of its own
+tree-sitter queries refuse a write:
+
+```zon
+.{
+    .style = .{
+        .parsers = "TREE_SITTER_PARSERS",
+        .grammars = .{
+            .{ .language = "zig", .extensions = .{".zig"} },
+        },
+        .rules = .{
+            .{ .name = "comment-block", .query = "style/comments.scm", .max_lines = 10 },
+        },
+    },
+}
+```
+
+`parsers` names an environment variable and never a path, because a store path
+changes whenever the grammar package is bumped. A rule carries exactly one
+bound, and `style.parse` in the policy table decides whether any rule runs at
+all. There can be at most 32 rules and 16 grammars.
+
+Two more keys pick the parser. `engine` is `command`, which runs
+`tree-sitter`, or `wasm`, which runs a module inside Chock's own engine and
+needs no `tree-sitter` on the host. `modules` names the variable holding the
+parser modules, one `<language>.wasm` a language, and defaults to
+`CHOCK_PARSER_MODULES`. [style.md](../using/style.md) has the bounds, the two
+decisions, what the log holds, and what the wasm engine costs before the first
+write.
+
 ### Which way of sandboxing a session uses
 
 `config.zon` is the only file that names this, and that is deliberate: a

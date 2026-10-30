@@ -332,6 +332,31 @@ them as not built.
 
 ## Known open items
 
+- A style rule has two parsers, and the second one is slow to start and
+  narrower than the first. The wasm parser is tree-sitter's runtime and one
+  grammar in a single freestanding module with no imports at all, 780 KB and
+  269 functions, run by Chock's own engine. The engine compiles every function
+  before the first answer: 29 seconds on the aarch64 dev box on 2026-10-29,
+  against 18 milliseconds for a parse once it has. That cost is paid once a
+  session and never a write, because the parser is a process that stays alive,
+  and it is why the default stays the command at a quarter of a second a parse.
+
+  Two limits come with it. A module carries one grammar, so a session has one
+  language and a write in any other is not checked, which the `style.check`
+  row says and the session says once. And the test that puts both parsers over
+  one file is the slowest in the suite: it is built where
+  `CHOCK_PARSER_MODULES` names a directory, which is the dev shell and so is
+  CI, and the host it drives is a debug build of Chock, where the engine takes
+  eight minutes over the same module it compiles in half a minute when it is
+  built for release.
+
+- A style rule is about the agent's writes and not about the repository. A
+  person's own commit reaches no rule, and neither does a file the agent
+  writes through a program it ran: `run_command` writes through the program's
+  own file descriptors, and the gate is in the one function the structured
+  write tools funnel through. A rule is a guard on what the model produces in
+  the turn, so it is not a substitute for a formatter or a check in CI.
+
 - A remote MCP server gets no OAuth. Chock carries a token from the credential
   store, under `bind = "header"`, and runs no browser flow: no protected
   resource metadata, no dynamic client registration and no PKCE. The

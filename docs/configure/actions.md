@@ -27,6 +27,7 @@ no `chock.zon` at all runs them without a prompt.
 | `nix.net.build.opaque` | a build that names no URL at all | `allow` |
 | `git.<subcommand>` | one git subcommand | `allow` where it changes only the workspace |
 | `lsp.*` | starting a language server | `allow` |
+| `style.parse` | parsing a file a write would leave behind, for the project's style rules | none, so `ask` |
 | `device.*` | a USB or serial device | none, so `ask` |
 | `mcp.*` | an MCP server, its tools, and the host a remote one is reached at | none, so `ask` |
 | `plugin.*` | a plugin and its tools | none, so `ask` |
@@ -484,6 +485,26 @@ rule to trust, and `lsp.zls` is a convenience. What bounds the damage is not
 the name: the server runs inside the same sandbox a tool call gets, and reaches
 nothing a tool call cannot. A program whose name cannot be one label of a rule
 does not start at all, and it says so.
+
+## `style.parse`
+
+One action covers a project's whole `style` block: whether any of its rules may
+run. A rule parses the content a write would leave behind, and a parser is a
+program whichever engine answers, so this is a policy decision and not a
+configuration key.
+
+```zon
+.{ .action = "style.parse", .decision = .allow }
+```
+
+Chock ships no default, so a project that writes rules writes this rule too.
+Anything other than `allow` leaves every write unchecked and says so in one
+line at session start, which is the opposite of what a rule is for: a rule that
+quietly does not run is worse than no rule.
+
+There is no action a rule, because a rule cannot do anything a parse cannot. A
+rule reads the content the call already carries, answers a number, and either
+refuses the write or does not. See [style.md](../using/style.md).
 
 ## `mcp.*` and `plugin.*`
 

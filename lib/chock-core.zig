@@ -8,6 +8,8 @@ pub const compaction = @import("chock-core/compaction.zig");
 pub const prompt = @import("chock-core/prompt.zig");
 pub const Loop = @import("chock-core/Loop.zig");
 
+pub const ast = @import("chock-core/ast.zig");
+pub const ast_command = @import("chock-core/ast_command.zig");
 pub const constitution = @import("chock-core/constitution.zig");
 pub const commands = @import("chock-core/commands.zig");
 pub const frontmatter = @import("chock-core/frontmatter.zig");
@@ -17,6 +19,7 @@ pub const instructions = @import("chock-core/instructions.zig");
 pub const memory = @import("chock-core/memory.zig");
 pub const guidance = @import("chock-core/guidance.zig");
 pub const skills = @import("chock-core/skills.zig");
+pub const style = @import("chock-core/style.zig");
 pub const notices = @import("chock-core/notices.zig");
 pub const idle = @import("chock-core/idle.zig");
 pub const lsp = @import("chock-core/lsp.zig");
