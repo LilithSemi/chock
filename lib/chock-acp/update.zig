@@ -50,6 +50,27 @@ pub const Diff = struct {
     operation: DiffOperation = .modify,
 };
 
+pub const SubagentState = enum { running, idle };
+
+pub const Subagent = struct {
+    session_id: []const u8,
+    title: []const u8,
+    description: []const u8,
+    cwd: []const u8,
+    state: SubagentState,
+    stop_reason: []const u8 = "",
+};
+
+pub const Compaction = struct {
+    id: []const u8,
+    summary: []const u8,
+};
+
+pub const SessionState = struct {
+    state: enum { running, requires_action, idle },
+    stop_reason: []const u8 = "",
+};
+
 /// ACP's `usage_update` gauge, not a bill: `used`/`size` show window fullness.
 pub const Usage = struct {
     used: u64,
@@ -65,6 +86,9 @@ pub const Update = union(enum) {
     user_message: Chunk,
     tool: Tool,
     diff: Diff,
+    subagent: Subagent,
+    compaction: Compaction,
+    state: SessionState,
     /// The whole plan, not a change to it.
     plan: []const PlanStep,
     usage: Usage,
@@ -85,10 +109,105 @@ pub fn encode(
         .user_message => |one| try chunk(arena, version, session_id, "user_message_chunk", one),
         .tool => |one| try tool(arena, version, session_id, one),
         .diff => |one| try diff(arena, version, session_id, one),
+        .subagent => |one| try subagent(arena, version, session_id, one),
+        .compaction => |one| try compaction(arena, version, session_id, one),
+        .state => |one| try sessionState(arena, version, session_id, one),
         .plan => |steps| try plan(arena, version, session_id, steps),
         .usage => |one| try usage(arena, version, session_id, one),
         .title => |text| try title(arena, version, session_id, text),
     };
+}
+
+/// Adds the audit-log cursor without making it part of any ACP update entity.
+/// The key is namespaced because ACP reserves `_meta` for extensions.
+pub fn encodeAt(
+    arena: std.mem.Allocator,
+    version: Version,
+    session_id: []const u8,
+    update: Update,
+    log_offset: u64,
+) std.mem.Allocator.Error!?[]u8 {
+    const body = (try encode(arena, version, session_id, update)) orelse return null;
+    std.debug.assert(body.len != 0 and body[body.len - 1] == '}');
+    return try std.fmt.allocPrint(
+        arena,
+        "{s},\"_meta\":{{\"dev.lilithsemi.chock/logOffset\":{d}}}}}",
+        .{ body[0 .. body.len - 1], log_offset },
+    );
+}
+
+fn subagent(
+    arena: std.mem.Allocator,
+    version: Version,
+    session_id: []const u8,
+    one: Subagent,
+) std.mem.Allocator.Error![]u8 {
+    _ = version;
+    if (one.state == .running) {
+        return std.json.Stringify.valueAlloc(arena, .{
+            .sessionId = session_id,
+            .update = .{
+                .sessionUpdate = "subagent_update",
+                .sessionId = one.session_id,
+                .title = one.title,
+                .description = one.description,
+                .cwd = one.cwd,
+                .state = .{ .state = "running" },
+            },
+        }, .{});
+    }
+    return std.json.Stringify.valueAlloc(arena, .{
+        .sessionId = session_id,
+        .update = .{
+            .sessionUpdate = "subagent_update",
+            .sessionId = one.session_id,
+            .title = one.title,
+            .description = one.description,
+            .cwd = one.cwd,
+            .state = .{ .state = "idle", .stopReason = one.stop_reason },
+        },
+    }, .{});
+}
+
+fn compaction(
+    arena: std.mem.Allocator,
+    version: Version,
+    session_id: []const u8,
+    one: Compaction,
+) std.mem.Allocator.Error![]u8 {
+    _ = version;
+    return std.json.Stringify.valueAlloc(arena, .{
+        .sessionId = session_id,
+        .update = .{
+            .sessionUpdate = "compaction_update",
+            .compactionId = one.id,
+            .status = "completed",
+            .summary = .{.{ .type = "text", .text = one.summary }},
+        },
+    }, .{});
+}
+
+fn sessionState(
+    arena: std.mem.Allocator,
+    version: Version,
+    session_id: []const u8,
+    one: SessionState,
+) std.mem.Allocator.Error!?[]u8 {
+    if (version == .v1) return null;
+    if (one.state != .idle or one.stop_reason.len == 0) {
+        return try std.json.Stringify.valueAlloc(arena, .{
+            .sessionId = session_id,
+            .update = .{ .sessionUpdate = "state_update", .state = @tagName(one.state) },
+        }, .{});
+    }
+    return try std.json.Stringify.valueAlloc(arena, .{
+        .sessionId = session_id,
+        .update = .{
+            .sessionUpdate = "state_update",
+            .state = "idle",
+            .stopReason = one.stop_reason,
+        },
+    }, .{});
 }
 
 fn diff(
@@ -467,6 +586,41 @@ test "workspace diffs are native in version 2 and honest text in version 1" {
     try testing.expectEqualStrings("content", content.items[1].object.get("type").?.string);
 }
 
+test "subagents, compactions, state, and log offsets remain structured" {
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    const child = try encoded(arena, .v1, .{ .subagent = .{
+        .session_id = "child-1",
+        .title = "reviewer",
+        .description = "review the patch",
+        .cwd = "/tmp/worktree",
+        .state = .running,
+    } });
+    try testing.expectEqualStrings("subagent_update", try field(arena, child, &.{ "update", "sessionUpdate" }));
+    try testing.expectEqualStrings("child-1", try field(arena, child, &.{ "update", "sessionId" }));
+    try testing.expectEqualStrings("running", try field(arena, child, &.{ "update", "state", "state" }));
+
+    const compacted = try encoded(arena, .v2, .{ .compaction = .{
+        .id = "compact-9",
+        .summary = "kept context",
+    } });
+    try testing.expectEqualStrings("compaction_update", try field(arena, compacted, &.{ "update", "sessionUpdate" }));
+    try testing.expectEqualStrings("completed", try field(arena, compacted, &.{ "update", "status" }));
+
+    try testing.expect((try encode(arena, .v1, "s", .{ .state = .{ .state = .running } })) == null);
+    const idle = try encoded(arena, .v2, .{ .state = .{ .state = .idle, .stop_reason = "cancelled" } });
+    try testing.expectEqualStrings("state_update", try field(arena, idle, &.{ "update", "sessionUpdate" }));
+    try testing.expectEqualStrings("cancelled", try field(arena, idle, &.{ "update", "stopReason" }));
+
+    const offset = (try encodeAt(arena, .v2, "s", .{ .title = "replay" }, 4096)).?;
+    try testing.expectEqualStrings(
+        "4096",
+        try field(arena, offset, &.{ "_meta", "dev.lilithsemi.chock/logOffset" }),
+    );
+}
+
 test "an abandoned step is cancelled in version 2 and absent from version 1" {
     var state = std.heap.ArenaAllocator.init(testing.allocator);
     defer state.deinit();
@@ -531,6 +685,9 @@ test "every update is something both versions can be asked for" {
         .{ .tool = .{ .id = "c", .title = "t", .phase = .started } },
         .{ .tool = .{ .id = "c", .title = "t", .phase = .finished } },
         .{ .diff = .{ .id = "d", .path = "/tmp/file", .patch = "+change" } },
+        .{ .subagent = .{ .session_id = "child", .title = "reviewer", .description = "review", .cwd = "/tmp", .state = .running } },
+        .{ .compaction = .{ .id = "compact-1", .summary = "earlier work" } },
+        .{ .state = .{ .state = .running } },
         .{ .plan = &.{} },
         .{ .usage = .{ .used = 1, .size = 2 } },
         .{ .title = "what this session is about" },

@@ -279,6 +279,11 @@ const Answered = struct {
     }
 };
 
+const ClientFeatures = struct {
+    subagents: bool = false,
+    compaction: bool = false,
+};
+
 const Agent = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -286,11 +291,14 @@ const Agent = struct {
     project: []const u8,
 
     version: ?chock_acp.Version = null,
+    client_features: ClientFeatures = .{},
     sessions: std.ArrayList(Live) = .empty,
     queue: Queue = undefined,
     turn: ?Turn = null,
     out: *std.Io.Writer = undefined,
     next_ask: u64 = 1,
+    sending_offset: ?u64 = null,
+    suppress_updates: bool = false,
     stopping: bool = false,
 
     const Turn = struct {
@@ -391,9 +399,17 @@ const Agent = struct {
 
     fn send(self: *Agent, arena: std.mem.Allocator, one: updates.Update) void {
         const turn = self.turn orelse return;
-        const live = &self.sessions.items[turn.session];
+        self.sendTo(arena, turn.session, one);
+    }
+
+    fn sendTo(self: *Agent, arena: std.mem.Allocator, which: usize, one: updates.Update) void {
+        if (self.suppress_updates) return;
+        const live = &self.sessions.items[which];
         const version = self.version orelse return;
-        const params = (updates.encode(arena, version, &live.id, one) catch return) orelse return;
+        const params = if (self.sending_offset) |offset|
+            (updates.encodeAt(arena, version, &live.id, one, offset) catch return) orelse return
+        else
+            (updates.encode(arena, version, &live.id, one) catch return) orelse return;
         self.notify(arena, self.clientMethod(.session_update), params);
     }
 
@@ -453,6 +469,7 @@ const Agent = struct {
 
         self.gpa.free(pending.ask);
         turn.pending = null;
+        self.send(arena, .{ .state = .{ .state = .running } });
     }
 
     fn permittedBy(arena: std.mem.Allocator, result: []const u8) bool {
@@ -660,6 +677,7 @@ const Agent = struct {
             return;
         };
         self.version = version;
+        self.client_features = clientFeatures(arena, incoming.params, version);
 
         const result = capabilities(arena, version) catch return;
         self.answer(arena, id, result);
@@ -734,12 +752,31 @@ const Agent = struct {
             return;
         };
 
-        const answered = self.replay(arena, known);
-        if (answered) |text| {
-            self.fail(arena, id, .resource_not_found, text);
+        const replay_after = replayAfter(arena, self.version orelse return, incoming.method, incoming.params) catch {
+            self.fail(arena, id, .invalid_params, "replayFrom is malformed or unsupported");
             return;
+        };
+        if (replay_after) |after| {
+            const answered = self.replay(arena, known, after);
+            if (answered) |text| {
+                self.fail(arena, id, .resource_not_found, text);
+                return;
+            }
         }
-        self.answer(arena, id, "");
+        const current: updates.SessionState = if (self.turn) |turn|
+            if (turn.session == known)
+                .{ .state = if (turn.pending != null) .requires_action else .running }
+            else
+                .{ .state = .idle }
+        else
+            .{ .state = .idle };
+        self.sendTo(arena, known, .{ .state = current });
+        const result = std.fmt.allocPrint(
+            arena,
+            "{{\"_meta\":{{\"dev.lilithsemi.chock/logOffset\":{d}}}}}",
+            .{self.sessions.items[known].seen},
+        ) catch return;
+        self.answer(arena, id, result);
     }
 
     fn handleSessionPrompt(self: *Agent, arena: std.mem.Allocator, incoming: jsonrpc.Incoming) void {
@@ -778,6 +815,7 @@ const Agent = struct {
             return;
         };
         self.turn = .{ .request = .{ .raw = held }, .session = known };
+        self.send(arena, .{ .state = .{ .state = .running } });
     }
 
     fn handleSessionCancel(self: *Agent, arena: std.mem.Allocator, incoming: jsonrpc.Incoming) void {
@@ -901,10 +939,36 @@ const Agent = struct {
         ev: event.Event,
         offset: u64,
     ) void {
+        const previous_offset = self.sending_offset;
+        self.sending_offset = offset;
+        defer self.sending_offset = previous_offset;
+
         const live = &self.sessions.items[which];
         switch (ev) {
             .message => |one| self.sendMessage(arena, one),
             .workspace_open => |one| live.setWorkspace(self.gpa, one.path) catch {},
+            .session_spawn => |one| {
+                if (self.client_features.subagents) {
+                    self.send(arena, .{ .subagent = .{
+                        .session_id = one.child_session,
+                        .title = one.child_agent_kind,
+                        .description = one.reason,
+                        .cwd = live.workspace orelse live.project,
+                        .state = .running,
+                    } });
+                } else {
+                    self.send(arena, .{ .tool = .{
+                        .id = one.child_session,
+                        .title = std.fmt.allocPrint(arena, "Subagent {s}: {s}", .{
+                            one.child_agent_kind,
+                            one.reason,
+                        }) catch one.child_agent_kind,
+                        .name = "subagent",
+                        .kind = .other,
+                        .phase = .started,
+                    } });
+                }
+            },
             .tool_call => |one| {
                 live.noteCall(self.gpa, one.call_id, one.tool) catch {};
                 self.send(arena, .{ .tool = .{
@@ -935,6 +999,34 @@ const Agent = struct {
                     .patch = one.patch,
                     .operation = diffOperation(one.patch),
                 } });
+            },
+            .compaction => |one| if (self.client_features.compaction) {
+                const id = std.fmt.allocPrint(arena, "compaction-{d}", .{offset}) catch return;
+                self.send(arena, .{ .compaction = .{ .id = id, .summary = one.summary } });
+            },
+            .agent_complete => |one| {
+                if (self.client_features.subagents) {
+                    self.send(arena, .{ .subagent = .{
+                        .session_id = one.child_session,
+                        .title = one.child_agent_kind,
+                        .description = one.result,
+                        .cwd = live.workspace orelse live.project,
+                        .state = .idle,
+                        .stop_reason = stopReasonForAgent(one.outcome),
+                    } });
+                } else {
+                    self.send(arena, .{ .tool = .{
+                        .id = one.child_session,
+                        .title = "",
+                        .name = "subagent",
+                        .kind = .other,
+                        .phase = switch (one.outcome) {
+                            .finished => .finished,
+                            else => .failed,
+                        },
+                        .output = one.result,
+                    } });
+                }
             },
             .plan_update => |one| {
                 for (one.steps) |step| {
@@ -1012,26 +1104,10 @@ const Agent = struct {
         self.next_ask += 1;
 
         const raw = std.fmt.allocPrint(arena, "{d}", .{ask_id}) catch return;
-        const params = std.json.Stringify.valueAlloc(arena, .{
-            .sessionId = &live.id,
-            .toolCall = .{
-                .toolCallId = if (one.tool_call_id.len != 0) one.tool_call_id else one.action,
-                .title = one.summary,
-                .kind = toolKindFor("").wireName(),
-                .status = "pending",
-                .content = .{.{
-                    .type = "content",
-                    .content = .{ .type = "text", .text = one.detail },
-                }},
-            },
-            .options = .{
-                .{ .optionId = "allow_once", .name = "Allow once", .kind = "allow_once" },
-                .{ .optionId = "allow_always", .name = "Allow for this turn", .kind = "allow_always" },
-                .{ .optionId = "reject_once", .name = "Refuse", .kind = "reject_once" },
-            },
-        }, .{}) catch return;
+        const params = permissionParams(arena, self.version orelse return, &live.id, one) catch return;
 
         const body = jsonrpc.requestBody(arena, .{ .raw = raw }, self.clientMethod(.request_permission), params) catch return;
+        self.send(arena, .{ .state = .{ .state = .requires_action } });
         jsonrpc.writeFrame(arena, self.out, body) catch {
             self.stopping = true;
             return;
@@ -1053,6 +1129,11 @@ const Agent = struct {
         // A cancel that was sent wins over what the log says: the turn can finish between the signal and the handler.
         const said = if (turn.cancelled) chock_acp.common.StopReason.cancelled else reason;
 
+        self.send(arena, .{ .state = .{
+            .state = .idle,
+            .stop_reason = said.wireName(),
+        } });
+
         if (turn.pending) |pending| {
             self.gpa.free(pending.ask);
         }
@@ -1066,7 +1147,7 @@ const Agent = struct {
         self.turn = null;
     }
 
-    fn replay(self: *Agent, arena: std.mem.Allocator, which: usize) ?[]const u8 {
+    fn replay(self: *Agent, arena: std.mem.Allocator, which: usize, after: u64) ?[]const u8 {
         const live = &self.sessions.items[which];
 
         const stream = self.daemon.connect(self.io) catch {
@@ -1086,6 +1167,8 @@ const Agent = struct {
         const Replay = struct {
             agent: *Agent,
             which: usize,
+            after: u64,
+            found_after: bool,
             failed: ?[]const u8 = null,
 
             fn take(self_take: *@This(), reply: control.Reply) anyerror!bool {
@@ -1097,10 +1180,14 @@ const Agent = struct {
                         const parsed = std.json.parseFromSlice(event.Envelope, each, one.payload, .{
                             .ignore_unknown_fields = true,
                         }) catch return true;
-                        if (parsed.value.event == .session_end) return true;
-                        self_take.agent.translate(each, self_take.which, parsed.value.event, one.id);
+                        if (one.id == self_take.after) self_take.found_after = true;
                         const live_now = &self_take.agent.sessions.items[self_take.which];
                         if (one.id > live_now.seen) live_now.seen = one.id;
+                        if (parsed.value.event == .session_end) return true;
+                        const held_suppression = self_take.agent.suppress_updates;
+                        self_take.agent.suppress_updates = one.id <= self_take.after;
+                        defer self_take.agent.suppress_updates = held_suppression;
+                        self_take.agent.translate(each, self_take.which, parsed.value.event, one.id);
                     },
                     .failed => |text| {
                         self_take.failed = text;
@@ -1112,7 +1199,12 @@ const Agent = struct {
             }
         };
 
-        var replaying = Replay{ .agent = self, .which = which };
+        var replaying = Replay{
+            .agent = self,
+            .which = which,
+            .after = after,
+            .found_after = after == 0,
+        };
         var said: control.Handshake = .{ .unreadable = "" };
         control.exchange(
             &stream_reader.interface,
@@ -1124,6 +1216,7 @@ const Agent = struct {
         ) catch {
             return "that session could not be read";
         };
+        if (!replaying.found_after) return "that session offset does not name a retained event";
         _ = arena;
         return replaying.failed;
     }
@@ -1210,6 +1303,73 @@ fn numberField(arena: std.mem.Allocator, params: []const u8, name: []const u8) ?
     };
 }
 
+fn clientFeatures(
+    arena: std.mem.Allocator,
+    params: []const u8,
+    version: chock_acp.Version,
+) ClientFeatures {
+    if (version == .v2) return .{ .subagents = true, .compaction = true };
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, params, .{}) catch return .{};
+    const root = switch (parsed.value) {
+        .object => |one| one,
+        else => return .{},
+    };
+    const client_caps = switch (root.get("clientCapabilities") orelse return .{}) {
+        .object => |one| one,
+        else => return .{},
+    };
+    const session = switch (client_caps.get("session") orelse std.json.Value.null) {
+        .object => |one| one,
+        else => null,
+    };
+    return .{
+        .subagents = switch (client_caps.get("subagents") orelse std.json.Value.null) {
+            .object => true,
+            else => false,
+        },
+        .compaction = if (session) |one| switch (one.get("compaction") orelse std.json.Value.null) {
+            .object => true,
+            else => false,
+        } else false,
+    };
+}
+
+const ReplayCursorError = error{ Malformed, Unsupported };
+
+fn replayAfter(
+    arena: std.mem.Allocator,
+    version: chock_acp.Version,
+    method: []const u8,
+    params: []const u8,
+) ReplayCursorError!?u64 {
+    if (version == .v1) {
+        if (std.mem.eql(u8, method, chock_acp.v1.Method.session_load.wireName())) return 0;
+        return null;
+    }
+
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, params, .{}) catch return error.Malformed;
+    const root = switch (parsed.value) {
+        .object => |one| one,
+        else => return error.Malformed,
+    };
+    const raw = root.get("replayFrom") orelse return null;
+    const cursor = switch (raw) {
+        .null => return null,
+        .object => |one| one,
+        else => return error.Malformed,
+    };
+    const kind = switch (cursor.get("type") orelse return error.Malformed) {
+        .string => |one| one,
+        else => return error.Malformed,
+    };
+    if (std.mem.eql(u8, kind, "start")) return 0;
+    if (!std.mem.eql(u8, kind, "_chock_offset")) return error.Unsupported;
+    return switch (cursor.get("after") orelse return error.Malformed) {
+        .integer => |one| std.math.cast(u64, one) orelse return error.Malformed,
+        else => error.Malformed,
+    };
+}
+
 fn listedSessionIn(arena: std.mem.Allocator, payload: []const u8) ?[]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, arena, payload, .{}) catch return null;
     const object = switch (parsed.value) {
@@ -1268,6 +1428,57 @@ fn diffOperation(patch: []const u8) updates.DiffOperation {
         return .delete;
     }
     return .modify;
+}
+
+fn stopReasonForAgent(outcome: event.AgentOutcome) []const u8 {
+    return switch (outcome) {
+        .finished => "end_turn",
+        .budget => "max_tokens",
+        .refused, .no_progress, .died, .rate_limited, .unknown => "refusal",
+    };
+}
+
+fn permissionParams(
+    arena: std.mem.Allocator,
+    version: chock_acp.Version,
+    session_id: []const u8,
+    one: event.ApprovalRequest,
+) std.mem.Allocator.Error![]u8 {
+    const effect = try std.fmt.allocPrint(
+        arena,
+        "Action: {s}\nProposed effect: {s}\nReason: {s}",
+        .{ one.action, one.detail, one.reason },
+    );
+    const call_id = if (one.tool_call_id.len != 0) one.tool_call_id else one.action;
+    const options = .{
+        .{ .optionId = "allow_once", .name = "Allow once", .kind = "allow_once" },
+        .{ .optionId = "allow_always", .name = "Allow for this turn", .kind = "allow_always" },
+        .{ .optionId = "reject_once", .name = "Refuse", .kind = "reject_once" },
+    };
+    const tool_call = .{
+        .toolCallId = call_id,
+        .title = one.summary,
+        .kind = toolKindFor("").wireName(),
+        .status = "pending",
+        .content = .{.{
+            .type = "content",
+            .content = .{ .type = "text", .text = effect },
+        }},
+    };
+    return switch (version) {
+        .v1 => std.json.Stringify.valueAlloc(arena, .{
+            .sessionId = session_id,
+            .toolCall = tool_call,
+            .options = options,
+        }, .{}),
+        .v2 => std.json.Stringify.valueAlloc(arena, .{
+            .sessionId = session_id,
+            .title = one.summary,
+            .description = effect,
+            .subject = .{ .type = "tool_call", .toolCall = tool_call },
+            .options = options,
+        }, .{}),
+    };
 }
 
 fn toolKindFor(tool: []const u8) chock_acp.common.ToolKind {
@@ -1548,6 +1759,90 @@ test "a capability answer is the shape of the version it was asked in" {
     try testing.expect(two_parsed.value.object.get("agentInfo") == null);
 }
 
+test "client feature negotiation gates v1 extensions and ignores unknown capabilities" {
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    const none = clientFeatures(arena,
+        \\{"clientCapabilities":{"futureThing":{"enabled":true}}}
+    , .v1);
+    try testing.expect(!none.subagents);
+    try testing.expect(!none.compaction);
+
+    const both = clientFeatures(arena,
+        \\{"clientCapabilities":{"subagents":{},"session":{"compaction":{}}}}
+    , .v1);
+    try testing.expect(both.subagents);
+    try testing.expect(both.compaction);
+
+    const baseline = clientFeatures(arena, "{}", .v2);
+    try testing.expect(baseline.subagents);
+    try testing.expect(baseline.compaction);
+}
+
+test "approval requests name the exact action and proposed effect in both versions" {
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const request: event.ApprovalRequest = .{
+        .action = "delete_file",
+        .summary = "Delete generated output",
+        .detail = "remove /workspace/generated.txt",
+        .reason = "the generator no longer produces it",
+        .agent_kind = "worker",
+        .spawn_chain = &.{},
+        .timeout_at_ms = 0,
+        .tool_call_id = "call-9",
+    };
+    const expected = "Action: delete_file\nProposed effect: remove /workspace/generated.txt\nReason: the generator no longer produces it";
+
+    const v1 = try std.json.parseFromSlice(
+        std.json.Value,
+        arena,
+        try permissionParams(arena, .v1, "session-1", request),
+        .{},
+    );
+    const v1_call = v1.value.object.get("toolCall").?.object;
+    try testing.expectEqualStrings("call-9", v1_call.get("toolCallId").?.string);
+    const v1_content = v1_call.get("content").?.array.items[0].object;
+    try testing.expectEqualStrings(expected, v1_content.get("content").?.object.get("text").?.string);
+
+    const v2 = try std.json.parseFromSlice(
+        std.json.Value,
+        arena,
+        try permissionParams(arena, .v2, "session-1", request),
+        .{},
+    );
+    try testing.expectEqualStrings(expected, v2.value.object.get("description").?.string);
+    const subject = v2.value.object.get("subject").?.object;
+    try testing.expectEqualStrings("tool_call", subject.get("type").?.string);
+    try testing.expectEqualStrings("call-9", subject.get("toolCall").?.object.get("toolCallId").?.string);
+}
+
+test "v2 replay accepts start and Chock offsets but refuses unknown cursors" {
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    try testing.expectEqual(@as(?u64, null), try replayAfter(arena, .v2, "session/resume", "{}"));
+    try testing.expectEqual(@as(?u64, 0), try replayAfter(arena, .v2, "session/resume",
+        \\{"replayFrom":{"type":"start"}}
+    ));
+    try testing.expectEqual(@as(?u64, 8192), try replayAfter(arena, .v2, "session/resume",
+        \\{"replayFrom":{"type":"_chock_offset","after":8192}}
+    ));
+    try testing.expectError(error.Unsupported, replayAfter(arena, .v2, "session/resume",
+        \\{"replayFrom":{"type":"future"}}
+    ));
+    try testing.expectError(error.Malformed, replayAfter(arena, .v2, "session/resume",
+        \\{"replayFrom":{"type":"_chock_offset","after":-1}}
+    ));
+
+    try testing.expectEqual(@as(?u64, 0), try replayAfter(arena, .v1, "session/load", "{}"));
+    try testing.expectEqual(@as(?u64, null), try replayAfter(arena, .v1, "session/resume", "{}"));
+}
+
 test "the version answered is the newest both sides speak" {
     try testing.expectEqual(chock_acp.Version.v1, chock_acp.negotiate(1).?);
     try testing.expectEqual(chock_acp.Version.v2, chock_acp.negotiate(2).?);
@@ -1614,4 +1909,149 @@ test "a listing row is read by the name a summary uses, not a log envelope's" {
     try testing.expectEqual(@as(?[]const u8, null), listedSessionIn(arena, "{\"id\":7}"));
     try testing.expectEqual(@as(?[]const u8, null), listedSessionIn(arena, "{}"));
     try testing.expectEqual(@as(?[]const u8, null), listedSessionIn(arena, "not json"));
+}
+
+test "disconnect and offset replay rebuilds state before emitting the gap" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var state = std.heap.ArenaAllocator.init(gpa);
+    defer state.deinit();
+    const arena = state.allocator();
+    const id = "01JQ" ++ @as([22]u8, @splat('R'));
+
+    const rows = [_]struct { id: u64, payload: []const u8 }{
+        .{ .id = 100, .payload = try event.toJson(arena, .{
+            .id = 100,
+            .session = id,
+            .time_ms = 1,
+            .event = .{ .workspace_open = .{
+                .kind = .worktree,
+                .attempt = "attempt-1",
+                .path = "/isolated/session",
+                .base_commit = "abc",
+            } },
+        }) },
+        .{ .id = 200, .payload = try event.toJson(arena, .{
+            .id = 200,
+            .session = id,
+            .time_ms = 2,
+            .event = .{ .plan_update = .{ .steps = &.{.{
+                .id = "first",
+                .subject = "read the code",
+                .status = .done,
+            }} } },
+        }) },
+        .{ .id = 300, .payload = try event.toJson(arena, .{
+            .id = 300,
+            .session = id,
+            .time_ms = 3,
+            .event = .{ .plan_update = .{ .steps = &.{.{
+                .id = "second",
+                .subject = "edit the code",
+                .status = .in_progress,
+            }} } },
+        }) },
+        .{ .id = 400, .payload = try event.toJson(arena, .{
+            .id = 400,
+            .session = id,
+            .time_ms = 4,
+            .event = .{ .diff = .{
+                .path = "src/main.zig",
+                .patch = "+changed\n",
+                .change_set_id = "change-1",
+                .review = .none,
+                .review_note = "",
+            } },
+        }) },
+    };
+
+    var listener = try (control.Address{ .ip = .{ .host = "127.0.0.1", .port = 0 } }).listen(io);
+    defer listener.close(io);
+    const address = control.Address{ .ip = .{
+        .host = "127.0.0.1",
+        .port = listener.server.socket.address.getPort(),
+    } };
+
+    const Fixture = struct {
+        listener: *control.Listener,
+        io: std.Io,
+        rows: []const @TypeOf(rows[0]),
+        fault: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.serveOne() catch |err| {
+                self.fault = err;
+            };
+        }
+
+        fn serveOne(self: *@This()) !void {
+            var stream = try self.listener.server.accept(self.io);
+            defer stream.close(self.io);
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(self.io, &read_buffer);
+            _ = (try reader.interface.takeDelimiter('\n')) orelse return error.EndOfStream;
+
+            var write_buffer: [64 * 1024]u8 = undefined;
+            var writer = stream.writer(self.io, &write_buffer);
+            try writer.interface.print("{s}{d}\n", .{ control.Greeting.answer_prefix, control.protocol_version });
+            try writer.interface.flush();
+            _ = (try reader.interface.takeDelimiter('\n')) orelse return error.EndOfStream;
+            for (self.rows) |row| {
+                try writer.interface.print("{d}\t{s}\n", .{ row.id, row.payload });
+            }
+            try writer.interface.flush();
+        }
+    };
+    var fixture = Fixture{ .listener = &listener, .io = io, .rows = &rows };
+    const first_thread = try std.Thread.spawn(.{}, Fixture.run, .{&fixture});
+
+    var first_output: std.Io.Writer.Allocating = .init(gpa);
+    defer first_output.deinit();
+    var first = Agent{
+        .gpa = gpa,
+        .io = io,
+        .daemon = address,
+        .project = "/project",
+        .version = .v2,
+        .client_features = .{ .subagents = true, .compaction = true },
+        .out = &first_output.writer,
+    };
+    defer first.deinit();
+    const first_known = try first.remember(id, "/project");
+    const first_fault = first.replay(arena, first_known, 0);
+    first_thread.join();
+    try testing.expect(fixture.fault == null);
+    try testing.expect(first_fault == null);
+    try testing.expect(std.mem.indexOf(u8, first_output.written(), "logOffset\":200") != null);
+    try testing.expect(std.mem.indexOf(u8, first_output.written(), "logOffset\":400") != null);
+
+    // A new adapter process has no folded state. It restores the prefix without
+    // emitting it, then sends only records the disconnected client missed.
+    fixture.fault = null;
+    const resumed_thread = try std.Thread.spawn(.{}, Fixture.run, .{&fixture});
+    var resumed_output: std.Io.Writer.Allocating = .init(gpa);
+    defer resumed_output.deinit();
+    var resumed = Agent{
+        .gpa = gpa,
+        .io = io,
+        .daemon = address,
+        .project = "/project",
+        .version = .v2,
+        .client_features = .{ .subagents = true, .compaction = true },
+        .out = &resumed_output.writer,
+    };
+    defer resumed.deinit();
+    const resumed_known = try resumed.remember(id, "/project");
+    const resumed_fault = resumed.replay(arena, resumed_known, 200);
+    resumed_thread.join();
+    try testing.expect(fixture.fault == null);
+    try testing.expect(resumed_fault == null);
+    const replayed = resumed_output.written();
+    try testing.expect(std.mem.indexOf(u8, replayed, "logOffset\":100") == null);
+    try testing.expect(std.mem.indexOf(u8, replayed, "logOffset\":200") == null);
+    try testing.expect(std.mem.indexOf(u8, replayed, "logOffset\":300") != null);
+    try testing.expect(std.mem.indexOf(u8, replayed, "logOffset\":400") != null);
+    try testing.expect(std.mem.indexOf(u8, replayed, "read the code") != null);
+    try testing.expect(std.mem.indexOf(u8, replayed, "edit the code") != null);
+    try testing.expect(std.mem.indexOf(u8, replayed, "/isolated/session/src/main.zig") != null);
 }

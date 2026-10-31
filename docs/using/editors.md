@@ -41,8 +41,10 @@ chooses it over a version the editor also offered.
 | A tool starts | a tool call, with a kind so the editor draws the right thing |
 | A tool ends | a tool call update carrying what it produced |
 | A file changes | a diff tied to the isolated session workspace |
+| A child agent runs | a child session and its current work state |
 | The plan changes | the whole plan |
 | A request is priced | a context gauge: how full the window is, and the cost |
+| Context is compacted | the retained summary, when the client supports it |
 | The turn ends | a stop reason on the reply |
 
 A tool call reports a kind, so an editor shows a read differently from a command.
@@ -55,6 +57,13 @@ complete before-and-after file contents for its native diff shape; Chock's log
 holds the patch instead, so those editors receive the patch as an edit result
 rather than made-up file contents. Reopening a session replays the same diff
 identifier from the audit log.
+
+Version 1 clients opt in to child-session updates with
+`clientCapabilities.subagents` and to compaction updates with
+`clientCapabilities.session.compaction`. Without either capability, Chock does
+not send an update the client has said it cannot read: child work remains an
+ordinary tool call and compaction remains visible through the conversation and
+context gauge. Version 2 includes both update forms in its session model.
 
 ## An approval arrives in the editor
 
@@ -98,6 +107,20 @@ An editor can ask for a session that already exists, and Chock replays what the
 log holds as updates before answering, so the editor ends up with the
 conversation it would have had. The same session can be picked up later, by the
 editor or by anything else, because the daemon still has it.
+
+Every replayable update carries the audit byte offset in
+`_meta["dev.lilithsemi.chock/logOffset"]`. Version 2 supports the standard
+`replayFrom: {"type":"start"}` cursor and a gap-recovery cursor:
+
+```json
+{"replayFrom":{"type":"_chock_offset","after":4096}}
+```
+
+The latter silently folds events through offset 4096 to restore plans,
+workspace paths, tool identities, and context state, then emits only the later
+events. A cursor that is not a retained event is refused instead of producing
+a partial view. Omitting `replayFrom` reconnects without replay, as ACP version
+2 specifies; version 1 `session/load` replays from the start.
 
 Closing a session in the editor forgets it there. It does not end the session,
 and the log stays.
