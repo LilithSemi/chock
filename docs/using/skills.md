@@ -9,6 +9,7 @@ another agent works here unchanged.
 ```
 review-a-diff/
   SKILL.md        the procedure, with its frontmatter
+  training.zon    optional training and evaluation entry points
   scripts/        programs it tells the agent to run
   references/     longer documents it points at
   assets/         templates and data
@@ -93,6 +94,48 @@ written as a YAML block, where the marker becomes the whole value.
 
 A directory with no `SKILL.md` under it anywhere is a problem of its own, so a
 path that points at the wrong place cannot read as clean.
+
+## Making a skill trainable
+
+`SKILL.md` remains the portable runtime instruction. A sibling `training.zon`
+can bind it to the evaluation suites Surgeon uses to teach and measure the
+same behavior:
+
+```zig
+.{
+    .schema = "chock.skill-training",
+    .version = 1,
+    .skill = "review-a-diff",
+    .mode = .hybrid,
+    .adapter = "haruka-review-a-diff",
+    .suites = .{
+        .train = "evals/train.zon",
+        .validation = "evals/validation.zon",
+        .@"test" = "evals/test.zon",
+    },
+}
+```
+
+`runtime` means the skill is prompt-only and must not name an adapter or
+suites. `trainable` means it is a training target rather than a runtime prompt.
+`hybrid` supports both. Trainable and hybrid skills must name all three suites;
+the test suite is held out from training and model selection.
+
+Run `chock skills inspect` to validate both files and emit the normalized JSON
+contract consumed by Surgeon:
+
+```console
+chock skills inspect skills/review-a-diff
+```
+
+The inspection resolves every suite inside the skill directory and records the
+SHA-256 of `training.zon` and each suite. Absolute paths, `..`, and symbolic
+links which leave the skill directory are refused. `chock skills validate`
+also reports an invalid `training.zon` as a problem when it encounters one.
+
+This file does not grant anything to a running agent. It names training data
+entry points and an adapter label; policy, tools, secrets, networks, and the
+sandbox still come only from Chock's ordinary configuration.
 
 ## What a skill cannot do
 

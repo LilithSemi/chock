@@ -8,9 +8,11 @@ const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const skills = chock_core.skills;
+const training = chock_core.skill_training;
 
 const usage_text =
     \\Usage: chock skills validate <dir>... [options]
+    \\       chock skills inspect <skill-dir> [options]
     \\
     \\Checks each directory against the Agent Skills format. A directory holding a
     \\SKILL.md is one skill. Any other directory is read as a layer, holding one
@@ -18,6 +20,7 @@ const usage_text =
     \\
     \\Reports a problem for anything a session would refuse, and a note for a line
     \\the reader goes past. Exits 2 when there is a problem, and 0 for notes alone.
+    \\Inspect writes the normalized, integrity-bound training.zon contract as JSON.
     \\
     \\Options:
     \\
@@ -27,7 +30,7 @@ const usage_text =
 /// prompt gets and nothing this command prints, so every read takes the same one.
 const layer: skills.Layer = .project;
 
-const Action = enum { validate };
+const Action = enum { validate, inspect };
 
 const Options = struct {
     action: Action,
@@ -69,7 +72,6 @@ pub fn main(
     exe_path: []const u8,
     args: []const []const u8,
 ) anyerror!u8 {
-    _ = gpa;
     _ = exe_path;
 
     var threaded = std.Io.Threaded.init(arena, .{ .environ = environ });
@@ -90,7 +92,39 @@ pub fn main(
 
     return switch (options.action) {
         .validate => validate(arena, io, options.paths),
+        .inspect => inspectTraining(arena, gpa, io, options.paths[0]),
     };
+}
+
+fn inspectTraining(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !u8 {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch |err| {
+        tty.print(.err, "chock skills: {s} could not be opened: {t}\n", .{ path, err });
+        return Exit.usage.code();
+    };
+    defer dir.close(io);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const absolute = try arena.dupe(u8, buffer[0..try dir.realPath(io, &buffer)]);
+
+    const read_it = try skills.read(arena, io, layer, absolute) orelse {
+        tty.print(.err, "chock skills: {s} holds no {s}\n", .{ absolute, skills.file_name });
+        return Exit.usage.code();
+    };
+    if (read_it == .refused) {
+        tty.print(.err, "chock skills: {s} is not a valid skill: {s}\n", .{ absolute, read_it.refused.fault.sentence() });
+        return Exit.usage.code();
+    }
+    const inspected = training.inspect(arena, gpa, io, absolute) catch |err| {
+        tty.print(.err, "chock skills: {s}/{s} is invalid: {t}\n", .{ absolute, training.file_name, err });
+        return Exit.usage.code();
+    };
+    const json = try std.json.Stringify.valueAlloc(arena, inspected, .{});
+    tty.out(.plain, "{s}\n", .{json});
+    return Exit.finished.code();
 }
 
 fn validate(arena: std.mem.Allocator, io: std.Io, paths: []const []const u8) !u8 {
@@ -214,6 +248,18 @@ fn addSkill(
             .text = try said(arena, one.note.sentence(), one.detail),
         });
     }
+
+    _ = training.inspect(arena, arena, io, skill.dir) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => {
+            try out.append(arena, .{
+                .kind = .problem,
+                .at = try trainingFileIn(arena, skill.dir),
+                .text = try std.fmt.allocPrint(arena, "the training contract is invalid ({t})", .{err}),
+            });
+            return;
+        },
+    };
 }
 
 fn addRefused(
@@ -233,6 +279,10 @@ fn addRefused(
 
 fn fileIn(arena: std.mem.Allocator, dir: []const u8) skills.Error![]const u8 {
     return std.fs.path.join(arena, &.{ dir, skills.file_name });
+}
+
+fn trainingFileIn(arena: std.mem.Allocator, dir: []const u8) skills.Error![]const u8 {
+    return std.fs.path.join(arena, &.{ dir, training.file_name });
 }
 
 fn said(
@@ -264,6 +314,7 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
     }
 
     if (paths.items.len == 0) return error.BadArguments;
+    if (action.? == .inspect and paths.items.len != 1) return error.BadArguments;
     return .{ .action = action.?, .paths = try paths.toOwnedSlice(arena) };
 }
 
@@ -283,13 +334,44 @@ test "the command line names the action and at least one directory" {
     try testing.expectEqual(@as(usize, 2), many.paths.len);
     try testing.expectEqualStrings("skills/b", many.paths[1]);
 
+    const inspected = try parseOptions(arena, &.{ "inspect", "skills/a" });
+    try testing.expectEqual(Action.inspect, inspected.action);
+    try testing.expectEqualStrings("skills/a", inspected.paths[0]);
+
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{}));
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{"validate"}));
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{"skills"}));
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "check", "skills" }));
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "validate", "--loud" }));
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "inspect", "a", "b" }));
     try testing.expectError(error.HelpWanted, parseOptions(arena, &.{"--help"}));
     try testing.expectError(error.HelpWanted, parseOptions(arena, &.{ "validate", "a", "-h" }));
+}
+
+test "validation reports an invalid training contract beside a valid skill" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeSkill(io, tmp.dir, "review-a-diff", "name: review-a-diff\ndescription: Review one.\n");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "review-a-diff/training.zon",
+        .data = ".{ .skill = \"another-skill\", .mode = .runtime }\n",
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const findings = try examine(arena, io, &.{root});
+
+    try testing.expectEqual(@as(usize, 1), countOf(findings).problem);
+    try testing.expectEqual(Exit.faulted, exitFor(findings));
+    for (findings) |one| {
+        if (one.kind != .problem) continue;
+        try testing.expect(std.mem.endsWith(u8, one.at, "review-a-diff/training.zon"));
+        try testing.expect(std.mem.indexOf(u8, one.text, "SkillNameMismatch") != null);
+    }
 }
 
 fn writeSkill(io: std.Io, dir: std.Io.Dir, name: []const u8, frontmatter: []const u8) !void {

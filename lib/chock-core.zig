@@ -19,6 +19,7 @@ pub const instructions = @import("chock-core/instructions.zig");
 pub const memory = @import("chock-core/memory.zig");
 pub const guidance = @import("chock-core/guidance.zig");
 pub const skills = @import("chock-core/skills.zig");
+pub const skill_training = @import("chock-core/skill_training.zig");
 pub const style = @import("chock-core/style.zig");
 pub const notices = @import("chock-core/notices.zig");
 pub const idle = @import("chock-core/idle.zig");
