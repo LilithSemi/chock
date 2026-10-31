@@ -43,6 +43,7 @@ const usage_text =
     \\                      only instance when the configuration has exactly one.
     \\  --model <id>        The model on the wire. Defaults to .defaults.model.
     \\  --project <dir>     The project. Defaults to the current directory.
+    \\  --base-commit <id>  Start a new Git workspace at this exact commit.
     \\  --allow-dirty       Copy the project's uncommitted work into the workspace.
     \\                      Without this the agent sees the committed state.
     \\  --dev-shell <name>  The devShells attribute the tool environment comes
@@ -110,6 +111,7 @@ const Options = struct {
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
     project: ?[]const u8 = null,
+    base_commit: ?[]const u8 = null,
     session: ?[]const u8 = null,
     agent_kind: []const u8 = "main",
     org_bundle: ?[]const u8 = null,
@@ -1522,16 +1524,29 @@ fn start(
             .{ paths.work, &attempt },
         );
         return error.Reported;
-    } else chock_workspace.Workspace.openAndDenied(
-        arena,
-        io,
-        env,
-        project_root,
-        paths.work,
-        &attempt,
-        if (org_bundle) |bundle| bundle.deny_read else &.{},
-        &open_diag,
-    ) catch |err| {
+    } else (if (options.base_commit) |base_commit|
+        chock_workspace.Workspace.openAtAndDenied(
+            arena,
+            io,
+            env,
+            project_root,
+            paths.work,
+            &attempt,
+            base_commit,
+            if (org_bundle) |bundle| bundle.deny_read else &.{},
+            &open_diag,
+        )
+    else
+        chock_workspace.Workspace.openAndDenied(
+            arena,
+            io,
+            env,
+            project_root,
+            paths.work,
+            &attempt,
+            if (org_bundle) |bundle| bundle.deny_read else &.{},
+            &open_diag,
+        )) catch |err| {
         if (open_diag) |*fault| {
             tty.print(
                 .err,
@@ -13314,6 +13329,7 @@ const value_options = [_][]const u8{
     "--provider",
     "--model",
     "--project",
+    "--base-commit",
     "--session",
     "--guest",
     "--agent-kind",
@@ -13415,6 +13431,8 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
             options.model = value;
         } else if (std.mem.eql(u8, argument, "--project")) {
             options.project = value;
+        } else if (std.mem.eql(u8, argument, "--base-commit")) {
+            options.base_commit = value;
         } else if (std.mem.eql(u8, argument, "--session")) {
             options.session = value;
         } else if (std.mem.eql(u8, argument, "--guest")) {
@@ -13486,6 +13504,11 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
 
     if (options.eval_record != null and options.eval_replay != null) {
         tty.print(.err, "chock run: --eval-record and --eval-replay cannot be used together.\n", .{});
+        return error.BadArguments;
+    }
+
+    if (options.base_commit != null and (options.adopt or options.session != null or options.continue_newest or options.allow_dirty)) {
+        tty.print(.err, "chock run: --base-commit starts a clean new session and cannot be combined with resume, adopt, or --allow-dirty.\n", .{});
         return error.BadArguments;
     }
 
@@ -14368,6 +14391,16 @@ test "--allow-dirty is off unless it is asked for, and it takes no value" {
     try testing.expect(with_flag.allow_dirty);
     try testing.expectEqual(@as(usize, 3), with_flag.message_words.len);
     try testing.expect(!takesValue("--allow-dirty"));
+}
+
+test "--base-commit only starts a clean new session" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = try parseOptions(arena, &.{ "--base-commit", "abc123", "do it" });
+    try testing.expectEqualStrings("abc123", parsed.base_commit.?);
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "--base-commit", "abc123", "--allow-dirty", "do it" }));
 }
 
 test "the ref a session's work lands on is the session's own, never a branch of the user" {

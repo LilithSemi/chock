@@ -42,6 +42,7 @@ fixture for either command.
     .fixture = "fixtures/parser",
     .provider = "local",
     .model = "coder",
+    .base_commit = "refs/tags/eval-fixture-v1",
     .capture = "captures/parser.json",
     .expect = .{
         .end_reason = "finished",
@@ -84,6 +85,13 @@ Repository paths must be relative and cannot leave the fixture. Test commands
 are argument arrays rather than shell strings and run with the fixture as their
 working directory. A missing required path, a present forbidden path, or a
 nonzero command exit is a finding rather than a malformed evaluation.
+
+Provider runs resolve `base_commit` (which defaults to `HEAD`) to a full object
+ID before creating the session workspace. Every grouped rollout therefore
+starts at the same immutable Git tree even if the source branch moves while a
+suite is running. Reports and dataset entries retain that resolved commit. Pin
+a tag or full object ID in committed training suites; the `HEAD` default is
+mainly convenient for an ad-hoc local evaluation.
 
 `files` pins exact repository bytes by SHA-256. `config_sha256` pins the
 project configuration recorded by `session.config`, while `sandbox_sha256`

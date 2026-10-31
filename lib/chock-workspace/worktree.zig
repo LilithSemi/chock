@@ -570,7 +570,22 @@ pub fn create(
     session_id: []const u8,
     diag: ?*?Diagnostic,
 ) Error!Worktree {
-    return createWithLayout(allocator, io, env, project_root, scratch_dir, session_id, Layout.forHost(), diag);
+    return createAtWithLayout(allocator, io, env, project_root, scratch_dir, session_id, "HEAD", Layout.forHost(), diag);
+}
+
+/// Creates a detached session worktree at one already-resolved revision.
+/// Evaluation uses this to ensure concurrent rollouts do not race a moving HEAD.
+pub fn createAt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    scratch_dir: []const u8,
+    session_id: []const u8,
+    revision: []const u8,
+    diag: ?*?Diagnostic,
+) Error!Worktree {
+    return createAtWithLayout(allocator, io, env, project_root, scratch_dir, session_id, revision, Layout.forHost(), diag);
 }
 
 /// Exists so a Linux test can build the mount list macOS gets.
@@ -584,13 +599,28 @@ pub fn createWithLayout(
     layout: Layout,
     diag: ?*?Diagnostic,
 ) Error!Worktree {
+    return createAtWithLayout(allocator, io, env, project_root, scratch_dir, session_id, "HEAD", layout, diag);
+}
+
+pub fn createAtWithLayout(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    scratch_dir: []const u8,
+    session_id: []const u8,
+    revision: []const u8,
+    layout: Layout,
+    diag: ?*?Diagnostic,
+) Error!Worktree {
     try validateSessionId(session_id);
+    if (revision.len == 0 or revision[0] == '-') return error.InvalidSessionId;
 
     const worktree_path = try std.fs.path.join(allocator, &.{ scratch_dir, session_id });
     errdefer allocator.free(worktree_path);
 
     var add_output = try git.run(allocator, io, env, project_root, &.{
-        "worktree", "add", "--detach", worktree_path, "HEAD",
+        "worktree", "add", "--detach", worktree_path, revision,
     }, diag);
     defer add_output.deinit(allocator);
     switch (add_output.term) {
@@ -2603,6 +2633,31 @@ test "countUncommitted names the split, and a clean project counts zero" {
     try std.testing.expectEqual(@as(usize, 3), dirty.untracked);
     try std.testing.expectEqual(@as(usize, 4), dirty.total());
     try std.testing.expect(dirty.any());
+}
+
+test "createAt pins the workspace even after the project head moves" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const tracked_path = try std.fmt.bufPrintSentinel(&tracked_buffer, "{s}/tracked.txt", .{project.root_path}, 0);
+    try writeFile(tracked_path, "new head\n");
+    var commit = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "commit", "-am", "move head" }, null);
+    defer commit.deinit(allocator);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, commit.term);
+
+    var worktree = try createAtWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", project.head_sha, .remapped, null);
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
+    try std.testing.expectEqualStrings(project.head_sha, worktree.base_commit);
+    const checked_path = try std.fs.path.join(allocator, &.{ worktree.path, "tracked.txt" });
+    defer allocator.free(checked_path);
+    const checked = try readFile(allocator, checked_path);
+    defer allocator.free(checked);
+    try std.testing.expectEqualStrings("hello\n", checked);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "countUncommitted counts a staged addition as modified, the same way the import reports it" {

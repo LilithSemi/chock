@@ -136,6 +136,7 @@ const Spec = struct {
     fixture: []const u8 = ".",
     provider: []const u8 = "",
     model: []const u8 = "",
+    base_commit: []const u8 = "HEAD",
     capture: []const u8 = "",
     expect: Expectations = .{},
     reward_weights: RewardWeights = .{},
@@ -155,6 +156,7 @@ const Report = struct {
     version: u32 = 1,
     eval: []const u8,
     session_id: []const u8,
+    base_commit: []const u8 = "",
     passed: bool,
     checks: usize,
     failures: usize,
@@ -279,9 +281,17 @@ pub fn main(
         tty.print(.err, "chock eval: provider runs and replays require .capture in the spec\n", .{});
         return Exit.usage.code();
     }
+    const pinned_base = switch (options.action) {
+        .run, .replay => resolveRevision(arena, gpa, io, project, spec.base_commit) catch |err| {
+            tty.print(.err, "chock eval: base revision {s} could not be resolved: {t}\n", .{ spec.base_commit, err });
+            return Exit.usage.code();
+        },
+        .check => "",
+        .compare => unreachable,
+    };
     const session = switch (options.action) {
         .check => options.session,
-        .run, .replay => runProvider(arena, gpa, io, &env, exe_path, project, spec, capture_path, options.action) catch |err| {
+        .run, .replay => runProvider(arena, gpa, io, &env, exe_path, project, pinned_base, spec, capture_path, options.action) catch |err| {
             tty.print(.err, "chock eval: the provider-backed run did not produce a session: {t}\n", .{err});
             return Exit.faulted.code();
         },
@@ -323,6 +333,7 @@ pub fn main(
     const report = Report{
         .eval = spec.name,
         .session_id = session,
+        .base_commit = if (observed.session.workspace) |workspace| workspace.base_commit else pinned_base,
         .passed = failures == 0,
         .checks = checks,
         .failures = failures,
@@ -514,8 +525,24 @@ fn resolveProject(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]con
     return arena.dupe(u8, buffer[0..len]);
 }
 
+fn resolveRevision(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, project_path: []const u8, revision: []const u8) ![]const u8 {
+    var project = try std.Io.Dir.openDirAbsolute(io, project_path, .{ .iterate = true });
+    defer project.close(io);
+    var diag: ?ziggit.Diagnostic = null;
+    defer if (diag) |*fault| fault.deinit(gpa);
+    var layout = try ziggit.discover(gpa, io, project, .{}, &diag);
+    var repo = ziggit.Repository.open(gpa, io, layout, .{}, &diag) catch |err| {
+        layout.deinit(io);
+        return err;
+    };
+    defer repo.deinit();
+    const oid = try ziggit.resolve(gpa, &repo, revision, &diag);
+    var buffer: [ziggit.Oid.max_formatted_length]u8 = undefined;
+    return arena.dupe(u8, oid.toHex(&buffer));
+}
+
 fn validSpec(spec: Spec) bool {
-    if (spec.task.len == 0) return false;
+    if (spec.task.len == 0 or spec.base_commit.len == 0 or spec.base_commit[0] == '-') return false;
     for (spec.expect.required_paths) |path| if (!safeRelative(path)) return false;
     for (spec.expect.forbidden_paths) |path| if (!safeRelative(path)) return false;
     for (spec.expect.files) |file| {
@@ -555,13 +582,14 @@ fn runProvider(
     env: *const std.process.Environ.Map,
     exe_path: []const u8,
     project: []const u8,
+    base_commit: []const u8,
     spec: Spec,
     capture_path: []const u8,
     action: Action,
 ) ![]const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    try argv.appendSlice(gpa, &.{ exe_path, "run", "--project", project, "--output", "json" });
+    try argv.appendSlice(gpa, &.{ exe_path, "run", "--project", project, "--base-commit", base_commit, "--output", "json" });
     if (spec.provider.len != 0) try argv.appendSlice(gpa, &.{ "--provider", spec.provider });
     if (spec.model.len != 0) try argv.appendSlice(gpa, &.{ "--model", spec.model });
     try argv.appendSlice(gpa, &.{ if (action == .replay) "--eval-replay" else "--eval-record", capture_path });

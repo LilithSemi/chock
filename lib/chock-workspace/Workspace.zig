@@ -71,17 +71,34 @@ pub const Workspace = struct {
         also_denied: []const []const u8,
         diag: ?*?Diagnostic,
     ) Error!Workspace {
-        return openWithLayoutAndDenied(
+        return openAtWithLayoutAndDenied(
             allocator,
             io,
             env,
             project_root,
             scratch_dir,
             session_id,
+            null,
             Layout.forHost(),
             also_denied,
             diag,
         );
+    }
+
+    /// Opens a Git-backed workspace at an exact revision instead of live HEAD.
+    /// Non-Git overlay projects have no commit object to pin and are refused.
+    pub fn openAtAndDenied(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        project_root: []const u8,
+        scratch_dir: []const u8,
+        session_id: []const u8,
+        revision: []const u8,
+        also_denied: []const []const u8,
+        diag: ?*?Diagnostic,
+    ) Error!Workspace {
+        return openAtWithLayoutAndDenied(allocator, io, env, project_root, scratch_dir, session_id, revision, Layout.forHost(), also_denied, diag);
     }
 
     pub fn openWithLayout(
@@ -118,6 +135,21 @@ pub const Workspace = struct {
         also_denied: []const []const u8,
         diag: ?*?Diagnostic,
     ) Error!Workspace {
+        return openAtWithLayoutAndDenied(allocator, io, env, project_root, scratch_dir, session_id, null, layout, also_denied, diag);
+    }
+
+    fn openAtWithLayoutAndDenied(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        project_root: []const u8,
+        scratch_dir: []const u8,
+        session_id: []const u8,
+        revision: ?[]const u8,
+        layout: Layout,
+        also_denied: []const []const u8,
+        diag: ?*?Diagnostic,
+    ) Error!Workspace {
         // Checked before either backing is built, so a bad block refuses rather than half building.
         const own = try deny_mod.loadEntries(allocator, io, project_root, diag);
         defer deny_mod.free(allocator, own);
@@ -126,7 +158,10 @@ pub const Workspace = struct {
         defer deny_mod.free(allocator, entries);
 
         if (try git.isRepository(allocator, io, env, project_root, diag)) {
-            var wt = try worktree_mod.createWithLayout(allocator, io, env, project_root, scratch_dir, session_id, layout, diag);
+            var wt = if (revision) |commit|
+                try worktree_mod.createAtWithLayout(allocator, io, env, project_root, scratch_dir, session_id, commit, layout, diag)
+            else
+                try worktree_mod.createWithLayout(allocator, io, env, project_root, scratch_dir, session_id, layout, diag);
             errdefer wt.remove(allocator, io, env, null) catch {};
 
             const denied = try deny_mod.joinOnto(allocator, entries, wt.sandboxRoot());
@@ -140,6 +175,8 @@ pub const Workspace = struct {
                 .deny_paths = denied,
             };
         }
+
+        if (revision != null) return error.OverlayCannotBeAdopted;
 
         var ov = try overlay_mod.createWithLayout(allocator, io, project_root, scratch_dir, layout, diag);
         errdefer ov.deinit(allocator);

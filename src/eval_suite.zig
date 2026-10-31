@@ -68,6 +68,7 @@ const Entry = struct {
     trajectory: []const u8,
     exit_code: u8,
     session_id: []const u8 = "",
+    base_commit: []const u8 = "",
     reward: f64 = 0,
     trainable: bool = false,
 };
@@ -264,13 +265,14 @@ fn sha256(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
 }
 
 fn readSummary(arena: std.mem.Allocator, io: std.Io, entry: *Entry) !void {
-    const Report = struct { session_id: []const u8 = "", reward: f64 = 0 };
+    const Report = struct { session_id: []const u8 = "", base_commit: []const u8 = "", reward: f64 = 0 };
     const report_bytes = try std.Io.Dir.cwd().readFileAlloc(io, entry.report, arena, .limited(max_artifact_bytes));
     const report = try std.json.parseFromSliceLeaky(Report, arena, report_bytes, .{ .ignore_unknown_fields = true });
     const Trajectory = struct { trainable: bool = false };
     const trajectory_bytes = try std.Io.Dir.cwd().readFileAlloc(io, entry.trajectory, arena, .limited(max_artifact_bytes));
     const trajectory = try std.json.parseFromSliceLeaky(Trajectory, arena, trajectory_bytes, .{ .ignore_unknown_fields = true });
     entry.session_id = report.session_id;
+    entry.base_commit = report.base_commit;
     entry.reward = report.reward;
     entry.trainable = trajectory.trainable;
 }
