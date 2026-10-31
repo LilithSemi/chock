@@ -227,6 +227,7 @@ const Observed = struct {
     config_sha256: []const u8 = "",
     sandbox_sha256: []const u8 = "",
     sandbox_driver: []const u8 = "",
+    result_revision: []const u8 = "",
     audit_sha256: [64]u8,
     chain: chock_proto.chain.Verdict,
     audit_jsonl: []const u8 = "",
@@ -347,13 +348,19 @@ pub fn main(
 
     var findings: std.ArrayList(Finding) = .empty;
     try scoreAudit(arena, spec, &observed, &findings);
-    const result_path = materializeResult(arena, gpa, io, project, session_dir, session) catch |err| result: {
-        try add(arena, &findings, "session result tree", "harness", false, "refs/chock/<session>", @errorName(err));
+    const result_revision = if (observed.result_revision.len != 0)
+        observed.result_revision
+    else if (observed.session.workspace) |workspace|
+        workspace.base_commit
+    else
+        "";
+    const result_path = materializeResult(arena, gpa, io, project, session_dir, session, result_revision) catch |err| result: {
+        try add(arena, &findings, "session result tree", "harness", false, "recorded result revision", @errorName(err));
         break :result null;
     };
     if (result_path) |path| {
         defer std.Io.Dir.cwd().deleteTree(io, path) catch {};
-        try add(arena, &findings, "session result tree", "harness", true, "refs/chock/<session>", "materialized");
+        try add(arena, &findings, "session result tree", "harness", true, "recorded result revision", "materialized");
         try scoreFixture(arena, io, path, spec, &findings);
         if (!options.skip_tests) try scoreTests(arena, gpa, io, &env, path, spec.tests, &findings);
     } else {
@@ -666,7 +673,7 @@ fn runProvider(
 ) ![]const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    try argv.appendSlice(gpa, &.{ exe_path, "run", "--project", project, "--base-commit", base_commit, "--output", "json" });
+    try argv.appendSlice(gpa, &.{ exe_path, "run", "--project", project, "--base-commit", base_commit, "--output", "json", "--no-notices" });
     if (spec.provider.len != 0) try argv.appendSlice(gpa, &.{ "--provider", spec.provider });
     if (spec.model.len != 0) try argv.appendSlice(gpa, &.{ "--model", spec.model });
     try argv.appendSlice(gpa, &.{ if (action == .replay) "--eval-replay" else "--eval-record", capture_path });
@@ -679,6 +686,11 @@ fn runProvider(
     const result = try std.process.run(gpa, io, .{ .argv = argv.items, .environ_map = env });
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
+    const succeeded = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!succeeded and result.stderr.len != 0) tty.print(.err, "{s}", .{result.stderr});
     return parseRunResult(arena, result.stdout);
 }
 
@@ -730,6 +742,7 @@ fn observe(
                 out.sandbox_sha256 = try arena.dupe(u8, one.sandbox_hash);
                 out.sandbox_driver = try arena.dupe(u8, one.sandbox_driver);
             },
+            .workspace_integrate => |one| out.result_revision = try arena.dupe(u8, one.ref),
             .tool_call => |one| try out.tools.append(arena, try arena.dupe(u8, one.tool)),
             .mcp_request => |one| if (one.host.len != 0) try out.hosts.append(arena, try arena.dupe(u8, one.host)),
             .network_summary => |one| out.network_granted += one.granted,
@@ -824,9 +837,11 @@ fn scoreFixture(arena: std.mem.Allocator, io: std.Io, project: []const u8, spec:
     }
 }
 
-/// Materialize the immutable tree parked by a completed Git-worktree session.
-/// Evaluation never reads the caller's checkout: it may have moved to another
-/// branch (or have unrelated edits) by the time an old session is scored.
+/// Materialize the immutable result of a completed Git-worktree session. A
+/// session that changed work has a parked result ref; a read-only session uses
+/// its recorded base commit. Evaluation never reads the caller's checkout: it
+/// may have moved to another branch (or have unrelated edits) by the time an
+/// old session is scored.
 fn materializeResult(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -834,7 +849,9 @@ fn materializeResult(
     project_path: []const u8,
     session_dir: []const u8,
     session: []const u8,
+    revision: []const u8,
 ) ![]const u8 {
+    if (revision.len == 0) return error.NoResultRevision;
     var project = try std.Io.Dir.openDirAbsolute(io, project_path, .{ .iterate = true });
     defer project.close(io);
 
@@ -847,8 +864,7 @@ fn materializeResult(
     };
     defer repo.deinit();
 
-    const ref_name = try std.fmt.allocPrint(arena, "refs/chock/{s}", .{session});
-    const commit = try repo.refs.resolve(ref_name, &diag);
+    const commit = try ziggit.resolve(gpa, &repo, revision, &diag);
     const tree = try ziggit.peel(gpa, &repo, commit, .tree);
     const nonce = std.Io.Clock.awake.now(io).toNanoseconds();
     const result_path = try std.fmt.allocPrint(arena, "{s}/.eval-result-{s}-{d}", .{ session_dir, session, nonce });

@@ -95,6 +95,7 @@ pub fn save(arena: std.mem.Allocator, io: std.Io, path: []const u8, payload: Pay
 
 pub fn requestDigest(arena: std.mem.Allocator, request: message.Request) ![64]u8 {
     const json = try std.json.Stringify.valueAlloc(arena, request, .{});
+    defer arena.free(json);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(json, &digest, .{});
     return std.fmt.bytesToHex(digest, .lower);
@@ -622,6 +623,7 @@ test "Chock-owned tools replay their ordered log effects" {
         .child_agent_kind = "reviewer",
         .outcome = .finished,
         .result = "looks good",
+        .scratchpad_path = "",
     } });
     try tape.finish(arena, .{
         .call_id = "spawn-1",

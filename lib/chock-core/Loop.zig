@@ -6925,6 +6925,7 @@ test "captured spawn effects restore child state without starting a child" {
         .child_agent_kind = "reviewer",
         .outcome = .finished,
         .result = "captured result",
+        .scratchpad_path = "",
     } }, .{});
     var tape = ReplayedSpawnTape{ .effects_json = &.{ spawn_json, complete_json } };
 

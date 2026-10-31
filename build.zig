@@ -2203,6 +2203,11 @@ pub fn build(b: *std.Build) void {
         "git_path",
         b.findProgram(.{ .names = &.{"git"} }) orelse "",
     );
+    const cli_fake_provider = b.createModule(.{
+        .root_source_file = b.path("test/core/fake_provider.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const cli_tests = b.addTest(.{
         .use_llvm = evaluator_llvm,
@@ -2213,6 +2218,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "chock_path", .module = chock_path_options.createModule() },
                 .{ .name = "chock_main", .module = chock_exe_module },
+                .{ .name = "fake_provider", .module = cli_fake_provider },
             },
         }),
     });

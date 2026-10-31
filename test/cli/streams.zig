@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const fake_provider = @import("fake_provider");
 const chock_path = @import("chock_path").chock_path;
 /// Found by `build.zig`. Empty when there is none, and the one test that needs it then skips.
 const git_path = @import("chock_path").git_path;
@@ -306,6 +307,10 @@ const Project = struct {
     const dead_provider = "http://127.0.0.1:1/v1";
 
     fn make(gpa: std.mem.Allocator, io: std.Io, box: *Sandbox) !Project {
+        return makeWithProvider(gpa, io, box, dead_provider);
+    }
+
+    fn makeWithProvider(gpa: std.mem.Allocator, io: std.Io, box: *Sandbox, provider_url: []const u8) !Project {
         // `Sandbox` builds its environment from nothing, so the workspace builder would find no `git`.
         try box.env.put("PATH", std.fs.path.dirname(git_path) orelse "/usr/bin");
 
@@ -329,7 +334,7 @@ const Project = struct {
             \\    .defaults = .{{ .provider = "dead", .model = "no-such-model" }},
             \\}}
             \\
-        , .{dead_provider});
+        , .{provider_url});
         try writer.interface.flush();
 
         const path = try std.fmt.allocPrint(gpa, "{s}/project", .{box.root});
@@ -477,6 +482,107 @@ test "chock run JSON mode writes one result object and keeps diagnostics on stan
     }
     try testing.expect(saw_event);
     try testing.expect(saw_result);
+}
+
+test "eval records once and replays after its provider is gone" {
+    if (git_path.len == 0) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const response_head =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "Connection: close\r\n\r\n";
+    const content = fake_provider.httpChunk(
+        "data: {\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"content\":\"Done.\"}}]}\n\n",
+    );
+    const stopped = fake_provider.httpChunk(
+        "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n",
+    );
+    const done = fake_provider.httpChunk("data: [DONE]\n\n");
+    var provider = try fake_provider.FakeProvider.start(gpa, io, .{
+        .head = response_head,
+        .body = &.{
+            .{ .bytes = content },
+            .{ .bytes = stopped },
+            .{ .bytes = done },
+            .{ .bytes = fake_provider.last_chunk },
+        },
+    });
+
+    var box = try Sandbox.init(gpa, io);
+    defer box.deinit(gpa);
+    var base_url_buffer: [96]u8 = undefined;
+    var url_buffer: [128]u8 = undefined;
+    const provider_url = try std.fmt.bufPrint(&url_buffer, "{s}/v1", .{provider.baseUrl(&base_url_buffer)});
+    var project = try Project.makeWithProvider(gpa, io, &box, provider_url);
+    defer project.deinit(gpa);
+
+    const spec_path = try std.fmt.allocPrint(gpa, "{s}/case.zon", .{box.root});
+    defer gpa.free(spec_path);
+    const capture_path = try std.fmt.allocPrint(gpa, "{s}/capture.json", .{box.root});
+    defer gpa.free(capture_path);
+    const recorded_report = try std.fmt.allocPrint(gpa, "{s}/recorded.json", .{box.root});
+    defer gpa.free(recorded_report);
+    const replayed_report = try std.fmt.allocPrint(gpa, "{s}/replayed.json", .{box.root});
+    defer gpa.free(replayed_report);
+    const trajectory_path = try std.fmt.allocPrint(gpa, "{s}/trajectory.json", .{box.root});
+    defer gpa.free(trajectory_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = spec_path,
+        .data =
+        \\.{
+        \\    .schema = "chock.eval",
+        \\    .version = 1,
+        \\    .name = "real replay",
+        \\    .task = "Answer briefly.",
+        \\    .provider = "dead",
+        \\    .model = "no-such-model",
+        \\    .expect = .{ .end_reason = "finished", .max_turns = 1 },
+        \\}
+        \\
+        ,
+    });
+
+    var recorded = try runChock(gpa, io, &box.env, &.{
+        "eval",          "run",        spec_path,  "--project",     project.path,
+        "--capture",     capture_path, "--report", recorded_report, "--trajectory",
+        trajectory_path, "--format",   "json",
+    });
+    defer recorded.deinit(gpa);
+    provider.join();
+    try testing.expect(provider.captured.body.len != 0);
+    provider.deinit();
+    try testing.expectEqual(@as(u8, 0), recorded.code);
+
+    const capture = try std.Io.Dir.cwd().readFileAlloc(io, capture_path, gpa, .limited(1024 * 1024));
+    defer gpa.free(capture);
+    try testing.expect(std.mem.indexOf(u8, capture, "chock.eval-fixture") != null);
+    try testing.expect(std.mem.indexOf(u8, capture, "sk-not-a-real-key") == null);
+
+    var replayed = try runChock(gpa, io, &box.env, &.{
+        "eval",      "replay",     spec_path,  "--project",     project.path,
+        "--capture", capture_path, "--report", replayed_report, "--format",
+        "json",
+    });
+    defer replayed.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), replayed.code);
+
+    var compared = try runChock(gpa, io, &box.env, &.{
+        "eval", "compare", recorded_report, replayed_report, "--format", "json",
+    });
+    defer compared.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), compared.code);
+    try testing.expect(std.mem.indexOf(u8, compared.out, "\"passed\":true") != null);
+
+    const trajectory = try std.Io.Dir.cwd().readFileAlloc(io, trajectory_path, gpa, .limited(2 * 1024 * 1024));
+    defer gpa.free(trajectory);
+    try testing.expect(std.mem.indexOf(u8, trajectory, "chock.rl-trajectory") != null);
+    try testing.expect(std.mem.indexOf(u8, trajectory, "\"trainable\":false") != null);
 }
 
 /// Three files rather than pipes, since `std.process.RunOptions` has no way to give a child its standard input.
