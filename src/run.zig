@@ -95,6 +95,10 @@ const usage_text =
     \\  --output <format>   Write human output (the default), one versioned JSON
     \\                      result, or live JSONL events followed by that result.
     \\                      JSON modes never prompt and fail closed.
+    \\  --eval-record <path>
+    \\                      Record redacted provider and tool exchanges for replay.
+    \\  --eval-replay <path>
+    \\                      Use only the captured exchanges; any mismatch fails closed.
     \\
 ++ tty.options_text;
 
@@ -121,6 +125,8 @@ const Options = struct {
     output: Output = .human,
     export_dir: ?[]const u8 = null,
     export_syslog: ?[]const u8 = null,
+    eval_record: ?[]const u8 = null,
+    eval_replay: ?[]const u8 = null,
     parent_session: []const u8 = "",
     parent_chain: []const chock_proto.event.SpawnLink = &.{},
     scratchpad: []const u8 = "",
@@ -11897,10 +11903,47 @@ fn runSession(
         tool_runner.context.idle = pump.coreIdle();
     }
 
+    var eval_fixture_arena = std.heap.ArenaAllocator.init(gpa);
+    defer eval_fixture_arena.deinit();
+    const fixture_allocator = eval_fixture_arena.allocator();
+
+    var fixture_replay: ?chock_core.eval_fixture.Replay = if (options.eval_replay) |path| replay: {
+        const payload = chock_core.eval_fixture.load(fixture_allocator, io, path) catch |err| {
+            tty.print(.err, "chock run: the evaluation fixture at {s} could not be verified: {t}\n", .{ path, err });
+            return .audit_gap;
+        };
+        break :replay .{ .payload = payload };
+    } else null;
+    var fixture_recorder: ?chock_core.eval_fixture.Recorder = if (options.eval_record != null) .{
+        .arena = fixture_allocator,
+        .policy = started.redact,
+    } else null;
+    var recording_provider: ?chock_core.eval_fixture.RecordingProvider = if (fixture_recorder) |*one|
+        one.provider(http.client())
+    else
+        null;
+    var recording_tools: ?chock_core.eval_fixture.RecordingTools = if (fixture_recorder) |*one|
+        one.tools(plugin_aware.runner())
+    else
+        null;
+
+    const eval_client = if (fixture_replay) |*one|
+        one.client()
+    else if (recording_provider) |*one|
+        one.client()
+    else
+        http.client();
+    const eval_tools = if (fixture_replay) |*one|
+        one.runner()
+    else if (recording_tools) |*one|
+        one.runner()
+    else
+        plugin_aware.runner();
+
     var deps = chock_core.Loop.Deps{
-        .client = http.client(),
+        .client = eval_client,
         .storage = started.storage,
-        .tool_runner = plugin_aware.runner(),
+        .tool_runner = eval_tools,
         .give_locked = give_locked.giveLocked(),
         .tool_definitions = tool_definitions,
         .model = started.model,
@@ -11965,7 +12008,15 @@ fn runSession(
             }
         }
 
-        try chock_core.Loop.run(gpa, io, deps);
+        chock_core.Loop.run(gpa, io, deps) catch |err| switch (err) {
+            error.ReplayExhausted, error.ReplayMismatch => {
+                tty.print(.err, "chock run: deterministic replay stopped: {s}\n", .{
+                    if (fixture_replay) |*one| one.mismatch else @errorName(err),
+                });
+                return .audit_gap;
+            },
+            else => return err,
+        };
         const ending = try finalEnding(gpa, io, started.storage);
         _ = chock_workspace.checkpoint.save(
             gpa,
@@ -11988,6 +12039,21 @@ fn runSession(
     }
 
     if (turns == 0 and fork_request.* == null) return .usage;
+
+    if (fixture_replay) |*one| {
+        if (!one.complete()) {
+            tty.print(.err, "chock run: deterministic replay did not consume the whole fixture: {s}\n", .{
+                if (one.mismatch.len != 0) one.mismatch else "captured exchanges remain",
+            });
+            return .audit_gap;
+        }
+    }
+    if (options.eval_record) |path| {
+        chock_core.eval_fixture.save(fixture_allocator, io, path, fixture_recorder.?.payload()) catch |err| {
+            tty.print(.err, "chock run: the evaluation fixture could not be written to {s}: {t}\n", .{ path, err });
+            return .faulted;
+        };
+    }
 
     return try finalExit(gpa, io, started.storage);
 }
@@ -13259,6 +13325,8 @@ const value_options = [_][]const u8{
     "--export-dir",
     "--export-syslog",
     "--output",
+    "--eval-record",
+    "--eval-replay",
     subagent.flag.parent_session,
     subagent.flag.parent_kind,
     subagent.flag.spawn_reason,
@@ -13364,6 +13432,10 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
                 tty.print(.err, "chock run: --output takes human, json, or jsonl, and \"{s}\" is none of them.\n", .{value});
                 return error.BadArguments;
             };
+        } else if (std.mem.eql(u8, argument, "--eval-record")) {
+            options.eval_record = value;
+        } else if (std.mem.eql(u8, argument, "--eval-replay")) {
+            options.eval_replay = value;
         } else if (std.mem.eql(u8, argument, subagent.flag.parent_session)) {
             options.parent_session = value;
         } else if (std.mem.eql(u8, argument, subagent.flag.parent_kind)) {
@@ -13409,6 +13481,11 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
 
     if (options.session != null and options.continue_newest) {
         tty.print(.err, "chock run: --session and --continue name two different sessions.\n", .{});
+        return error.BadArguments;
+    }
+
+    if (options.eval_record != null and options.eval_replay != null) {
+        tty.print(.err, "chock run: --eval-record and --eval-replay cannot be used together.\n", .{});
         return error.BadArguments;
     }
 

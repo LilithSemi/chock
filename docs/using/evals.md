@@ -6,17 +6,24 @@ session use the same evaluator:
 
 ```console
 chock eval run evals/parser.zon
+chock eval replay evals/parser.zon
 chock eval check evals/parser.zon --session 01M...
 chock eval check evals/parser.zon --session 01M... --format json
 chock eval compare baseline.json candidate.json --minimum-score 0.9
 ```
 
 `run` starts `chock run --output json` with the task, provider and model from
-the spec. `check` does not contact a provider. It replays the named audit log,
-checks its hash chain, inspects the resulting repository, and runs the declared
-commands. This makes `check` suitable for regression CI after an interesting
-session has already been captured. Pass `--skip-tests` when the repository
-commands are deliberately being run elsewhere.
+the spec and records the neutral provider and tool exchanges named by
+`capture`. `replay` runs a fresh Chock session against only those exchanges: it
+does not send a provider request or dispatch a captured generic tool call.
+Every request is matched by digest, the capture itself has an integrity digest,
+and an exhausted, divergent, truncated, or partly unused capture fails closed.
+
+`check` does not contact a provider. It replays the named audit log, checks its
+hash chain, inspects the resulting repository, and runs the declared commands.
+This makes `check` suitable for regression CI after an interesting session has
+already been captured. Pass `--skip-tests` when the repository commands are
+deliberately being run elsewhere.
 
 ## The spec
 
@@ -33,6 +40,7 @@ fixture for either command.
     .fixture = "fixtures/parser",
     .provider = "local",
     .model = "coder",
+    .capture = "captures/parser.json",
     .expect = .{
         .end_reason = "finished",
         .max_turns = 8,

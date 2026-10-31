@@ -121,6 +121,8 @@ pub const SendError =
         BodyCompressed,
         StreamStalled,
         StreamTruncated,
+        ReplayExhausted,
+        ReplayMismatch,
     };
 
 pub const Client = struct {

@@ -14,19 +14,19 @@ const max_spec_bytes: usize = 1024 * 1024;
 const max_log_bytes: usize = 128 * 1024 * 1024;
 
 const usage_text =
-    \\Usage: chock eval <run|check> <spec.zon> [options]
+    \\Usage: chock eval <run|replay|check> <spec.zon> [options]
     \\       chock eval compare <baseline.json> <candidate.json> [options]
     \\
     \\run starts a provider-backed `chock run --output json` with the task and
-    \\provider settings in the spec, then scores its audited session. check scores
-    \\an existing session without contacting a provider. Both run repository tests
-    \\declared by the spec unless --skip-tests is passed.
+    \\provider settings in the spec and records its fixture. replay runs the same
+    \\harness against only that fixture. check scores an existing session. All
+    \\three run repository tests unless --skip-tests is passed.
     \\
     \\The report distinguishes model/session, harness/audit, sandbox, fixture, policy,
     \\network, budget and test failures. JSON is versioned and suitable for CI.
     \\
     \\Options:
-    \\  --session <id>      Session to score. Required by check; forbidden by run.
+    \\  --session <id>      Session to score. Required by check; forbidden by run/replay.
     \\  --project <dir>     Repository to run and inspect. Overrides spec.fixture.
     \\  --format <kind>     human (default) or json.
     \\  --skip-tests        Score the audit and repository without executing tests.
@@ -42,6 +42,7 @@ const usage_text =
     \\      .fixture = "fixtures/parser",
     \\      .provider = "local",
     \\      .model = "coder",
+    \\      .capture = "captures/parser.json",
     \\      .expect = .{
     \\          .end_reason = "finished",
     \\          .max_turns = 8,
@@ -59,7 +60,7 @@ const usage_text =
     \\
 ++ tty.options_text;
 
-const Action = enum { run, check, compare };
+const Action = enum { run, replay, check, compare };
 const Format = enum { human, json };
 
 const Options = struct {
@@ -103,6 +104,7 @@ const Spec = struct {
     fixture: []const u8 = ".",
     provider: []const u8 = "",
     model: []const u8 = "",
+    capture: []const u8 = "",
     expect: Expectations = .{},
     tests: []const Test = &.{},
 };
@@ -210,9 +212,14 @@ pub fn main(
         tty.print(.err, "chock eval: the fixture could not be opened: {t}\n", .{err});
         return Exit.usage.code();
     };
+    const capture_path = if (spec.capture.len == 0) "" else fixtureFromSpec(arena, options.spec_path, spec.capture);
+    if ((options.action == .run or options.action == .replay) and capture_path.len == 0) {
+        tty.print(.err, "chock eval: provider runs and replays require .capture in the spec\n", .{});
+        return Exit.usage.code();
+    }
     const session = switch (options.action) {
         .check => options.session,
-        .run => runProvider(arena, gpa, io, &env, exe_path, project, spec) catch |err| {
+        .run, .replay => runProvider(arena, gpa, io, &env, exe_path, project, spec, capture_path, options.action) catch |err| {
             tty.print(.err, "chock eval: the provider-backed run did not produce a session: {t}\n", .{err});
             return Exit.faulted.code();
         },
@@ -297,7 +304,7 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
         return error.BadArguments;
     }
     if (action == .check and !session_paths.isValidId(out.session)) return error.BadArguments;
-    if (action == .run and out.session.len != 0) return error.BadArguments;
+    if ((action == .run or action == .replay) and out.session.len != 0) return error.BadArguments;
     if (action != .compare and (out.minimum_score != 0 or out.max_regression != 0)) return error.BadArguments;
     if (action == .compare and (out.session.len != 0 or out.project != null or out.skip_tests)) return error.BadArguments;
     return out;
@@ -387,12 +394,15 @@ fn runProvider(
     exe_path: []const u8,
     project: []const u8,
     spec: Spec,
+    capture_path: []const u8,
+    action: Action,
 ) ![]const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.appendSlice(gpa, &.{ exe_path, "run", "--project", project, "--output", "json" });
     if (spec.provider.len != 0) try argv.appendSlice(gpa, &.{ "--provider", spec.provider });
     if (spec.model.len != 0) try argv.appendSlice(gpa, &.{ "--model", spec.model });
+    try argv.appendSlice(gpa, &.{ if (action == .replay) "--eval-replay" else "--eval-record", capture_path });
     if (spec.expect.max_cost) |amount| {
         const text = try std.fmt.allocPrint(arena, "{d}", .{amount});
         try argv.appendSlice(gpa, &.{ "--max-cost", text });
@@ -586,6 +596,7 @@ test "eval command line separates provider runs from deterministic checks" {
     try testing.expect(checked.skip_tests);
     try testing.expectError(error.BadArguments, parseOptions(&.{ "check", "case.zon" }));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "run", "case.zon", "--session", id }));
+    try testing.expectEqual(Action.replay, (try parseOptions(&.{ "replay", "case.zon" })).action);
 
     const compared = try parseOptions(&.{ "compare", "base.json", "candidate.json", "--minimum-score", "0.8", "--max-regression", "0.05" });
     try testing.expectEqual(Action.compare, compared.action);

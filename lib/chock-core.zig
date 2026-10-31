@@ -50,6 +50,7 @@ pub const search = @import("chock-core/search.zig");
 pub const handback = @import("chock-core/handback.zig");
 pub const ask = @import("chock-core/ask.zig");
 pub const redact = @import("chock-core/redact.zig");
+pub const eval_fixture = @import("chock-core/eval_fixture.zig");
 pub const devices = @import("chock-core/devices.zig");
 
 test {
