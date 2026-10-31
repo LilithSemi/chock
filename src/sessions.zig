@@ -13,6 +13,7 @@ const chock_workspace = @import("chock-workspace");
 const approval = @import("approval.zig");
 const session_paths = @import("session.zig");
 const show_cmd = @import("session_show.zig");
+const tree_cmd = @import("session_tree.zig");
 const usage_cmd = @import("usage.zig");
 const workspace_cmd = @import("workspace.zig");
 const Exit = @import("exit.zig").Exit;
@@ -33,7 +34,7 @@ pub const answer_timeout_ms: u64 = 5 * 60 * 1000;
 pub const day_ms: u64 = 24 * 60 * 60 * 1000;
 
 const usage_text =
-    \\Usage: chock sessions [list|show <session>|verify [<session>]|seal [<session>]|
+    \\Usage: chock sessions [list|show <session>|tree <session>|verify [<session>]|seal [<session>]|
     \\                       export [<session>] --to <dir>|fork <session>|remove <session>|prune] [options]
     \\
     \\With no subcommand, says what every session of this project was, oldest first,
@@ -45,6 +46,11 @@ const usage_text =
     \\the event's byte offset in the audit log. Human output previews large bodies;
     \\--full expands them. Compact output keeps one event to a line. JSON output is
     \\JSON Lines, one complete event per line, with its real byte offset.
+    \\
+    \\tree follows every session.spawn recursively. It shows each branch's status,
+    \\delegated cost budget, actual token and cost use, and whether the parent wrote
+    \\a terminal agent.complete record. Compact and JSON formats emit one row per
+    \\session, so one branch can be selected without mixing in its siblings.
     \\
     \\verify reads the hash chain each log carries: every event holds the hash of the
     \\line before it, so an event changed after the fact is found and named. A hash
@@ -89,7 +95,7 @@ const usage_text =
     \\  --to <dir>           For export: where the copies go. Made if it is not there.
     \\  --at <event>         For fork: a session.end event byte offset. Defaults to the last.
     \\  --older-than <days>  For prune: remove sessions that started before this.
-    \\  --format <kind>       For show: human (default), compact, or json.
+    \\  --format <kind>       For show or tree: human (default), compact, or json.
     \\  --only <groups>       For show: comma-separated lifecycle, messages, tools,
     \\                        approvals, policy, diffs, subagents, usage, context, workspace,
     \\                        sandbox, or network. Unknown events are always shown.
@@ -117,11 +123,13 @@ const Options = struct {
     show_filters: show_cmd.Filters = .{},
     show_full: bool = false,
     show_options_named: bool = false,
+    tree_incompatible_options: bool = false,
 };
 
 const Action = enum {
     list,
     show,
+    tree,
     verify,
     seal,
     @"export",
@@ -131,7 +139,7 @@ const Action = enum {
 
     fn takesSession(self: Action) bool {
         return switch (self) {
-            .show, .verify, .seal, .@"export", .fork, .remove => true,
+            .show, .tree, .verify, .seal, .@"export", .fork, .remove => true,
             .list, .prune => false,
         };
     }
@@ -186,6 +194,26 @@ pub fn main(
             .invalid => Exit.audit_gap.code(),
             .not_found => {
                 tty.print(.err, "chock sessions show: there is no session {s} in this project\n", .{options.session});
+                return Exit.usage.code();
+            },
+        };
+    }
+
+    if (options.action == .tree) {
+        if (!session_paths.isValidId(options.session)) {
+            tty.print(.err, "chock sessions tree: \"{s}\" is not a session identifier\n", .{options.session});
+            return Exit.usage.code();
+        }
+        const format: tree_cmd.Format = switch (options.show_format) {
+            .human => .human,
+            .compact => .compact,
+            .json => .json,
+        };
+        return switch (try tree_cmd.show(arena, gpa, io, dir, options.session, format)) {
+            .shown => Exit.finished.code(),
+            .invalid => Exit.audit_gap.code(),
+            .not_found => {
+                tty.print(.err, "chock sessions tree: there is no session {s} in this project\n", .{options.session});
                 return Exit.usage.code();
             },
         };
@@ -273,7 +301,7 @@ pub fn main(
     const action = switch (options.action) {
         .remove => remove_action,
         .prune => prune_action,
-        .list, .show, .verify, .seal, .@"export", .fork => unreachable,
+        .list, .show, .tree, .verify, .seal, .@"export", .fork => unreachable,
     };
     if (try retentionRefusal(arena, org_rules, action)) |why| {
         tty.print(.warn, "chock sessions {s}: {s}\n", .{ @tagName(options.action), why });
@@ -294,7 +322,7 @@ pub fn main(
     const console = stdin.console();
 
     return switch (options.action) {
-        .list, .show, .verify, .seal, .@"export", .fork => unreachable,
+        .list, .show, .tree, .verify, .seal, .@"export", .fork => unreachable,
         .remove => removeSession(
             arena,
             io,
@@ -2292,11 +2320,13 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             if (index >= args.len) return error.BadArguments;
             options.show_filters = show_cmd.Filters.parse(args[index]) orelse return error.BadArguments;
             options.show_options_named = true;
+            options.tree_incompatible_options = true;
             continue;
         }
         if (std.mem.eql(u8, argument, "--full")) {
             options.show_full = true;
             options.show_options_named = true;
+            options.tree_incompatible_options = true;
             continue;
         }
         if (std.mem.eql(u8, argument, "--yes")) {
@@ -2314,7 +2344,7 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
         options.session = argument;
     }
 
-    if ((options.action == .remove or options.action == .fork or options.action == .show) and options.session.len == 0)
+    if ((options.action == .remove or options.action == .fork or options.action == .show or options.action == .tree) and options.session.len == 0)
         return error.BadArguments;
     if (!options.action.takesSession() and options.session.len != 0) return error.BadArguments;
     if (options.action == .prune and options.older_than_days == null) return error.BadArguments;
@@ -2323,7 +2353,8 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
     if (options.action != .@"export" and options.to != null) return error.BadArguments;
     if (options.action != .fork and options.at != null) return error.BadArguments;
     if (options.action != .seal and options.require_card) return error.BadArguments;
-    if (options.action != .show and options.show_options_named) return error.BadArguments;
+    if (options.action != .show and options.action != .tree and options.show_options_named) return error.BadArguments;
+    if (options.action == .tree and options.tree_incompatible_options) return error.BadArguments;
     if (options.show_full and options.show_format != .human) return error.BadArguments;
     return options;
 }
@@ -2443,6 +2474,10 @@ test "the command line names an action and exactly what that action needs" {
     try testing.expectEqualStrings("01JQ" ++ @as([22]u8, @splat('F')), forking.session);
     try testing.expectEqual(@as(?u64, 42), forking.at);
 
+    const tree = try parseOptions(&.{ "tree", "01JQ" ++ @as([22]u8, @splat('T')), "--format", "json" });
+    try testing.expectEqual(Action.tree, tree.action);
+    try testing.expectEqual(show_cmd.Format.json, tree.show_format);
+
     const pruning = try parseOptions(&.{ "prune", "--older-than", "30", "--yes" });
     try testing.expectEqual(Action.prune, pruning.action);
     try testing.expectEqual(@as(?u32, 30), pruning.older_than_days);
@@ -2458,6 +2493,9 @@ test "the command line names an action and exactly what that action needs" {
     try testing.expectError(error.BadArguments, parseOptions(&.{ "prune", "--older-than", "not-a-number" }));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "list", "--older-than", "30" }));
     try testing.expectError(error.BadArguments, parseOptions(&.{"fork"}));
+    try testing.expectError(error.BadArguments, parseOptions(&.{"tree"}));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "tree", "01JQ" ++ @as([22]u8, @splat('T')), "--full" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "tree", "01JQ" ++ @as([22]u8, @splat('T')), "--only", "subagents" }));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "list", "--at", "42" }));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "fork", "01JQ" ++ @as([22]u8, @splat('F')), "--at", "nope" }));
 

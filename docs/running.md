@@ -162,6 +162,7 @@ leaves a log written a moment ago and no process at all.
 ```
 chock sessions                          # every session, oldest first
 chock sessions show <session>           # conversation and tool timeline
+chock sessions tree <session>           # recursive subagent status and budgets
 chock sessions verify [<session>]       # read the hash chain, and the seal
 chock sessions seal [<session>]         # sign the head of a log's chain
 chock sessions seal --require-card      # sign on a card, or write nothing
@@ -190,6 +191,15 @@ shown and make the command return the audit-gap exit status; a filter never
 hides something this Chock does not understand. Torn records, undecodable
 records, and broken hash chains are likewise printed at their byte offset and
 return an audit gap.
+
+`chock sessions tree <session>` follows every `session.spawn` from that root.
+Each row keeps a branch separate and shows its agent kind, current or terminal
+status, delegated cost budget, actual token use and priced cost. A child whose
+process died can have no complete child log; the parent's durable
+`agent.complete` record still makes that branch terminal. A spawned branch
+with neither a live log nor a terminal parent record is instead reported as an
+audit gap. `--format compact` and `--format json` write one row per session for
+scripts that need to inspect or total one branch without mixing in siblings.
 
 ### What reached the model
 

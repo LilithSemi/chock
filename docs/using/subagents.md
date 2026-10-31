@@ -56,6 +56,12 @@ own, and its parent's log holds two events around it: one when the child was
 asked for, and one saying how it ended and what it answered. So an agent that
 acts on a subagent's answer always leaves a trace of having been told it.
 
+Read the whole delegation tree with `chock sessions tree <parent>`. It follows
+the child identifiers recursively and puts each branch's promised budget,
+actual use and terminal outcome on its own row. A missing terminal record is
+an audit gap rather than an apparently idle child; a recorded crash remains a
+terminal outcome even when the crashed process could not finish its own log.
+
 The child's own log stands on its own. Its first event names the parent
 session, and it also names every agent kind above it, root first. A child holds
 no more policy than its parent, so the answer the policy table gives depends on

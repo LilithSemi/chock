@@ -28,6 +28,11 @@ pub const Child = struct {
     reason: []const u8,
     budget_max_cost: f64 = 0,
     budget_currency: []const u8 = "",
+    /// Set when the parent records agent.complete. Keeping this beside the
+    /// spawn makes a folded parent sufficient for tree status and restart.
+    outcome: ?event.AgentOutcome = null,
+    result: []const u8 = "",
+    scratchpad_path: []const u8 = "",
 };
 
 pub const Workspace = struct {
@@ -351,6 +356,7 @@ pub const Session = struct {
             .session_spawn => |spawn| {
                 try self.children.append(allocator, try childFrom(allocator, spawn));
             },
+            .agent_complete => |complete| try completeChild(allocator, &self.children, complete),
             .workspace_open => |opened| {
                 // The last one wins; the first could point at a path an earlier attempt removed.
                 self.workspace = .{
@@ -434,6 +440,23 @@ fn childFrom(allocator: std.mem.Allocator, spawn: event.SessionSpawn) std.mem.Al
     };
 }
 
+fn completeChild(
+    allocator: std.mem.Allocator,
+    children: *std.ArrayList(Child),
+    complete: event.AgentComplete,
+) std.mem.Allocator.Error!void {
+    for (children.items) |*child| {
+        if (!std.mem.eql(u8, child.session, complete.child_session)) continue;
+        child.outcome = switch (complete.outcome) {
+            .unknown => |name| .{ .unknown = try allocator.dupe(u8, name) },
+            inline else => |_, tag| @unionInit(event.AgentOutcome, @tagName(tag), {}),
+        };
+        child.result = try allocator.dupe(u8, complete.result);
+        child.scratchpad_path = try allocator.dupe(u8, complete.scratchpad_path);
+        return;
+    }
+}
+
 fn ownedUsage(allocator: std.mem.Allocator, usage: event.Usage) std.mem.Allocator.Error!event.Usage {
     var owned = usage;
     if (usage.cost == .known) {
@@ -466,6 +489,7 @@ pub const PolicyFold = struct {
         const allocator = self.arena.allocator();
         switch (envelope.event) {
             .session_spawn => |spawn| try self.children.append(allocator, try childFrom(allocator, spawn)),
+            .agent_complete => |complete| try completeChild(allocator, &self.children, complete),
             .usage => |usage| self.spend.add(try ownedUsage(allocator, usage)),
             .policy_self => |update| {
                 for (update.restrictions) |restriction| {
@@ -798,6 +822,30 @@ test "a session.spawn event records the child session and not its transcript" {
     try std.testing.expectEqualStrings("review the diff", session.children.items[0].reason);
 
     try std.testing.expectEqual(@as(usize, 0), session.context.items.len);
+}
+
+test "agent.complete makes a spawned child's terminal state durable" {
+    const allocator = std.testing.allocator;
+    var session = Session.init(allocator);
+    defer session.deinit();
+
+    try session.apply(.{ .id = 1, .session = "01PARENT", .time_ms = 1, .event = .{
+        .session_spawn = .{ .child_session = "01CHILD", .child_agent_kind = "worker", .reason = "run tests" },
+    } });
+    try session.apply(.{ .id = 2, .session = "01PARENT", .time_ms = 2, .event = .{
+        .agent_complete = .{
+            .child_session = "01CHILD",
+            .child_agent_kind = "worker",
+            .outcome = .died,
+            .result = "the child exited without session.end",
+            .scratchpad_path = "/tmp/child.md",
+        },
+    } });
+
+    const child = session.children.items[0];
+    try std.testing.expectEqual(event.AgentOutcome.died, child.outcome.?);
+    try std.testing.expectEqualStrings("the child exited without session.end", child.result);
+    try std.testing.expectEqualStrings("/tmp/child.md", child.scratchpad_path);
 }
 
 test "a session with no plan.update event has no plan at all" {
