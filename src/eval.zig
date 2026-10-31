@@ -679,12 +679,19 @@ fn runProvider(
     const result = try std.process.run(gpa, io, .{ .argv = argv.items, .environ_map = env });
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
+    return parseRunResult(arena, result.stdout);
+}
+
+fn parseRunResult(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     const RunResult = struct { schema: []const u8 = "", session_id: ?[]const u8 = null };
-    const parsed = try std.json.parseFromSliceLeaky(RunResult, arena, result.stdout, .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSliceLeaky(RunResult, arena, bytes, .{ .ignore_unknown_fields = true });
     if (!std.mem.eql(u8, parsed.schema, "chock.run-result")) return error.BadRunResult;
     const id = parsed.session_id orelse return error.NoSession;
     if (!session_paths.isValidId(id)) return error.NoSession;
-    return id;
+    // JSON strings without escapes may borrow the input buffer. The provider
+    // subprocess output is freed as soon as runProvider returns, so give the
+    // caller an arena-owned session ID explicitly.
+    return arena.dupe(u8, id);
 }
 
 fn observe(
@@ -1039,6 +1046,21 @@ test "evaluation paths cannot leave their fixture" {
         .task = "run somewhere",
         .expect = .{ .sandbox_driver = "container" },
     }));
+}
+
+test "provider result session ID outlives subprocess output" {
+    var backing = std.heap.ArenaAllocator.init(testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    const expected = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const bytes = try testing.allocator.dupe(u8,
+        \\{"schema":"chock.run-result","session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}
+    );
+    defer testing.allocator.free(bytes);
+
+    const id = try parseRunResult(arena, bytes);
+    @memset(bytes, 'x');
+    try testing.expectEqualStrings(expected, id);
 }
 
 test "evaluation can require the microVM driver" {

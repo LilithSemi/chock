@@ -488,6 +488,7 @@ test "an encoded fixture verifies its payload" {
             .old_logprobs = &.{-0.25},
         },
     }} });
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"response_mask\":[1]") != null);
     const decoded = try decode(arena, encoded);
     try std.testing.expectEqual(@as(usize, 1), decoded.providers.len);
     try std.testing.expectEqualStrings("hello", decoded.providers[0].deltas[0].text);

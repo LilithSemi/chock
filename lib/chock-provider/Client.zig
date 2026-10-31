@@ -77,6 +77,24 @@ pub const TrainingTrace = struct {
     response_token_ids: []const u32,
     response_mask: []const u8,
     old_logprobs: []const f32,
+
+    pub fn jsonStringify(self: TrainingTrace, jw: *std.json.Stringify) std.json.Stringify.Error!void {
+        try jw.beginObject();
+        try jw.objectField("prompt_token_ids");
+        try jw.write(self.prompt_token_ids);
+        try jw.objectField("response_token_ids");
+        try jw.write(self.response_token_ids);
+        try jw.objectField("response_mask");
+        // Zig's generic JSON writer treats a byte slice as text. A training
+        // mask is numeric data, so write its elements explicitly to preserve
+        // the same array shape accepted from the training gateway.
+        try jw.beginArray();
+        for (self.response_mask) |one| try jw.write(one);
+        try jw.endArray();
+        try jw.objectField("old_logprobs");
+        try jw.write(self.old_logprobs);
+        try jw.endObject();
+    }
 };
 
 pub const Delta = union(enum) {
