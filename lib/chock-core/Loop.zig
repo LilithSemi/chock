@@ -6716,6 +6716,7 @@ const SpawnCase = struct {
     budget: ?chock_cost.budget.Budget = null,
     spent: f64 = 0,
     internal_tool_tape: ?InternalToolTape = null,
+    redact_policy: redact.Policy = .{},
 };
 
 fn attemptSpawn(allocator: std.mem.Allocator, io: std.Io, case: SpawnCase) !SpawnAttempt {
@@ -6761,6 +6762,7 @@ fn attemptSpawn(allocator: std.mem.Allocator, io: std.Io, case: SpawnCase) !Spaw
     deps.spawner = case.spawner;
     deps.budget = case.budget;
     deps.internal_tool_tape = case.internal_tool_tape;
+    deps.redact = case.redact_policy;
     try run(allocator, io, deps);
 
     var attempt = SpawnAttempt{
@@ -6862,6 +6864,53 @@ const ReplayedSpawnTape = struct {
     }
 };
 
+const RecordingSpawnProbe = struct {
+    active: bool = false,
+    completed: bool = false,
+    leaked: bool = false,
+
+    fn tape(self: *RecordingSpawnProbe) InternalToolTape {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = InternalToolTape.VTable{
+        .start = start,
+        .observe = observe,
+        .finish = finish,
+    };
+
+    fn start(
+        raw: *anyopaque,
+        _: std.mem.Allocator,
+        _: event.ToolCall,
+        _: []const u8,
+    ) InternalToolTape.TapeError!?CapturedInternalTool {
+        const self: *RecordingSpawnProbe = @ptrCast(@alignCast(raw));
+        self.active = true;
+        return null;
+    }
+
+    fn observe(
+        raw: *anyopaque,
+        _: std.mem.Allocator,
+        ev: event.Event,
+    ) InternalToolTape.TapeError!void {
+        const self: *RecordingSpawnProbe = @ptrCast(@alignCast(raw));
+        if (!self.active or ev != .agent_complete) return;
+        self.completed = true;
+        self.leaked = std.mem.indexOf(u8, ev.agent_complete.result, "supersecret") != null;
+    }
+
+    fn finish(
+        raw: *anyopaque,
+        _: std.mem.Allocator,
+        _: event.ToolResult,
+    ) InternalToolTape.TapeError!void {
+        const self: *RecordingSpawnProbe = @ptrCast(@alignCast(raw));
+        self.active = false;
+    }
+};
+
 test "captured spawn effects restore child state without starting a child" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -6891,6 +6940,20 @@ test "captured spawn effects restore child state without starting a child" {
     try testing.expectEqual(@as(usize, 1), attempt.complete_events);
     try testing.expectEqual(@as(usize, 0), attempt.runner_calls);
     try testing.expectEqualStrings("reviewer finished: captured result", attempt.output);
+}
+
+test "captured spawn effects see redaction before fixture recording" {
+    var spawner = FakeSpawner{ .result = "the child found supersecret" };
+    var tape = RecordingSpawnProbe{};
+    const attempt = try attemptSpawn(testing.allocator, testing.io, .{
+        .spawner = spawner.spawner(),
+        .internal_tool_tape = tape.tape(),
+        .redact_policy = .{ .secrets = &.{.{ .value = "supersecret" }} },
+    });
+    defer testing.allocator.free(attempt.output);
+
+    try testing.expect(tape.completed);
+    try testing.expect(!tape.leaked);
 }
 
 test "a spawn under a limit of zero is refused, names the limit, and starts nothing" {
