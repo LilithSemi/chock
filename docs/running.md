@@ -184,11 +184,30 @@ or choose `--format compact` for one line per event. `--format json` writes one
 complete JSON event per line with the real offset in its `id` field.
 
 Use `--only` with a comma-separated set of `lifecycle`, `messages`, `tools`,
-`approvals`, `policy`, `diffs`, `subagents`, `usage`, `workspace`, `sandbox`,
-and `network` to narrow the view. Unknown event kinds are still shown and make
-the command return the audit-gap exit status; a filter never hides something
-this Chock does not understand. Torn records, undecodable records, and broken
-hash chains are likewise printed at their byte offset and return an audit gap.
+`approvals`, `policy`, `diffs`, `subagents`, `usage`, `context`, `workspace`,
+`sandbox`, and `network` to narrow the view. Unknown event kinds are still
+shown and make the command return the audit-gap exit status; a filter never
+hides something this Chock does not understand. Torn records, undecodable
+records, and broken hash chains are likewise printed at their byte offset and
+return an audit gap.
+
+### What reached the model
+
+`chock sessions show <session> --only context` is the context inspection view.
+For every provider attempt it shows the effective system prompt, tool schemas,
+messages, compaction summaries and transient harness notices as separate rows.
+A transcript row points back to the byte offset of the event it came from.
+The view also names the instruction files, skill indexes, memory index and
+guidance index that contributed to the system prompt, and shows the context
+limit and the threshold that would cause compaction.
+
+The log records sizes and an intentionally rough estimate of one token per
+four encoded bytes. It does not record another copy of prompt text, message
+text, tool arguments or secrets: those either already have an audited source
+event or remain represented only by their source name and size. `--format
+json` exposes the same `context.request` records for other inspection tools.
+Retries get their own record and attempt number because each one is a real
+provider request even when its effective context is unchanged.
 
 Every run writes a `session.config` event, holding what a person put on the
 command line and the SHA-256 of the `chock.zon` the policy came from:
@@ -196,7 +215,10 @@ command line and the SHA-256 of the `chock.zon` the policy came from:
 ```json
 {"session.config":{"config_hash":"9f2a...","sandbox_hash":"41c8...",
  "instructions":["./task.md"],"policy_rules":["net.fetch.*=allow"],
- "dev_shell":"ci","allow_dirty":true}}
+ "context_sources":["harness chock","instruction given ./task.md"],
+ "dev_shell":"ci","allow_dirty":true,"context_limit_tokens":65536,
+ "context_policy":{"warn_at_percent":60,"compact_at_percent":75,
+ "keep_recent_entries":6,"keep_recent_kib":16,"summary_max_kib":16}}}
 ```
 
 It holds what the session had, and nothing about what it did not: a field you

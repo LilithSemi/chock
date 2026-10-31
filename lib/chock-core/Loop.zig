@@ -656,15 +656,13 @@ fn emptyReplyDetail(
     );
 }
 
-fn sendOnce(
+fn sendPrepared(
     allocator: std.mem.Allocator,
-    arena: std.mem.Allocator,
     deps: Deps,
     request: message.Request,
     watcher: ?chock_provider.Client.Watcher,
 ) Error!chock_provider.Client.AssembledReply {
-    const outbound = try redact.request(arena, deps.redact, request);
-    return chock_provider.Client.sendAndAssembleWatching(deps.client, allocator, outbound, watcher);
+    return chock_provider.Client.sendAndAssembleWatching(deps.client, allocator, request, watcher);
 }
 
 fn sendWithRetry(
@@ -682,7 +680,9 @@ fn sendWithRetry(
     var attempts: usize = 0;
     while (true) {
         attempts += 1;
-        const answer = try sendOnce(allocator, arena, deps, request, watcher);
+        const outbound = try redact.request(arena, deps.redact, request);
+        try recordContextRequest(allocator, arena, io, locked, session, deps, outbound, "turn", attempts);
+        const answer = try sendPrepared(allocator, deps, outbound, watcher);
         var held = true;
         errdefer if (held) freeReply(allocator, answer);
 
@@ -740,6 +740,81 @@ fn freeReply(allocator: std.mem.Allocator, reply: chock_provider.Client.Assemble
         .message => |said| chock_provider.Client.freeAssembledMessage(allocator, said),
         .failed => |failed| chock_provider.Client.freeAssembledMessage(allocator, failed.partial),
     }
+}
+
+fn recordContextRequest(
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    locked: anytype,
+    session: *chock_proto.state.Session,
+    deps: Deps,
+    request: message.Request,
+    purpose: []const u8,
+    attempt: u64,
+) Error!void {
+    var components: std.ArrayList(event.ContextComponent) = .empty;
+    var total_bytes: u64 = 0;
+
+    try appendContextComponent(arena, &components, &total_bytes, .{
+        .kind = "system",
+        .name = "effective system prompt",
+        .bytes = @intCast(request.system.len),
+    });
+
+    const tools_json = try std.json.Stringify.valueAlloc(arena, request.tools, .{});
+    try appendContextComponent(arena, &components, &total_bytes, .{
+        .kind = "tools",
+        .name = "tool definitions",
+        .bytes = @intCast(tools_json.len),
+    });
+
+    const links_to_session = std.mem.eql(u8, purpose, "turn");
+    for (request.messages, 0..) |one, index| {
+        const encoded = try std.json.Stringify.valueAlloc(arena, one, .{});
+        const entry = if (links_to_session and index < session.context.items.len)
+            session.context.items[index]
+        else
+            null;
+        try appendContextComponent(arena, &components, &total_bytes, .{
+            .kind = if (entry) |held| switch (held.data) {
+                .summary => "summary",
+                .message => "message",
+            } else if (links_to_session)
+                "notice"
+            else
+                "compaction input",
+            .name = one.role.wireName(),
+            .event_id = if (entry) |held| held.id else 0,
+            .bytes = @intCast(encoded.len),
+        });
+    }
+
+    _ = try appendAndApply(allocator, io, locked, session, deps, .{ .context_request = .{
+        .purpose = purpose,
+        .attempt = attempt,
+        .model_alias = deps.model_alias,
+        .components = components.items,
+        .estimated_tokens = estimateTokens(total_bytes),
+        .context_limit_tokens = deps.compaction.context_limit_tokens,
+        .compact_at_tokens = compaction.thresholdTokens(deps.compaction, deps.compaction.compact_at),
+    } });
+}
+
+fn appendContextComponent(
+    arena: std.mem.Allocator,
+    components: *std.ArrayList(event.ContextComponent),
+    total_bytes: *u64,
+    component: event.ContextComponent,
+) std.mem.Allocator.Error!void {
+    var with_estimate = component;
+    with_estimate.estimated_tokens = estimateTokens(component.bytes);
+    total_bytes.* +|= component.bytes;
+    try components.append(arena, with_estimate);
+}
+
+fn estimateTokens(bytes: u64) u64 {
+    return (bytes +| 3) / 4;
 }
 
 fn givingUpDetail(
@@ -1139,7 +1214,10 @@ fn askForSummary(
         .messages = &messages,
     };
 
-    const reply = sendOnce(allocator, arena, deps, request, null) catch |err| switch (err) {
+    const outbound = try redact.request(arena, deps.redact, request);
+    try recordContextRequest(allocator, arena, io, locked, session, deps, outbound, "compaction", 1);
+
+    const reply = sendPrepared(allocator, deps, outbound, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .stand_in_reason = try std.fmt.allocPrint(
             arena,
@@ -4437,15 +4515,18 @@ test "an observer is told about every event, in order, and never about one the l
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
     var index: usize = 0;
+    var context_requests: usize = 0;
     while (try replay.next(io)) |parsed| {
         defer parsed.deinit();
         try testing.expect(index < watcher.ids.items.len);
         try testing.expectEqual(parsed.value.id, watcher.ids.items[index]);
         try testing.expectEqual(std.meta.activeTag(parsed.value.event), watcher.kinds.items[index]);
+        if (parsed.value.event == .context_request) context_requests += 1;
         index += 1;
     }
     try testing.expectEqual(index, watcher.ids.items.len);
-    try testing.expectEqual(@as(usize, 9), index);
+    try testing.expectEqual(@as(usize, 11), index);
+    try testing.expectEqual(@as(usize, 2), context_requests);
 
     for (watcher.ids.items, watcher.log_lengths.items) |id, length| {
         try testing.expect(length > id);
@@ -4990,13 +5071,56 @@ test "a session with no observer behaves exactly as it did before there was one"
     try run(allocator, io, deps);
 
     var events: usize = 0;
+    var context_requests: usize = 0;
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
     while (try replay.next(io)) |parsed| {
         defer parsed.deinit();
         events += 1;
+        if (parsed.value.event == .context_request) context_requests += 1;
     }
-    try testing.expectEqual(@as(usize, 4), events);
+    try testing.expectEqual(@as(usize, 5), events);
+    try testing.expectEqual(@as(usize, 1), context_requests);
+}
+
+test "a context request records provenance and estimates without recording prompt content" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01LOOP");
+    const store = backing.storage();
+    defer store.close(io);
+    const secret_text = "do-not-copy-this-prompt-content";
+    const content = [_]event.ContentPart{.{ .text = secret_text }};
+    try seedEvent(allocator, io, store, .{ .message = .{ .role = .user, .content = &content } });
+
+    var fake_client = FakeClient{ .turns = &.{.{ .deltas = &.{.{ .text = "done" }} }} };
+    var fake_tools = FakeToolRunner{ .output = "unused" };
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.system_prompt = secret_text;
+    deps.compaction = .{ .context_limit_tokens = 1000, .compact_at = 0.75 };
+    try run(allocator, io, deps);
+
+    var found = false;
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .context_request) continue;
+        const request = parsed.value.event.context_request;
+        found = true;
+        try testing.expectEqualStrings("turn", request.purpose);
+        try testing.expectEqual(@as(?u64, 1000), request.context_limit_tokens);
+        try testing.expectEqual(@as(?u64, 750), request.compact_at_tokens);
+        try testing.expect(request.estimated_tokens != 0);
+        try testing.expect(request.components.len >= 3);
+        try testing.expect(request.components[2].event_id != 0);
+
+        const encoded = try event.toJson(allocator, parsed.value);
+        defer allocator.free(encoded);
+        try testing.expect(std.mem.indexOf(u8, encoded, secret_text) == null);
+    }
+    try testing.expect(found);
 }
 
 fn seedEvent(

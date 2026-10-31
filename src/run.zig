@@ -795,6 +795,7 @@ const Started = struct {
     scratch_owned: bool,
     tasks_dir: ?[]const u8,
     context_tokens: ?u64,
+    context_policy: chock_core.compaction.Policy = .{},
     uncommitted_files: usize,
     approvals: ?*chock_broker.socket.Endpoint,
     handovers: ?*chock_broker.handover.Endpoint,
@@ -907,6 +908,8 @@ fn sessionConfig(
     context_tokens: ?u64,
     sandbox_config: palisade.Sandbox.Config,
     read_instructions: []const chock_core.instructions.ReadFile,
+    context_sources: []const []const u8,
+    context_settings: chock_policy.context.Settings,
 ) std.mem.Allocator.Error!chock_proto.event.SessionConfig {
     var rules: std.ArrayList([]const u8) = .empty;
     for (options.policy_rules) |rule| {
@@ -933,11 +936,62 @@ fn sessionConfig(
         .sandbox_hash = try std.fmt.allocPrint(arena, "{x}", .{chock_net.shapeHash(sandbox_config)}),
         .instructions = options.instructions,
         .instruction_files = files.items,
+        .context_sources = context_sources,
         .policy_rules = rules.items,
         .dev_shell = dev_shell_name orelse "",
         .allow_dirty = options.allow_dirty,
         .context_limit_tokens = context_tokens,
+        .context_policy = .{
+            .warn_at_percent = context_settings.warn_at_percent,
+            .compact_at_percent = context_settings.compact_at_percent,
+            .keep_recent_entries = context_settings.keep_recent_entries,
+            .keep_recent_kib = context_settings.keep_recent_kib,
+            .summary_max_kib = context_settings.summary_max_kib,
+        },
     };
+}
+
+fn contextPolicy(
+    settings: chock_policy.context.Settings,
+    context_limit_tokens: ?u64,
+) chock_core.compaction.Policy {
+    return .{
+        .context_limit_tokens = context_limit_tokens,
+        .compact_at = @as(f64, @floatFromInt(settings.compact_at_percent)) / 100.0,
+        .warn_at = @as(f64, @floatFromInt(settings.warn_at_percent)) / 100.0,
+        .keep_recent_entries = settings.keep_recent_entries,
+        .keep_recent_max_bytes = @as(usize, settings.keep_recent_kib) * 1024,
+        .summary_max_bytes = @as(usize, settings.summary_max_kib) * 1024,
+    };
+}
+
+fn contextSources(
+    arena: std.mem.Allocator,
+    project: chock_core.prompt.Project,
+    sources: chock_core.prompt.Sources,
+) std.mem.Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.append(arena, "harness chock");
+    try out.append(arena, "constitution chock");
+    if (project.kind.len != 0) {
+        try out.append(arena, try std.fmt.allocPrint(arena, "project {s}", .{project.kind}));
+    }
+    for (sources.instructions.files) |one| {
+        try out.append(arena, try std.fmt.allocPrint(arena, "instruction {t} {s}", .{ one.layer, one.path }));
+    }
+    for (sources.instructions.subtrees) |one| {
+        try out.append(arena, try std.fmt.allocPrint(arena, "instruction subtree {s}", .{one.name}));
+    }
+    for (sources.guidance) |one| {
+        try out.append(arena, try std.fmt.allocPrint(arena, "guidance {s}", .{one.name}));
+    }
+    for (sources.skills) |one| {
+        try out.append(arena, try std.fmt.allocPrint(arena, "skill {t} {s}", .{ one.layer, one.name }));
+    }
+    for (sources.memory) |one| {
+        try out.append(arena, try std.fmt.allocPrint(arena, "memory {s}", .{one.name}));
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// Whether this project could ever publish a port, which decides both whether
@@ -1727,6 +1781,18 @@ fn start(
     };
     const subagent_limits = subagentsUnderOrg(limits_from_file, org_bundle);
 
+    var context_diag: ?chock_policy.context.Diagnostic = null;
+    defer if (context_diag) |*d| d.deinit(arena);
+    const context_settings = chock_policy.context.load(arena, io, project_root, &context_diag) catch |err| {
+        if (context_diag) |*d| {
+            tty.print(.err, "chock run: the context block in chock.zon could not be read: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the context block in chock.zon could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
+    const context_policy = contextPolicy(context_settings, instance.context_tokens);
+
     var language_server_diag: ?chock_core.lsp_driver.Diagnostic = null;
     defer if (language_server_diag) |*d| d.deinit(arena);
     const language_server = chock_core.lsp_driver.load(
@@ -1967,6 +2033,8 @@ fn start(
             instance.context_tokens,
             sandbox_config,
             loaded_instructions.files,
+            try contextSources(arena, prompt_project, prompt_sources),
+            context_settings,
         ),
         .model = model,
         .model_alias = instance.name,
@@ -1979,6 +2047,7 @@ fn start(
         .scratch_owned = options.scratchpad.len == 0,
         .tasks_dir = tasks_dir,
         .context_tokens = instance.context_tokens,
+        .context_policy = context_policy,
         .uncommitted_files = uncommitted_files,
         .approvals = approvals,
         .handovers = handovers,
@@ -11851,7 +11920,7 @@ fn runSession(
         .parent_session = options.parent_session,
         .spawner = subagent_spawner.spawner(),
         .children = &children,
-        .compaction = .{ .context_limit_tokens = started.context_tokens },
+        .compaction = started.context_policy,
         .notices = .{
             .enabled = !options.no_notices,
             .clock = wall.clock(),

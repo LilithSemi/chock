@@ -10,6 +10,7 @@ pub const hardening = @import("chock-policy/hardening.zig");
 pub const apply = @import("chock-policy/apply.zig");
 pub const limits = @import("chock-policy/limits.zig");
 pub const instructions = @import("chock-policy/instructions.zig");
+pub const context = @import("chock-policy/context.zig");
 pub const dirs = @import("chock-policy/dirs.zig");
 pub const search = @import("chock-policy/search.zig");
 pub const sandbox = @import("chock-policy/sandbox.zig");

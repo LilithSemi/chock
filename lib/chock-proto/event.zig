@@ -109,6 +109,7 @@ pub const Kind = enum {
     approval_response,
     prompt_password,
     diff,
+    context_request,
     compaction,
     usage,
     task_complete,
@@ -160,6 +161,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .approval_response = "approval.response",
     .prompt_password = "prompt.password",
     .diff = "diff",
+    .context_request = "context.request",
     .compaction = "compaction",
     .usage = "usage",
     .task_complete = "task.complete",
@@ -241,6 +243,19 @@ pub const SessionStart = struct {
 
 /// Config git and `chock.zon` can't show. Unset fields are omitted;
 /// `config_hash` is always written, even null, since absence matters.
+pub const ContextPolicy = struct {
+    warn_at_percent: u8,
+    compact_at_percent: u8,
+    keep_recent_entries: u16,
+    keep_recent_kib: u16,
+    summary_max_kib: u16,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 pub const SessionConfig = struct {
     /// SHA-256 of `chock.zon`, lower case hex; null means no `chock.zon`, so built-in rules applied.
     config_hash: ?[]const u8 = null,
@@ -250,12 +265,16 @@ pub const SessionConfig = struct {
     /// Every instruction file read, as `<layer> <path> sha256:<hex>`, so a
     /// replay can tell whether a project's own instructions changed.
     instruction_files: []const []const u8 = &.{},
+    /// Secret-free names of every instruction, skill, memory index, guidance
+    /// index, and fixed harness source that contributed to the system prompt.
+    context_sources: []const []const u8 = &.{},
     policy_rules: []const []const u8 = &.{},
     /// The `devShells` attribute read, from `--dev-shell` or the `nix` block.
     dev_shell: []const u8 = "",
     allow_dirty: bool = false,
     /// The model's token limit, if said; null skips compaction in `lib/chock-core/compaction.zig`.
     context_limit_tokens: ?u64 = null,
+    context_policy: ?ContextPolicy = null,
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
@@ -280,6 +299,10 @@ pub const SessionConfig = struct {
             try jw.objectField("instruction_files");
             try jw.write(self.instruction_files);
         }
+        if (self.context_sources.len != 0) {
+            try jw.objectField("context_sources");
+            try jw.write(self.context_sources);
+        }
         if (self.policy_rules.len != 0) {
             try jw.objectField("policy_rules");
             try jw.write(self.policy_rules);
@@ -291,6 +314,14 @@ pub const SessionConfig = struct {
         if (self.allow_dirty) {
             try jw.objectField("allow_dirty");
             try jw.write(true);
+        }
+        if (self.context_limit_tokens) |limit| {
+            try jw.objectField("context_limit_tokens");
+            try jw.write(limit);
+        }
+        if (self.context_policy) |policy| {
+            try jw.objectField("context_policy");
+            try jw.write(policy);
         }
 
         for (self.extra.members) |member| {
@@ -700,6 +731,39 @@ pub const Diff = struct {
 pub const EventRange = struct {
     from_id: u64,
     through_id: u64,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
+/// One secret-free description of a piece of a provider request. Event ids
+/// point back into the audit log; zero means the piece was generated for this
+/// request (the system prompt, tool schema, or a transient harness notice).
+pub const ContextComponent = struct {
+    kind: []const u8,
+    name: []const u8 = "",
+    event_id: u64 = 0,
+    bytes: u64 = 0,
+    estimated_tokens: u64 = 0,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
+/// The effective context immediately before one provider call. It deliberately
+/// records provenance and sizes, never prompt or message content.
+pub const ContextRequest = struct {
+    purpose: []const u8 = "turn",
+    attempt: u64 = 1,
+    model_alias: []const u8 = "",
+    components: []const ContextComponent = &.{},
+    estimated_tokens: u64 = 0,
+    context_limit_tokens: ?u64 = null,
+    compact_at_tokens: ?u64 = null,
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
@@ -1228,6 +1292,7 @@ pub const Event = union(Kind) {
     approval_response: ApprovalResponse,
     prompt_password: PromptPassword,
     diff: Diff,
+    context_request: ContextRequest,
     compaction: Compaction,
     usage: Usage,
     task_complete: TaskComplete,
@@ -1735,6 +1800,13 @@ test "no serialized envelope contains a raw newline, whatever the Kind, and ever
         .{ .unknown = .{ .name = nl, .raw = .{ .string = nl } } },
     };
     const kept_ranges = [_]EventRange{.{ .from_id = 1, .through_id = 2 }};
+    const context_components = [_]ContextComponent{.{
+        .kind = nl,
+        .name = nl,
+        .event_id = 7,
+        .bytes = 80,
+        .estimated_tokens = 20,
+    }};
     const plan_steps = [_]PlanStep{.{ .id = nl, .subject = nl, .status = .in_progress, .blocked_by = nl }};
 
     const events = [_]Event{
@@ -1779,6 +1851,15 @@ test "no serialized envelope contains a raw newline, whatever the Kind, and ever
         } },
         .{ .prompt_password = .{ .correlation_id = nl, .prompt = nl } },
         .{ .diff = .{ .path = nl, .patch = nl, .change_set_id = nl, .review = .approved, .review_note = nl } },
+        .{ .context_request = .{
+            .purpose = nl,
+            .attempt = 2,
+            .model_alias = nl,
+            .components = &context_components,
+            .estimated_tokens = 20,
+            .context_limit_tokens = 100,
+            .compact_at_tokens = 75,
+        } },
         .{ .compaction = .{ .summary = nl, .from_id = 1, .through_id = 9, .kept_ranges = &kept_ranges, .model_alias = nl } },
         .{ .usage = .{
             .input_tokens = 1200,
@@ -2369,9 +2450,18 @@ test "every part of a session's configuration reaches the log, and reads back" {
         .config_hash = "ff00",
         .sandbox_hash = "aa11",
         .instructions = &.{ "./task.md", "./style.md" },
+        .context_sources = &.{ "harness chock", "skill project test" },
         .policy_rules = &.{"net.fetch.*=allow"},
         .dev_shell = "ci",
         .allow_dirty = true,
+        .context_limit_tokens = 65536,
+        .context_policy = .{
+            .warn_at_percent = 60,
+            .compact_at_percent = 80,
+            .keep_recent_entries = 12,
+            .keep_recent_kib = 32,
+            .summary_max_kib = 8,
+        },
     } };
     const text = try std.json.Stringify.valueAlloc(gpa, full, .{});
     defer gpa.free(text);
@@ -2384,9 +2474,13 @@ test "every part of a session's configuration reaches the log, and reads back" {
     try std.testing.expectEqualStrings("aa11", back.sandbox_hash);
     try std.testing.expectEqual(@as(usize, 2), back.instructions.len);
     try std.testing.expectEqualStrings("./style.md", back.instructions[1]);
+    try std.testing.expectEqualStrings("skill project test", back.context_sources[1]);
     try std.testing.expectEqualStrings("net.fetch.*=allow", back.policy_rules[0]);
     try std.testing.expectEqualStrings("ci", back.dev_shell);
     try std.testing.expect(back.allow_dirty);
+    try std.testing.expectEqual(@as(?u64, 65536), back.context_limit_tokens);
+    try std.testing.expectEqual(@as(u8, 80), back.context_policy.?.compact_at_percent);
+    try std.testing.expectEqual(@as(u16, 12), back.context_policy.?.keep_recent_entries);
 
     const other = Event{ .session_config = .{
         .config_hash = "ff00",

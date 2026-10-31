@@ -91,7 +91,7 @@ const usage_text =
     \\  --older-than <days>  For prune: remove sessions that started before this.
     \\  --format <kind>       For show: human (default), compact, or json.
     \\  --only <groups>       For show: comma-separated lifecycle, messages, tools,
-    \\                        approvals, policy, diffs, subagents, usage, workspace,
+    \\                        approvals, policy, diffs, subagents, usage, context, workspace,
     \\                        sandbox, or network. Unknown events are always shown.
     \\  --full                For human show: do not shorten large recorded bodies.
     \\  --require-card       For seal: sign on a card or write nothing. Refuses every

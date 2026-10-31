@@ -30,6 +30,7 @@ pub const Filters = struct {
     diffs: bool = true,
     subagents: bool = true,
     usage: bool = true,
+    context: bool = true,
     workspace: bool = true,
     sandbox: bool = true,
     network: bool = true,
@@ -47,6 +48,7 @@ pub const Filters = struct {
             .diffs = false,
             .subagents = false,
             .usage = false,
+            .context = false,
             .workspace = false,
             .sandbox = false,
             .network = false,
@@ -54,7 +56,7 @@ pub const Filters = struct {
         var names = std.mem.splitScalar(u8, text, ',');
         while (names.next()) |name| {
             if (name.len == 0) return null;
-            if (std.mem.eql(u8, name, "lifecycle")) out.lifecycle = true else if (std.mem.eql(u8, name, "messages")) out.messages = true else if (std.mem.eql(u8, name, "tools")) out.tools = true else if (std.mem.eql(u8, name, "approvals")) out.approvals = true else if (std.mem.eql(u8, name, "policy")) out.policy = true else if (std.mem.eql(u8, name, "diffs")) out.diffs = true else if (std.mem.eql(u8, name, "subagents")) out.subagents = true else if (std.mem.eql(u8, name, "usage")) out.usage = true else if (std.mem.eql(u8, name, "workspace")) out.workspace = true else if (std.mem.eql(u8, name, "sandbox")) out.sandbox = true else if (std.mem.eql(u8, name, "network")) out.network = true else return null;
+            if (std.mem.eql(u8, name, "lifecycle")) out.lifecycle = true else if (std.mem.eql(u8, name, "messages")) out.messages = true else if (std.mem.eql(u8, name, "tools")) out.tools = true else if (std.mem.eql(u8, name, "approvals")) out.approvals = true else if (std.mem.eql(u8, name, "policy")) out.policy = true else if (std.mem.eql(u8, name, "diffs")) out.diffs = true else if (std.mem.eql(u8, name, "subagents")) out.subagents = true else if (std.mem.eql(u8, name, "usage")) out.usage = true else if (std.mem.eql(u8, name, "context")) out.context = true else if (std.mem.eql(u8, name, "workspace")) out.workspace = true else if (std.mem.eql(u8, name, "sandbox")) out.sandbox = true else if (std.mem.eql(u8, name, "network")) out.network = true else return null;
         }
         return out;
     }
@@ -68,6 +70,8 @@ pub const Filters = struct {
             .diff => self.diffs,
             .session_spawn, .agent_complete => self.subagents,
             .usage => self.usage,
+            .session_config => self.lifecycle or self.context,
+            .context_request, .compaction => self.context,
             .workspace_open, .workspace_integrate, .workspace_adopt, .workspace_select => self.workspace,
             .sandbox_open,
             .sandbox_supervisor,
@@ -254,6 +258,9 @@ fn writeCompact(arena: std.mem.Allocator, envelope: event.Envelope) !void {
         .diff => |one| tty.out(.plain, " path={s} bytes={d}", .{
             try inlineText(arena, one.path), one.patch.len,
         }),
+        .context_request => |one| tty.out(.plain, " purpose={s} attempt={d} components={d} estimated_tokens={d}", .{
+            try inlineText(arena, one.purpose), one.attempt, one.components.len, one.estimated_tokens,
+        }),
         .usage => |one| tty.out(.plain, " model={s} input={d} output={d}", .{
             try inlineText(arena, one.model), one.input_tokens, one.output_tokens,
         }),
@@ -294,12 +301,29 @@ fn writeHuman(arena: std.mem.Allocator, envelope: event.Envelope, full: bool) !v
                 });
             }
         },
-        .session_config => |one| tty.out(.plain, "  config={s} sandbox={s}, {d} instructions, {d} policy rules\n", .{
-            try inlineText(arena, one.config_hash orelse "built in"),
-            try inlineText(arena, one.sandbox_hash),
-            one.instructions.len,
-            one.policy_rules.len,
-        }),
+        .session_config => |one| {
+            tty.out(.plain, "  config={s} sandbox={s}, {d} instructions, {d} policy rules\n", .{
+                try inlineText(arena, one.config_hash orelse "built in"),
+                try inlineText(arena, one.sandbox_hash),
+                one.instructions.len,
+                one.policy_rules.len,
+            });
+            for (one.context_sources) |source| {
+                tty.out(.plain, "  source: {s}\n", .{try inlineText(arena, source)});
+            }
+            if (one.context_limit_tokens) |limit| tty.out(.plain, "  context limit: {d} tokens\n", .{limit});
+            if (one.context_policy) |policy| tty.out(
+                .plain,
+                "  context policy: warn {d}%, compact {d}%, keep {d} entries/{d} KiB, summary {d} KiB\n",
+                .{
+                    policy.warn_at_percent,
+                    policy.compact_at_percent,
+                    policy.keep_recent_entries,
+                    policy.keep_recent_kib,
+                    policy.summary_max_kib,
+                },
+            );
+        },
         .session_end => |one| {
             tty.out(.plain, "  {s}\n", .{try inlineText(arena, one.reason.wireName())});
             if (one.detail.len != 0) try field(arena, "detail", one.detail, full);
@@ -363,10 +387,35 @@ fn writeHuman(arena: std.mem.Allocator, envelope: event.Envelope, full: bool) !v
             tty.out(.plain, "  review: {s}\n", .{try inlineText(arena, one.review.wireName())});
             try field(arena, "patch", one.patch, full);
         },
+        .context_request => |one| {
+            tty.out(.plain, "  {s} request, attempt {d}, model {s}\n", .{
+                try inlineText(arena, one.purpose), one.attempt, try inlineText(arena, one.model_alias),
+            });
+            tty.out(.plain, "  estimated {d} tokens", .{one.estimated_tokens});
+            if (one.context_limit_tokens) |limit| tty.out(.plain, " of {d}", .{limit});
+            if (one.compact_at_tokens) |at| tty.out(.plain, "; compaction at {d}", .{at});
+            tty.out(.plain, "\n", .{});
+            for (one.components) |component| {
+                tty.out(.plain, "  {s}: {d} bytes, about {d} tokens", .{
+                    try inlineText(arena, component.kind), component.bytes, component.estimated_tokens,
+                });
+                if (component.name.len != 0) tty.out(.plain, " ({s})", .{try inlineText(arena, component.name)});
+                if (component.event_id != 0) tty.out(.plain, " from event {d}", .{component.event_id});
+                tty.out(.plain, "\n", .{});
+            }
+        },
         .compaction => |one| {
             tty.out(.plain, "  events {d} through {d}, model {s}\n", .{
                 one.from_id, one.through_id, try inlineText(arena, one.model_alias),
             });
+            if (one.kept_ranges.len == 0) {
+                tty.out(.plain, "  retained unchanged: none; the range is represented by the summary\n", .{});
+            } else {
+                for (one.kept_ranges) |range| tty.out(.plain, "  retained unchanged: {d} through {d}\n", .{
+                    range.from_id, range.through_id,
+                });
+                tty.out(.plain, "  every other event in the range is represented by the summary\n", .{});
+            }
             try field(arena, "summary", one.summary, full);
         },
         .usage => |one| tty.out(.plain, "  {s}: input {d}, output {d}, cache write {d}, cache read {d}\n", .{
@@ -541,7 +590,18 @@ test "filters name every documented group and unknown events always remain visib
         .payload = .null,
     } }));
 
-    try std.testing.expect(Filters.parse("messages,tools,approvals,policy,diffs,subagents,usage,sandbox,network") != null);
+    const only_context = Filters.parse("context").?;
+    try std.testing.expect(only_context.includes(.{ .context_request = .{} }));
+    try std.testing.expect(only_context.includes(.{ .compaction = .{
+        .summary = "summary",
+        .from_id = 1,
+        .through_id = 2,
+        .kept_ranges = &.{},
+        .model_alias = "main",
+    } }));
+    try std.testing.expect(!only_context.includes(.{ .message = .{ .role = .user, .content = &.{} } }));
+
+    try std.testing.expect(Filters.parse("messages,tools,approvals,policy,diffs,subagents,usage,context,workspace,sandbox,network") != null);
     try std.testing.expect(Filters.parse("messages,no-such-group") == null);
     try std.testing.expect(Filters.parse("") == null);
 }

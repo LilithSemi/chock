@@ -169,12 +169,41 @@ is a complete `chock.zon` with every block a first project needs:
         ".env",
     },
     .subagents = .{ .max_width = 2 },
+    .context = .{ .compact_at_percent = 80 },
     .apply = .{ .mode = .merge },
 }
 ```
 
 `.subagents` also takes `.max_depth`. Both default to 6. See
 [subagents.md](../using/subagents.md).
+
+The `context` block controls when the transcript is compacted and how much of
+its recent tail survives unchanged:
+
+```zon
+.{
+    .context = .{
+        .warn_at_percent = 60,
+        .compact_at_percent = 75,
+        .keep_recent_entries = 6,
+        .keep_recent_kib = 16,
+        .summary_max_kib = 16,
+    },
+}
+```
+
+The percentages apply to the provider's model limit. The warning must precede
+compaction; compaction is bounded to 10–95%, at most 64 recent entries and 256
+KiB of recent text, and a summary of at most 64 KiB. Leaving the block out uses
+the values above. Files supplied with `--instructions`, `AGENTS.md`, and files
+in the `instructions` block are pinned in the system prompt rather than the
+compactable transcript. Each file is already bounded to 8 KiB, and its
+operator/session/project layer fixes precedence; pinning one cannot lift an
+organisation policy or turn project text into operator instructions.
+
+Inspect the effective result with `chock sessions show <session> --only
+context`. The log records the threshold and every retained, summarized, or
+dropped event range, so replay gives the same provenance.
 
 `.apply.mode` says how an approved apply lands. It defaults to `merge`, which
 parks the work at `refs/chock/<session>` and then merges it into the branch you
