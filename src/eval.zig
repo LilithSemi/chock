@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const chock_proto = @import("chock-proto");
+const chock_core = @import("chock-core");
 
 const session_paths = @import("session.zig");
 const Exit = @import("exit.zig").Exit;
@@ -30,6 +31,7 @@ const usage_text =
     \\  --project <dir>     Repository to run and inspect. Overrides spec.fixture.
     \\  --format <kind>     human (default) or json.
     \\  --skip-tests        Score the audit and repository without executing tests.
+    \\  --trajectory <path> Write a versioned RL trajectory beside the report.
     \\  --minimum-score <n> Candidate score required by compare (default 0).
     \\  --max-regression <n>
     \\                       How far below the baseline compare may fall (default 0).
@@ -71,6 +73,7 @@ const Options = struct {
     project: ?[]const u8 = null,
     format: Format = .human,
     skip_tests: bool = false,
+    trajectory: ?[]const u8 = null,
     minimum_score: f64 = 0,
     max_regression: f64 = 0,
 };
@@ -188,6 +191,20 @@ const Observed = struct {
     sandbox_sha256: []const u8 = "",
     audit_sha256: [64]u8,
     chain: chock_proto.chain.Verdict,
+    audit_jsonl: []const u8 = "",
+};
+
+const Trajectory = struct {
+    schema: []const u8 = "chock.rl-trajectory",
+    version: u32 = 1,
+    chock_version: []const u8,
+    eval: []const u8,
+    session_id: []const u8,
+    audit_sha256: []const u8,
+    audit_jsonl: []const u8,
+    capture: ?chock_core.eval_fixture.Payload,
+    trainable: bool,
+    report: Report,
 };
 
 pub fn main(
@@ -291,6 +308,12 @@ pub fn main(
         .reward_components = reward_summary.components,
         .findings = findings.items,
     };
+    if (options.trajectory) |path| {
+        writeTrajectory(arena, io, path, spec, report, &observed, capture_path) catch |err| {
+            tty.print(.err, "chock eval: the RL trajectory could not be written: {t}\n", .{err});
+            return Exit.faulted.code();
+        };
+    }
     writeReport(arena, options.format, report) catch return Exit.faulted.code();
     return if (report.passed) Exit.finished.code() else Exit.refused.code();
 }
@@ -373,6 +396,12 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
             out.project = args[i];
             continue;
         }
+        if (std.mem.eql(u8, args[i], "--trajectory")) {
+            i += 1;
+            if (i >= args.len) return error.BadArguments;
+            out.trajectory = args[i];
+            continue;
+        }
         if (std.mem.eql(u8, args[i], "--format")) {
             i += 1;
             if (i >= args.len) return error.BadArguments;
@@ -393,7 +422,7 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
     if (action == .check and !session_paths.isValidId(out.session)) return error.BadArguments;
     if ((action == .run or action == .replay) and out.session.len != 0) return error.BadArguments;
     if (action != .compare and (out.minimum_score != 0 or out.max_regression != 0)) return error.BadArguments;
-    if (action == .compare and (out.session.len != 0 or out.project != null or out.skip_tests)) return error.BadArguments;
+    if (action == .compare and (out.session.len != 0 or out.project != null or out.skip_tests or out.trajectory != null)) return error.BadArguments;
     return out;
 }
 
@@ -544,6 +573,7 @@ fn observe(
         .session = state.Session.init(arena),
         .audit_sha256 = std.fmt.bytesToHex(raw_digest, .lower),
         .chain = verified.verdict,
+        .audit_jsonl = bytes,
     };
     var replay = try storage.replay(gpa, io, 0);
     defer replay.deinit();
@@ -716,6 +746,54 @@ fn writeReport(arena: std.mem.Allocator, format: Format, report: Report) !void {
             tty.out(if (report.passed) .plain else .warn, "{d}/{d} checks passed; score {d:.3}; reward {d:.3}\n", .{ report.checks - report.failures, report.checks, report.score, report.reward });
         },
     }
+}
+
+fn writeTrajectory(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    spec: Spec,
+    report: Report,
+    observed: *const Observed,
+    capture_path: []const u8,
+) !void {
+    const capture: ?chock_core.eval_fixture.Payload = if (capture_path.len == 0)
+        null
+    else
+        try chock_core.eval_fixture.load(arena, io, capture_path);
+    var trainable = capture != null and capture.?.providers.len != 0;
+    if (capture) |held| {
+        for (held.providers) |exchange| {
+            const trace = exchange.training orelse {
+                trainable = false;
+                continue;
+            };
+            if (trace.response_token_ids.len != trace.response_mask.len or
+                trace.response_token_ids.len != trace.old_logprobs.len)
+            {
+                return error.BadTrainingTrace;
+            }
+        }
+    }
+    const trajectory = Trajectory{
+        .chock_version = @import("chock-version").text,
+        .eval = spec.name,
+        .session_id = report.session_id,
+        .audit_sha256 = &observed.audit_sha256,
+        .audit_jsonl = observed.audit_jsonl,
+        .capture = capture,
+        .trainable = trainable,
+        .report = report,
+    };
+    const json = try std.json.Stringify.valueAlloc(arena, trajectory, .{});
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true })
+    else
+        try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, json);
+    try file.writeStreamingAll(io, "\n");
+    try file.sync(io);
 }
 
 const testing = std.testing;

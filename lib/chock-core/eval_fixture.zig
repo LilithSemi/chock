@@ -25,6 +25,14 @@ pub const ProviderExchange = struct {
     request_sha256: []const u8,
     deltas: []const Client.Delta,
     result: ProviderResult,
+    training: ?TrainingTrace = null,
+};
+
+pub const TrainingTrace = struct {
+    prompt_token_ids: []const u32,
+    response_token_ids: []const u32,
+    response_mask: []const u8,
+    old_logprobs: []const f32,
 };
 
 pub const ToolExchange = struct {
@@ -349,10 +357,17 @@ test "an encoded fixture verifies its payload" {
         .request_sha256 = &@as([64]u8, @splat('a')),
         .deltas = &.{ .{ .text = "hello" }, .{ .stop_reason = .{ .reason = "stop" } } },
         .result = .ok,
+        .training = .{
+            .prompt_token_ids = &.{ 1, 2 },
+            .response_token_ids = &.{3},
+            .response_mask = &.{1},
+            .old_logprobs = &.{-0.25},
+        },
     }} });
     const decoded = try decode(arena, encoded);
     try std.testing.expectEqual(@as(usize, 1), decoded.providers.len);
     try std.testing.expectEqualStrings("hello", decoded.providers[0].deltas[0].text);
+    try std.testing.expectEqual(@as(u32, 3), decoded.providers[0].training.?.response_token_ids[0]);
 
     var damaged = try arena.dupe(u8, encoded);
     damaged[damaged.len - 4] = if (damaged[damaged.len - 4] == 'x') 'y' else 'x';

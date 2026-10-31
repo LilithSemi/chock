@@ -10,6 +10,7 @@ chock eval replay evals/parser.zon
 chock eval check evals/parser.zon --session 01M...
 chock eval check evals/parser.zon --session 01M... --format json
 chock eval compare baseline.json candidate.json --minimum-score 0.9
+chock eval check evals/parser.zon --session 01M... --trajectory rollout.json
 ```
 
 `run` starts `chock run --output json` with the task, provider and model from
@@ -117,6 +118,16 @@ category. `reward_weights` controls their weighted mean; a zero weight keeps a
 component visible without letting it alter the scalar. This is the stable
 boundary for an RL trainer: Chock owns the named measurements and the spec owns
 their composition, while the trainer receives both the scalar and its parts.
+
+`--trajectory <path>` writes `chock.rl-trajectory` version 1. The object binds
+the exact audit JSONL bytes and SHA-256, the verified provider/tool capture,
+the complete report, and the Chock version which produced it. Provider turns
+may additionally carry `prompt_token_ids`, `response_token_ids`,
+`response_mask`, and `old_logprobs`. A trajectory is marked `trainable` only
+when every provider turn has all four arrays and the response-shaped arrays
+have identical lengths. Ordinary hosted-provider captures therefore remain
+valid evaluation evidence without pretending to be policy-gradient input; an
+RL rollout adapter supplies the token-level fields at generation time.
 
 `chock eval compare` reads two JSON reports without opening either session. It
 fails when the candidate score is below `--minimum-score` or more than
