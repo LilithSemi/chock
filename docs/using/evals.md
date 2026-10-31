@@ -129,7 +129,8 @@ matters in a model regression suite: an unreadable log is not evidence that the
 model failed, and a broken fixture is not a bad answer.
 
 JSON output has schema `chock.eval-report` version 1. It includes the session
-identifier, the aggregate score, and every finding with its category, expected
+identifier, resolved base commit, actual configuration and sandbox digests,
+sandbox driver, aggregate score, and every finding with its category, expected
 value, and actual value. A report with any failed finding exits with Chock's
 refused status. A malformed spec is usage failure, and a log which cannot be
 verified is an audit gap.
@@ -170,9 +171,12 @@ writes an independent integrity-checked capture, report, and lossless
 trajectory for each rollout, followed by `dataset.json` with schema
 `chock.rl-dataset` version 1. The index records the train, validation, or test
 split, group and rollout numbers, the evaluation-spec SHA-256, Chock version,
-session, reward, exit status, and whether the trajectory contains complete
-token-level training data. An existing dataset index is never overwritten;
-use a fresh output directory for every collection run.
+session, resolved base commit, configuration and sandbox fingerprints, model
+provenance, reward, exit status, and whether the trajectory contains complete
+token-level training data. An external trainer can therefore reject a group
+whose environment or policy does not match its peers. An existing dataset
+index is never overwritten; use a fresh output directory for every collection
+run.
 
 ```zig
 .{

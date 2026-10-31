@@ -69,6 +69,9 @@ const Entry = struct {
     exit_code: u8,
     session_id: []const u8 = "",
     base_commit: []const u8 = "",
+    config_sha256: []const u8 = "",
+    sandbox_sha256: []const u8 = "",
+    sandbox_driver: []const u8 = "",
     reward: f64 = 0,
     trainable: bool = false,
     model_profile: []const u8 = "",
@@ -285,6 +288,9 @@ fn readSummary(arena: std.mem.Allocator, io: std.Io, entry: *Entry) !void {
     const Report = struct {
         session_id: []const u8 = "",
         base_commit: []const u8 = "",
+        config_sha256: []const u8 = "",
+        sandbox_sha256: []const u8 = "",
+        sandbox_driver: []const u8 = "",
         reward: f64 = 0,
         provenance: Provenance = .{},
     };
@@ -295,6 +301,9 @@ fn readSummary(arena: std.mem.Allocator, io: std.Io, entry: *Entry) !void {
     const trajectory = try std.json.parseFromSliceLeaky(Trajectory, arena, trajectory_bytes, .{ .ignore_unknown_fields = true });
     entry.session_id = report.session_id;
     entry.base_commit = report.base_commit;
+    entry.config_sha256 = report.config_sha256;
+    entry.sandbox_sha256 = report.sandbox_sha256;
+    entry.sandbox_driver = report.sandbox_driver;
     entry.reward = report.reward;
     entry.trainable = trajectory.trainable;
     entry.model_profile = report.provenance.model_profile;
