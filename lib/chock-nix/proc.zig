@@ -8,6 +8,7 @@ pub const Diagnostic = diagnostic.Diagnostic;
 pub const Error = error{
     ProgramNotFound,
     OutputTooLong,
+    TimedOut,
     Unexpected,
     OutOfMemory,
 };
@@ -36,6 +37,7 @@ pub const Options = struct {
     env: ?*const std.process.Environ.Map = null,
     cwd: ?[]const u8 = null,
     max_output_bytes: usize = 8 * 1024 * 1024,
+    timeout_ns: ?u64 = null,
     diag: ?diagnostic.Sink = null,
 };
 
@@ -59,12 +61,31 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) Error!Out
             return error.Unexpected;
         },
     };
+    errdefer child.kill(io);
 
-    const streams = try readPipes(allocator, io, &child, options.max_output_bytes);
+    var timed_out: std.atomic.Value(bool) = .init(false);
+    var timer = if (options.timeout_ns) |timeout_ns|
+        io.concurrent(killAfter, .{ io, &child, &timed_out, timeout_ns }) catch null
+    else
+        null;
+    defer {
+        if (timer) |*future| _ = future.cancel(io);
+    }
+
+    const streams = readPipes(allocator, io, &child, options.max_output_bytes) catch |err| {
+        if (timer) |*future| _ = future.cancel(io);
+        timer = null;
+        if (timed_out.load(.acquire)) return error.TimedOut;
+        return err;
+    };
     errdefer {
         allocator.free(streams.stdout);
         allocator.free(streams.stderr);
     }
+
+    if (timer) |*future| _ = future.cancel(io);
+    timer = null;
+    if (timed_out.load(.acquire)) return error.TimedOut;
 
     const term = child.wait(io) catch |err| {
         try diagnostic.noteNamed(options.diag, .program_wait_failed, options.argv[0], err);
@@ -72,6 +93,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) Error!Out
     };
 
     return .{ .term = term, .stdout = streams.stdout, .stderr = streams.stderr };
+}
+
+fn killAfter(
+    io: std.Io,
+    child: *std.process.Child,
+    timed_out: *std.atomic.Value(bool),
+    timeout_ns: u64,
+) void {
+    std.Io.sleep(io, .fromNanoseconds(@intCast(timeout_ns)), .awake) catch return;
+    timed_out.store(true, .release);
+    child.kill(io);
 }
 
 fn readPipes(
@@ -231,4 +263,18 @@ test "a caller that wants no diagnostic gets the same error and stores nothing" 
     } else |err| {
         try std.testing.expectEqual(@as(anyerror, error.Unexpected), err);
     }
+}
+
+test "a host process is killed when its deadline expires" {
+    const allocator = std.testing.allocator;
+    var env = try std.testing.environ.createMap(allocator);
+    defer env.deinit();
+
+    const sleep = resolve(allocator, std.testing.io, &env, "sleep") catch return error.SkipZigTest;
+    defer allocator.free(sleep);
+
+    try std.testing.expectError(error.TimedOut, run(allocator, std.testing.io, .{
+        .argv = &.{ sleep, "10" },
+        .timeout_ns = 10 * std.time.ns_per_ms,
+    }));
 }

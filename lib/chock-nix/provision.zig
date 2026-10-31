@@ -11,7 +11,13 @@ const store = @import("store.zig");
 
 pub const Error = std.mem.Allocator.Error || error{
     RunnerFailed,
+    RunnerTimedOut,
 };
+
+/// A cache miss may take minutes, but one Nix subprocess may not hold a turn
+/// forever. Resolution makes at most three bounded calls (build, provenance,
+/// closure), each with this limit.
+pub const default_timeout_ns: u64 = 15 * 60 * std.time.ns_per_s;
 
 pub const default_registry = "nixpkgs";
 
@@ -94,6 +100,7 @@ pub const Runner = struct {
 pub const Host = struct {
     nix_program: []const u8,
     env: *const std.process.Environ.Map,
+    timeout_ns: u64 = default_timeout_ns,
     diag: ?*?Diagnostic = null,
 
     pub fn runner(self: *const Host) Runner {
@@ -131,9 +138,11 @@ pub const Host = struct {
             .env = if (pinned) |*one| one else self.env,
             // The same bound store.closureOf gives its own nix path-info: a closure of thirty thousand paths sits far below this, and a nix that writes without end must not take the session's memory with it.
             .max_output_bytes = 10 * 1024 * 1024,
+            .timeout_ns = self.timeout_ns,
             .diag = sink,
         }) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
+            error.TimedOut => error.RunnerTimedOut,
             else => {
                 _ = diagnostic.note(sink, .{ .nix_not_runnable = err });
                 return error.RunnerFailed;

@@ -196,9 +196,10 @@ the path inward is a network namespace the platform does not have.
 
 ### What it costs
 
-A request holds the turn and has no deadline. `nix build` on a cache miss is
-minutes, and the turn waits for it, because the answer has to reach the mount
-set of the very next tool call, not the model. A line is printed before the
-wait so the terminal is not silent, and Ctrl-C reaches the `nix` child the
-same way it reaches a subagent. A build that never ends holds the session,
-which [status.md](../status.md) lists as an open item.
+A request holds the turn while Nix works, because the answer has to reach the
+mount set of the very next tool call, not the model. A line is printed before
+the wait so the terminal is not silent, and Ctrl-C reaches the `nix` child the
+same way it reaches a subagent. Each Nix process has a fifteen-minute deadline;
+one resolution may use a build, a provenance check and a closure query, each
+under that same bound. A timeout refuses the request and adds nothing to the
+toolchain.

@@ -179,14 +179,6 @@ them as not built.
   write. A tree of real `chock run` sessions, with a provider behind each one,
   has never been run.
 
-- A provisioning request holds the turn and has no deadline. `nix build` on a
-  cache miss is minutes, and the turn waits for it, because the answer has to
-  reach the mount set the very next tool call is built from and not the model.
-  A line is printed before the wait so the terminal is not silent, and Ctrl-C
-  reaches the `nix` child the same way it reaches a subagent, but a build that
-  never ends holds the session. It is also not asked about: the policy answer
-  is read once, at the start, and decides whether the tool exists at all.
-
 - A project cannot ship guidance of its own. The shelf `read_guidance` reads is
   compiled into Chock, which is why no tool call can write it. Letting a
   project add to it needs the read only path into the project that `chock.zon`
