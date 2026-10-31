@@ -953,8 +953,14 @@ fn endIfHandedOver(
 ) Error!bool {
     const asked = deps.handover orelse return false;
     const in_flight = InFlight{
-        .tasks = if (deps.tasks) |table| table.runningCount() else 0,
-        .children = if (deps.children) |table| table.runningCount() else 0,
+        .tasks = if (deps.tasks) |table|
+            if (table.independentlySupervised()) 0 else table.runningCount()
+        else
+            0,
+        .children = if (deps.children) |table|
+            if (table.independentlySupervised()) 0 else table.runningCount()
+        else
+            0,
     };
     if (!asked(io, in_flight)) return false;
 
@@ -979,7 +985,7 @@ fn recordFinishedTasks(
     delivery: TaskDelivery,
 ) Error!void {
     const table = deps.tasks orelse return;
-    const finished = try table.take(allocator);
+    const finished = try table.take(allocator, io);
     defer task_table.freeCompletions(allocator, finished);
 
     for (finished) |one| {
@@ -1051,7 +1057,7 @@ fn recordFinishedChildren(
     delivery: TaskDelivery,
 ) Error!void {
     const table = deps.children orelse return;
-    const finished = try table.take(allocator);
+    const finished = try table.take(allocator, io);
     defer subagent.freeCompletions(allocator, finished);
 
     for (finished) |one| {
@@ -1842,6 +1848,7 @@ fn runTool(
 
 fn isInternalTool(name: []const u8) bool {
     return std.mem.eql(u8, name, spawn_tool_name) or
+        std.mem.eql(u8, name, cancel_tool_name) or
         std.mem.eql(u8, name, plan_tool_name) or
         std.mem.eql(u8, name, restrict_tool_name) or
         std.mem.eql(u8, name, fetch_tool_name) or
@@ -1880,6 +1887,8 @@ fn runInternalTool(
 
     const result = if (std.mem.eql(u8, call.tool, spawn_tool_name))
         try runSpawn(allocator, io, locked, session, deps, call)
+    else if (std.mem.eql(u8, call.tool, cancel_tool_name))
+        try runCancelWork(allocator, io, deps, call)
     else if (std.mem.eql(u8, call.tool, plan_tool_name))
         try runPlanUpdate(allocator, io, locked, session, deps, call)
     else if (std.mem.eql(u8, call.tool, restrict_tool_name))
@@ -1914,7 +1923,49 @@ fn freeInternalResult(allocator: std.mem.Allocator, result: event.ToolResult) vo
 
 pub const spawn_tool_name = @tagName(tools.Tool.spawn_agent);
 
+pub const cancel_tool_name = @tagName(tools.Tool.cancel_work);
+
 const run_command_tool_name = @tagName(tools.Tool.run_command);
+
+fn runCancelWork(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    deps: Deps,
+    call: event.ToolCall,
+) Error!event.ToolResult {
+    const parsed = std.json.parseFromSlice(
+        tools.CancelWorkArgs,
+        allocator,
+        call.arguments,
+        .{ .ignore_unknown_fields = true },
+    ) catch return spawnRefusal(allocator, call, try allocator.dupe(
+        u8,
+        cancel_tool_name ++ " needs a JSON object with the field: \"id\"",
+    ));
+    defer parsed.deinit();
+
+    const id = parsed.value.id;
+    const canceled = if (std.mem.startsWith(u8, id, "task-"))
+        if (deps.tasks) |table| table.cancel(allocator, io, id) else false
+    else if (deps.children) |children|
+        children.cancelChild(allocator, io, id)
+    else
+        false;
+
+    return .{
+        .call_id = try allocator.dupe(u8, call.call_id),
+        .output = if (canceled)
+            try std.fmt.allocPrint(allocator, "canceled {s}; its terminal completion will follow", .{id})
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "nothing was canceled: {s} is not unfinished work leased to this session owner",
+                .{id},
+            ),
+        .is_error = !canceled,
+        .truncated = false,
+    };
+}
 
 pub const spawn_has_no_spawner_detail = "no subagent was started: the limits in chock.zon allow " ++
     "one, and this session was started with no way to run a child process. Do the work yourself.";
@@ -7484,7 +7535,7 @@ test "a spawn that carries on lets the parent work between the spawn and the ans
     try testing.expect(std.mem.indexOf(u8, spawn_result, "01CHILDAA") != null);
     try testing.expect(std.mem.indexOf(u8, spawn_result, "has not answered yet") != null);
 
-    const again = try table.take(allocator);
+    const again = try table.take(allocator, io);
     defer subagent.freeCompletions(allocator, again);
     try testing.expectEqual(@as(usize, 0), again.len);
 }
@@ -8296,7 +8347,7 @@ test "a finished background task is recorded as an event and delivered as a mess
     try testing.expect(assistant_id != null);
     try testing.expect(delivery_id.? < assistant_id.?);
 
-    const again = try table.take(allocator);
+    const again = try table.take(allocator, io);
     defer task_table.freeCompletions(allocator, again);
     try testing.expectEqual(@as(usize, 0), again.len);
 }

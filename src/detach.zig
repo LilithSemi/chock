@@ -24,10 +24,9 @@ const usage_text =
     \\The daemon has to be running already. Start one with `chock daemon`.
     \\
     \\A session that is still running is asked, and it answers at its next turn
-    \\boundary, so this waits. A session running a background command or a
-    \\background subagent says so and hands over once that work finishes,
-    \\because neither of those moves to another process. Its workspace and its
-    \\scratchpad do move.
+    \\boundary, so this waits. Independently supervised background commands and
+    \\subagents keep running across the handover. Its workspace and scratchpad
+    \\move too.
     \\
     \\Options:
     \\  --project <dir>    The project. Defaults to the current directory.
@@ -38,7 +37,7 @@ const usage_text =
     \\                     as `--daemon 127.0.0.1:<n>`. Only a daemon started with
     \\                     --host listens on one.
     \\  --wait <seconds>   How long to wait for a running session to reach a turn
-    \\                     boundary, and again for any background work it names.
+    \\                     boundary.
     \\                     Default 300. A session that does not answer in time
     \\                     keeps running, unchanged.
     \\
@@ -138,7 +137,6 @@ pub fn main(
 
     switch (sessions_cmd.readinessOf(gpa, io, paths.log, id)) {
         .running => {
-            if (!reportMovableWorkspace(gpa, io, paths.log, id)) return Exit.usage.code();
             if (!reportDaemonListening(io, daemon, id)) return Exit.usage.code();
             switch (askRunningSession(arena, io, paths.dir, id, options.patience_ms)) {
                 .handed_over => stopped_for_this = true,
@@ -251,39 +249,6 @@ fn endedHandedOver(gpa: std.mem.Allocator, io: std.Io, log_path: [:0]const u8) b
         handed_over = parsed.value.event.session_end.reason == .handed_over;
     }
     return handed_over;
-}
-
-fn reportMovableWorkspace(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    log_path: [:0]const u8,
-    id: []const u8,
-) bool {
-    const log = chock_proto.log.Log.open(io, log_path, "") catch return true;
-    var backing = chock_proto.storage.JsonLines{ .log = log };
-    const store = backing.storage();
-    defer store.close(io);
-
-    var replay = store.replay(gpa, io, 0) catch return true;
-    defer replay.deinit();
-
-    var kind: ?std.meta.Tag(chock_proto.event.WorkspaceKind) = null;
-    while (replay.next(io) catch null) |parsed| {
-        defer parsed.deinit();
-        if (parsed.value.event != .workspace_open) continue;
-        kind = std.meta.activeTag(parsed.value.event.workspace_open.kind);
-    }
-
-    const found = kind orelse return true;
-    if (found == .worktree) return true;
-    tty.print(
-        .err,
-        "chock detach: session {s} works in a {s} workspace, and only a git worktree moves to " ++
-            "another process yet. Stop it with Ctrl-C first. Its work stays where it is, and " ++
-            "`chock workspace adopt {s}` copies that work into the project.\n",
-        .{ id, @tagName(found), id },
-    );
-    return false;
 }
 
 const Asked = enum {
@@ -787,69 +752,6 @@ test "a running session that will not answer is refused, and it keeps running no
     var client = chock_broker.handover.Client.over(patient.socket.handle, &answers);
     try testing.expectEqual(chock_broker.handover.Decision.carry_on, endpoint.look(io, .{}, 0));
     try testing.expect(client.sendAsk());
-}
-
-test "a workspace that does not move yet is refused before the session is ever asked" {
-    const gpa = testing.allocator;
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_len = try tmp.dir.realPath(io, &dir_buffer);
-    const dir = dir_buffer[0..dir_len];
-    const id = "01JQ" ++ @as([22]u8, @splat('W'));
-    const log_path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}.jsonl", .{ dir, id }, 0);
-    defer gpa.free(log_path);
-
-    var said: tty.Capture = undefined;
-    said.start(io, gpa);
-    defer said.stop(io);
-
-    const kinds = [_]chock_proto.event.WorkspaceKind{ .worktree, .overlay };
-    for (kinds) |kind| {
-        said.clear();
-        tmp.dir.deleteFile(io, id ++ ".jsonl") catch {};
-        const log = try chock_proto.log.Log.open(io, log_path, id);
-        var backing = chock_proto.storage.JsonLines{ .log = log };
-        const store = backing.storage();
-        var locked = try store.lock(io);
-        _ = try locked.append(gpa, io, .{ .workspace_open = .{
-            .kind = kind,
-            .attempt = "01JQ" ++ @as([22]u8, @splat('B')),
-            .path = "/state/somewhere",
-            .base_commit = "a1b2c3",
-        } }, 1);
-        try locked.unlock(io);
-        store.close(io);
-
-        try testing.expectEqual(
-            kind == .worktree,
-            reportMovableWorkspace(gpa, io, log_path, id),
-        );
-        if (kind == .worktree) {
-            try testing.expectEqualStrings("", said.err());
-        } else {
-            try testing.expect(std.mem.indexOf(u8, said.err(), "overlay") != null);
-            try testing.expect(std.mem.indexOf(u8, said.err(), "Ctrl-C") != null);
-            try testing.expect(std.mem.indexOf(u8, said.err(), "chock workspace adopt") != null);
-            try testing.expect(std.mem.indexOf(u8, said.err(), id) != null);
-        }
-        try testing.expectEqualStrings("", said.out());
-    }
-
-    tmp.dir.deleteFile(io, id ++ ".jsonl") catch {};
-    {
-        const log = try chock_proto.log.Log.open(io, log_path, id);
-        var backing = chock_proto.storage.JsonLines{ .log = log };
-        const store = backing.storage();
-        defer store.close(io);
-        var locked = try store.lock(io);
-        const content = [_]chock_proto.event.ContentPart{.{ .text = "carry this on" }};
-        _ = try locked.append(gpa, io, .{ .message = .{ .role = .user, .content = &content } }, 1);
-        try locked.unlock(io);
-    }
-    try testing.expect(reportMovableWorkspace(gpa, io, log_path, id));
 }
 
 test "a running session with no handover socket is refused, and not waited on" {

@@ -9,7 +9,9 @@ pub const git = @import("chock-workspace/git.zig");
 pub const checkpoint = @import("chock-workspace/checkpoint.zig");
 pub const worktree = @import("chock-workspace/worktree.zig");
 pub const overlay = @import("chock-workspace/overlay.zig");
-pub const Workspace = @import("chock-workspace/Workspace.zig").Workspace;
+const workspace = @import("chock-workspace/Workspace.zig");
+pub const Workspace = workspace.Workspace;
+pub const KindTag = workspace.KindTag;
 
 test {
     @import("std").testing.refAllDecls(@This());

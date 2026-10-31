@@ -62,6 +62,12 @@ actual use and terminal outcome on its own row. A missing terminal record is
 an audit gap rather than an apparently idle child; a recorded crash remains a
 terminal outcome even when the crashed process could not finish its own log.
 
+Background subagents have a durable lease beside the parent session. The
+subagent runs in a supervisor process group, so `chock detach` can hand the
+parent to another process without waiting for it. The next owner adopts the
+lease, observes the same completion receipt, and may call `cancel_work` with
+the child session identifier. Only the current lease owner can cancel it.
+
 The child's own log stands on its own. Its first event names the parent
 session, and it also names every agent kind above it, root first. A child holds
 no more policy than its parent, so the answer the policy table gives depends on
@@ -76,6 +82,5 @@ nobody by default and is refused at once. `chock approve` can attach to it, and
 a rule in `chock.zon` is the way to answer without a person there, which
 [approvals.md](approvals.md) shows.
 
-A session running a background command or a background subagent is handed to
-the daemon only after that work finishes, because neither one moves to another
-process. `chock detach` says what it is waiting for.
+A background subagent does not keep a handover waiting. Its durable supervisor
+and output receipt outlive the session process, and the daemon adopts its lease.

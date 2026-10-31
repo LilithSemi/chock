@@ -492,7 +492,7 @@ test "a real child runs while its parent works, and the parent records it afterw
     }
 
     table.waitAll();
-    const finished = try table.take(gpa);
+    const finished = try table.take(gpa, testing.io);
     defer subagent.freeCompletions(gpa, finished);
     try testing.expectEqual(@as(usize, 1), finished.len);
     try testing.expectEqual(event.AgentOutcome.finished, finished[0].outcome);

@@ -5,6 +5,7 @@ const std = @import("std");
 
 const diagnostic = @import("diagnostic.zig");
 pub const Diagnostic = diagnostic.Diagnostic;
+const durable = @import("durable.zig");
 const chock_cost = @import("chock-cost");
 const chock_proto = @import("chock-proto");
 
@@ -376,12 +377,15 @@ const Lock = struct {
 pub const Table = struct {
     gpa: std.mem.Allocator,
     spawner: Spawner,
+    dir: ?[]const u8 = null,
 
     mutex: Lock = .{},
     started: usize = 0,
     completed: usize = 0,
     finished: std.ArrayList(Completion) = .empty,
     threads: std.ArrayList(std.Thread) = .empty,
+    supervisors: std.ArrayList(Supervisor) = .empty,
+    leave_running: bool = false,
     lost: ?Diagnostic = null,
 
     pub fn takeLost(self: *Table) ?Diagnostic {
@@ -399,11 +403,21 @@ pub const Table = struct {
     }
 
     pub fn deinit(self: *Table) void {
-        self.waitAll();
-        if (self.take(self.gpa)) |taken| freeCompletions(self.gpa, taken) else |_| {}
+        if (!self.leave_running) self.waitAll();
+        for (self.finished.items) |one| freeCompletion(self.gpa, one);
+        for (self.supervisors.items) |one| self.gpa.free(one.child_session);
+        self.supervisors.deinit(self.gpa);
         self.threads.deinit(self.gpa);
         self.finished.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    pub fn independentlySupervised(self: *const Table) bool {
+        return durable.supported and self.dir != null;
+    }
+
+    pub fn handOver(self: *Table) void {
+        self.leave_running = true;
     }
 
     pub fn waitAll(self: *Table) void {
@@ -411,7 +425,14 @@ pub const Table = struct {
             self.mutex.lock();
             const thread = self.threads.pop();
             self.mutex.unlock();
-            if (thread) |one| one.join() else return;
+            if (thread) |one| one.join() else break;
+        }
+        if (self.independentlySupervised()) {
+            for (self.supervisors.items) |*one| {
+                if (one.pid <= 0) continue;
+                _ = durable.reap(one.pid, true);
+                one.pid = 0;
+            }
         }
     }
 
@@ -422,6 +443,18 @@ pub const Table = struct {
     }
 
     pub fn runningCount(self: *Table) usize {
+        if (self.independentlySupervised()) {
+            var running: usize = 0;
+            for (self.supervisors.items) |*one| {
+                if (one.pid <= 0) continue;
+                if (durable.reap(one.pid, false)) {
+                    one.pid = 0;
+                    continue;
+                }
+                if (durable.alive(one.pid)) running += 1;
+            }
+            return running;
+        }
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.started - self.completed;
@@ -452,7 +485,9 @@ pub const Table = struct {
             .scratchpad_path = try arena.dupe(u8, prepared.scratchpad_path),
         };
 
-        const thread = std.Thread.spawn(.{}, Job.run, .{job}) catch return error.OutOfMemory;
+        if (self.independentlySupervised()) return self.startSupervised(io, job);
+
+        const thread = std.Thread.spawn(.{}, Job.runThread, .{job}) catch return error.OutOfMemory;
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -462,7 +497,38 @@ pub const Table = struct {
         };
     }
 
-    pub fn take(self: *Table, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Completion {
+    fn startSupervised(self: *Table, io: std.Io, job: *Job) std.mem.Allocator.Error!void {
+        const forked = durable.fork() catch return error.OutOfMemory;
+        if (forked == null) {
+            durable.beginSupervisor();
+            job.runSupervisor();
+            durable.exit();
+        }
+
+        const child_session = try self.gpa.dupe(u8, job.prepared.child_session);
+        errdefer self.gpa.free(child_session);
+        writeLease(self.gpa, io, self.dir.?, job, forked.?) catch {
+            durable.terminate(forked.?);
+            _ = durable.reap(forked.?, true);
+            return error.OutOfMemory;
+        };
+        self.supervisors.append(self.gpa, .{
+            .child_session = child_session,
+            .pid = forked.?,
+        }) catch {
+            durable.terminate(forked.?);
+            _ = durable.reap(forked.?, true);
+            return error.OutOfMemory;
+        };
+        self.mutex.lock();
+        self.started += 1;
+        self.mutex.unlock();
+        job.release();
+    }
+
+    pub fn take(self: *Table, allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]Completion {
+        if (self.independentlySupervised()) return self.takeDurable(allocator, io);
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -489,6 +555,86 @@ pub const Table = struct {
         return copies;
     }
 
+    fn takeDurable(self: *Table, allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]Completion {
+        var copies: std.ArrayList(Completion) = .empty;
+        errdefer {
+            for (copies.items) |one| freeCompletion(allocator, one);
+            copies.deinit(allocator);
+        }
+
+        for (self.supervisors.items) |*one| {
+            if (one.delivered) continue;
+            const completion = readCompletion(allocator, io, self.dir.?, one.child_session) catch |err| switch (err) {
+                error.FileNotFound => {
+                    if (durable.alive(one.pid)) continue;
+                    const died = try deadCompletion(allocator, io, self.dir.?, one.child_session);
+                    try copies.append(allocator, died);
+                    one.delivered = true;
+                    continue;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            try copies.append(allocator, completion);
+            one.delivered = true;
+        }
+        return copies.toOwnedSlice(allocator);
+    }
+
+    pub fn adoptChild(
+        self: *Table,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        child_session: []const u8,
+    ) std.mem.Allocator.Error!void {
+        if (!self.independentlySupervised()) return;
+        for (self.supervisors.items) |one| {
+            if (std.mem.eql(u8, one.child_session, child_session)) return;
+        }
+        const lease = readLease(allocator, io, self.dir.?, child_session) catch return;
+        defer freeLease(allocator, lease);
+        writeLeaseValue(self.gpa, io, self.dir.?, .{
+            .child_session = lease.child_session,
+            .agent_kind = lease.agent_kind,
+            .scratchpad_path = lease.scratchpad_path,
+            .supervisor_pid = lease.supervisor_pid,
+            .owner_pid = durable.currentPid(),
+            .cancel_requested = lease.cancel_requested,
+        }) catch return error.OutOfMemory;
+        try self.supervisors.append(self.gpa, .{
+            .child_session = try self.gpa.dupe(u8, child_session),
+            .pid = lease.supervisor_pid,
+        });
+        self.started += 1;
+    }
+
+    pub fn cancelChild(
+        self: *Table,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        child_session: []const u8,
+    ) bool {
+        const lease = readLease(allocator, io, self.dir orelse return false, child_session) catch return false;
+        defer freeLease(allocator, lease);
+        if (lease.owner_pid != durable.currentPid()) return false;
+        writeLeaseValue(allocator, io, self.dir.?, .{
+            .child_session = lease.child_session,
+            .agent_kind = lease.agent_kind,
+            .scratchpad_path = lease.scratchpad_path,
+            .supervisor_pid = lease.supervisor_pid,
+            .owner_pid = lease.owner_pid,
+            .cancel_requested = true,
+        }) catch return false;
+        durable.terminate(lease.supervisor_pid);
+        return true;
+    }
+
+    pub fn markDelivered(self: *Table, child_session: []const u8) void {
+        for (self.supervisors.items) |*one| {
+            if (std.mem.eql(u8, one.child_session, child_session)) one.delivered = true;
+        }
+    }
+
     fn record(self: *Table, completion: Completion) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -497,6 +643,12 @@ pub const Table = struct {
             diagnostic.note(&self.lost, .subagent_record_not_kept);
         };
     }
+};
+
+const Supervisor = struct {
+    child_session: []u8,
+    pid: durable.Pid,
+    delivered: bool = false,
 };
 
 fn copyShape(allocator: std.mem.Allocator, shape: Shape) std.mem.Allocator.Error!Shape {
@@ -516,7 +668,7 @@ const Job = struct {
     request: Request = undefined,
     prepared: Prepared = undefined,
 
-    fn run(self: *Job) void {
+    fn runThread(self: *Job) void {
         const allocator = self.arena.allocator();
         const report = self.table.spawner.run(allocator, self.io, self.request, self.prepared) catch |err| {
             return self.finish(.died, switch (err) {
@@ -526,6 +678,36 @@ const Job = struct {
             });
         };
         self.finish(report.outcome, report.result);
+    }
+
+    fn runSupervisor(self: *Job) void {
+        const allocator = self.arena.allocator();
+        var io_impl: std.Io.Threaded = .init_single_threaded;
+        const io = io_impl.io();
+        const report = self.table.spawner.run(allocator, io, self.request, self.prepared) catch |err| {
+            const result = switch (err) {
+                error.ChildNotStarted => "the subagent's process could not be started",
+                error.OutOfMemory => "the subagent ran and its supervisor ran out of memory reading what it said",
+            };
+            writeCompletion(allocator, io, self.table.dir.?, .{
+                .child_session = self.prepared.child_session,
+                .agent_kind = self.request.agent_kind,
+                .outcome = .died,
+                .result = result,
+                .scratchpad_path = self.prepared.scratchpad_path,
+            }) catch {};
+            self.release();
+            return;
+        };
+        writeCompletion(allocator, io, self.table.dir.?, .{
+            .child_session = self.prepared.child_session,
+            .agent_kind = self.request.agent_kind,
+            .outcome = report.outcome,
+            .result = report.result,
+            .scratchpad_path = self.prepared.scratchpad_path,
+        }) catch {};
+        freeReport(allocator, report);
+        self.release();
     }
 
     fn finish(self: *Job, outcome: event.AgentOutcome, result: []const u8) void {
@@ -562,6 +744,158 @@ const Job = struct {
         gpa.destroy(self);
     }
 };
+
+const Lease = struct {
+    child_session: []const u8,
+    agent_kind: []const u8,
+    scratchpad_path: []const u8,
+    supervisor_pid: durable.Pid,
+    owner_pid: durable.Pid,
+    cancel_requested: bool = false,
+};
+
+const max_receipt_bytes = 1024 * 1024;
+
+fn leasePathFor(allocator: std.mem.Allocator, dir: []const u8, child: []const u8) std.mem.Allocator.Error![]u8 {
+    const leaf = try std.fmt.allocPrint(allocator, "agent-{s}.lease.json", .{child});
+    defer allocator.free(leaf);
+    return durable.receiptPath(allocator, dir, leaf);
+}
+
+fn completionPathFor(allocator: std.mem.Allocator, dir: []const u8, child: []const u8) std.mem.Allocator.Error![]u8 {
+    const leaf = try std.fmt.allocPrint(allocator, "agent-{s}.complete.json", .{child});
+    defer allocator.free(leaf);
+    return durable.receiptPath(allocator, dir, leaf);
+}
+
+fn writeLease(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    job: *const Job,
+    pid: durable.Pid,
+) !void {
+    try durable.ensureReceiptDir(allocator, io, dir);
+    const path = try leasePathFor(allocator, dir, job.prepared.child_session);
+    defer allocator.free(path);
+    try durable.writeJsonAtomic(allocator, io, path, Lease{
+        .child_session = job.prepared.child_session,
+        .agent_kind = job.request.agent_kind,
+        .scratchpad_path = job.prepared.scratchpad_path,
+        .supervisor_pid = pid,
+        .owner_pid = durable.currentPid(),
+        .cancel_requested = false,
+    });
+}
+
+fn writeLeaseValue(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    lease: Lease,
+) !void {
+    try durable.ensureReceiptDir(allocator, io, dir);
+    const path = try leasePathFor(allocator, dir, lease.child_session);
+    defer allocator.free(path);
+    try durable.writeJsonAtomic(allocator, io, path, lease);
+}
+
+fn writeCompletion(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    completion: Completion,
+) !void {
+    try durable.ensureReceiptDir(allocator, io, dir);
+    const path = try completionPathFor(allocator, dir, completion.child_session);
+    defer allocator.free(path);
+    try durable.writeJsonAtomic(allocator, io, path, completion);
+}
+
+fn readLease(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, child: []const u8) !Lease {
+    const path = try leasePathFor(allocator, dir, child);
+    defer allocator.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_receipt_bytes));
+    defer allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(Lease, allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return .{
+        .child_session = try allocator.dupe(u8, parsed.value.child_session),
+        .agent_kind = try allocator.dupe(u8, parsed.value.agent_kind),
+        .scratchpad_path = try allocator.dupe(u8, parsed.value.scratchpad_path),
+        .supervisor_pid = parsed.value.supervisor_pid,
+        .owner_pid = parsed.value.owner_pid,
+        .cancel_requested = parsed.value.cancel_requested,
+    };
+}
+
+fn freeLease(allocator: std.mem.Allocator, lease: Lease) void {
+    allocator.free(lease.child_session);
+    allocator.free(lease.agent_kind);
+    allocator.free(lease.scratchpad_path);
+}
+
+fn readCompletion(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    child: []const u8,
+) !Completion {
+    const path = try completionPathFor(allocator, dir, child);
+    defer allocator.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_receipt_bytes));
+    defer allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(Completion, allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return copyCompletion(allocator, parsed.value);
+}
+
+fn copyCompletion(allocator: std.mem.Allocator, one: Completion) std.mem.Allocator.Error!Completion {
+    var copy = Completion{
+        .child_session = try allocator.dupe(u8, one.child_session),
+        .agent_kind = undefined,
+        .outcome = .died,
+        .result = undefined,
+        .scratchpad_path = undefined,
+    };
+    errdefer allocator.free(copy.child_session);
+    copy.agent_kind = try allocator.dupe(u8, one.agent_kind);
+    errdefer allocator.free(copy.agent_kind);
+    copy.result = try allocator.dupe(u8, one.result);
+    errdefer allocator.free(copy.result);
+    copy.scratchpad_path = try allocator.dupe(u8, one.scratchpad_path);
+    errdefer allocator.free(copy.scratchpad_path);
+    copy.outcome = if (one.outcome == .unknown)
+        .{ .unknown = try allocator.dupe(u8, one.outcome.unknown) }
+    else
+        one.outcome;
+    return copy;
+}
+
+fn deadCompletion(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    child: []const u8,
+) std.mem.Allocator.Error!Completion {
+    const lease = readLease(allocator, io, dir, child) catch return error.OutOfMemory;
+    defer freeLease(allocator, lease);
+    const completion = Completion{
+        .child_session = try allocator.dupe(u8, child),
+        .agent_kind = try allocator.dupe(u8, lease.agent_kind),
+        .outcome = .died,
+        .result = try allocator.dupe(
+            u8,
+            if (lease.cancel_requested)
+                "the subagent was canceled"
+            else
+                "the subagent supervisor died before it wrote a completion record",
+        ),
+        .scratchpad_path = try allocator.dupe(u8, lease.scratchpad_path),
+    };
+    writeCompletion(allocator, io, dir, completion) catch {};
+    return completion;
+}
 
 pub const flag = struct {
     pub const project = "--project";
@@ -1033,7 +1367,7 @@ test "a child that has finished stops being a running child, however its record 
     });
     try testing.expectEqual(@as(usize, 1), table.runningCount());
 
-    const drained = try table.take(gpa);
+    const drained = try table.take(gpa, testing.io);
     freeCompletions(gpa, drained);
     try testing.expectEqual(@as(usize, 1), table.runningCount());
 
@@ -1047,7 +1381,7 @@ test "a child that has finished stops being a running child, however its record 
     try testing.expectEqual(@as(usize, 0), table.runningCount());
     try testing.expectEqual(@as(usize, 2), table.startedCount());
 
-    const rest = try table.take(gpa);
+    const rest = try table.take(gpa, testing.io);
     freeCompletions(gpa, rest);
 }
 
@@ -1068,6 +1402,72 @@ test "a record the table could not keep reaches the caller, and no longer only a
     );
 
     try testing.expectEqual(@as(?Diagnostic, null), table.takeLost());
+}
+
+test "an adopted subagent lease produces one durable death completion" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buffer);
+    const dir = try std.fmt.allocPrint(gpa, "{s}/tasks", .{buffer[0..len]});
+    defer gpa.free(dir);
+    try std.Io.Dir.createDirAbsolute(testing.io, dir, .default_dir);
+
+    const child = "01JQ" ++ @as([22]u8, @splat('D'));
+    try writeLeaseValue(gpa, testing.io, dir, .{
+        .child_session = child,
+        .agent_kind = "reviewer",
+        .scratchpad_path = "/tmp/child-scratch",
+        .supervisor_pid = 2_000_000_000,
+        .owner_pid = 123,
+    });
+
+    var table = Table{ .gpa = gpa, .spawner = undefined, .dir = dir };
+    defer table.deinit();
+    try table.adoptChild(gpa, testing.io, child);
+
+    const claimed = try readLease(gpa, testing.io, dir, child);
+    defer freeLease(gpa, claimed);
+    try testing.expectEqual(durable.currentPid(), claimed.owner_pid);
+
+    const completed = try table.take(gpa, testing.io);
+    defer freeCompletions(gpa, completed);
+    try testing.expectEqual(@as(usize, 1), completed.len);
+    try testing.expectEqual(event.AgentOutcome.died, completed[0].outcome);
+
+    const persisted = try readCompletion(gpa, testing.io, dir, child);
+    defer freeCompletion(gpa, persisted);
+    try testing.expectEqualStrings(child, persisted.child_session);
+}
+
+test "only the current lease owner can cancel a durable subagent" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buffer);
+    const dir = try std.fmt.allocPrint(gpa, "{s}/tasks", .{buffer[0..len]});
+    defer gpa.free(dir);
+    try std.Io.Dir.createDirAbsolute(testing.io, dir, .default_dir);
+
+    const child = "01JQ" ++ @as([22]u8, @splat('E'));
+    try writeLeaseValue(gpa, testing.io, dir, .{
+        .child_session = child,
+        .agent_kind = "reviewer",
+        .scratchpad_path = "/tmp/child-scratch",
+        .supervisor_pid = 2_000_000_000,
+        .owner_pid = durable.currentPid() + 1,
+    });
+
+    var table = Table{ .gpa = gpa, .spawner = undefined, .dir = dir };
+    defer table.deinit();
+    try testing.expect(!table.cancelChild(gpa, testing.io, child));
+
+    const unchanged = try readLease(gpa, testing.io, dir, child);
+    defer freeLease(gpa, unchanged);
+    try testing.expect(!unchanged.cancel_requested);
+    try testing.expectEqual(durable.currentPid() + 1, unchanged.owner_pid);
 }
 
 test "a rate limited child is not reported as a refused one" {

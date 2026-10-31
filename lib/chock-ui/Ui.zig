@@ -609,7 +609,7 @@ pub const Ui = struct {
 
     pub fn pollFinishedTasks(self: *Ui) void {
         const table = self.tasks orelse return;
-        const finished = table.peek(self.gpa) catch return;
+        const finished = table.peek(self.gpa, self.io) catch return;
         defer chock_core.tasks.freeCompletions(self.gpa, finished);
 
         if (finished.len <= self.tasks_shown_early) return;

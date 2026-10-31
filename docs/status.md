@@ -103,30 +103,6 @@ them as not built.
   only for a project that sets `web.search` to `allow` outright, and that has to
   be a decision somebody makes rather than a surprise they meet.
 
-- A handover cannot carry a background command or a background subagent, so it
-  waits for one. Both live in the process that started them, and that process
-  is what writes their record into the log, so a handover that took the session
-  would drop the record and tell the person who asked that the work carried on.
-  A background command cannot move by any means: its thread reads the command's
-  output in this process, and the session's own teardown ends the command. A
-  background subagent could in principle be adopted, because its process and
-  its log both outlive the parent and its log's lock says whether it still
-  runs, but that costs the property every replay reads, that each
-  `session.spawn` has an `agent.complete` after it. So the ask is held open
-  instead and the session hands over once the work is recorded. What is missing
-  is a handover that does not make the person wait for a long build.
-
-- Only a git project's workspace moves to a second process. A project with no
-  git of its own gets the overlay backing, and `overlay.create` cannot be
-  called twice on the same scratch directory: the Linux driver refuses a
-  directory that exists, and Darwin's clone refuses the same. `overlay.adopt`
-  stands beside `overlay.create`, one per driver, and rebuilds the four paths
-  over a layout that is already on disk. What is missing is the rest of a live
-  handover for that backing. `Workspace.adopt` takes a `base_commit` a project
-  with no git does not have, and `src/run.zig`'s own `takenOver` reads only a
-  worktree `workspace.open`. So `chock detach` refuses a running overlay
-  session by name, and names `chock workspace adopt` in the same sentence.
-
 - The work of an overlay session is reachable, and it is never applied for you.
   `chock workspace adopt <session>` rebuilds the overlay, reads the upper layer
   with `Overlay.changedFiles`, and copies what changed into

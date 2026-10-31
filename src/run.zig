@@ -1496,14 +1496,16 @@ fn start(
 
     const attempt = if (taken) |one| one.attempt else session_paths.newId(io);
     var open_diag: ?chock_workspace.Diagnostic = null;
-    var workspace = if (taken) |one| chock_workspace.Workspace.adopt(
+    var workspace = if (taken) |one| chock_workspace.Workspace.adoptExistingAndDenied(
         arena,
         io,
         env,
         project_root,
         paths.work,
         &attempt,
+        one.kind,
         one.base_commit,
+        if (org_bundle) |bundle| bundle.deny_read else &.{},
         &open_diag,
     ) catch |err| {
         if (open_diag) |*fault| {
@@ -2262,7 +2264,11 @@ fn takenOver(
     arena: std.mem.Allocator,
     log_path: [:0]const u8,
     work_path: []const u8,
-) ?struct { attempt: [session_paths.id_length]u8, base_commit: []const u8 } {
+) ?struct {
+    attempt: [session_paths.id_length]u8,
+    kind: chock_workspace.KindTag,
+    base_commit: []const u8,
+} {
     _ = std.Io.Dir.cwd().statFile(io, log_path, .{}) catch return null;
     const log = chock_proto.log.Log.open(io, log_path, "") catch return null;
     var backing = chock_proto.storage.JsonLines{ .log = log };
@@ -2276,6 +2282,7 @@ fn takenOver(
     var ended_at: u64 = 0;
     var opened_at: ?u64 = null;
     var attempt: [session_paths.id_length]u8 = undefined;
+    var kind: chock_workspace.KindTag = .worktree;
     var base_buffer: [128]u8 = undefined;
     var base_len: usize = 0;
 
@@ -2287,14 +2294,18 @@ fn takenOver(
                 ended_at = parsed.value.id;
             },
             .workspace_open => |opened| {
-                if (opened.kind != .worktree) {
-                    opened_at = null;
-                    continue;
-                }
                 if (opened.attempt.len != session_paths.id_length) continue;
                 if (!session_paths.isValidId(opened.attempt)) continue;
                 if (opened.base_commit.len > base_buffer.len) continue;
                 @memcpy(&attempt, opened.attempt);
+                kind = switch (opened.kind) {
+                    .worktree => .worktree,
+                    .overlay => .overlay,
+                    .unknown => {
+                        opened_at = null;
+                        continue;
+                    },
+                };
                 @memcpy(base_buffer[0..opened.base_commit.len], opened.base_commit);
                 base_len = opened.base_commit.len;
                 opened_at = parsed.value.id;
@@ -2307,12 +2318,18 @@ fn takenOver(
     const opened = opened_at orelse return null;
     if (opened > ended_at) return null;
 
-    const path = std.fs.path.join(arena, &.{ work_path, &attempt }) catch return null;
+    const path = switch (kind) {
+        .worktree => std.fs.path.join(arena, &.{ work_path, &attempt }) catch return null,
+        // Overlay backings use the session work directory itself. The attempt
+        // identifier belongs to the log, but unlike a Git worktree it is not
+        // another path component.
+        .overlay => std.fs.path.join(arena, &.{ work_path, "upper" }) catch return null,
+    };
     var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return null;
     dir.close(io);
 
     const base_commit = arena.dupe(u8, base_buffer[0..base_len]) catch return null;
-    return .{ .attempt = attempt, .base_commit = base_commit };
+    return .{ .attempt = attempt, .kind = kind, .base_commit = base_commit };
 }
 
 fn recordWorkspace(
@@ -11440,6 +11457,10 @@ fn runSession(
         chock_core.tools.cancelRunningTool();
         one.deinit();
     };
+    if (table) |*one| {
+        try one.adopt(gpa, io);
+        reconcileTaskReceipts(gpa, io, started.storage, one);
+    }
     if (table) |*one| context.tasks = one;
 
     var tool_runner = chock_core.Loop.SandboxToolRunner{
@@ -11635,8 +11656,10 @@ fn runSession(
     var children = chock_core.subagent.Table{
         .gpa = std.heap.page_allocator,
         .spawner = subagent_spawner.spawner(),
+        .dir = started.tasks_dir,
     };
     defer children.deinit();
+    reconcileChildReceipts(gpa, io, started.storage, &children);
 
     defer {
         if (children.takeLost()) |lost| tty.print(.warn, "chock: {f}\n", .{lost});
@@ -12080,7 +12103,46 @@ fn runSession(
         };
     }
 
-    return try finalExit(gpa, io, started.storage);
+    const exit = try finalExit(gpa, io, started.storage);
+    if (exit == .handed_over) {
+        if (table) |*one| one.handOver();
+        children.handOver();
+    }
+    return exit;
+}
+
+fn reconcileChildReceipts(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    table: *chock_core.subagent.Table,
+) void {
+    var replay = storage.replay(gpa, io, 0) catch return;
+    defer replay.deinit();
+    while (replay.next(io) catch return) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .session_spawn => |spawn| table.adoptChild(gpa, io, spawn.child_session) catch {},
+            .agent_complete => |done| table.markDelivered(done.child_session),
+            else => {},
+        }
+    }
+}
+
+fn reconcileTaskReceipts(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    table: *chock_core.tasks.Table,
+) void {
+    var replay = storage.replay(gpa, io, 0) catch return;
+    defer replay.deinit();
+    while (replay.next(io) catch return) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event == .task_complete) {
+            table.markDelivered(parsed.value.event.task_complete.task_id);
+        }
+    }
 }
 
 fn keepAsking(ending: Exit, interrupted: bool) bool {
@@ -13647,7 +13709,51 @@ test "the next owner finds the handed over workspace in the log, and takes nothi
 
     const taken = takenOver(gpa, io, arena, log_path, work).?;
     try testing.expectEqualStrings(attempt, &taken.attempt);
+    try testing.expectEqual(chock_workspace.KindTag.worktree, taken.kind);
     try testing.expectEqualStrings(base_commit, taken.base_commit);
+}
+
+test "the next owner finds a handed over overlay workspace" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const dir = buffer[0..len];
+    const id = "01JQ" ++ @as([22]u8, @splat('O'));
+    const attempt = "01JQ" ++ @as([22]u8, @splat('P'));
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ dir, id }, 0);
+    const work = try std.fmt.allocPrint(arena, "{s}/{s}.work", .{ dir, id });
+    const upper = try std.fmt.allocPrint(arena, "{s}/upper", .{work});
+    try std.Io.Dir.cwd().createDirPath(io, upper);
+
+    const log = try chock_proto.log.Log.open(io, log_path, id);
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    _ = try locked.append(gpa, io, .{ .workspace_open = .{
+        .kind = .overlay,
+        .attempt = attempt,
+        .path = upper,
+        .base_commit = "",
+    } }, 1);
+    _ = try locked.append(gpa, io, .{ .session_end = .{
+        .reason = .handed_over,
+        .detail = "",
+    } }, 2);
+    try locked.unlock(io);
+
+    const taken = takenOver(gpa, io, arena, log_path, work).?;
+    try testing.expectEqual(chock_workspace.KindTag.overlay, taken.kind);
+    try testing.expectEqualStrings(attempt, &taken.attempt);
+    try testing.expectEqualStrings("", taken.base_commit);
 }
 
 test "a workspace opened after the handover belongs to the owner that came next" {
@@ -14410,7 +14516,13 @@ test "--base-commit only starts a clean new session" {
     const arena = arena_state.allocator();
     const parsed = try parseOptions(arena, &.{ "--base-commit", "abc123", "do it" });
     try testing.expectEqualStrings("abc123", parsed.base_commit.?);
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, gpa);
+    defer said.stop(testing.io);
+
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "--base-commit", "abc123", "--allow-dirty", "do it" }));
+    try testing.expect(std.mem.indexOf(u8, said.err(), "starts a clean new session") != null);
 }
 
 test "the ref a session's work lands on is the session's own, never a branch of the user" {

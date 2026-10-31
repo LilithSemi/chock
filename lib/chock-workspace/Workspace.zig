@@ -40,6 +40,8 @@ pub const Kind = union(enum) {
     overlay: overlay_mod.Overlay,
 };
 
+pub const KindTag = std.meta.Tag(Kind);
+
 pub const Workspace = struct {
     kind: Kind,
     chock_zon_source: ?[]u8,
@@ -258,13 +260,92 @@ pub const Workspace = struct {
         layout: Layout,
         diag: ?*?Diagnostic,
     ) Error!Workspace {
-        if (!try git.isRepository(allocator, io, env, project_root, diag)) {
-            return error.OverlayCannotBeAdopted;
-        }
+        return adoptExistingWithLayoutAndDenied(
+            allocator,
+            io,
+            env,
+            project_root,
+            scratch_dir,
+            session_id,
+            .worktree,
+            base_commit,
+            layout,
+            &.{},
+            diag,
+        );
+    }
 
+    /// Rebuilds the backing named by a previous `workspace.open`. Unlike
+    /// `open`, this never chooses a backing from the project's current state:
+    /// a project may have gained or lost `.git` while the session was away.
+    pub fn adoptExistingAndDenied(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        project_root: []const u8,
+        scratch_dir: []const u8,
+        session_id: []const u8,
+        kind: KindTag,
+        base_commit: []const u8,
+        also_denied: []const []const u8,
+        diag: ?*?Diagnostic,
+    ) Error!Workspace {
+        return adoptExistingWithLayoutAndDenied(
+            allocator,
+            io,
+            env,
+            project_root,
+            scratch_dir,
+            session_id,
+            kind,
+            base_commit,
+            Layout.forHost(),
+            also_denied,
+            diag,
+        );
+    }
+
+    pub fn adoptExistingWithLayoutAndDenied(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        project_root: []const u8,
+        scratch_dir: []const u8,
+        session_id: []const u8,
+        kind: KindTag,
+        base_commit: []const u8,
+        layout: Layout,
+        also_denied: []const []const u8,
+        diag: ?*?Diagnostic,
+    ) Error!Workspace {
         // The host project's own, not the checkout's, else the deny list could be escaped.
-        const entries = try deny_mod.loadEntries(allocator, io, project_root, diag);
+        const own = try deny_mod.loadEntries(allocator, io, project_root, diag);
+        defer deny_mod.free(allocator, own);
+        const entries = try withAlsoDenied(allocator, own, also_denied);
         defer deny_mod.free(allocator, entries);
+
+        switch (kind) {
+            .overlay => {
+                var ov = try overlay_mod.adoptWithLayout(allocator, io, project_root, scratch_dir, layout, diag);
+                errdefer ov.deinit(allocator);
+
+                const denied = try deny_mod.joinOnto(allocator, entries, ov.sandboxRoot());
+                errdefer deny_mod.free(allocator, denied);
+
+                const zon_source_root = switch (layout) {
+                    .remapped => ov.project,
+                    .in_place => ov.upper,
+                };
+                const chock_zon = try findChockZon(allocator, io, zon_source_root, ov.sandboxRoot(), diag);
+                return .{
+                    .kind = .{ .overlay = ov },
+                    .chock_zon_source = chock_zon.source,
+                    .chock_zon_target = chock_zon.target,
+                    .deny_paths = denied,
+                };
+            },
+            .worktree => {},
+        }
 
         var wt = try worktree_mod.adoptWithLayout(
             allocator,
@@ -1214,7 +1295,7 @@ test "adopt refuses a chock.zon that is a symlink instead of an ordinary file" {
     ));
 }
 
-test "adopt refuses the overlay kind by name, because there is no overlay.adopt to call" {
+test "adoptExisting rebuilds an overlay a first process left" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1227,16 +1308,20 @@ test "adopt refuses the overlay kind by name, because there is no overlay.adopt 
     try std.testing.expect(first.kind == .overlay);
     first.keep(allocator);
 
-    try std.testing.expectError(error.OverlayCannotBeAdopted, Workspace.adopt(
+    var second = try Workspace.adoptExistingAndDenied(
         allocator,
         io,
         &project.env,
         project.root_path,
         project.scratch_path,
         "sess1",
-        "0000000000000000000000000000000000000000",
+        .overlay,
+        "",
+        &.{},
         null,
-    ));
+    );
+    defer second.close(allocator, io, &project.env, null) catch unreachable;
+    try std.testing.expect(second.kind == .overlay);
 }
 
 test "a layer above the project adds denied paths, and the project cannot take one off" {

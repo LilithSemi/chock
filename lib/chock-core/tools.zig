@@ -203,6 +203,7 @@ pub const Tool = enum {
     write_file,
     edit_file,
     run_command,
+    cancel_work,
     read_guidance,
     read_skill,
     read_memory,
@@ -230,6 +231,7 @@ pub const Tool = enum {
             .write_file,
             .edit_file,
             .run_command,
+            .cancel_work,
             .read_guidance,
             .read_skill,
             .read_memory,
@@ -268,6 +270,7 @@ pub const Tool = enum {
             .write_file,
             .edit_file,
             .run_command,
+            .cancel_work,
             .read_guidance,
             .spawn_agent,
             .update_plan,
@@ -436,6 +439,7 @@ pub const Tool = enum {
             .grep,
             .write_file,
             .edit_file,
+            .cancel_work,
             .read_guidance,
             .read_memory,
             .write_memory,
@@ -462,6 +466,7 @@ pub const Tool = enum {
             .glob,
             .grep,
             .run_command,
+            .cancel_work,
             .read_guidance,
             .read_skill,
             .read_memory,
@@ -490,6 +495,7 @@ pub const Tool = enum {
             .list_directory,
             .glob,
             .grep,
+            .cancel_work,
             .read_guidance,
             .read_skill,
             .read_memory,
@@ -572,6 +578,11 @@ pub const Tool = enum {
                 "with a slash is a path inside the project, which is how you run a program you " ++
                 "built here, such as \"./zig-out/bin/tool\"; a path outside the project is " ++
                 "refused. " ++ writable_directories_text,
+            .cancel_work => "Stop one background command or background subagent by the identifier " ++
+                "returned when it started. The durable lease is checked immediately before the " ++
+                "signal, so an earlier session owner cannot stop work after handing it over. The " ++
+                "whole process group is stopped, including programs the work started. A terminal " ++
+                "completion is delivered on the next turn.",
             .read_guidance => "Read one piece of guidance by name. The system prompt lists what " ++
                 "there is, one line each. Read the one that applies to what you are about to do.",
             .read_skill => "Read one skill by name. The system prompt lists what there is, one " ++
@@ -735,6 +746,7 @@ pub const Tool = enum {
             .write_file => WriteFileArgs,
             .edit_file => EditFileArgs,
             .run_command => RunCommandArgs,
+            .cancel_work => CancelWorkArgs,
             .read_guidance => ReadGuidanceArgs,
             .read_skill => ReadSkillArgs,
             .read_memory => ReadMemoryArgs,
@@ -870,6 +882,11 @@ pub const Registry = struct {
             .write_file => writeFile(allocator, io, env, config, call, timeout_ns, context),
             .edit_file => editFile(allocator, io, env, config, call, timeout_ns, context),
             .run_command => runCommand(allocator, io, env, config, call, context),
+            .cancel_work => toolErrorResult(
+                allocator,
+                call,
+                try allocator.dupe(u8, cancel_needs_a_session),
+            ),
             .read_guidance => readGuidance(allocator, call),
             .read_skill => readSkill(allocator, call, context),
             .read_memory => readMemory(allocator, io, env, config, call, context),
@@ -896,6 +913,9 @@ pub const Registry = struct {
 
 pub const spawn_needs_a_session = "no subagent was started: a spawn is measured against the " ++
     "session that would own the child, and this tool call was run without one.";
+
+pub const cancel_needs_a_session = "nothing was canceled: background work belongs to a session, " ++
+    "and this tool call was run without one.";
 
 pub const plan_needs_a_session = "the task list was not changed: a task list is kept in the " ++
     "session log, and this tool call was run without a session. Say what you are doing in " ++
@@ -1071,6 +1091,14 @@ const RunCommandArgs = struct {
         .timeout_ms = "Give up on the command after this many milliseconds. It can only ask " ++
             "for less time than the session's own limit, never more, and a foreground command " ++
             "takes the shorter of the two.",
+    };
+};
+
+pub const CancelWorkArgs = struct {
+    id: []const u8,
+
+    pub const docs = .{
+        .id = "The task name or child session identifier returned when the background work started.",
     };
 };
 
@@ -1660,6 +1688,14 @@ fn runCommand(
                     "each one keeps its output file as a record. Read the output of one you " ++
                     "already have, or run this command in the foreground.",
                 .{tasks.max_tasks},
+            ),
+        ),
+        error.SupervisorNotStarted => return toolErrorResult(
+            allocator,
+            call,
+            try allocator.dupe(
+                u8,
+                "no background task was started: its durable supervisor could not be started",
             ),
         ),
         error.EmptyArgv => unreachable, // already checked above
@@ -3233,7 +3269,7 @@ fn fixedProgram(
         => unreachable,
         error.ExecutableNotFound => null,
         error.StagingFailed => unreachable, // stageContent already ran, in putContent
-        error.TooManyTasks => unreachable,
+        error.TooManyTasks, error.SupervisorNotStarted => unreachable,
         else => |e| return e,
     };
 }
@@ -4606,12 +4642,13 @@ test "every tool in the enum is offered, and each one is named exactly once" {
     }
 
     const expected = [_][]const u8{
-        "read_file",     "read_image",  "list_directory", "glob",
-        "grep",          "write_file",  "edit_file",      "run_command",
-        "read_guidance", "read_skill",  "read_memory",    "write_memory",
-        "spawn_agent",   "update_plan", "provide_tool",   "serve_port",
-        "nix_eval",      "nix_build",   "restrict_self",  "fetch_url",
-        "web_search",    "ask_user",    "set_title",      "request_action",
+        "read_file",      "read_image",    "list_directory", "glob",
+        "grep",           "write_file",    "edit_file",      "run_command",
+        "cancel_work",    "read_guidance", "read_skill",     "read_memory",
+        "write_memory",   "spawn_agent",   "update_plan",    "provide_tool",
+        "serve_port",     "nix_eval",      "nix_build",      "restrict_self",
+        "fetch_url",      "web_search",    "ask_user",       "set_title",
+        "request_action",
     };
     try std.testing.expectEqual(expected.len, defs.len);
     for (expected, defs) |name, def| try std.testing.expectEqualStrings(name, def.name);

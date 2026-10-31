@@ -344,7 +344,7 @@ const Agent = struct {
     fn join(self: *Agent) !void {
         const table = self.table orelse return;
         table.waitAll();
-        const finished = try table.take(self.arena);
+        const finished = try table.take(self.arena, self.io);
         defer subagent.freeCompletions(self.arena, finished);
         for (finished) |one| {
             try self.append(.{ .agent_complete = .{

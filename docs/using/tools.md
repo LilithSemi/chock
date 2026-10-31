@@ -1,6 +1,6 @@
 # The tools
 
-The agent has 24 tools, and every one that touches the machine goes through the
+The agent has 25 tools, and every one that touches the machine goes through the
 sandbox: `read_file`, `list_directory`, `glob`, `grep`, `write_file`,
 `edit_file`, `run_command`, `read_memory` and `write_memory`. Only
 `run_command` takes a command. The rest name a path, a pattern, or the text to
@@ -21,6 +21,13 @@ A call can ask for less with `timeout_ms`, and never for more: a number past
 the session's own limit changes nothing. Anything longer than a couple of
 minutes belongs in the background instead.
 
+`cancel_work` stops a background command or subagent by the identifier returned
+when it started. It checks the durable lease before signaling, so a process that
+already handed the session over cannot cancel work its successor owns. The
+supervisor has a process group of its own, and cancellation reaches descendants
+as well as the first program. The terminal result arrives through the same
+ordered completion path as an ordinary finish.
+
 `read_guidance` reads a document compiled into Chock, so it reaches nothing on
 the machine at all. `ask_user` puts one question to the person who started the
 session, and it grants nothing: a yes there permits no act. `set_title` names
@@ -31,7 +38,7 @@ disk at session start. It is offered only to a session that found at least one,
 and the answer says who wrote it, because a skill from a repository or a package
 is a stranger's writing. [skills.md](skills.md) is the whole of it.
 
-The last ten are described here or on a page of their own:
+The last eleven are described here or on a page of their own:
 
 | Tool | What it asks for | Page |
 |---|---|---|
@@ -40,6 +47,7 @@ The last ten are described here or on a page of their own:
 | `nix_eval` | what one Nix expression says | [nix.md](nix.md) |
 | `nix_build` | one attribute of a flake, built | [nix.md](nix.md) |
 | `spawn_agent` | a subagent | [subagents.md](subagents.md) |
+| `cancel_work` | a background command or subagent to stop | above |
 | `restrict_self` | a promise the agent cannot take back | [policy.md](../configure/policy.md) |
 | `fetch_url` | one page over http or https | [actions.md](../configure/actions.md) |
 | `web_search` | one query against a search engine | [search.md](../configure/search.md) |

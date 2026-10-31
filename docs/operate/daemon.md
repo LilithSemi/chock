@@ -173,20 +173,21 @@ are the two facts a second process cannot work out for itself. A run that hands
 over leaves the directory on disk, and the next owner adopts the same checkout
 instead of building a new one from committed state. A linked worktree records
 nothing about the process that made it, so taking one costs no git command at
-all. The scratchpad moves the same way, because it is keyed on the session
-identifier.
+all. An overlay records its backing kind and is rebuilt over the same upper
+layer rather than cloned a second time. The scratchpad moves the same way,
+because it is keyed on the session identifier.
 
-Two things do not move, so a handover waits for them. A background
-command and a background subagent both live in the process that started them,
-and that process is what writes their record into the log. A session asked while
-it holds either one names the counts, keeps the ask open, and hands over at the
-first turn boundary after that work is recorded. It keeps running its turns the
-whole time, so the wait costs the session nothing.
+Background commands and subagents do not keep a handover waiting. Each runs in
+an independent supervisor process group and leaves an atomic lease and
+completion receipt in the session directory. The daemon claims those leases
+when it takes the session. A completion is appended to the log exactly once,
+in spawn order, and keeps the same output limit. If a supervisor disappears
+without a receipt, the new owner writes an explicit terminal record instead of
+leaving the work apparently running forever. `cancel_work` signals the whole
+process group, and succeeds only for the current lease owner.
 
-`--wait` bounds each read of the exchange on its own, so a session that names
-background work gets one wait for the turn boundary and one for the work. At the
-bound `chock detach` says what the session is still holding and leaves it
-running, unchanged. Nothing was taken, so asking again costs nothing.
+`--wait` therefore bounds the turn-boundary exchange only. At the bound the
+session keeps running unchanged; background work has no separate wait.
 
 A session that ended some other abnormal way also keeps its workspace, and that
 one is still refused: `chock detach` names the kept workspace and points at
