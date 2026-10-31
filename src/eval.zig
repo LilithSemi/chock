@@ -32,6 +32,8 @@ const usage_text =
     \\  --project <dir>     Repository to run and inspect. Overrides spec.fixture.
     \\  --format <kind>     human (default) or json.
     \\  --skip-tests        Score the audit and repository without executing tests.
+    \\  --capture <path>    Override the spec's record/replay capture path.
+    \\  --report <path>     Also write the versioned JSON report to this path.
     \\  --trajectory <path> Write a versioned RL trajectory beside the report.
     \\  --minimum-score <n> Candidate score required by compare (default 0).
     \\  --max-regression <n>
@@ -74,6 +76,8 @@ const Options = struct {
     project: ?[]const u8 = null,
     format: Format = .human,
     skip_tests: bool = false,
+    capture: ?[]const u8 = null,
+    report: ?[]const u8 = null,
     trajectory: ?[]const u8 = null,
     minimum_score: f64 = 0,
     max_regression: f64 = 0,
@@ -265,7 +269,7 @@ pub fn main(
         tty.print(.err, "chock eval: the fixture could not be opened: {t}\n", .{err});
         return Exit.usage.code();
     };
-    const capture_path = if (spec.capture.len == 0) "" else fixtureFromSpec(arena, options.spec_path, spec.capture);
+    const capture_path = options.capture orelse if (spec.capture.len == 0) "" else fixtureFromSpec(arena, options.spec_path, spec.capture);
     if ((options.action == .run or options.action == .replay) and capture_path.len == 0) {
         tty.print(.err, "chock eval: provider runs and replays require .capture in the spec\n", .{});
         return Exit.usage.code();
@@ -328,6 +332,10 @@ pub fn main(
             return Exit.faulted.code();
         };
     }
+    if (options.report) |path| writeJsonFile(arena, io, path, report) catch |err| {
+        tty.print(.err, "chock eval: the JSON report could not be written: {t}\n", .{err});
+        return Exit.faulted.code();
+    };
     writeReport(arena, options.format, report) catch return Exit.faulted.code();
     return if (report.passed) Exit.finished.code() else Exit.refused.code();
 }
@@ -410,10 +418,11 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
             out.project = args[i];
             continue;
         }
-        if (std.mem.eql(u8, args[i], "--trajectory")) {
+        if (std.mem.eql(u8, args[i], "--capture") or std.mem.eql(u8, args[i], "--report") or std.mem.eql(u8, args[i], "--trajectory")) {
+            const option = args[i];
             i += 1;
             if (i >= args.len) return error.BadArguments;
-            out.trajectory = args[i];
+            if (std.mem.eql(u8, option, "--capture")) out.capture = args[i] else if (std.mem.eql(u8, option, "--report")) out.report = args[i] else out.trajectory = args[i];
             continue;
         }
         if (std.mem.eql(u8, args[i], "--format")) {
@@ -436,7 +445,8 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
     if (action == .check and !session_paths.isValidId(out.session)) return error.BadArguments;
     if ((action == .run or action == .replay) and out.session.len != 0) return error.BadArguments;
     if (action != .compare and (out.minimum_score != 0 or out.max_regression != 0)) return error.BadArguments;
-    if (action == .compare and (out.session.len != 0 or out.project != null or out.skip_tests or out.trajectory != null)) return error.BadArguments;
+    if (action == .check and out.capture != null) return error.BadArguments;
+    if (action == .compare and (out.session.len != 0 or out.project != null or out.skip_tests or out.capture != null or out.trajectory != null)) return error.BadArguments;
     return out;
 }
 
@@ -457,6 +467,7 @@ fn compareReports(arena: std.mem.Allocator, io: std.Io, options: Options) !u8 {
         .max_regression = options.max_regression,
         .passed = passed,
     };
+    if (options.report) |path| try writeJsonFile(arena, io, path, comparison);
     switch (options.format) {
         .json => {
             const json = try std.json.Stringify.valueAlloc(arena, comparison, .{});
@@ -835,7 +846,11 @@ fn writeTrajectory(
         .trainable = trainable,
         .report = report,
     };
-    const json = try std.json.Stringify.valueAlloc(arena, trajectory, .{});
+    try writeJsonFile(arena, io, path, trajectory);
+}
+
+fn writeJsonFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, value: anytype) !void {
+    const json = try std.json.Stringify.valueAlloc(arena, value, .{});
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true })
     else
