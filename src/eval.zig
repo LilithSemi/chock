@@ -6,6 +6,7 @@ const chock_core = @import("chock-core");
 const ziggit = @import("ziggit");
 
 const session_paths = @import("session.zig");
+const eval_suite = @import("eval_suite.zig");
 const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
@@ -18,6 +19,7 @@ const max_log_bytes: usize = 128 * 1024 * 1024;
 const usage_text =
     \\Usage: chock eval <run|replay|check> <spec.zon> [options]
     \\       chock eval compare <baseline.json> <candidate.json> [options]
+    \\       chock eval suite <suite.zon> [--output <dir>] [--parallel <n>]
     \\
     \\run starts a provider-backed `chock run --output json` with the task and
     \\provider settings in the spec and records its fixture. replay runs the same
@@ -224,6 +226,9 @@ pub fn main(
     const io = threaded.io();
     var env = try environ.createMap(arena);
     defer env.deinit();
+
+    if (args.len != 0 and std.mem.eql(u8, args[0], "suite"))
+        return eval_suite.main(arena, gpa, io, &env, exe_path, args[1..]);
 
     const options = parseOptions(args) catch |err| switch (err) {
         error.HelpWanted => {

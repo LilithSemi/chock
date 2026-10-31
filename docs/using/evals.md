@@ -11,6 +11,7 @@ chock eval check evals/parser.zon --session 01M...
 chock eval check evals/parser.zon --session 01M... --format json
 chock eval compare baseline.json candidate.json --minimum-score 0.9
 chock eval check evals/parser.zon --session 01M... --trajectory rollout.json
+chock eval suite evals/train.zon --output rollouts/run-001 --parallel 8
 ```
 
 `run` starts `chock run --output json` with the task, provider and model from
@@ -128,6 +129,49 @@ when every provider turn has all four arrays and the response-shaped arrays
 have identical lengths. Ordinary hosted-provider captures therefore remain
 valid evaluation evidence without pretending to be policy-gradient input; an
 RL rollout adapter supplies the token-level fields at generation time.
+
+## Batched RL rollouts
+
+`chock eval suite` expands evaluation cases into bounded parallel rollouts. It
+writes an independent integrity-checked capture, report, and lossless
+trajectory for each rollout, followed by `dataset.json` with schema
+`chock.rl-dataset` version 1. The index records the train, validation, or test
+split, group and rollout numbers, the evaluation-spec SHA-256, Chock version,
+session, reward, exit status, and whether the trajectory contains complete
+token-level training data. An existing dataset index is never overwritten;
+use a fresh output directory for every collection run.
+
+```zig
+.{
+    .schema = "chock.rl-suite",
+    .version = 1,
+    .name = "parser policy train v1",
+    .output = "rollouts/run-001",
+    .parallelism = 8,
+    .cases = &.{
+        .{
+            .name = "reject empty input",
+            .spec = "parser.zon",
+            .split = .train,
+            .rollouts = 8,
+            .group_size = 8,
+        },
+        .{
+            .name = "preserve comments",
+            .spec = "comments.zon",
+            .split = .validation,
+            .rollouts = 2,
+            .group_size = 1,
+        },
+    },
+}
+```
+
+`group_size` must divide `rollouts`. Group identifiers let an external trainer
+compute within-prompt relative advantages for GRPO while retaining each
+rollout's component rewards. `parallelism` limits live Chock processes; every
+one still receives its own session worktree or microVM and starts from the
+fixture rather than another rollout's result.
 
 `chock eval compare` reads two JSON reports without opening either session. It
 fails when the candidate score is below `--minimum-score` or more than
