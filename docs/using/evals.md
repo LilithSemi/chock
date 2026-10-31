@@ -164,6 +164,20 @@ An activation-steering run should name the layer, representation and strength
 in `intervention`, and pin the actual vector or configuration bytes with
 `intervention_sha256`. Reports, trajectories and dataset entries retain these
 fields, so a steered rollout cannot silently join an unsteered comparison.
+Online trainers can supply the same fields without rewriting a shared spec:
+
+```console
+chock eval run case.zon \
+  --provenance-checkpoint Qwen/Qwen3-8B@0123456789abcdef \
+  --provenance-trainer verl-grpo \
+  --provenance-seed 42 \
+  --provenance-intervention persona-warm-v1 \
+  --provenance-intervention-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
+
+These flags are accepted only for `run` and `replay`. They replace the
+corresponding spec fields before validation; an intervention description and
+digest still have to be present together.
 
 ## Batched RL rollouts
 

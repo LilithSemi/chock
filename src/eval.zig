@@ -37,6 +37,13 @@ const usage_text =
     \\  --capture <path>    Override the spec's record/replay capture path.
     \\  --report <path>     Also write the versioned JSON report to this path.
     \\  --trajectory <path> Write a versioned RL trajectory beside the report.
+    \\  --provenance-model-profile <name>
+    \\  --provenance-checkpoint <revision>
+    \\  --provenance-trainer <name>
+    \\  --provenance-seed <n>
+    \\  --provenance-intervention <description>
+    \\  --provenance-intervention-sha256 <digest>
+    \\                       Bind a live rollout to its trainer and intervention.
     \\  --minimum-score <n> Candidate score required by compare (default 0).
     \\  --max-regression <n>
     \\                       How far below the baseline compare may fall (default 0).
@@ -83,6 +90,12 @@ const Options = struct {
     trajectory: ?[]const u8 = null,
     minimum_score: f64 = 0,
     max_regression: f64 = 0,
+    provenance_model_profile: ?[]const u8 = null,
+    provenance_checkpoint: ?[]const u8 = null,
+    provenance_trainer: ?[]const u8 = null,
+    provenance_seed: ?u64 = null,
+    provenance_intervention: ?[]const u8 = null,
+    provenance_intervention_sha256: ?[]const u8 = null,
 };
 
 const Test = struct {
@@ -272,7 +285,7 @@ pub fn main(
     };
     const source_z = try arena.dupeSentinel(u8, source, 0);
     var diagnostics: std.zon.parse.Diagnostics = undefined;
-    const spec = std.zon.parse.fromSlice(Spec, .{
+    var spec = std.zon.parse.fromSlice(Spec, .{
         .gpa = gpa,
         .arena = arena,
         .source = source_z,
@@ -281,6 +294,12 @@ pub fn main(
         tty.print(.err, "chock eval: {s} is not a valid evaluation spec: {t}\n", .{ options.spec_path, err });
         return Exit.usage.code();
     };
+    if (options.provenance_model_profile) |value| spec.provenance.model_profile = value;
+    if (options.provenance_checkpoint) |value| spec.provenance.checkpoint = value;
+    if (options.provenance_trainer) |value| spec.provenance.trainer = value;
+    if (options.provenance_seed) |value| spec.provenance.seed = value;
+    if (options.provenance_intervention) |value| spec.provenance.intervention = value;
+    if (options.provenance_intervention_sha256) |value| spec.provenance.intervention_sha256 = value;
     if (!std.mem.eql(u8, spec.schema, "chock.eval") or spec.version != 1 or spec.name.len == 0) {
         tty.print(.err, "chock eval: the spec must name schema chock.eval version 1 and a non-empty evaluation\n", .{});
         return Exit.usage.code();
@@ -469,6 +488,26 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
             out.format = std.meta.stringToEnum(Format, args[i]) orelse return error.BadArguments;
             continue;
         }
+        if (std.mem.startsWith(u8, args[i], "--provenance-")) {
+            const option = args[i];
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.BadArguments;
+            if (std.mem.eql(u8, option, "--provenance-model-profile")) {
+                out.provenance_model_profile = args[i];
+            } else if (std.mem.eql(u8, option, "--provenance-checkpoint")) {
+                out.provenance_checkpoint = args[i];
+            } else if (std.mem.eql(u8, option, "--provenance-trainer")) {
+                out.provenance_trainer = args[i];
+            } else if (std.mem.eql(u8, option, "--provenance-seed")) {
+                out.provenance_seed = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArguments;
+            } else if (std.mem.eql(u8, option, "--provenance-intervention")) {
+                out.provenance_intervention = args[i];
+            } else if (std.mem.eql(u8, option, "--provenance-intervention-sha256")) {
+                if (!validSha256(args[i])) return error.BadArguments;
+                out.provenance_intervention_sha256 = args[i];
+            } else return error.BadArguments;
+            continue;
+        }
         if (std.mem.eql(u8, args[i], "--minimum-score") or std.mem.eql(u8, args[i], "--max-regression")) {
             const is_minimum = std.mem.eql(u8, args[i], "--minimum-score");
             i += 1;
@@ -484,8 +523,19 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
     if ((action == .run or action == .replay) and out.session.len != 0) return error.BadArguments;
     if (action != .compare and (out.minimum_score != 0 or out.max_regression != 0)) return error.BadArguments;
     if (action == .check and out.capture != null) return error.BadArguments;
+    if (action == .check and hasProvenanceOverrides(out)) return error.BadArguments;
     if (action == .compare and (out.session.len != 0 or out.project != null or out.skip_tests or out.capture != null or out.trajectory != null)) return error.BadArguments;
+    if (action == .compare and hasProvenanceOverrides(out)) return error.BadArguments;
     return out;
+}
+
+fn hasProvenanceOverrides(options: Options) bool {
+    return options.provenance_model_profile != null or
+        options.provenance_checkpoint != null or
+        options.provenance_trainer != null or
+        options.provenance_seed != null or
+        options.provenance_intervention != null or
+        options.provenance_intervention_sha256 != null;
 }
 
 fn compareReports(arena: std.mem.Allocator, io: std.Io, options: Options) !u8 {
@@ -944,6 +994,20 @@ test "eval command line separates provider runs from deterministic checks" {
     try testing.expectApproxEqAbs(@as(f64, 0.05), compared.max_regression, 0.0001);
     try testing.expectError(error.BadArguments, parseOptions(&.{ "compare", "base.json" }));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "compare", "base.json", "candidate.json", "--minimum-score", "1.1" }));
+
+    const provenance_digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const steered = try parseOptions(&.{
+        "run",                              "case.zon",
+        "--provenance-checkpoint",          "Qwen/Qwen3-8B@revision",
+        "--provenance-seed",                "42",
+        "--provenance-intervention",        "persona profile",
+        "--provenance-intervention-sha256", provenance_digest,
+    });
+    try testing.expectEqualStrings("Qwen/Qwen3-8B@revision", steered.provenance_checkpoint.?);
+    try testing.expectEqual(@as(?u64, 42), steered.provenance_seed);
+    try testing.expectEqualStrings(provenance_digest, steered.provenance_intervention_sha256.?);
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "check", "case.zon", "--session", id, "--provenance-checkpoint", "other" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "run", "case.zon", "--provenance-intervention-sha256", "short" }));
 }
 
 test "evaluation paths cannot leave their fixture" {
