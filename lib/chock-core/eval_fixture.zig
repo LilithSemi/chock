@@ -370,7 +370,8 @@ test "an encoded fixture verifies its payload" {
     try std.testing.expectEqual(@as(u32, 3), decoded.providers[0].training.?.response_token_ids[0]);
 
     var damaged = try arena.dupe(u8, encoded);
-    damaged[damaged.len - 4] = if (damaged[damaged.len - 4] == 'x') 'y' else 'x';
+    const text_at = std.mem.indexOf(u8, damaged, "hello") orelse unreachable;
+    damaged[text_at] = 'j';
     try std.testing.expectError(error.BadDigest, decode(arena, damaged));
 }
 

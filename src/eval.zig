@@ -3,6 +3,7 @@
 const std = @import("std");
 const chock_proto = @import("chock-proto");
 const chock_core = @import("chock-core");
+const ziggit = @import("ziggit");
 
 const session_paths = @import("session.zig");
 const Exit = @import("exit.zig").Exit;
@@ -290,8 +291,21 @@ pub fn main(
 
     var findings: std.ArrayList(Finding) = .empty;
     try scoreAudit(arena, spec, &observed, &findings);
-    try scoreFixture(arena, io, project, spec, &findings);
-    if (!options.skip_tests) try scoreTests(arena, gpa, io, &env, project, spec.tests, &findings);
+    const result_path = materializeResult(arena, gpa, io, project, session_dir, session) catch |err| result: {
+        try add(arena, &findings, "session result tree", "harness", false, "refs/chock/<session>", @errorName(err));
+        break :result null;
+    };
+    if (result_path) |path| {
+        defer std.Io.Dir.cwd().deleteTree(io, path) catch {};
+        try add(arena, &findings, "session result tree", "harness", true, "refs/chock/<session>", "materialized");
+        try scoreFixture(arena, io, path, spec, &findings);
+        if (!options.skip_tests) try scoreTests(arena, gpa, io, &env, path, spec.tests, &findings);
+    } else {
+        for (spec.expect.required_paths) |relative| try add(arena, &findings, try std.fmt.allocPrint(arena, "required path {s}", .{relative}), "fixture", false, "present", "result unavailable");
+        for (spec.expect.forbidden_paths) |relative| try add(arena, &findings, try std.fmt.allocPrint(arena, "forbidden path {s}", .{relative}), "fixture", false, "absent", "result unavailable");
+        for (spec.expect.files) |expected| try add(arena, &findings, try std.fmt.allocPrint(arena, "file digest {s}", .{expected.path}), "fixture", false, expected.sha256, "result unavailable");
+        if (!options.skip_tests) for (spec.tests) |one| try add(arena, &findings, one.name, "test", false, "exit 0", "result unavailable");
+    }
 
     var failures: usize = 0;
     for (findings.items) |finding| failures += @intFromBool(!finding.passed);
@@ -678,6 +692,42 @@ fn scoreFixture(arena: std.mem.Allocator, io: std.Io, project: []const u8, spec:
         };
         try add(arena, out, try std.fmt.allocPrint(arena, "file digest {s}", .{expected.path}), "fixture", std.mem.eql(u8, expected.sha256, actual), expected.sha256, actual);
     }
+}
+
+/// Materialize the immutable tree parked by a completed Git-worktree session.
+/// Evaluation never reads the caller's checkout: it may have moved to another
+/// branch (or have unrelated edits) by the time an old session is scored.
+fn materializeResult(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    project_path: []const u8,
+    session_dir: []const u8,
+    session: []const u8,
+) ![]const u8 {
+    var project = try std.Io.Dir.openDirAbsolute(io, project_path, .{ .iterate = true });
+    defer project.close(io);
+
+    var diag: ?ziggit.Diagnostic = null;
+    defer if (diag) |*fault| fault.deinit(gpa);
+    var layout = try ziggit.discover(gpa, io, project, .{}, &diag);
+    var repo = ziggit.Repository.open(gpa, io, layout, .{}, &diag) catch |err| {
+        layout.deinit(io);
+        return err;
+    };
+    defer repo.deinit();
+
+    const ref_name = try std.fmt.allocPrint(arena, "refs/chock/{s}", .{session});
+    const commit = try repo.refs.resolve(ref_name, &diag);
+    const tree = try ziggit.peel(gpa, &repo, commit, .tree);
+    const nonce = std.Io.Clock.awake.now(io).toNanoseconds();
+    const result_path = try std.fmt.allocPrint(arena, "{s}/.eval-result-{s}-{d}", .{ session_dir, session, nonce });
+    try std.Io.Dir.createDirAbsolute(io, result_path, .default_dir);
+    errdefer std.Io.Dir.cwd().deleteTree(io, result_path) catch {};
+    var result = try std.Io.Dir.openDirAbsolute(io, result_path, .{ .iterate = true });
+    defer result.close(io);
+    try ziggit.checkoutTree(gpa, io, &repo.odb, result, tree, .{}, &diag);
+    return result_path;
 }
 
 fn fileSha256(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
