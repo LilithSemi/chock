@@ -29,8 +29,8 @@
             .hash = "mirage-0.1.0-ORLT6E02FgBblg4Zls7U4mEBHCboH0-NC5rJ_u4t4uOG",
         },
         .palisade = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/palisade#3de554f9379e4d9482138a948945285e6d0b28c2",
-            .hash = "palisade-0.1.0-kI7k7zFNCADtMYCkzyeOBldr-xBp8sSJYvDXzhQ4ksBq",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/palisade#be84db7236ae5a06002402b4f015813a48f65d20",
+            .hash = "palisade-0.1.0-kI7k7wBYCACmg_K3izmw3Kf-cMYYu82uo2Z7y_DGhe5n",
         },
         .ziggit = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/ziggit#52a7deaf438c677b670e8f2af0d208bd29bfb92b",

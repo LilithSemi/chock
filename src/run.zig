@@ -30,6 +30,7 @@ const session_paths = @import("session.zig");
 const ui = @import("ui.zig");
 const Exit = @import("exit.zig").Exit;
 const exitFor = @import("main.zig").exitFor;
+const plugin_process = @import("plugin-host.zig");
 
 const usage_text =
     \\Usage: chock run [options] [message...]
@@ -9127,10 +9128,6 @@ fn reportMcpOffers(session: *const chock_core.mcp.Session) void {
     }
 }
 
-const plugin_module_target = "/plugin.wasm";
-
-const plugin_host_target = "/chock";
-
 const PluginToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
     state: *PluginState,
@@ -9168,6 +9165,7 @@ const PluginState = struct {
     arena: std.heap.ArenaAllocator,
 
     helpers: [chock_core.plugin.max_plugins]chock_core.helper.Helper = undefined,
+    processes: [chock_core.plugin.max_plugins]plugin_process.Process = undefined,
     drivers: [chock_core.plugin.max_plugins]chock_core.plugin_host.Driver = undefined,
     records: [chock_core.plugin.max_plugins]chock_core.plugin.Loaded = undefined,
     count: usize = 0,
@@ -9193,7 +9191,6 @@ fn startPlugins(
     io: std.Io,
     started: *Started,
     options: Options,
-    context: *const chock_core.tools.Context,
     state: *PluginState,
     mcp_session: *const chock_core.mcp.Session,
     definitions: []chock_core.tools.Definition,
@@ -9201,7 +9198,7 @@ fn startPlugins(
 ) std.mem.Allocator.Error!struct { []chock_core.tools.Definition, []const u8 } {
     const settings = started.plugins orelse return .{ definitions, prompt };
 
-    if (builtin.target.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) {
         tty.print(
             .warn,
             "chock: a plugin runs in a sandbox of its own, and this platform has none, so no " ++
@@ -9218,16 +9215,6 @@ fn startPlugins(
         .chain = try policyChain(keep, started, options),
         .agent_kind = options.agent_kind,
         .model = started.model,
-    };
-
-    const host_path = try chock_core.plugin_host.selfProgramPath(keep, io, started.exe_path) orelse {
-        tty.print(
-            .warn,
-            "chock: this program's own path could not be resolved, so no plugin is in this " ++
-                "session.\n",
-            .{},
-        );
-        return .{ definitions, prompt };
     };
 
     state.session.reserved = try reservedNames(keep, mcp_session);
@@ -9266,15 +9253,7 @@ fn startPlugins(
             continue;
         };
 
-        const config = try pluginSandbox(
-            keep,
-            io,
-            started.sandbox_config,
-            context.store_paths,
-            context.read_only_mounts,
-            host_path,
-            module_path,
-        );
+        const config = try pluginSandbox(keep, started.sandbox_config);
 
         var module_refusal: ?chock_core.plugin_module.Refusal = null;
         var failure: ?chock_core.plugin.Failure = null;
@@ -9321,14 +9300,19 @@ fn startPlugins(
             &state.session,
             one.name,
         );
-        const argv = try pluginArgv(keep, capabilities);
-
         const index = state.count;
+        state.processes[index] = .{
+            .module = try keep.dupe(u8, bytes),
+            .capabilities = capabilities,
+        };
         state.helpers[index] = chock_core.helper.Helper.init(std.heap.page_allocator);
         state.drivers[index] = chock_core.plugin_host.Driver.init(
             gpa,
             &state.helpers[index],
-            .{ .call = .{ .config = config }, .argv = argv },
+            .{
+                .call = .{ .config = config },
+                .entry = state.processes[index].entry(),
+            },
         );
         state.records[index] = .{ .name = one.name, .host = state.drivers[index].host() };
         state.count += 1;
@@ -9367,60 +9351,19 @@ fn reservedNames(
     return names.toOwnedSlice(keep);
 }
 
-fn pluginArgv(
-    keep: std.mem.Allocator,
-    capabilities: []const []const u8,
-) std.mem.Allocator.Error![]const []const u8 {
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.append(keep, plugin_host_target);
-    try argv.append(keep, chock_core.plugin_host.verb);
-    try argv.append(keep, plugin_module_target);
-    try argv.appendSlice(keep, capabilities);
-    return argv.toOwnedSlice(keep);
-}
-
 fn pluginSandbox(
     keep: std.mem.Allocator,
-    io: std.Io,
     workspace_config: palisade.Sandbox.Config,
-    store_paths: []const []const u8,
-    read_only_mounts: []const chock_core.tools.ToolchainMount,
-    host_path: []const u8,
-    module_path: []const u8,
 ) std.mem.Allocator.Error!palisade.Sandbox.Config {
     var base = workspace_config;
     base.cwd = "/";
+    base.env = &.{};
+    base.mounts = &.{};
     base.rules = &.{};
-
-    const with_store = try chock_core.tools.withStore(keep, io, .{ .config = base }, store_paths, read_only_mounts);
-
-    var mounts: std.ArrayList(palisade.linux.namespace.Mount) = .empty;
-    try mounts.appendSlice(keep, with_store.config.mounts);
-    try mounts.append(keep, .{ .bind = .{
-        .source = host_path,
-        .target = plugin_host_target,
-        .read_only = true,
-    } });
-    try mounts.append(keep, .{ .bind = .{
-        .source = module_path,
-        .target = plugin_module_target,
-        .read_only = true,
-    } });
-
-    var reach: std.ArrayList(palisade.Sandbox.Rule) = .empty;
-    try reach.appendSlice(keep, with_store.config.rules);
-    try reach.append(keep, .{
-        .path = plugin_host_target,
-        .access = .{ .execute = true, .read_file = true },
-    });
-    try reach.append(keep, .{
-        .path = plugin_module_target,
-        .access = .{ .read_file = true },
-    });
-
-    var config = try chock_core.plugin_host.lockdown(keep, with_store.config, reach.items);
-    config.mounts = try mounts.toOwnedSlice(keep);
-    return config;
+    base.scratch = &.{};
+    base.substitutions = &.{};
+    base.owned_directories = &.{};
+    return chock_core.plugin_host.lockdown(keep, base, &.{});
 }
 
 fn reportPluginOffers(session: *const chock_core.plugin.Session) void {
@@ -11567,7 +11510,6 @@ fn runSession(
         io,
         started,
         options,
-        &context,
         &plugin_state,
         &mcp_state.session,
         mcp_definitions,
@@ -18550,7 +18492,7 @@ test "a plugin tool cannot take a name an MCP server already declared" {
     try std.testing.expectEqual(@as(usize, 0), inner.calls);
 }
 
-test "the sandbox a plugin host gets carries its program, its module and nothing writable" {
+test "the sandbox a forked plugin gets carries no workspace, program, module, or environment" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -18568,70 +18510,16 @@ test "the sandbox a plugin host gets carries its program, its module and nothing
         .network = .{ .isolated = chock_net.netns.params },
     };
 
-    const config = try pluginSandbox(
-        arena_state.allocator(),
-        std.testing.io,
-        workspace,
-        &.{"/nix/store/aaa-glibc"},
-        &.{},
-        "/nix/store/bbb-chock/bin/chock",
-        "/home/someone/work/plugins/hello.wasm",
-    );
+    const config = try pluginSandbox(arena_state.allocator(), workspace);
 
     try std.testing.expect(config.network == .none);
     try std.testing.expectEqualStrings("/", config.cwd);
-
-    var reaches_program = false;
-    var reaches_module = false;
-    for (config.rules) |rule| {
-        try std.testing.expect(!rule.access.write_file);
-        try std.testing.expect(!rule.access.make_reg);
-        try std.testing.expect(!rule.access.remove_file);
-        try std.testing.expect(!rule.access.truncate);
-        try std.testing.expect(!std.mem.eql(u8, rule.path, "/home/someone/work"));
-
-        if (std.mem.eql(u8, rule.path, plugin_host_target)) {
-            reaches_program = rule.access.execute and rule.access.read_file;
-        }
-        if (std.mem.eql(u8, rule.path, plugin_module_target)) {
-            reaches_module = rule.access.read_file;
-        }
-    }
-    try std.testing.expect(reaches_program);
-    try std.testing.expect(reaches_module);
-
-    var binds_program = false;
-    var binds_module = false;
-    for (config.mounts) |mount| {
-        const bind = switch (mount) {
-            .bind => |one| one,
-            else => continue,
-        };
-        if (std.mem.eql(u8, bind.target, plugin_host_target)) {
-            binds_program = bind.read_only and
-                std.mem.eql(u8, bind.source, "/nix/store/bbb-chock/bin/chock");
-        }
-        if (std.mem.eql(u8, bind.target, plugin_module_target)) {
-            binds_module = bind.read_only and
-                std.mem.eql(u8, bind.source, "/home/someone/work/plugins/hello.wasm");
-        }
-    }
-    try std.testing.expect(binds_program);
-    try std.testing.expect(binds_module);
-}
-
-test "a plugin host is started as chock itself, under the word that is not a command" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    const argv = try pluginArgv(arena_state.allocator(), &.{"read_file"});
-
-    try std.testing.expectEqual(@as(usize, 4), argv.len);
-    try std.testing.expectEqualStrings(plugin_host_target, argv[0]);
-    try std.testing.expectEqualStrings(chock_core.plugin_host.verb, argv[1]);
-    try std.testing.expectEqualStrings(plugin_module_target, argv[2]);
-    try std.testing.expectEqualStrings("read_file", argv[3]);
+    try std.testing.expectEqual(@as(usize, 0), config.env.len);
+    try std.testing.expectEqual(@as(usize, 0), config.mounts.len);
+    try std.testing.expectEqual(@as(usize, 0), config.rules.len);
+    try std.testing.expectEqual(@as(usize, 0), config.scratch.len);
+    try std.testing.expectEqual(@as(usize, 0), config.substitutions.len);
+    try std.testing.expectEqual(@as(usize, 0), config.owned_directories.len);
 }
 
 const PluginProbeHost = struct {

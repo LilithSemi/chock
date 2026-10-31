@@ -1,29 +1,11 @@
 //! The plugin host process, and the pipe that reaches it.
 
 const std = @import("std");
-const builtin = @import("builtin");
-
 const palisade = @import("palisade");
 
 const helper = @import("helper.zig");
 const plugin = @import("plugin.zig");
 const plugin_engine = @import("plugin_engine.zig");
-
-pub const verb = "__plugin-host";
-
-pub fn selfProgramPath(
-    keep: std.mem.Allocator,
-    io: std.Io,
-    exe_path: []const u8,
-) std.mem.Allocator.Error!?[]const u8 {
-    for ([_][]const u8{ "/proc/self/exe", exe_path }) |candidate| {
-        if (candidate.len == 0) continue;
-        const resolved = std.Io.Dir.cwd().realPathFileAlloc(io, candidate, keep) catch continue;
-        std.debug.assert(std.fs.path.isAbsolute(resolved));
-        return resolved;
-    }
-    return null;
-}
 
 pub const max_inbox_bytes = 8 << 20;
 
@@ -737,51 +719,6 @@ test "a line that never ends is refused rather than grown until the machine comp
 
     std.Io.File.close(pair.channel.from_helper, io);
     pair.channel.from_helper = .{ .handle = -1, .flags = .{ .nonblocking = false } };
-}
-
-test "the program that is running is the answer, and never whatever argv[0] named" {
-    if (builtin.target.os.tag != .linux) {
-        return error.SkipZigTest;
-    }
-
-    const io = testing.io;
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const running = try std.Io.Dir.cwd().realPathFileAlloc(io, "/proc/self/exe", arena);
-    const answer = (try selfProgramPath(arena, io, "/proc/self/cmdline")).?;
-    try testing.expectEqualStrings(running, answer);
-}
-
-test "a bare argv[0] still gives an absolute path, because a mount source has to be one" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
-
-    const io = testing.io;
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const answer = (try selfProgramPath(arena, io, "chock")).?;
-    try testing.expect(std.fs.path.isAbsolute(answer));
-
-    const running = try std.Io.Dir.cwd().realPathFileAlloc(io, "/proc/self/exe", arena);
-    try testing.expectEqualStrings(running, answer);
-}
-
-test "an empty argv[0] is not a candidate" {
-    if (builtin.target.os.tag == .linux) {
-        return error.SkipZigTest;
-    }
-
-    const io = testing.io;
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-
-    try testing.expectEqual(
-        @as(?[]const u8, null),
-        try selfProgramPath(arena_state.allocator(), io, ""),
-    );
 }
 
 comptime {

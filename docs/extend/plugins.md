@@ -40,9 +40,11 @@ of its other tools included.
 The tool list, the capabilities and the decisions are all read out of the
 module's own file with no engine, before any of it runs. A plugin whose tools
 are never called starts no process. The first call starts one, and it is a
-sandbox of its own with no network. It reads three things, and all three read
-only: the `chock` program that hosts it, its own module, and the toolchain the
-session runs under. It reaches neither the project nor the workspace.
+sandbox of its own with no network. Chock forks the already-loaded runtime into
+that sandbox instead of executing a hidden command there. The module bytes and
+the capabilities arrive through inherited memory, so the sandbox mounts no
+program, module, toolchain, project, or workspace and grants no filesystem
+path at all.
 
 ## Writing one
 

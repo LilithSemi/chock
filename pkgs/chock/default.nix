@@ -115,7 +115,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   zigDeps = zig.fetchDeps {
     inherit (finalAttrs) src pname version;
-    hash = "sha256-M7wwwXZIcexLGIPCvnWuSeMfrIxsEvzxYvz5rTwE2RI=";
+    hash = "sha256-lLqP1u2HIP7A0SBVEnizrRPgAiHYlQqSkkrM5k5pgTk=";
   };
 
   nativeBuildInputs = [

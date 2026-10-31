@@ -22,7 +22,8 @@ const start_step_ns: u64 = std.time.ns_per_ms;
 
 pub const Request = struct {
     call: chock_net.Call,
-    argv: []const []const u8,
+    argv: []const []const u8 = &.{},
+    entry: ?palisade.Sandbox.Entry = null,
 };
 
 pub const Channel = struct {
@@ -154,6 +155,7 @@ pub const Helper = struct {
             .allocator = allocator,
             .call = .{ .config = spawn_config, .links = request.call.links },
             .argv = argv_copy,
+            .entry = request.entry,
         };
         const thread = std.Thread.spawn(.{}, Spawn.run, .{&self.spawn_state}) catch {
             closeRaw(io, requests.read_fd);
@@ -203,7 +205,7 @@ pub const Helper = struct {
             std.Io.File.close(channel.to_helper, io);
         }
 
-        self.spawn_state.middle.signal(@intFromEnum(std.os.linux.SIG.KILL)) catch {};
+        self.spawn_state.middle.signal(@backingInt(std.os.linux.SIG.KILL)) catch {};
 
         if (self.thread) |one| one.join();
         self.spawn_state.middle.close();
@@ -228,6 +230,7 @@ const Spawn = struct {
     allocator: std.mem.Allocator = undefined,
     call: chock_net.Call = undefined,
     argv: []const []const u8 = undefined,
+    entry: ?palisade.Sandbox.Entry = null,
     middle: palisade.Sandbox.Handle = .{},
     done: std.atomic.Value(bool) = .init(false),
     term: std.process.Child.Term = undefined,
@@ -236,6 +239,7 @@ const Spawn = struct {
     fn run(self: *Spawn) void {
         self.term = chock_net.Driver.native_driver.spawn(self.allocator, self.call, self.argv, .{
             .handle = &self.middle,
+            .entry = self.entry,
         }) catch |err| {
             self.spawn_err = err;
             self.done.store(true, .release);

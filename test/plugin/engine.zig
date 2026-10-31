@@ -9,6 +9,7 @@ const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
 const core = @import("chock-plugin-core");
 const paths = @import("engine_paths");
+const plugin_runtime = @import("plugin-runtime");
 const palisade = @import("palisade");
 
 const helper = chock_core.helper;
@@ -69,8 +70,7 @@ const LockedLog = struct {
 };
 
 const wasm_path: []const u8 = paths.plugin_wasm_path;
-/// `chock` itself, started under `plugin_host.verb`.
-const host_path: []const u8 = paths.chock_path;
+const host_path: []const u8 = paths.engine_host_path;
 
 const Host = struct {
     child: std.process.Child,
@@ -85,7 +85,6 @@ const Host = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
         try argv.append(gpa, host_path);
-        try argv.append(gpa, plugin_host.verb);
         try argv.append(gpa, module);
         try argv.appendSlice(gpa, capabilities);
 
@@ -454,12 +453,10 @@ const AllowEverything = struct {
     }
 };
 
-const host_target = "/chock";
-const module_target = "/plugin.wasm";
-
 test "a tool name reaches a real plugin host in a real sandbox, and the guest's own answer comes back" {
     if (builtin.target.os.tag != .linux) {
-        // `Sandbox.spawn` refuses on Darwin, so there is no host process there.
+        // This case proves Linux's empty mount tree and Landlock rules. Palisade's
+        // Darwin suite separately runs the same callback entry under Seatbelt.
         return error.SkipZigTest;
     }
     // Asked in a child, the only way to ask without spending this process's one namespace.
@@ -494,19 +491,9 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
     var root = try sandboxRoot(gpa);
     defer root.cleanup(io);
 
-    // `chock_sandbox.namespace` asserts a mount source is absolute.
-    const host_here = try std.Io.Dir.cwd().realPathFileAlloc(io, host_path, keep);
-    const module_here = try std.Io.Dir.cwd().realPathFileAlloc(io, wasm_path, keep);
-
-    const mounts = try keep.dupe(palisade.linux.namespace.Mount, &.{
-        .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } },
-        .{ .bind = .{ .source = host_here, .target = host_target, .read_only = true } },
-        .{ .bind = .{ .source = module_here, .target = module_target, .read_only = true } },
-    });
-
     const config = try plugin_host.lockdown(keep, .{
         .root = root.path(),
-        .mounts = mounts,
+        .mounts = &.{},
         // A tool call's config carries the workspace writable. The lockdown must
         // drop it.
         .rules = &.{
@@ -515,22 +502,19 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
         .cwd = "/",
         .env = &.{},
         .network = .host,
-    }, &.{
-        .{ .path = "/nix/store", .access = palisade.linux.landlock.AccessFs.read_only },
-        .{ .path = host_target, .access = .{ .execute = true, .read_file = true } },
-        .{ .path = module_target, .access = .{ .read_file = true } },
-    });
+    }, &.{});
     try testing.expect(config.network == .none);
-    // Three and not four: the writable rule above is gone.
-    try testing.expectEqual(@as(usize, 3), config.rules.len);
+    try testing.expectEqual(@as(usize, 0), config.rules.len);
 
     // The page allocator, not the test's own: `fork` carries only one thread.
     var process = helper.Helper.init(std.heap.page_allocator);
     defer process.deinit(io);
 
+    var runtime = plugin_runtime.Process{ .module = bytes, .capabilities = &.{} };
+
     var driver = plugin_host.Driver.init(gpa, &process, .{
         .call = .{ .config = config },
-        .argv = &.{ host_target, plugin_host.verb, module_target },
+        .entry = runtime.entry(),
     });
     defer driver.deinit();
 

@@ -1706,14 +1706,11 @@ pub fn build(b: *std.Build) void {
     // The wasm engine, for `src/plugin-host.zig` and for nothing else.
     //
     // **It is here, in the one binary, because there is only one binary.**
-    // `chock-plugin-host` used to be a second installed program, and
-    // `src/run.zig` found it by looking in the directory `chock` itself is in,
-    // so an install that moved one file and not the other lost every plugin.
-    // Chock links no libc and Zig cross compiles it, which makes a single file
-    // install the whole point, so the second artifact is gone and `chock`
-    // re-execs itself under a hidden word instead: see
-    // `chock_core.plugin_host.verb`. It is the same thing this project already
-    // does for a subagent, and the plugin still gets a process of its own.
+    // `chock-plugin-host` used to be a second installed program, then `chock`
+    // re-executed itself under a hidden word. A plugin now enters this runtime
+    // directly in a forked sandbox child. The installed artifact remains one
+    // static binary, and starting a plugin loads neither it nor its module from
+    // the sandbox filesystem.
     //
     // **What that must not cost, and does not:**
     //
@@ -1724,12 +1721,10 @@ pub fn build(b: *std.Build) void {
     // * `chock-core` still compiles with no engine at all, on every target.
     //   It holds every rule a plugin is held to, over the `plugin_engine.Engine`
     //   seam, and it does not import this.
-    // * No library test binary links an engine, and neither does any of the
-    //   test binaries below. The exception is `chock`'s own test binary, which
-    //   is built from `src/main.zig`, the very root the shipped binary is built
-    //   from. That is not a leak: it is the test of the artifact that holds the
-    //   engine, and it could only be avoided by testing a different program
-    //   than the one that ships.
+    // * No ordinary library test binary links an engine. The exceptions are
+    //   `chock`'s own test binary and the dedicated engine acceptance suite
+    //   below, including its test-only protocol host. Both import this same
+    //   file, so the tests cannot drift into a second runtime implementation.
     const vulcan = b.dependency("vulcan", .{ .target = target, .optimize = optimize });
 
     // **Running a guest is every target Mirage has both a machine and an
@@ -2547,22 +2542,42 @@ pub fn build(b: *std.Build) void {
     // The acceptance test, and the only one in this project that runs guest
     // code.
     //
-    // It drives the real host process, over a real pipe, with the real module
+    // It drives the real host runtime, over a real pipe, with the real module
     // built above and the real engine, so the framing, the call ABI and the
     // bounded reads of guest memory are all the production ones. Every other
     // test of this feature drives a peer written by the same hand: see
     // `lib/chock-core/plugin_host.zig`'s own note.
     //
-    // **The host process is `chock` itself**, started under
-    // `chock_core.plugin_host.verb`. So the program this test drives is the
-    // very program a person installs, and not a helper built beside it: see
-    // the `vulcan` dependency above.
-    //
-    // Both paths are build time constants, for the reason
-    // `plugin_wasm_path_options` above gives.
+    // Most protocol cases use a test-only executable around that runtime. The
+    // final case uses the production callback entry in a real sandbox and is
+    // the guard that no executable or module mount came back.
+    const plugin_runtime = b.createModule(.{
+        .root_source_file = b.path("src/plugin-host.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "chock-core", .module = chock_core },
+            .{ .name = "palisade", .module = palisade },
+            .{ .name = "vulcan-wasm", .module = vulcan.module("vulcan-wasm") },
+        },
+    });
+
+    const plugin_engine_host = b.addExecutable(.{
+        .name = "chock-plugin-engine-test-host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/plugin/engine_host.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "plugin-runtime", .module = plugin_runtime },
+                .{ .name = "chock-core", .module = chock_core },
+            },
+        }),
+    });
+
     const engine_paths = b.addOptions();
     engine_paths.addOptionPath("plugin_wasm_path", hello_wasm.getEmittedBin());
-    engine_paths.addOptionPath("chock_path", exe.getEmittedBin());
+    engine_paths.addOptionPath("engine_host_path", plugin_engine_host.getEmittedBin());
 
     const plugin_engine_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -2583,18 +2598,25 @@ pub fn build(b: *std.Build) void {
                 // lockdown are all sandbox values.
                 .{ .name = "chock-net", .module = chock_net },
                 .{ .name = "palisade", .module = palisade },
+                .{ .name = "plugin-runtime", .module = plugin_runtime },
                 .{ .name = "engine_paths", .module = engine_paths.createModule() },
             },
         }),
     });
-    // The test spawns the host process and reads the module, so both have to
+    // The test spawns its host process and reads the module, so both have to
     // exist before it runs. `addOptionPath` records where they will be and
     // does not itself order the steps.
-    plugin_engine_tests.step.dependOn(&exe.step);
+    plugin_engine_tests.step.dependOn(&plugin_engine_host.step);
     plugin_engine_tests.step.dependOn(&hello_wasm.step);
     const run_plugin_engine_tests = b.addRunArtifact(plugin_engine_tests);
     run_plugin_engine_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_plugin_engine_tests.step);
+    module_test_steps.add(
+        b,
+        "test-plugin-engine",
+        "Run the real WebAssembly plugin engine tests only",
+        &run_plugin_engine_tests.step,
+    );
 
     // **The install list, read out of the install step itself and handed to a
     // test.** `chock` is a static binary that links no libc and Zig cross

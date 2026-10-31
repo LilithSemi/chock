@@ -6,7 +6,6 @@ const chock_broker = @import("chock-broker");
 const chock_core = @import("chock-core");
 const chock_proto = @import("chock-proto");
 
-const plugin_host_cmd = @import("plugin-host.zig");
 const run_cmd = @import("run.zig");
 const login_cmd = @import("login.zig");
 const models_cmd = @import("models.zig");
@@ -248,22 +247,6 @@ comptime {
 
 const stdout_buffer_size = 8 * 1024;
 
-const plugin_host_verb = chock_core.plugin_host.verb;
-
-/// The verbs a person never types. Each one writes its own wire on standard
-/// output, so each is answered before anything else buffers that descriptor.
-const hidden_verbs = [_][]const u8{plugin_host_verb};
-
-comptime {
-    for (commands) |entry| {
-        for (hidden_verbs) |verb| {
-            if (std.mem.eql(u8, entry.name, verb)) @compileError("chock " ++
-                entry.name ++ " is both a command in the table and a hidden host verb, " ++
-                "so the command could never run. Rename the command.");
-        }
-    }
-}
-
 comptime {
     var found = false;
     for (commands) |entry| {
@@ -294,13 +277,6 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     const args = try init.minimal.args.toSlice(arena);
-
-    // Answered before the buffered writer below exists: a plugin host writes
-    // its own wire on standard output, and a second writer on that
-    // descriptor would corrupt it.
-    if (args.len >= 2 and std.mem.eql(u8, args[1], plugin_host_verb)) {
-        return plugin_host_cmd.main(arena, gpa, init.io, args[2..]);
-    }
 
     var stdout_buffer: [stdout_buffer_size]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
@@ -505,28 +481,6 @@ test "the edit distance helper counts the three edits it says it counts" {
     try testing.expectEqual(@as(usize, 1), editDistance("run", "rung"));
     try testing.expectEqual(@as(usize, 3), editDistance("", "run"));
     try testing.expectEqual(@as(usize, 3), editDistance("plan", "plugin"));
-}
-
-test "a person cannot reach a hidden host verb by mistyping a word chock answers to" {
-    for (hidden_verbs) |verb| {
-        for (commands) |entry| {
-            try testing.expect(editDistance(entry.name, verb) >= 3);
-        }
-        for (own_words) |word| {
-            try testing.expect(editDistance(word, verb) >= 3);
-        }
-    }
-}
-
-test "a hidden host verb is in no command table and in no usage text" {
-    for (hidden_verbs) |verb| {
-        for (commands) |entry| {
-            try testing.expect(!std.mem.eql(u8, entry.name, verb));
-        }
-        for (own_words) |word| {
-            try testing.expect(!std.mem.eql(u8, word, verb));
-        }
-    }
 }
 
 test "the command table names each command exactly once" {

@@ -1,8 +1,9 @@
-//! `chock __plugin-host`: what one plugin runs inside.
+//! The runtime entered by one forked, sandboxed plugin process.
 
 const std = @import("std");
 
 const chock_core = @import("chock-core");
+const palisade = @import("palisade");
 const wasm = @import("vulcan-wasm");
 
 const plugin_engine = chock_core.plugin_engine;
@@ -56,17 +57,30 @@ const Vulcan = struct {
     }
 };
 
-pub fn main(
-    arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    args: []const []const u8,
-) anyerror!u8 {
-    if (args.len < 1) {
-        return 2;
+pub const Process = struct {
+    module: []const u8,
+    capabilities: []const []const u8,
+
+    pub fn entry(self: *Process) palisade.Sandbox.Entry {
+        return .{ .ptr = self, .run = runFn };
     }
-    const module_path = args[0];
-    const capabilities = args[1..];
+
+    fn runFn(ptr: *anyopaque) u8 {
+        const self: *Process = @ptrCast(@alignCast(ptr));
+        return run(self.module, self.capabilities) catch 1;
+    }
+};
+
+/// Runs after fork in the already-confined child. It deliberately uses the
+/// single-threaded I/O implementation: no thread from the parent survives a
+/// fork, and the plugin wire only needs blocking stdin and stdout.
+pub fn run(module_bytes: []const u8, capabilities: []const []const u8) anyerror!u8 {
+    const gpa = std.heap.page_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    const io = io_impl.io();
 
     var engine_state: Vulcan = .{ .gpa = gpa };
     defer engine_state.deinit();
@@ -76,7 +90,7 @@ pub fn main(
     var module: ?plugin_module.Module = null;
     defer if (module) |one| one.deinit();
 
-    const load_failure = load(gpa, arena, io, module_path, capabilities, &runner, &module) catch |err|
+    const load_failure = load(gpa, arena, module_bytes, capabilities, &runner, &module) catch |err|
         try std.fmt.allocPrint(arena, "the plugin would not load: {t}", .{err});
 
     const input: std.Io.File = .{
@@ -102,23 +116,11 @@ pub fn main(
 fn load(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
-    io: std.Io,
-    module_path: []const u8,
+    bytes: []const u8,
     capabilities: []const []const u8,
     runner: *plugin_engine.Runner,
     kept: *?plugin_module.Module,
 ) !?[]const u8 {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(
-        io,
-        module_path,
-        arena,
-        .limited(plugin_module.max_module_bytes),
-    ) catch return try std.fmt.allocPrint(
-        arena,
-        "the plugin's own file could not be read",
-        .{},
-    );
-
     var module_refusal: ?plugin_module.Refusal = null;
     const read = plugin_module.read(gpa, bytes, &module_refusal) catch {
         if (module_refusal) |detail| {
