@@ -147,8 +147,9 @@ boundary for an RL trainer: Chock owns the named measurements and the spec owns
 their composition, while the trainer receives both the scalar and its parts.
 
 `--trajectory <path>` writes `chock.rl-trajectory` version 1. The object binds
-the exact audit JSONL bytes and SHA-256, the verified provider/tool capture,
-the complete report, and the Chock version which produced it. Provider turns
+the exact audit JSONL bytes and SHA-256, the verified provider/tool capture and
+its canonical payload SHA-256, the complete report, and the Chock version which
+produced it. Provider turns
 may additionally carry `prompt_token_ids`, `response_token_ids`,
 `response_mask`, and `old_logprobs`. A trajectory is marked `trainable` only
 when every provider turn has all four arrays and the response-shaped arrays
@@ -174,9 +175,10 @@ split, group and rollout numbers, the evaluation-spec SHA-256, Chock version,
 session, resolved base commit, configuration and sandbox fingerprints, model
 provenance, reward, exit status, and whether the trajectory contains complete
 token-level training data. An external trainer can therefore reject a group
-whose environment or policy does not match its peers. An existing dataset
-index is never overwritten; use a fresh output directory for every collection
-run.
+whose environment or policy does not match its peers. Every entry also binds
+its capture, report, and trajectory files by SHA-256, so a consumer can detect
+a partial or modified rollout before training. An existing dataset index is
+never overwritten; use a fresh output directory for every collection run.
 
 ```zig
 .{

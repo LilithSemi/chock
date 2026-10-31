@@ -64,8 +64,11 @@ const Entry = struct {
     group: u32,
     rollout: u32,
     capture: []const u8,
+    capture_sha256: []const u8 = "",
     report: []const u8,
+    report_sha256: []const u8 = "",
     trajectory: []const u8,
+    trajectory_sha256: []const u8 = "",
     exit_code: u8,
     session_id: []const u8 = "",
     base_commit: []const u8 = "",
@@ -299,6 +302,10 @@ fn readSummary(arena: std.mem.Allocator, io: std.Io, entry: *Entry) !void {
     const Trajectory = struct { trainable: bool = false };
     const trajectory_bytes = try std.Io.Dir.cwd().readFileAlloc(io, entry.trajectory, arena, .limited(max_artifact_bytes));
     const trajectory = try std.json.parseFromSliceLeaky(Trajectory, arena, trajectory_bytes, .{ .ignore_unknown_fields = true });
+    const capture_bytes = try std.Io.Dir.cwd().readFileAlloc(io, entry.capture, arena, .limited(max_artifact_bytes));
+    entry.capture_sha256 = try sha256(arena, capture_bytes);
+    entry.report_sha256 = try sha256(arena, report_bytes);
+    entry.trajectory_sha256 = try sha256(arena, trajectory_bytes);
     entry.session_id = report.session_id;
     entry.base_commit = report.base_commit;
     entry.config_sha256 = report.config_sha256;

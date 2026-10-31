@@ -55,24 +55,25 @@ pub const DecodeError = std.mem.Allocator.Error || std.json.ParseError(std.json.
 };
 
 pub fn encode(arena: std.mem.Allocator, payload: Payload) ![]const u8 {
-    const payload_json = try std.json.Stringify.valueAlloc(arena, payload, .{});
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(payload_json, &digest, .{});
-    const digest_hex = try arena.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+    const digest_hex = try payloadDigest(arena, payload);
     return std.json.Stringify.valueAlloc(arena, File{
         .payload_sha256 = digest_hex,
         .payload = payload,
     }, .{});
 }
 
+pub fn payloadDigest(arena: std.mem.Allocator, payload: Payload) ![]const u8 {
+    const payload_json = try std.json.Stringify.valueAlloc(arena, payload, .{});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload_json, &digest, .{});
+    return arena.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+}
+
 pub fn decode(arena: std.mem.Allocator, bytes: []const u8) DecodeError!Payload {
     const file = try std.json.parseFromSliceLeaky(File, arena, bytes, .{ .ignore_unknown_fields = true });
     if (!std.mem.eql(u8, file.schema, "chock.eval-fixture") or file.version != 1) return error.BadSchema;
-    const payload_json = try std.json.Stringify.valueAlloc(arena, file.payload, .{});
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(payload_json, &digest, .{});
-    const actual = std.fmt.bytesToHex(digest, .lower);
-    if (!std.mem.eql(u8, file.payload_sha256, &actual)) return error.BadDigest;
+    const actual = try payloadDigest(arena, file.payload);
+    if (!std.mem.eql(u8, file.payload_sha256, actual)) return error.BadDigest;
     return file.payload;
 }
 
