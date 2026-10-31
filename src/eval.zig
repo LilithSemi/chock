@@ -80,20 +80,31 @@ const Test = struct {
     argv: []const []const u8,
 };
 
+const FileExpectation = struct {
+    path: []const u8,
+    sha256: []const u8,
+};
+
 const Expectations = struct {
     end_reason: []const u8 = "finished",
     max_turns: ?u64 = null,
     max_cost: ?f64 = null,
     currency: []const u8 = "",
     audit_sha256: []const u8 = "",
+    config_sha256: []const u8 = "",
+    sandbox_sha256: []const u8 = "",
     required_events: []const []const u8 = &.{},
     forbidden_events: []const []const u8 = &.{},
     required_paths: []const []const u8 = &.{},
     forbidden_paths: []const []const u8 = &.{},
+    files: []const FileExpectation = &.{},
     forbidden_tools: []const []const u8 = &.{},
     forbidden_network_hosts: []const []const u8 = &.{},
     require_no_network: bool = false,
     require_no_refusals: bool = false,
+    min_subagents: ?u64 = null,
+    max_subagents: ?u64 = null,
+    require_subagents_complete: bool = false,
 };
 
 const Spec = struct {
@@ -151,6 +162,8 @@ const Observed = struct {
     hosts: std.ArrayList([]const u8) = .empty,
     network_granted: u64 = 0,
     refused: u64 = 0,
+    config_sha256: []const u8 = "",
+    sandbox_sha256: []const u8 = "",
     audit_sha256: [64]u8,
     chain: chock_proto.chain.Verdict,
 };
@@ -372,10 +385,22 @@ fn validSpec(spec: Spec) bool {
     if (spec.task.len == 0) return false;
     for (spec.expect.required_paths) |path| if (!safeRelative(path)) return false;
     for (spec.expect.forbidden_paths) |path| if (!safeRelative(path)) return false;
+    for (spec.expect.files) |file| {
+        if (!safeRelative(file.path) or !validSha256(file.sha256)) return false;
+    }
     for (spec.expect.required_events) |name| if (event.Kind.fromWireName(name) == null) return false;
     for (spec.expect.forbidden_events) |name| if (event.Kind.fromWireName(name) == null) return false;
     for (spec.tests) |one| if (one.name.len == 0 or one.argv.len == 0 or one.argv[0].len == 0) return false;
     if (spec.expect.max_cost != null and spec.expect.max_cost.? < 0) return false;
+    if (spec.expect.config_sha256.len != 0 and !validSha256(spec.expect.config_sha256)) return false;
+    if (spec.expect.sandbox_sha256.len != 0 and !validSha256(spec.expect.sandbox_sha256)) return false;
+    if (spec.expect.min_subagents != null and spec.expect.max_subagents != null and spec.expect.min_subagents.? > spec.expect.max_subagents.?) return false;
+    return true;
+}
+
+fn validSha256(text: []const u8) bool {
+    if (text.len != 64) return false;
+    for (text) |byte| if (!std.ascii.isHex(byte)) return false;
     return true;
 }
 
@@ -450,6 +475,10 @@ fn observe(
         const kind = std.meta.activeTag(parsed.value.event);
         out.kinds.insert(kind);
         switch (parsed.value.event) {
+            .session_config => |one| {
+                out.config_sha256 = if (one.config_hash) |hash| try arena.dupe(u8, hash) else "none";
+                out.sandbox_sha256 = try arena.dupe(u8, one.sandbox_hash);
+            },
             .tool_call => |one| try out.tools.append(arena, try arena.dupe(u8, one.tool)),
             .mcp_request => |one| if (one.host.len != 0) try out.hosts.append(arena, try arena.dupe(u8, one.host)),
             .network_summary => |one| out.network_granted += one.granted,
@@ -482,6 +511,8 @@ fn scoreAudit(arena: std.mem.Allocator, spec: Spec, observed: *const Observed, o
         spec.expect.audit_sha256,
         &observed.audit_sha256,
     );
+    if (spec.expect.config_sha256.len != 0) try add(arena, out, "configuration digest", "policy", std.mem.eql(u8, observed.config_sha256, spec.expect.config_sha256), spec.expect.config_sha256, observed.config_sha256);
+    if (spec.expect.sandbox_sha256.len != 0) try add(arena, out, "sandbox digest", "sandbox", std.mem.eql(u8, observed.sandbox_sha256, spec.expect.sandbox_sha256), spec.expect.sandbox_sha256, observed.sandbox_sha256);
     if (spec.expect.max_turns) |limit| try addNumber(arena, out, "turn budget", "budget", observed.session.spend.turns <= limit, limit, observed.session.spend.turns);
     if (spec.expect.max_cost) |limit| {
         const usable = observed.session.spend.enforceable();
@@ -500,6 +531,14 @@ fn scoreAudit(arena: std.mem.Allocator, spec: Spec, observed: *const Observed, o
     for (spec.expect.forbidden_network_hosts) |host| try add(arena, out, try std.fmt.allocPrint(arena, "forbidden network host {s}", .{host}), "network", !contains(observed.hosts.items, host), "absent", "contacted");
     if (spec.expect.require_no_network) try addNumber(arena, out, "network grants", "network", observed.network_granted == 0 and observed.hosts.items.len == 0, 0, observed.network_granted + observed.hosts.items.len);
     if (spec.expect.require_no_refusals) try addNumber(arena, out, "policy refusals", "policy", observed.refused == 0, 0, observed.refused);
+    const child_count: u64 = @intCast(observed.session.children.items.len);
+    if (spec.expect.min_subagents) |minimum| try addNumber(arena, out, "minimum subagents", "harness", child_count >= minimum, minimum, child_count);
+    if (spec.expect.max_subagents) |maximum| try addNumber(arena, out, "maximum subagents", "harness", child_count <= maximum, maximum, child_count);
+    if (spec.expect.require_subagents_complete) {
+        var incomplete: u64 = 0;
+        for (observed.session.children.items) |child| incomplete += @intFromBool(child.outcome == null);
+        try addNumber(arena, out, "completed subagents", "harness", incomplete == 0, 0, incomplete);
+    }
 }
 
 fn categoryFor(kind: event.Kind) []const u8 {
@@ -523,6 +562,21 @@ fn scoreFixture(arena: std.mem.Allocator, io: std.Io, project: []const u8, spec:
         const exists = if (std.Io.Dir.cwd().statFile(io, path, .{})) |_| true else |_| false;
         try add(arena, out, try std.fmt.allocPrint(arena, "forbidden path {s}", .{relative}), "fixture", !exists, "absent", "present");
     }
+    for (spec.expect.files) |expected| {
+        const path = try std.fs.path.join(arena, &.{ project, expected.path });
+        const actual = fileSha256(arena, io, path) catch |err| {
+            try add(arena, out, try std.fmt.allocPrint(arena, "file digest {s}", .{expected.path}), "fixture", false, expected.sha256, @errorName(err));
+            continue;
+        };
+        try add(arena, out, try std.fmt.allocPrint(arena, "file digest {s}", .{expected.path}), "fixture", std.mem.eql(u8, expected.sha256, actual), expected.sha256, actual);
+    }
+}
+
+fn fileSha256(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_log_bytes));
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return arena.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
 
 fn scoreTests(
@@ -612,6 +666,8 @@ test "evaluation paths cannot leave their fixture" {
     try testing.expect(!safeRelative("../secret"));
     try testing.expect(!safeRelative("/etc/passwd"));
     try testing.expect(!safeRelative(""));
+    try testing.expect(validSha256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    try testing.expect(!validSha256("not-a-digest"));
 }
 
 test "audit scoring preserves failure ownership" {

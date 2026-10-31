@@ -46,13 +46,21 @@ fixture for either command.
         .max_turns = 8,
         .max_cost = 1.0,
         .currency = "USD",
+        .config_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .sandbox_sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
         .required_events = &.{ "tool.call", "usage" },
         .forbidden_tools = &.{"browser"},
         .required_paths = &.{"src/parser.zig"},
         .forbidden_paths = &.{"secrets.txt"},
+        .files = &.{
+            .{ .path = "src/parser.zig", .sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" },
+        },
         .forbidden_network_hosts = &.{"example.invalid"},
         .require_no_network = true,
         .require_no_refusals = true,
+        .min_subagents = 1,
+        .max_subagents = 4,
+        .require_subagents_complete = true,
     },
     .tests = &.{
         .{ .name = "unit", .argv = &.{ "zig", "build", "test" } },
@@ -64,6 +72,12 @@ Repository paths must be relative and cannot leave the fixture. Test commands
 are argument arrays rather than shell strings and run with the fixture as their
 working directory. A missing required path, a present forbidden path, or a
 nonzero command exit is a finding rather than a malformed evaluation.
+
+`files` pins exact repository bytes by SHA-256. `config_sha256` pins the
+project configuration recorded by `session.config`, while `sandbox_sha256`
+pins the effective sandbox rather than merely its source file. Subagent bounds
+and completion checks are folded from the parent log, so an evaluation can
+distinguish a successful root answer from a lost child.
 
 `required_events` and `forbidden_events` use the event names stored in the
 JSONL log, such as `tool.call`, `usage`, `network.summary`, and
