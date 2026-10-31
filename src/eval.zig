@@ -85,6 +85,17 @@ const FileExpectation = struct {
     sha256: []const u8,
 };
 
+const RewardWeights = struct {
+    model: f64 = 1,
+    harness: f64 = 1,
+    sandbox: f64 = 1,
+    fixture: f64 = 1,
+    policy: f64 = 1,
+    network: f64 = 1,
+    budget: f64 = 1,
+    tests: f64 = 1,
+};
+
 const Expectations = struct {
     end_reason: []const u8 = "finished",
     max_turns: ?u64 = null,
@@ -117,6 +128,7 @@ const Spec = struct {
     model: []const u8 = "",
     capture: []const u8 = "",
     expect: Expectations = .{},
+    reward_weights: RewardWeights = .{},
     tests: []const Test = &.{},
 };
 
@@ -137,7 +149,17 @@ const Report = struct {
     checks: usize,
     failures: usize,
     score: f64,
+    reward: f64 = 0,
+    reward_components: []const RewardComponent = &.{},
     findings: []const Finding,
+};
+
+const RewardComponent = struct {
+    category: []const u8,
+    passed: usize,
+    checks: usize,
+    weight: f64,
+    value: f64,
 };
 
 const Comparison = struct {
@@ -257,6 +279,7 @@ pub fn main(
     var failures: usize = 0;
     for (findings.items) |finding| failures += @intFromBool(!finding.passed);
     const checks = findings.items.len;
+    const reward_summary = try summarizeReward(arena, spec.reward_weights, findings.items);
     const report = Report{
         .eval = spec.name,
         .session_id = session,
@@ -264,10 +287,61 @@ pub fn main(
         .checks = checks,
         .failures = failures,
         .score = if (checks == 0) 1 else @as(f64, @floatFromInt(checks - failures)) / @as(f64, @floatFromInt(checks)),
+        .reward = reward_summary.value,
+        .reward_components = reward_summary.components,
         .findings = findings.items,
     };
     writeReport(arena, options.format, report) catch return Exit.faulted.code();
     return if (report.passed) Exit.finished.code() else Exit.refused.code();
+}
+
+const RewardSummary = struct {
+    value: f64,
+    components: []const RewardComponent,
+};
+
+fn summarizeReward(arena: std.mem.Allocator, weights: RewardWeights, findings: []const Finding) !RewardSummary {
+    const categories = [_][]const u8{ "model", "harness", "sandbox", "fixture", "policy", "network", "budget", "test" };
+    var components: std.ArrayList(RewardComponent) = .empty;
+    var weighted: f64 = 0;
+    var total_weight: f64 = 0;
+    for (categories) |category| {
+        var checks: usize = 0;
+        var passed: usize = 0;
+        for (findings) |finding| {
+            if (!std.mem.eql(u8, finding.category, category)) continue;
+            checks += 1;
+            passed += @intFromBool(finding.passed);
+        }
+        if (checks == 0) continue;
+        const weight = rewardWeight(weights, category);
+        const value = @as(f64, @floatFromInt(passed)) / @as(f64, @floatFromInt(checks));
+        try components.append(arena, .{
+            .category = category,
+            .passed = passed,
+            .checks = checks,
+            .weight = weight,
+            .value = value,
+        });
+        weighted += value * weight;
+        total_weight += weight;
+    }
+    return .{
+        .value = if (total_weight == 0) 0 else weighted / total_weight,
+        .components = components.items,
+    };
+}
+
+fn rewardWeight(weights: RewardWeights, category: []const u8) f64 {
+    if (std.mem.eql(u8, category, "model")) return weights.model;
+    if (std.mem.eql(u8, category, "harness")) return weights.harness;
+    if (std.mem.eql(u8, category, "sandbox")) return weights.sandbox;
+    if (std.mem.eql(u8, category, "fixture")) return weights.fixture;
+    if (std.mem.eql(u8, category, "policy")) return weights.policy;
+    if (std.mem.eql(u8, category, "network")) return weights.network;
+    if (std.mem.eql(u8, category, "budget")) return weights.budget;
+    if (std.mem.eql(u8, category, "test")) return weights.tests;
+    unreachable;
 }
 
 fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Options {
@@ -395,6 +469,10 @@ fn validSpec(spec: Spec) bool {
     if (spec.expect.config_sha256.len != 0 and !validSha256(spec.expect.config_sha256)) return false;
     if (spec.expect.sandbox_sha256.len != 0 and !validSha256(spec.expect.sandbox_sha256)) return false;
     if (spec.expect.min_subagents != null and spec.expect.max_subagents != null and spec.expect.min_subagents.? > spec.expect.max_subagents.?) return false;
+    inline for (@typeInfo(RewardWeights).@"struct".field_names) |field| {
+        const weight = @field(spec.reward_weights, field);
+        if (!std.math.isFinite(weight) or weight < 0) return false;
+    }
     return true;
 }
 
@@ -635,7 +713,7 @@ fn writeReport(arena: std.mem.Allocator, format: Format, report: Report) !void {
                 finding.expected,
                 finding.actual,
             });
-            tty.out(if (report.passed) .plain else .warn, "{d}/{d} checks passed; score {d:.3}\n", .{ report.checks - report.failures, report.checks, report.score });
+            tty.out(if (report.passed) .plain else .warn, "{d}/{d} checks passed; score {d:.3}; reward {d:.3}\n", .{ report.checks - report.failures, report.checks, report.score, report.reward });
         },
     }
 }
@@ -715,4 +793,8 @@ test "audit scoring preserves failure ownership" {
     try testing.expectEqualStrings("policy", findings.items[3].category);
     try testing.expect(findings.items[4].passed);
     try testing.expectEqualStrings("network", findings.items[4].category);
+
+    const reward = try summarizeReward(arena, .{ .policy = 3, .network = 0 }, findings.items);
+    try testing.expectApproxEqAbs(@as(f64, 0.4), reward.value, 0.0001);
+    try testing.expectEqual(@as(usize, 4), reward.components.len);
 }

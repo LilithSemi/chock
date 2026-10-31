@@ -62,6 +62,16 @@ fixture for either command.
         .max_subagents = 4,
         .require_subagents_complete = true,
     },
+    .reward_weights = .{
+        .model = 1,
+        .harness = 0,
+        .sandbox = 1,
+        .fixture = 2,
+        .policy = 2,
+        .network = 2,
+        .budget = 0.5,
+        .tests = 3,
+    },
     .tests = &.{
         .{ .name = "unit", .argv = &.{ "zig", "build", "test" } },
     },
@@ -101,6 +111,12 @@ The aggregate score is the fraction of checks which passed. It is a convenient
 CI summary, not a training reward: consumers that turn reports into rewards
 should keep the individual findings and their categories so a harness failure
 cannot accidentally train the model.
+
+The report also carries a scalar `reward` and `reward_components` grouped by
+category. `reward_weights` controls their weighted mean; a zero weight keeps a
+component visible without letting it alter the scalar. This is the stable
+boundary for an RL trainer: Chock owns the named measurements and the spec owns
+their composition, while the trainer receives both the scalar and its parts.
 
 `chock eval compare` reads two JSON reports without opening either session. It
 fails when the candidate score is below `--minimum-score` or more than
