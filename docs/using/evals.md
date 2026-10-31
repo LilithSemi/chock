@@ -1,0 +1,80 @@
+# Evaluating a session
+
+`chock eval` turns the audit log and the repository left by a session into a
+versioned pass or fail report. A provider-backed run and a check of an existing
+session use the same evaluator:
+
+```console
+chock eval run evals/parser.zon
+chock eval check evals/parser.zon --session 01M...
+chock eval check evals/parser.zon --session 01M... --format json
+```
+
+`run` starts `chock run --output json` with the task, provider and model from
+the spec. `check` does not contact a provider. It replays the named audit log,
+checks its hash chain, inspects the resulting repository, and runs the declared
+commands. This makes `check` suitable for regression CI after an interesting
+session has already been captured. Pass `--skip-tests` when the repository
+commands are deliberately being run elsewhere.
+
+## The spec
+
+An evaluation is a versioned ZON value. Relative fixture paths are resolved
+from the directory containing the spec, while `--project <dir>` overrides the
+fixture for either command.
+
+```zig
+.{
+    .schema = "chock.eval",
+    .version = 1,
+    .name = "parser rejects empty input",
+    .task = "Make the parser reject an empty input and add a regression test.",
+    .fixture = "fixtures/parser",
+    .provider = "local",
+    .model = "coder",
+    .expect = .{
+        .end_reason = "finished",
+        .max_turns = 8,
+        .max_cost = 1.0,
+        .currency = "USD",
+        .required_events = &.{ "tool.call", "usage" },
+        .forbidden_tools = &.{"browser"},
+        .required_paths = &.{"src/parser.zig"},
+        .forbidden_paths = &.{"secrets.txt"},
+        .forbidden_network_hosts = &.{"example.invalid"},
+        .require_no_network = true,
+        .require_no_refusals = true,
+    },
+    .tests = &.{
+        .{ .name = "unit", .argv = &.{ "zig", "build", "test" } },
+    },
+}
+```
+
+Repository paths must be relative and cannot leave the fixture. Test commands
+are argument arrays rather than shell strings and run with the fixture as their
+working directory. A missing required path, a present forbidden path, or a
+nonzero command exit is a finding rather than a malformed evaluation.
+
+`required_events` and `forbidden_events` use the event names stored in the
+JSONL log, such as `tool.call`, `usage`, `network.summary`, and
+`approval.response`. `audit_sha256` may pin the exact bytes of a captured log;
+the hash-chain check still runs whether or not that field is present.
+
+## Reports and failure ownership
+
+The human report labels every finding with one of `model`, `harness`,
+`sandbox`, `fixture`, `policy`, `network`, `budget`, or `test`. This distinction
+matters in a model regression suite: an unreadable log is not evidence that the
+model failed, and a broken fixture is not a bad answer.
+
+JSON output has schema `chock.eval-report` version 1. It includes the session
+identifier, the aggregate score, and every finding with its category, expected
+value, and actual value. A report with any failed finding exits with Chock's
+refused status. A malformed spec is usage failure, and a log which cannot be
+verified is an audit gap.
+
+The aggregate score is the fraction of checks which passed. It is a convenient
+CI summary, not a training reward: consumers that turn reports into rewards
+should keep the individual findings and their categories so a harness failure
+cannot accidentally train the model.

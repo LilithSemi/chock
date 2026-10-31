@@ -21,6 +21,7 @@ const plan_cmd = @import("plan.zig");
 const commands_cmd = @import("commands.zig");
 const skills_cmd = @import("skills.zig");
 const sessions_cmd = @import("sessions.zig");
+const eval_cmd = @import("eval.zig");
 const migrate_cmd = @import("migrate.zig");
 const approve_cmd = @import("approve.zig");
 const doctor_cmd = @import("doctor.zig");
@@ -201,6 +202,11 @@ pub const commands = [_]Command{
         .name = "sessions",
         .summary = "List, inspect, fork, verify, export, or remove this project's sessions.",
         .run = sessions_cmd.main,
+    },
+    .{
+        .name = "eval",
+        .summary = "Run or score a reproducible evaluation against an audited session.",
+        .run = eval_cmd.main,
     },
     .{
         .name = "doctor",

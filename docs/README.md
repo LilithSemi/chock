@@ -26,6 +26,9 @@ Start with [running.md](running.md) for a session end to end, and
   limits, the budget slice, and a spawn that waits or carries on.
 - [using/forks.md](using/forks.md) - branch at a completed turn, restore its Git
   workspace and latest microVM, and keep the parent and child independent.
+- [using/evals.md](using/evals.md) - run a versioned evaluation or score an
+  existing audited session, with separate model, harness, policy and test
+  findings for regression CI.
 - [using/memory.md](using/memory.md) - the notes an agent keeps between
   sessions, their bounds, and the hazard a writable memory directory is.
 - [using/instructions.md](using/instructions.md) - the three layers of
