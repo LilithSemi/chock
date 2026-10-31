@@ -230,6 +230,8 @@ what a project cannot take back. [actions.md](actions.md) has both.
   directories of this project hold skills.
 - [commands.md](../using/commands.md) for the `commands` block, which says which
   directories of this project hold the messages a person can run by name.
+- The `guidance` block below names project-owned process notes the agent may
+  fetch with `read_guidance`.
 - [hooks.md](../using/hooks.md) for the `hooks` block, which says what this
   project runs at a point in a session.
 - [remote-mcp.md](../using/remote-mcp.md) for an `mcp_servers` entry that names
@@ -267,6 +269,34 @@ is read by the same reader with the same path checks:
 A command is a message a person runs with `chock run /<name>`, so this block
 adds nothing to what the agent may do.
 [commands.md](../using/commands.md) has the format and the arguments.
+
+### The project's own guidance
+
+The `guidance` block names up to four directories under the project:
+
+```zon
+.{
+    .guidance = .{ ".chock/guidance" },
+}
+```
+
+Each immediate child is one guidance name and holds `GUIDANCE.md`. Its name and
+one-line description are YAML frontmatter, and its body is returned only when
+the agent calls `read_guidance`:
+
+```markdown
+---
+name: verify-rtl
+description: Run the project's RTL checks in the order CI uses.
+---
+# Verify RTL
+
+Run the fast lint target before simulation.
+```
+
+The frontmatter name must match the directory (`verify-rtl` here). Project
+guidance cannot replace a Chock-built document or another project document.
+The prompt labels it as repository-authored rather than operator-authored.
 
 ### The project's own hooks
 

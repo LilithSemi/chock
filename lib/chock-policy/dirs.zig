@@ -1,5 +1,5 @@
 //! A block of a project's own `chock.zon` that names directories under the
-//! project: `skills` and `commands`. The block says only where to look. What
+//! project: `skills`, `commands`, and `guidance`. The block says only where to look. What
 //! may be done with what is found there is decided elsewhere, by `skill.read.*`
 //! in the policy table for a skill, and by a person typing its name for a
 //! command.
@@ -15,6 +15,7 @@ pub const file_name = limits_mod.file_name;
 pub const Which = enum {
     skills,
     commands,
+    guidance,
 
     /// The name the block has in the file, which is the name of the tag.
     pub fn blockName(self: Which) []const u8 {

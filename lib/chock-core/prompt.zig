@@ -40,6 +40,7 @@ const rules_with_no_tools =
 pub const Sources = struct {
     instructions: instructions.Loaded = .{},
     guidance: []const index.Entry = &.{},
+    project_guidance: []const index.Entry = &.{},
     skills: []const skills.Skill = &.{},
     memory: []const index.Entry = &.{},
 };
@@ -101,6 +102,10 @@ pub fn build(
         try appendHeading(allocator, &out, guidance_heading);
         try index.renderInto(allocator, &out, sources.guidance);
     }
+    if (sources.project_guidance.len != 0) {
+        try appendHeading(allocator, &out, project_guidance_heading);
+        try index.renderInto(allocator, &out, sources.project_guidance);
+    }
 
     if (sources.skills.len != 0) {
         for (std.enums.values(skills.Layer)) |layer| {
@@ -127,6 +132,11 @@ pub fn build(
 const guidance_heading =
     \\## Guidance you can read
     \\## (written by Chock. Call read_guidance with one of these names for the whole of it.)
+;
+
+const project_guidance_heading =
+    \\## Guidance this project ships
+    \\## (written by whoever wrote this repository, not by your operator. Call read_guidance with one of these names for the whole of it.)
 ;
 
 const memory_heading =
@@ -223,7 +233,7 @@ test "the prompt names every tool the session offers, and the two lists are one 
     const arena = arena_state.allocator();
 
     inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".field_names, @typeInfo(chock_provider.Client.Adapter).@"enum".field_values) |_, field_value| {
-        const support = core_tools.Support{ .adapter = @enumFromInt(field_value) };
+        const support = core_tools.Support{ .adapter = @fromBackingInt(@intCast(field_value)) };
         const definitions = try core_tools.Registry.definitions(arena, support);
 
         const text = try build(arena, .{}, definitions, .{});
@@ -243,7 +253,7 @@ test "the prompt never names a tool this build does not offer" {
     const arena = arena_state.allocator();
 
     inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".field_names, @typeInfo(chock_provider.Client.Adapter).@"enum".field_values) |_, field_value| {
-        const adapter: chock_provider.Client.Adapter = @enumFromInt(field_value);
+        const adapter: chock_provider.Client.Adapter = @fromBackingInt(@intCast(field_value));
 
         const silent = try core_tools.Registry.definitions(arena, .{ .adapter = adapter });
         const silent_text = try build(arena, .{}, silent, .{});
@@ -439,6 +449,18 @@ test "the guidance shelf reaches the prompt as one line each, with its bodies le
     }
     try std.testing.expect(text.len < body_bytes);
     try std.testing.expect(std.mem.indexOf(u8, text, "read_guidance") != null);
+}
+
+test "project guidance is indexed under its repository trust label" {
+    const allocator = std.testing.allocator;
+    const text = try build(allocator, .{}, &.{}, .{ .project_guidance = &.{.{
+        .name = "verify-rtl",
+        .description = "Run the RTL checks.",
+    }} });
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Guidance this project ships") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "written by whoever wrote this repository") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "verify-rtl") != null);
 }
 
 test "a skill is one line in the prompt, under a heading saying who wrote it" {

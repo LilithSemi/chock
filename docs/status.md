@@ -179,11 +179,6 @@ them as not built.
   write. A tree of real `chock run` sessions, with a provider behind each one,
   has never been run.
 
-- A project cannot ship guidance of its own. The shelf `read_guidance` reads is
-  compiled into Chock, which is why no tool call can write it. Letting a
-  project add to it needs the read only path into the project that `chock.zon`
-  already has.
-
 - A stream that broke in the middle of a reply is not retried. A 429 or a 5xx
   is answered with the same request sent again after a wait, up to six attempts
   spanning about a minute, honouring `Retry-After` when the provider sends one.

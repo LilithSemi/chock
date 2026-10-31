@@ -28,10 +28,12 @@ supervisor has a process group of its own, and cancellation reaches descendants
 as well as the first program. The terminal result arrives through the same
 ordered completion path as an ordinary finish.
 
-`read_guidance` reads a document compiled into Chock, so it reaches nothing on
-the machine at all. `ask_user` puts one question to the person who started the
-session, and it grants nothing: a yes there permits no act. `set_title` names
-the session, so `chock sessions` reads as more than a list of identifiers.
+`read_guidance` reads either a document compiled into Chock or one declared by
+the project's `guidance` block. Project guidance is read once at session start,
+bounded to 64 KiB per document, and is labeled as repository-authored in the
+prompt. `ask_user` puts one question to the person who started the session, and
+it grants nothing: a yes there permits no act. `set_title` names the session,
+so `chock sessions` reads as more than a list of identifiers.
 
 `read_skill` reads one skill: somebody's written procedure for a task, found on
 disk at session start. It is offered only to a session that found at least one,

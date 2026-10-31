@@ -887,7 +887,7 @@ pub const Registry = struct {
                 call,
                 try allocator.dupe(u8, cancel_needs_a_session),
             ),
-            .read_guidance => readGuidance(allocator, call),
+            .read_guidance => readGuidance(allocator, call, context),
             .read_skill => readSkill(allocator, call, context),
             .read_memory => readMemory(allocator, io, env, config, call, context),
             .write_memory => writeMemory(allocator, io, env, config, call, context),
@@ -1035,6 +1035,7 @@ pub const Context = struct {
     secrets: ?tool_secrets_mod.Seam = null,
     memory_dir: ?[]const u8 = null,
     skills: []const skills.Skill = &.{},
+    guidance: []const guidance.Piece = &.{},
     cache_dir: ?[]const u8 = null,
     scratch_dir: ?[]const u8 = null,
     workspace_dir: ?[]const u8 = null,
@@ -3000,20 +3001,16 @@ fn badNameResult(allocator: std.mem.Allocator, call: ToolCall, name: []const u8)
     ));
 }
 
-fn readGuidance(allocator: std.mem.Allocator, call: ToolCall) Error!ToolResult {
+fn readGuidance(allocator: std.mem.Allocator, call: ToolCall, context: Context) Error!ToolResult {
     const parsed = std.json.parseFromSlice(ReadGuidanceArgs, allocator, call.arguments, .{
         .ignore_unknown_fields = true,
     }) catch return parseFailure(allocator, call, .read_guidance);
     defer parsed.deinit();
 
-    const piece = guidance.find(parsed.value.name) orelse return toolErrorResult(
+    const piece = guidance.find(parsed.value.name) orelse guidance.findIn(context.guidance, parsed.value.name) orelse return toolErrorResult(
         allocator,
         call,
-        try std.fmt.allocPrint(
-            allocator,
-            "there is no guidance named \"{s}\". There is: " ++ guidance.names_text,
-            .{parsed.value.name},
-        ),
+        try missingGuidance(allocator, parsed.value.name, context.guidance),
     );
 
     return .{
@@ -3022,6 +3019,14 @@ fn readGuidance(allocator: std.mem.Allocator, call: ToolCall) Error!ToolResult {
         .is_error = false,
         .truncated = false,
     };
+}
+
+fn missingGuidance(allocator: std.mem.Allocator, name: []const u8, project: []const guidance.Piece) std.mem.Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator, "there is no guidance named \"{s}\". There is: {s}", .{ name, guidance.names_text });
+    for (project) |piece| try out.print(allocator, ", {s}", .{piece.name});
+    return out.toOwnedSlice(allocator);
 }
 
 fn readSkill(allocator: std.mem.Allocator, call: ToolCall, context: Context) Error!ToolResult {
@@ -5383,6 +5388,36 @@ test "a tool call is given a network router, named after the tool that is runnin
     try std.testing.expectEqual(@as(usize, 1), seam.calls);
     try std.testing.expectEqualStrings(@tagName(Tool.read_guidance), seam.tool());
     try std.testing.expectEqualStrings("read1", seam.callId());
+}
+
+test "read_guidance answers a project document carried by the session" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const config = chock_net.Call{ .config = .{
+        .root = "/does-not-matter-for-this-test",
+        .mounts = &.{},
+        .rules = &.{},
+        .cwd = "/",
+        .env = &.{},
+    } };
+    const project = [_]guidance.Piece{.{
+        .name = "verify-rtl",
+        .description = "Run the RTL checks.",
+        .body = "Run lint before simulation.",
+    }};
+    const result = try Registry.dispatchWith(
+        allocator,
+        std.testing.io,
+        &env,
+        config,
+        .{ .call_id = "guide1", .tool = "read_guidance", .arguments = "{\"name\":\"verify-rtl\"}" },
+        .{ .guidance = &project, .store_paths = &.{} },
+    );
+    defer allocator.free(result.call_id);
+    defer allocator.free(result.output);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("Run lint before simulation.", result.output);
 }
 
 test "spawnCapturing reports a pipe creation failure without ever reaching the sandbox" {

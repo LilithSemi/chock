@@ -764,6 +764,7 @@ const Started = struct {
     own_guest: ?*OwnGuest,
     read_only_mounts: []const chock_core.tools.ToolchainMount,
     skills: chock_core.skills.Found,
+    guidance: chock_core.guidance.Found,
     hooks: []const chock_core.hooks.Hook,
     tool_env: *std.process.Environ.Map,
     provisioning: ?Provisioning,
@@ -994,6 +995,9 @@ fn contextSources(
     }
     for (sources.guidance) |one| {
         try out.append(arena, try std.fmt.allocPrint(arena, "guidance {s}", .{one.name}));
+    }
+    for (sources.project_guidance) |one| {
+        try out.append(arena, try std.fmt.allocPrint(arena, "project guidance {s}", .{one.name}));
     }
     for (sources.skills) |one| {
         try out.append(arena, try std.fmt.allocPrint(arena, "skill {t} {s}", .{ one.layer, one.name }));
@@ -1915,6 +1919,7 @@ fn start(
     reportHooks(project_hooks);
 
     const found_skills = try skillsFor(arena, io, config_dir, project_root, toolchain.store_paths);
+    const found_guidance = try guidanceFor(arena, io, project_root);
     const skill_mounts = try placeSkills(
         arena,
         found_skills.skills,
@@ -1927,6 +1932,7 @@ fn start(
         &.{ toolchain.mounts, skill_mounts },
     );
     reportSkills(found_skills);
+    reportGuidance(found_guidance);
 
     const support = chock_core.tools.Support{
         .adapter = adapter,
@@ -1989,6 +1995,7 @@ fn start(
     const prompt_sources = chock_core.prompt.Sources{
         .instructions = loaded_instructions,
         .guidance = chock_core.guidance.indexEntries(arena) catch return error.OutOfMemory,
+        .project_guidance = chock_core.guidance.projectIndexEntries(arena, found_guidance.pieces) catch return error.OutOfMemory,
         .skills = found_skills.skills,
         .memory = note_index,
     };
@@ -2023,6 +2030,7 @@ fn start(
         .toolchain = toolchain,
         .read_only_mounts = read_only_mounts,
         .skills = found_skills,
+        .guidance = found_guidance,
         .hooks = project_hooks,
         .tool_env = tool_env,
         .provisioning = provisioning,
@@ -4935,6 +4943,30 @@ fn skillsFor(
     }
 
     return chock_core.skills.discover(arena, io, roots.items);
+}
+
+fn guidanceFor(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+) StartError!chock_core.guidance.Found {
+    return chock_core.guidance.discoverProject(
+        arena,
+        io,
+        try projectDirs(arena, io, project_root, .guidance),
+    );
+}
+
+fn reportGuidance(found: chock_core.guidance.Found) void {
+    for (found.refused) |one| tty.print(.warn, "chock: {s} is not project guidance: {s}\n", .{
+        one.path,
+        one.fault.sentence(),
+    });
+    if (found.left_out != 0) tty.print(.warn, "chock: {d} more project guidance documents were not listed\n", .{found.left_out});
+    if (found.pieces.len != 0) tty.print(.plain, "chock: {d} guidance document{s} from this project\n", .{
+        found.pieces.len,
+        if (found.pieces.len == 1) "" else "s",
+    });
 }
 
 /// The hooks a project declared, read the way every other block of its
@@ -11406,6 +11438,7 @@ fn runSession(
     };
     context.store_paths = started.toolchain.store_paths;
     context.skills = started.skills.skills;
+    context.guidance = started.guidance.pieces;
     context.read_only_mounts = started.read_only_mounts;
     context.provisioning = started.provisioning != null;
     context.role = agentRole(options);

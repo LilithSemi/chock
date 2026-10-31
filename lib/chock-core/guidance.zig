@@ -2,7 +2,13 @@
 //! does not have to hold it.
 
 const std = @import("std");
+const frontmatter = @import("frontmatter.zig");
 const index = @import("index.zig");
+
+pub const project_file_name = "GUIDANCE.md";
+pub const max_file_bytes: usize = 64 * 1024;
+pub const max_pieces: usize = 32;
+pub const max_dir_entries: usize = 256;
 
 pub const Piece = struct {
     name: []const u8,
@@ -155,6 +161,153 @@ pub fn find(name: []const u8) ?Piece {
     return null;
 }
 
+pub fn findIn(found: []const Piece, name: []const u8) ?Piece {
+    for (found) |piece| {
+        if (std.mem.eql(u8, piece.name, name)) return piece;
+    }
+    return null;
+}
+
+pub const Fault = enum {
+    no_frontmatter,
+    frontmatter_not_closed,
+    name_missing,
+    name_not_the_shape,
+    name_is_not_the_directory,
+    description_missing,
+    description_not_one_line,
+    file_too_long,
+    name_already_taken,
+    directory_unreadable,
+
+    pub fn sentence(self: Fault) []const u8 {
+        return switch (self) {
+            .no_frontmatter => "GUIDANCE.md does not open with a `---` line",
+            .frontmatter_not_closed => "GUIDANCE.md has no closing `---` line",
+            .name_missing => "its frontmatter has no `name`",
+            .name_not_the_shape => "its name is not lowercase letters, digits and single hyphens",
+            .name_is_not_the_directory => "its name is not the directory name",
+            .description_missing => "its frontmatter has no description",
+            .description_not_one_line => "its description is not one line",
+            .file_too_long => "GUIDANCE.md is larger than 64 KiB",
+            .name_already_taken => "guidance with that name already exists",
+            .directory_unreadable => "the guidance directory could not be read completely",
+        };
+    }
+};
+
+pub const Refused = struct {
+    path: []const u8,
+    fault: Fault,
+};
+
+pub const Found = struct {
+    pieces: []Piece = &.{},
+    refused: []Refused = &.{},
+    left_out: usize = 0,
+};
+
+const Fields = struct {
+    name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+
+    fn put(self: *Fields, key: []const u8, value: []const u8) void {
+        if (std.mem.eql(u8, key, "name")) self.name = value;
+        if (std.mem.eql(u8, key, "description")) self.description = value;
+    }
+};
+
+const Read = union(enum) { piece: Piece, refused: Refused };
+
+fn readProject(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) std.mem.Allocator.Error!?Read {
+    const path = try std.fs.path.join(allocator, &.{ dir, project_file_name });
+    defer allocator.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_file_bytes + 1)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StreamTooLong => return .{ .refused = .{ .path = try allocator.dupe(u8, dir), .fault = .file_too_long } },
+        else => return null,
+    };
+    defer allocator.free(bytes);
+    if (bytes.len > max_file_bytes) return .{ .refused = .{ .path = try allocator.dupe(u8, dir), .fault = .file_too_long } };
+
+    const split = frontmatter.split(bytes) orelse return .{ .refused = .{
+        .path = try allocator.dupe(u8, dir),
+        .fault = if (frontmatter.opens(bytes)) .frontmatter_not_closed else .no_frontmatter,
+    } };
+    var fields = Fields{};
+    var walk = frontmatter.walk(bytes, split.frontmatter, "");
+    while (walk.next()) |item| {
+        const pair = item.pair orelse continue;
+        if (!item.nested) fields.put(pair.key, pair.value);
+    }
+    const name = fields.name orelse return .{ .refused = .{ .path = try allocator.dupe(u8, dir), .fault = .name_missing } };
+    if (!frontmatter.isTheShape(name)) return .{ .refused = .{ .path = try allocator.dupe(u8, dir), .fault = .name_not_the_shape } };
+    if (!std.mem.eql(u8, name, std.fs.path.basename(dir))) return .{ .refused = .{ .path = try allocator.dupe(u8, dir), .fault = .name_is_not_the_directory } };
+    const description = fields.description orelse return .{ .refused = .{ .path = try allocator.dupe(u8, dir), .fault = .description_missing } };
+    if (description.len == 0) return .{ .refused = .{ .path = try allocator.dupe(u8, dir), .fault = .description_missing } };
+    if (std.mem.indexOfScalar(u8, description, '\n') != null) return .{ .refused = .{ .path = try allocator.dupe(u8, dir), .fault = .description_not_one_line } };
+    return .{ .piece = .{
+        .name = try allocator.dupe(u8, name),
+        .description = try allocator.dupe(u8, description),
+        .body = try allocator.dupe(u8, split.body),
+    } };
+}
+
+pub fn discoverProject(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    roots: []const []const u8,
+) std.mem.Allocator.Error!Found {
+    var found: std.ArrayList(Piece) = .empty;
+    var refused: std.ArrayList(Refused) = .empty;
+    var left_out: usize = 0;
+    for (roots) |root| {
+        var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        var seen: usize = 0;
+        while (true) {
+            const next = it.next(io) catch {
+                try refused.append(allocator, .{ .path = try allocator.dupe(u8, root), .fault = .directory_unreadable });
+                break;
+            };
+            const entry = next orelse break;
+            if (seen >= max_dir_entries) break;
+            seen += 1;
+            if (entry.kind != .directory or entry.name.len == 0 or entry.name[0] == '.') continue;
+            const path = try std.fs.path.join(allocator, &.{ root, entry.name });
+            defer allocator.free(path);
+            const read = try readProject(allocator, io, path) orelse continue;
+            switch (read) {
+                .refused => |one| try refused.append(allocator, one),
+                .piece => |one| {
+                    if (find(one.name) != null or findIn(found.items, one.name) != null) {
+                        try refused.append(allocator, .{ .path = try allocator.dupe(u8, path), .fault = .name_already_taken });
+                    } else if (found.items.len >= max_pieces) {
+                        left_out += 1;
+                    } else {
+                        try found.append(allocator, one);
+                    }
+                },
+            }
+        }
+    }
+    return .{
+        .pieces = try found.toOwnedSlice(allocator),
+        .refused = try refused.toOwnedSlice(allocator),
+        .left_out = left_out,
+    };
+}
+
+pub fn projectIndexEntries(allocator: std.mem.Allocator, found: []const Piece) std.mem.Allocator.Error![]index.Entry {
+    const out = try allocator.alloc(index.Entry, found.len);
+    for (found, out) |piece, *line| line.* = .{
+        .name = piece.name,
+        .description = try index.oneLine(allocator, piece.description),
+    };
+    return out;
+}
+
 pub const names_text = blk: {
     var text: []const u8 = "";
     for (pieces) |piece| {
@@ -228,4 +381,49 @@ test "the shelf names no tool this build does not offer" {
     for (named) |name| {
         try testing.expect(std.meta.stringToEnum(core_tools.Tool, name) != null);
     }
+}
+
+test "project guidance is discovered from bounded frontmatter documents" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "guidance/verify-rtl");
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "guidance/verify-rtl/GUIDANCE.md",
+        .data = "---\nname: verify-rtl\ndescription: Run the RTL checks.\n---\n# Verify RTL\n\nRun lint first.\n",
+    });
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &path_buffer);
+    const root = try std.fs.path.join(arena, &.{ path_buffer[0..root_len], "guidance" });
+
+    const found = try discoverProject(arena, testing.io, &.{root});
+    try testing.expectEqual(@as(usize, 1), found.pieces.len);
+    try testing.expectEqualStrings("verify-rtl", found.pieces[0].name);
+    try testing.expectEqualStrings("Run the RTL checks.", found.pieces[0].description);
+    try testing.expect(std.mem.indexOf(u8, found.pieces[0].body, "Run lint first") != null);
+}
+
+test "project guidance cannot replace guidance compiled into Chock" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "guidance/plan-before-acting");
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "guidance/plan-before-acting/GUIDANCE.md",
+        .data = "---\nname: plan-before-acting\ndescription: Replace the built in.\n---\nDo something else.\n",
+    });
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &path_buffer);
+    const root = try std.fs.path.join(arena, &.{ path_buffer[0..root_len], "guidance" });
+
+    const found = try discoverProject(arena, testing.io, &.{root});
+    try testing.expectEqual(@as(usize, 0), found.pieces.len);
+    try testing.expectEqual(@as(usize, 1), found.refused.len);
+    try testing.expectEqual(Fault.name_already_taken, found.refused[0].fault);
 }
