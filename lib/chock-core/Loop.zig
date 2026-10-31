@@ -137,7 +137,7 @@ const PieceWatcher = struct {
         switch (delta) {
             .text => |text| self.observer.onPiece(.{ .text = text }),
             .reasoning => |text| self.observer.onPiece(.{ .reasoning = text }),
-            .reasoning_signature, .tool_call, .usage, .stop_reason => {},
+            .reasoning_signature, .tool_call, .usage, .stop_reason, .training_trace => {},
         }
     }
 };

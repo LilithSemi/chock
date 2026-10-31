@@ -68,6 +68,17 @@ pub const Stop = struct {
     }
 };
 
+/// Token-level behavior-policy data supplied by a local training gateway.
+/// This is deliberately provider-neutral: ordinary hosted providers never
+/// emit it, while an RL inference server can attach it to the same streamed
+/// response Chock already consumes.
+pub const TrainingTrace = struct {
+    prompt_token_ids: []const u32,
+    response_token_ids: []const u32,
+    response_mask: []const u8,
+    old_logprobs: []const f32,
+};
+
 pub const Delta = union(enum) {
     text: []const u8,
     reasoning: []const u8,
@@ -75,6 +86,7 @@ pub const Delta = union(enum) {
     tool_call: message.ToolCallFragment,
     usage: message.Usage,
     stop_reason: Stop,
+    training_trace: TrainingTrace,
 };
 
 pub const OnDeltaError = std.mem.Allocator.Error;
@@ -106,9 +118,12 @@ pub const DeltaShapeError = error{
     ToolCallIndexNotInteger,
     ToolCallIndexNegative,
     ToolCallFunctionNotObject,
+    BadTrainingTrace,
     MissingEventType,
     BlockIndexInvalid,
 };
+
+const training_trace_event = "chock.training_trace.v1";
 
 pub const SendError =
     std.mem.Allocator.Error ||
@@ -547,7 +562,9 @@ fn streamBody(
             switch (event) {
                 .done => saw_end = true,
                 .data => |data| switch (adapter) {
-                    .openai_compatible => if (std.mem.eql(u8, data.name, aiand_metrics_event))
+                    .openai_compatible => if (std.mem.eql(u8, data.name, training_trace_event))
+                        try deliverTrainingTrace(allocator, data.body, on_delta, ctx)
+                    else if (std.mem.eql(u8, data.name, aiand_metrics_event))
                         // ai&'s metrics event is identified by the name the server gave it, never by sniffing the JSON shape.
                         try deliverAiandMetrics(allocator, data.body, on_delta, ctx)
                     else
@@ -598,6 +615,26 @@ fn streamBody(
         return if (stalled) error.StreamStalled else error.StreamTruncated;
     }
     return .ok;
+}
+
+fn deliverTrainingTrace(
+    allocator: std.mem.Allocator,
+    json_text: []const u8,
+    on_delta: OnDelta,
+    ctx: ?*anyopaque,
+) SendError!void {
+    const parsed = try std.json.parseFromSlice(TrainingTrace, allocator, json_text, .{
+        .ignore_unknown_fields = false,
+    });
+    defer parsed.deinit();
+    const trace = parsed.value;
+    if (trace.response_token_ids.len != trace.response_mask.len or
+        trace.response_token_ids.len != trace.old_logprobs.len)
+    {
+        return error.BadTrainingTrace;
+    }
+    for (trace.response_mask) |one| if (one > 1) return error.BadTrainingTrace;
+    try on_delta(ctx, .{ .training_trace = trace });
 }
 
 fn deliverAnthropic(
@@ -1069,6 +1106,7 @@ const Collector = struct {
                     self.err = err;
                 };
             },
+            .training_trace => {},
         }
     }
 
@@ -1175,4 +1213,50 @@ test "a client that keeps no reason answers empty rather than refusing to build"
     var nothing: u8 = 0;
     const bare = Client{ .ptr = &nothing, .vtable = &Bare.table };
     try std.testing.expectEqualStrings("", bare.transportReason());
+}
+
+test "the RL trace extension preserves token ids masks and behavior logprobs" {
+    const Seen = struct {
+        ok: bool = false,
+
+        fn take(raw: ?*anyopaque, delta: Delta) OnDeltaError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (delta != .training_trace) return;
+            const trace = delta.training_trace;
+            self.ok = std.mem.eql(u32, &.{ 1, 2 }, trace.prompt_token_ids) and
+                std.mem.eql(u32, &.{ 3, 4 }, trace.response_token_ids) and
+                std.mem.eql(u8, &.{ 1, 0 }, trace.response_mask) and
+                std.mem.eql(f32, &.{ -0.5, -1.25 }, trace.old_logprobs);
+        }
+    };
+
+    var seen = Seen{};
+    try deliverTrainingTrace(
+        std.testing.allocator,
+        \\{"prompt_token_ids":[1,2],"response_token_ids":[3,4],"response_mask":[1,0],"old_logprobs":[-0.5,-1.25]}
+    ,
+        Seen.take,
+        &seen,
+    );
+    try std.testing.expect(seen.ok);
+}
+
+test "the RL trace extension rejects unequal response arrays and non-binary masks" {
+    const Ignore = struct {
+        fn take(_: ?*anyopaque, _: Delta) OnDeltaError!void {}
+    };
+    try std.testing.expectError(error.BadTrainingTrace, deliverTrainingTrace(
+        std.testing.allocator,
+        \\{"prompt_token_ids":[1],"response_token_ids":[2],"response_mask":[],"old_logprobs":[-0.5]}
+    ,
+        Ignore.take,
+        null,
+    ));
+    try std.testing.expectError(error.BadTrainingTrace, deliverTrainingTrace(
+        std.testing.allocator,
+        \\{"prompt_token_ids":[1],"response_token_ids":[2],"response_mask":[2],"old_logprobs":[-0.5]}
+    ,
+        Ignore.take,
+        null,
+    ));
 }

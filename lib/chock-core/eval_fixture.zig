@@ -28,12 +28,7 @@ pub const ProviderExchange = struct {
     training: ?TrainingTrace = null,
 };
 
-pub const TrainingTrace = struct {
-    prompt_token_ids: []const u32,
-    response_token_ids: []const u32,
-    response_mask: []const u8,
-    old_logprobs: []const f32,
-};
+pub const TrainingTrace = Client.TrainingTrace;
 
 pub const ToolExchange = struct {
     request_sha256: []const u8,
@@ -142,11 +137,16 @@ pub const RecordingProvider = struct {
     const Forward = struct {
         recorder: *Recorder,
         deltas: std.ArrayList(Client.Delta) = .empty,
+        training: ?TrainingTrace = null,
         on_delta: Client.OnDelta,
         ctx: ?*anyopaque,
 
         fn take(raw: ?*anyopaque, delta: Client.Delta) Client.OnDeltaError!void {
             const self: *Forward = @ptrCast(@alignCast(raw.?));
+            if (delta == .training_trace) {
+                self.training = try cloneTrainingTrace(self.recorder, delta.training_trace);
+                return;
+            }
             try self.deltas.append(self.recorder.arena, try cloneDelta(self.recorder, delta));
             try self.on_delta(self.ctx, delta);
         }
@@ -175,6 +175,7 @@ pub const RecordingProvider = struct {
             .request_sha256 = try self.recorder.arena.dupe(u8, &digest),
             .deltas = forward.deltas.items,
             .result = captured,
+            .training = forward.training,
         });
         return result;
     }
@@ -290,6 +291,16 @@ fn cloneDelta(recorder: *Recorder, delta: Client.Delta) !Client.Delta {
             .category = try clean(recorder, one.category),
             .explanation = try clean(recorder, one.explanation),
         } },
+        .training_trace => |one| .{ .training_trace = try cloneTrainingTrace(recorder, one) },
+    };
+}
+
+fn cloneTrainingTrace(recorder: *Recorder, trace: TrainingTrace) !TrainingTrace {
+    return .{
+        .prompt_token_ids = try recorder.arena.dupe(u32, trace.prompt_token_ids),
+        .response_token_ids = try recorder.arena.dupe(u32, trace.response_token_ids),
+        .response_mask = try recorder.arena.dupe(u8, trace.response_mask),
+        .old_logprobs = try recorder.arena.dupe(f32, trace.old_logprobs),
     };
 }
 
@@ -378,6 +389,12 @@ test "an encoded fixture verifies its payload" {
 const FakeProvider = struct {
     fn send(_: *anyopaque, _: std.mem.Allocator, _: message.Request, on_delta: Client.OnDelta, ctx: ?*anyopaque) Client.SendError!Client.SendResult {
         try on_delta(ctx, .{ .text = "the token is supersecret" });
+        try on_delta(ctx, .{ .training_trace = .{
+            .prompt_token_ids = &.{ 1, 2 },
+            .response_token_ids = &.{3},
+            .response_mask = &.{1},
+            .old_logprobs = &.{-0.25},
+        } });
         try on_delta(ctx, .{ .stop_reason = .{ .reason = "stop" } });
         return .ok;
     }
@@ -416,6 +433,7 @@ test "provider recording redacts and replay requires the same request" {
     try std.testing.expectEqualStrings("the token is supersecret", live.text);
     try std.testing.expectEqual(@as(usize, 1), recorder.payload().providers.len);
     try std.testing.expect(std.mem.indexOf(u8, recorder.payload().providers[0].deltas[0].text, "supersecret") == null);
+    try std.testing.expectEqualSlices(u32, &.{3}, recorder.payload().providers[0].training.?.response_token_ids);
 
     const bytes = try encode(arena, recorder.payload());
     var replay = Replay{ .payload = try decode(arena, bytes) };
