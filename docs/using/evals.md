@@ -8,6 +8,7 @@ session use the same evaluator:
 chock eval run evals/parser.zon
 chock eval check evals/parser.zon --session 01M...
 chock eval check evals/parser.zon --session 01M... --format json
+chock eval compare baseline.json candidate.json --minimum-score 0.9
 ```
 
 `run` starts `chock run --output json` with the task, provider and model from
@@ -78,3 +79,10 @@ The aggregate score is the fraction of checks which passed. It is a convenient
 CI summary, not a training reward: consumers that turn reports into rewards
 should keep the individual findings and their categories so a harness failure
 cannot accidentally train the model.
+
+`chock eval compare` reads two JSON reports without opening either session. It
+fails when the candidate score is below `--minimum-score` or more than
+`--max-regression` below the baseline. Both bounds are fractions from zero to
+one; the default permits no regression and sets no absolute floor. The command
+writes a versioned `chock.eval-comparison` object with `--format json`, so CI can
+keep both the decision and the numbers which produced it.

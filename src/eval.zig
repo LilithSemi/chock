@@ -15,6 +15,7 @@ const max_log_bytes: usize = 128 * 1024 * 1024;
 
 const usage_text =
     \\Usage: chock eval <run|check> <spec.zon> [options]
+    \\       chock eval compare <baseline.json> <candidate.json> [options]
     \\
     \\run starts a provider-backed `chock run --output json` with the task and
     \\provider settings in the spec, then scores its audited session. check scores
@@ -29,6 +30,9 @@ const usage_text =
     \\  --project <dir>     Repository to run and inspect. Overrides spec.fixture.
     \\  --format <kind>     human (default) or json.
     \\  --skip-tests        Score the audit and repository without executing tests.
+    \\  --minimum-score <n> Candidate score required by compare (default 0).
+    \\  --max-regression <n>
+    \\                       How far below the baseline compare may fall (default 0).
     \\
     \\Example spec:
     \\
@@ -55,16 +59,19 @@ const usage_text =
     \\
 ++ tty.options_text;
 
-const Action = enum { run, check };
+const Action = enum { run, check, compare };
 const Format = enum { human, json };
 
 const Options = struct {
     action: Action,
     spec_path: []const u8,
+    candidate_path: []const u8 = "",
     session: []const u8 = "",
     project: ?[]const u8 = null,
     format: Format = .human,
     skip_tests: bool = false,
+    minimum_score: f64 = 0,
+    max_regression: f64 = 0,
 };
 
 const Test = struct {
@@ -120,6 +127,21 @@ const Report = struct {
     findings: []const Finding,
 };
 
+const Comparison = struct {
+    schema: []const u8 = "chock.eval-comparison",
+    version: u32 = 1,
+    baseline_eval: []const u8,
+    baseline_session: []const u8,
+    baseline_score: f64,
+    candidate_eval: []const u8,
+    candidate_session: []const u8,
+    candidate_score: f64,
+    score_delta: f64,
+    minimum_score: f64,
+    max_regression: f64,
+    passed: bool,
+};
+
 const Observed = struct {
     session: state.Session,
     kinds: std.EnumSet(event.Kind) = .empty,
@@ -153,6 +175,11 @@ pub fn main(
             tty.print(.err, "{s}", .{usage_text});
             return Exit.usage.code();
         },
+    };
+
+    if (options.action == .compare) return compareReports(arena, io, options) catch |err| {
+        tty.print(.err, "chock eval: reports could not be compared: {t}\n", .{err});
+        return Exit.usage.code();
     };
 
     const source = std.Io.Dir.cwd().readFileAlloc(io, options.spec_path, arena, .limited(max_spec_bytes)) catch |err| {
@@ -189,6 +216,7 @@ pub fn main(
             tty.print(.err, "chock eval: the provider-backed run did not produce a session: {t}\n", .{err});
             return Exit.faulted.code();
         },
+        .compare => unreachable,
     };
 
     const session_dir = session_paths.projectDir(arena, &env, project) catch |err| {
@@ -229,6 +257,11 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
     if (args.len < 2 or args[1].len == 0 or args[1][0] == '-') return error.BadArguments;
     var out = Options{ .action = action, .spec_path = args[1] };
     var i: usize = 2;
+    if (action == .compare) {
+        if (args.len < 3 or args[2].len == 0 or args[2][0] == '-') return error.BadArguments;
+        out.candidate_path = args[2];
+        i = 3;
+    }
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--skip-tests")) {
             out.skip_tests = true;
@@ -252,11 +285,67 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
             out.format = std.meta.stringToEnum(Format, args[i]) orelse return error.BadArguments;
             continue;
         }
+        if (std.mem.eql(u8, args[i], "--minimum-score") or std.mem.eql(u8, args[i], "--max-regression")) {
+            const is_minimum = std.mem.eql(u8, args[i], "--minimum-score");
+            i += 1;
+            if (i >= args.len) return error.BadArguments;
+            const value = std.fmt.parseFloat(f64, args[i]) catch return error.BadArguments;
+            if (!std.math.isFinite(value) or value < 0 or value > 1) return error.BadArguments;
+            if (is_minimum) out.minimum_score = value else out.max_regression = value;
+            continue;
+        }
         return error.BadArguments;
     }
     if (action == .check and !session_paths.isValidId(out.session)) return error.BadArguments;
     if (action == .run and out.session.len != 0) return error.BadArguments;
+    if (action != .compare and (out.minimum_score != 0 or out.max_regression != 0)) return error.BadArguments;
+    if (action == .compare and (out.session.len != 0 or out.project != null or out.skip_tests)) return error.BadArguments;
     return out;
+}
+
+fn compareReports(arena: std.mem.Allocator, io: std.Io, options: Options) !u8 {
+    const baseline = try readReport(arena, io, options.spec_path);
+    const candidate = try readReport(arena, io, options.candidate_path);
+    const passed = candidate.score >= options.minimum_score and
+        candidate.score + options.max_regression >= baseline.score;
+    const comparison = Comparison{
+        .baseline_eval = baseline.eval,
+        .baseline_session = baseline.session_id,
+        .baseline_score = baseline.score,
+        .candidate_eval = candidate.eval,
+        .candidate_session = candidate.session_id,
+        .candidate_score = candidate.score,
+        .score_delta = candidate.score - baseline.score,
+        .minimum_score = options.minimum_score,
+        .max_regression = options.max_regression,
+        .passed = passed,
+    };
+    switch (options.format) {
+        .json => {
+            const json = try std.json.Stringify.valueAlloc(arena, comparison, .{});
+            tty.out(.plain, "{s}\n", .{json});
+        },
+        .human => {
+            tty.out(if (passed) .plain else .warn, "{s}  baseline {d:.3}; candidate {d:.3}; delta {d:.3}\n", .{
+                if (passed) "pass" else "FAIL",
+                comparison.baseline_score,
+                comparison.candidate_score,
+                comparison.score_delta,
+            });
+        },
+    }
+    return if (passed) Exit.finished.code() else Exit.refused.code();
+}
+
+fn readReport(arena: std.mem.Allocator, io: std.Io, path: []const u8) !Report {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_spec_bytes));
+    const report = try std.json.parseFromSliceLeaky(Report, arena, bytes, .{ .ignore_unknown_fields = true });
+    if (!std.mem.eql(u8, report.schema, "chock.eval-report") or report.version != 1 or
+        !std.math.isFinite(report.score) or report.score < 0 or report.score > 1)
+    {
+        return error.BadReport;
+    }
+    return report;
 }
 
 fn fixtureFromSpec(arena: std.mem.Allocator, spec_path: []const u8, fixture: []const u8) []const u8 {
@@ -497,6 +586,14 @@ test "eval command line separates provider runs from deterministic checks" {
     try testing.expect(checked.skip_tests);
     try testing.expectError(error.BadArguments, parseOptions(&.{ "check", "case.zon" }));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "run", "case.zon", "--session", id }));
+
+    const compared = try parseOptions(&.{ "compare", "base.json", "candidate.json", "--minimum-score", "0.8", "--max-regression", "0.05" });
+    try testing.expectEqual(Action.compare, compared.action);
+    try testing.expectEqualStrings("candidate.json", compared.candidate_path);
+    try testing.expectApproxEqAbs(@as(f64, 0.8), compared.minimum_score, 0.0001);
+    try testing.expectApproxEqAbs(@as(f64, 0.05), compared.max_regression, 0.0001);
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "compare", "base.json" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "compare", "base.json", "candidate.json", "--minimum-score", "1.1" }));
 }
 
 test "evaluation paths cannot leave their fixture" {
