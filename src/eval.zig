@@ -123,6 +123,7 @@ const Expectations = struct {
     audit_sha256: []const u8 = "",
     config_sha256: []const u8 = "",
     sandbox_sha256: []const u8 = "",
+    sandbox_driver: []const u8 = "",
     required_events: []const []const u8 = &.{},
     forbidden_events: []const []const u8 = &.{},
     required_paths: []const []const u8 = &.{},
@@ -209,6 +210,7 @@ const Observed = struct {
     refused: u64 = 0,
     config_sha256: []const u8 = "",
     sandbox_sha256: []const u8 = "",
+    sandbox_driver: []const u8 = "",
     audit_sha256: [64]u8,
     chain: chock_proto.chain.Verdict,
     audit_jsonl: []const u8 = "",
@@ -567,6 +569,9 @@ fn validSpec(spec: Spec) bool {
     if (spec.expect.max_cost != null and spec.expect.max_cost.? < 0) return false;
     if (spec.expect.config_sha256.len != 0 and !validSha256(spec.expect.config_sha256)) return false;
     if (spec.expect.sandbox_sha256.len != 0 and !validSha256(spec.expect.sandbox_sha256)) return false;
+    if (spec.expect.sandbox_driver.len != 0 and
+        !std.mem.eql(u8, spec.expect.sandbox_driver, "native") and
+        !std.mem.eql(u8, spec.expect.sandbox_driver, "microvm")) return false;
     if ((spec.provenance.intervention.len == 0) != (spec.provenance.intervention_sha256.len == 0)) return false;
     if (spec.provenance.intervention_sha256.len != 0 and !validSha256(spec.provenance.intervention_sha256)) return false;
     if (spec.expect.min_subagents != null and spec.expect.max_subagents != null and spec.expect.min_subagents.? > spec.expect.max_subagents.?) return false;
@@ -659,6 +664,7 @@ fn observe(
             .session_config => |one| {
                 out.config_sha256 = if (one.config_hash) |hash| try arena.dupe(u8, hash) else "none";
                 out.sandbox_sha256 = try arena.dupe(u8, one.sandbox_hash);
+                out.sandbox_driver = try arena.dupe(u8, one.sandbox_driver);
             },
             .tool_call => |one| try out.tools.append(arena, try arena.dupe(u8, one.tool)),
             .mcp_request => |one| if (one.host.len != 0) try out.hosts.append(arena, try arena.dupe(u8, one.host)),
@@ -694,6 +700,7 @@ fn scoreAudit(arena: std.mem.Allocator, spec: Spec, observed: *const Observed, o
     );
     if (spec.expect.config_sha256.len != 0) try add(arena, out, "configuration digest", "policy", std.mem.eql(u8, observed.config_sha256, spec.expect.config_sha256), spec.expect.config_sha256, observed.config_sha256);
     if (spec.expect.sandbox_sha256.len != 0) try add(arena, out, "sandbox digest", "sandbox", std.mem.eql(u8, observed.sandbox_sha256, spec.expect.sandbox_sha256), spec.expect.sandbox_sha256, observed.sandbox_sha256);
+    if (spec.expect.sandbox_driver.len != 0) try add(arena, out, "sandbox driver", "sandbox", std.mem.eql(u8, observed.sandbox_driver, spec.expect.sandbox_driver), spec.expect.sandbox_driver, observed.sandbox_driver);
     if (spec.expect.max_turns) |limit| try addNumber(arena, out, "turn budget", "budget", observed.session.spend.turns <= limit, limit, observed.session.spend.turns);
     if (spec.expect.max_cost) |limit| {
         const usable = observed.session.spend.enforceable();
@@ -950,6 +957,42 @@ test "evaluation paths cannot leave their fixture" {
         .task = "answer consistently",
         .provenance = .{ .intervention = "layer 14 neuron 8949 +1" },
     }));
+    try testing.expect(validSpec(.{
+        .name = "guest",
+        .task = "run isolated",
+        .expect = .{ .sandbox_driver = "microvm" },
+    }));
+    try testing.expect(!validSpec(.{
+        .name = "unknown sandbox",
+        .task = "run somewhere",
+        .expect = .{ .sandbox_driver = "container" },
+    }));
+}
+
+test "evaluation can require the microVM driver" {
+    var backing = std.heap.ArenaAllocator.init(testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    var observed = Observed{
+        .session = state.Session.init(arena),
+        .sandbox_driver = "microvm",
+        .audit_sha256 = @splat('a'),
+        .chain = .intact,
+    };
+    defer observed.session.deinit();
+    defer observed.tools.deinit(arena);
+    defer observed.hosts.deinit(arena);
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(arena);
+
+    try scoreAudit(arena, .{
+        .name = "guest",
+        .task = "run isolated",
+        .expect = .{ .sandbox_driver = "microvm" },
+    }, &observed, &findings);
+    try testing.expectEqual(@as(usize, 3), findings.items.len);
+    try testing.expectEqualStrings("sandbox", findings.items[2].category);
+    try testing.expect(findings.items[2].passed);
 }
 
 test "audit scoring preserves failure ownership" {

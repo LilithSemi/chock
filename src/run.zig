@@ -915,6 +915,7 @@ fn sessionConfig(
     dev_shell_name: ?[]const u8,
     context_tokens: ?u64,
     sandbox_config: palisade.Sandbox.Config,
+    sandbox_driver: chock_policy.sandbox.Driver,
     read_instructions: []const chock_core.instructions.ReadFile,
     context_sources: []const []const u8,
     context_settings: chock_policy.context.Settings,
@@ -942,6 +943,7 @@ fn sessionConfig(
         else
             null,
         .sandbox_hash = try std.fmt.allocPrint(arena, "{x}", .{chock_net.shapeHash(sandbox_config)}),
+        .sandbox_driver = sandbox_driver.wireName(),
         .instructions = options.instructions,
         .instruction_files = files.items,
         .context_sources = context_sources,
@@ -2053,6 +2055,7 @@ fn start(
             dev_shell_name,
             instance.context_tokens,
             sandbox_config,
+            sandbox_choice.chosen(),
             loaded_instructions.files,
             try contextSources(arena, prompt_project, prompt_sources),
             context_settings,

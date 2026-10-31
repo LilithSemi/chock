@@ -63,6 +63,7 @@ fixture for either command.
         .currency = "USD",
         .config_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         .sandbox_sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        .sandbox_driver = "microvm",
         .required_events = &.{ "tool.call", "usage" },
         .forbidden_tools = &.{"browser"},
         .required_paths = &.{"src/parser.zig"},
@@ -110,6 +111,10 @@ project configuration recorded by `session.config`, while `sandbox_sha256`
 pins the effective sandbox rather than merely its source file. Subagent bounds
 and completion checks are folded from the parent log, so an evaluation can
 distinguish a successful root answer from a lost child.
+
+Set `sandbox_driver` to `native` or `microvm` when the isolation implementation
+is part of the case. The selected driver is recorded in `session.config`, so a
+microVM evaluation fails rather than silently passing under the native sandbox.
 
 `required_events` and `forbidden_events` use the event names stored in the
 JSONL log, such as `tool.call`, `usage`, `network.summary`, and

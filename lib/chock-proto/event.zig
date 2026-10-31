@@ -261,6 +261,8 @@ pub const SessionConfig = struct {
     config_hash: ?[]const u8 = null,
     /// SHA-256 of what this sandbox lets a tool call reach; differs means a different sandbox.
     sandbox_hash: []const u8 = "",
+    /// The operator-selected isolation implementation (`native` or `microvm`).
+    sandbox_driver: []const u8 = "",
     instructions: []const []const u8 = &.{},
     /// Every instruction file read, as `<layer> <path> sha256:<hex>`, so a
     /// replay can tell whether a project's own instructions changed.
@@ -290,6 +292,10 @@ pub const SessionConfig = struct {
         if (self.sandbox_hash.len != 0) {
             try jw.objectField("sandbox_hash");
             try jw.write(self.sandbox_hash);
+        }
+        if (self.sandbox_driver.len != 0) {
+            try jw.objectField("sandbox_driver");
+            try jw.write(self.sandbox_driver);
         }
         if (self.instructions.len != 0) {
             try jw.objectField("instructions");
@@ -2449,6 +2455,7 @@ test "every part of a session's configuration reaches the log, and reads back" {
     const full = Event{ .session_config = .{
         .config_hash = "ff00",
         .sandbox_hash = "aa11",
+        .sandbox_driver = "microvm",
         .instructions = &.{ "./task.md", "./style.md" },
         .context_sources = &.{ "harness chock", "skill project test" },
         .policy_rules = &.{"net.fetch.*=allow"},
@@ -2472,6 +2479,7 @@ test "every part of a session's configuration reaches the log, and reads back" {
     const back = parsed.value.session_config;
     try std.testing.expectEqualStrings("ff00", back.config_hash.?);
     try std.testing.expectEqualStrings("aa11", back.sandbox_hash);
+    try std.testing.expectEqualStrings("microvm", back.sandbox_driver);
     try std.testing.expectEqual(@as(usize, 2), back.instructions.len);
     try std.testing.expectEqualStrings("./style.md", back.instructions[1]);
     try std.testing.expectEqualStrings("skill project test", back.context_sources[1]);
