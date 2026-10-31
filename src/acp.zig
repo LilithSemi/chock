@@ -189,6 +189,7 @@ const Queue = struct {
 const Live = struct {
     id: [session_paths.id_length]u8,
     project: []u8,
+    workspace: ?[]u8 = null,
     seen: u64 = 0,
     window: ?u64 = null,
     plan: std.ArrayList(Step) = .empty,
@@ -207,6 +208,7 @@ const Live = struct {
 
     fn deinit(self: *Live, gpa: std.mem.Allocator) void {
         gpa.free(self.project);
+        if (self.workspace) |path| gpa.free(path);
         for (self.plan.items) |step| {
             gpa.free(step.id);
             gpa.free(step.subject);
@@ -217,6 +219,12 @@ const Live = struct {
             gpa.free(call.tool);
         }
         self.calls.deinit(gpa);
+    }
+
+    fn setWorkspace(self: *Live, gpa: std.mem.Allocator, path: []const u8) !void {
+        const owned = try gpa.dupe(u8, path);
+        if (self.workspace) |held| gpa.free(held);
+        self.workspace = owned;
     }
 
     fn mergeStep(
@@ -896,6 +904,7 @@ const Agent = struct {
         const live = &self.sessions.items[which];
         switch (ev) {
             .message => |one| self.sendMessage(arena, one),
+            .workspace_open => |one| live.setWorkspace(self.gpa, one.path) catch {},
             .tool_call => |one| {
                 live.noteCall(self.gpa, one.call_id, one.tool) catch {};
                 self.send(arena, .{ .tool = .{
@@ -913,6 +922,20 @@ const Agent = struct {
                 .phase = if (one.is_error) .failed else .finished,
                 .output = one.output,
             } }),
+            .diff => |one| {
+                const root = live.workspace orelse live.project;
+                const path = if (std.fs.path.isAbsolute(one.path))
+                    one.path
+                else
+                    std.fs.path.join(arena, &.{ root, one.path }) catch return;
+                const id = std.fmt.allocPrint(arena, "workspace-diff-{d}", .{offset}) catch return;
+                self.send(arena, .{ .diff = .{
+                    .id = id,
+                    .path = path,
+                    .patch = one.patch,
+                    .operation = diffOperation(one.patch),
+                } });
+            },
             .plan_update => |one| {
                 for (one.steps) |step| {
                     live.mergeStep(self.gpa, step.id, step.subject, stepStatusFor(step.status)) catch {};
@@ -1233,6 +1256,20 @@ fn promptText(arena: std.mem.Allocator, params: []const u8) !?[]const u8 {
     return joined.items;
 }
 
+fn diffOperation(patch: []const u8) updates.DiffOperation {
+    if (std.mem.indexOf(u8, patch, "\nnew file mode ") != null or
+        std.mem.indexOf(u8, patch, "\n--- /dev/null\n") != null)
+    {
+        return .add;
+    }
+    if (std.mem.indexOf(u8, patch, "\ndeleted file mode ") != null or
+        std.mem.indexOf(u8, patch, "\n+++ /dev/null\n") != null)
+    {
+        return .delete;
+    }
+    return .modify;
+}
+
 fn toolKindFor(tool: []const u8) chock_acp.common.ToolKind {
     const known = [_]struct { []const u8, chock_acp.common.ToolKind }{
         .{ "read_file", .read },
@@ -1424,6 +1461,18 @@ test "a tool is drawn as what it does, and one nobody knows is other" {
 
     try testing.expectEqual(chock_acp.common.ToolKind.other, toolKindFor("create_issue"));
     try testing.expectEqual(chock_acp.common.ToolKind.other, toolKindFor(""));
+}
+
+test "a logged patch identifies additions and deletions without guessing fragments" {
+    try testing.expectEqual(updates.DiffOperation.add, diffOperation(
+        "diff --git a/new b/new\nnew file mode 100644\n--- /dev/null\n+++ b/new\n",
+    ));
+    try testing.expectEqual(updates.DiffOperation.delete, diffOperation(
+        "diff --git a/old b/old\ndeleted file mode 100644\n--- a/old\n+++ /dev/null\n",
+    ));
+    try testing.expectEqual(updates.DiffOperation.modify, diffOperation(
+        "@@ -1 +1 @@\n-old\n+new\n",
+    ));
 }
 
 test "an abandoned step stays abandoned, and an unknown status is not progress" {

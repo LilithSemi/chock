@@ -38,6 +38,18 @@ pub const Tool = struct {
     output: []const u8 = "",
 };
 
+/// A file change made in Chock's isolated session workspace. Version 2 can
+/// carry the logged Git patch directly. Version 1's diff requires complete
+/// old and new file contents, which an audit-log patch cannot safely invent.
+pub const DiffOperation = enum { add, delete, modify };
+
+pub const Diff = struct {
+    id: []const u8,
+    path: []const u8,
+    patch: []const u8,
+    operation: DiffOperation = .modify,
+};
+
 /// ACP's `usage_update` gauge, not a bill: `used`/`size` show window fullness.
 pub const Usage = struct {
     used: u64,
@@ -52,6 +64,7 @@ pub const Update = union(enum) {
     agent_thought: Chunk,
     user_message: Chunk,
     tool: Tool,
+    diff: Diff,
     /// The whole plan, not a change to it.
     plan: []const PlanStep,
     usage: Usage,
@@ -71,10 +84,83 @@ pub fn encode(
         .agent_thought => |one| try chunk(arena, version, session_id, "agent_thought_chunk", one),
         .user_message => |one| try chunk(arena, version, session_id, "user_message_chunk", one),
         .tool => |one| try tool(arena, version, session_id, one),
+        .diff => |one| try diff(arena, version, session_id, one),
         .plan => |steps| try plan(arena, version, session_id, steps),
         .usage => |one| try usage(arena, version, session_id, one),
         .title => |text| try title(arena, version, session_id, text),
     };
+}
+
+fn diff(
+    arena: std.mem.Allocator,
+    version: Version,
+    session_id: []const u8,
+    one: Diff,
+) std.mem.Allocator.Error![]u8 {
+    const diff_title = try std.fmt.allocPrint(arena, "Isolated workspace diff: {s}", .{one.path});
+
+    if (version == .v1) {
+        return std.json.Stringify.valueAlloc(arena, .{
+            .sessionId = session_id,
+            .update = .{
+                .sessionUpdate = "tool_call",
+                .toolCallId = one.id,
+                .title = diff_title,
+                .name = "workspace_diff",
+                .kind = "edit",
+                .status = "completed",
+                .content = .{.{
+                    .type = "content",
+                    .content = .{ .type = "text", .text = one.patch },
+                }},
+            },
+        }, .{});
+    }
+
+    const Change = struct {
+        operation: []const u8,
+        path: []const u8,
+        fileType: []const u8 = "text",
+    };
+    const change = Change{ .operation = @tagName(one.operation), .path = one.path };
+
+    // ACP v2 calls this format `git_patch`. A provider may log a useful patch
+    // fragment instead; keep the structured file change native and carry that
+    // fragment as text rather than lying about its format.
+    if (!std.mem.startsWith(u8, one.patch, "diff --git ")) {
+        return std.json.Stringify.valueAlloc(arena, .{
+            .sessionId = session_id,
+            .update = .{
+                .sessionUpdate = "tool_call_update",
+                .toolCallId = one.id,
+                .title = diff_title,
+                .name = "workspace_diff",
+                .kind = "edit",
+                .status = "completed",
+                .content = .{
+                    .{ .type = "diff", .changes = .{change} },
+                    .{ .type = "content", .content = .{ .type = "text", .text = one.patch } },
+                },
+            },
+        }, .{});
+    }
+
+    return std.json.Stringify.valueAlloc(arena, .{
+        .sessionId = session_id,
+        .update = .{
+            .sessionUpdate = "tool_call_update",
+            .toolCallId = one.id,
+            .title = diff_title,
+            .name = "workspace_diff",
+            .kind = "edit",
+            .status = "completed",
+            .content = .{.{
+                .type = "diff",
+                .changes = .{change},
+                .patch = .{ .format = "git_patch", .text = one.patch },
+            }},
+        },
+    }, .{});
 }
 
 fn chunk(
@@ -335,6 +421,52 @@ test "a finished call reports its output as content, and a failed one says so" {
     try testing.expect(quiet_parsed.value.object.get("update").?.object.get("content") == null);
 }
 
+test "workspace diffs are native in version 2 and honest text in version 1" {
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    const patch = "diff --git a/src/main.zig b/src/main.zig\n--- a/src/main.zig\n+++ b/src/main.zig\n";
+    const update = Update{ .diff = .{
+        .id = "diff-42",
+        .path = "/tmp/chock-worktree/src/main.zig",
+        .patch = patch,
+    } };
+
+    const one = try encoded(arena, .v1, update);
+    var one_parsed = try std.json.parseFromSlice(std.json.Value, arena, one, .{});
+    const one_update = one_parsed.value.object.get("update").?.object;
+    try testing.expectEqualStrings("tool_call", one_update.get("sessionUpdate").?.string);
+    try testing.expectEqualStrings("completed", one_update.get("status").?.string);
+    try testing.expectEqualStrings("content", one_update.get("content").?.array.items[0].object.get("type").?.string);
+
+    const two = try encoded(arena, .v2, update);
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, two, .{});
+    const sent = parsed.value.object.get("update").?.object;
+    try testing.expectEqualStrings("tool_call_update", sent.get("sessionUpdate").?.string);
+    try testing.expectEqualStrings("Isolated workspace diff: /tmp/chock-worktree/src/main.zig", sent.get("title").?.string);
+    const native = sent.get("content").?.array.items[0].object;
+    try testing.expectEqualStrings("diff", native.get("type").?.string);
+    try testing.expectEqualStrings("git_patch", native.get("patch").?.object.get("format").?.string);
+    try testing.expectEqualStrings(patch, native.get("patch").?.object.get("text").?.string);
+    const change = native.get("changes").?.array.items[0].object;
+    try testing.expectEqualStrings("modify", change.get("operation").?.string);
+    try testing.expectEqualStrings("/tmp/chock-worktree/src/main.zig", change.get("path").?.string);
+
+    const fragment = try encoded(arena, .v2, .{ .diff = .{
+        .id = "diff-43",
+        .path = "/tmp/chock-worktree/new.zig",
+        .patch = "+new\n",
+        .operation = .add,
+    } });
+    var fragment_parsed = try std.json.parseFromSlice(std.json.Value, arena, fragment, .{});
+    const content = fragment_parsed.value.object.get("update").?.object.get("content").?.array;
+    try testing.expectEqual(@as(usize, 2), content.items.len);
+    try testing.expect(content.items[0].object.get("patch") == null);
+    try testing.expectEqualStrings("add", content.items[0].object.get("changes").?.array.items[0].object.get("operation").?.string);
+    try testing.expectEqualStrings("content", content.items[1].object.get("type").?.string);
+}
+
 test "an abandoned step is cancelled in version 2 and absent from version 1" {
     var state = std.heap.ArenaAllocator.init(testing.allocator);
     defer state.deinit();
@@ -398,6 +530,7 @@ test "every update is something both versions can be asked for" {
         .{ .user_message = .{ .text = "a" } },
         .{ .tool = .{ .id = "c", .title = "t", .phase = .started } },
         .{ .tool = .{ .id = "c", .title = "t", .phase = .finished } },
+        .{ .diff = .{ .id = "d", .path = "/tmp/file", .patch = "+change" } },
         .{ .plan = &.{} },
         .{ .usage = .{ .used = 1, .size = 2 } },
         .{ .title = "what this session is about" },

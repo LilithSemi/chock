@@ -40,6 +40,7 @@ chooses it over a version the editor also offered.
 | The model reasons | a thought chunk, which an editor can hide separately |
 | A tool starts | a tool call, with a kind so the editor draws the right thing |
 | A tool ends | a tool call update carrying what it produced |
+| A file changes | a diff tied to the isolated session workspace |
 | The plan changes | the whole plan |
 | A request is priced | a context gauge: how full the window is, and the cost |
 | The turn ends | a stop reason on the reply |
@@ -47,6 +48,13 @@ chooses it over a version the editor also offered.
 A tool call reports a kind, so an editor shows a read differently from a command.
 An MCP tool or a plugin tool reports `other`, because its name belongs to the
 server and guessing a shape from it would draw something nobody declared.
+
+Version 2 editors receive a structured file operation, its absolute path in
+the isolated workspace, and a Git patch when the log has one. Version 1 needs
+complete before-and-after file contents for its native diff shape; Chock's log
+holds the patch instead, so those editors receive the patch as an edit result
+rather than made-up file contents. Reopening a session replays the same diff
+identifier from the audit log.
 
 ## An approval arrives in the editor
 
