@@ -59,6 +59,65 @@ pub const ToolRunner = struct {
     }
 };
 
+/// The part of a Chock-owned tool call that deterministic evaluation needs to
+/// restore without performing the external action again. `effects_json`
+/// contains redacted log events in the order the live call appended them.
+pub const CapturedInternalTool = struct {
+    result: event.ToolResult,
+    effects_json: []const []const u8,
+};
+
+pub const InternalToolTape = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const TapeError = std.mem.Allocator.Error || chock_provider.Client.SendError;
+
+    pub const VTable = struct {
+        start: *const fn (
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            call: event.ToolCall,
+            action: []const u8,
+        ) TapeError!?CapturedInternalTool,
+        observe: *const fn (
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            ev: event.Event,
+        ) TapeError!void,
+        finish: *const fn (
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            result: event.ToolResult,
+        ) TapeError!void,
+    };
+
+    pub fn start(
+        self: InternalToolTape,
+        allocator: std.mem.Allocator,
+        call: event.ToolCall,
+        action: []const u8,
+    ) TapeError!?CapturedInternalTool {
+        return self.vtable.start(self.ptr, allocator, call, action);
+    }
+
+    pub fn observe(
+        self: InternalToolTape,
+        allocator: std.mem.Allocator,
+        ev: event.Event,
+    ) TapeError!void {
+        return self.vtable.observe(self.ptr, allocator, ev);
+    }
+
+    pub fn finish(
+        self: InternalToolTape,
+        allocator: std.mem.Allocator,
+        result: event.ToolResult,
+    ) TapeError!void {
+        return self.vtable.finish(self.ptr, allocator, result);
+    }
+};
+
 pub const SandboxToolRunner = struct {
     env: *const std.process.Environ.Map,
     sandbox_config: chock_net.Call,
@@ -159,6 +218,7 @@ pub const Deps = struct {
     client: chock_provider.Client.Client,
     storage: chock_proto.storage.Storage,
     tool_runner: ToolRunner,
+    internal_tool_tape: ?InternalToolTape = null,
     give_locked: ?GiveLocked = null,
     tool_definitions: []const message.ToolDefinition,
     model: []const u8,
@@ -1699,22 +1759,8 @@ fn runTool(
     } else if (try gateToolCall(allocator, io, locked, deps, call, &gated_action_buffer, &gated_action)) |refusal| gated: {
         never_ran = true;
         break :gated refusal;
-    } else if (std.mem.eql(u8, call.tool, spawn_tool_name))
-        try runSpawn(allocator, io, locked, session, deps, call)
-    else if (std.mem.eql(u8, call.tool, plan_tool_name))
-        try runPlanUpdate(allocator, io, locked, session, deps, call)
-    else if (std.mem.eql(u8, call.tool, restrict_tool_name))
-        try runRestrictSelf(allocator, io, locked, session, deps, call)
-    else if (std.mem.eql(u8, call.tool, fetch_tool_name))
-        try runFetch(allocator, io, locked, session, deps, call)
-    else if (std.mem.eql(u8, call.tool, search_tool_name))
-        try runSearch(allocator, io, session, deps, call)
-    else if (std.mem.eql(u8, call.tool, ask_tool_name))
-        try runAskUser(allocator, io, deps, call)
-    else if (std.mem.eql(u8, call.tool, title_tool_name))
-        try runSetTitle(allocator, io, locked, session, deps, call)
-    else if (std.mem.eql(u8, call.tool, request_tool_name))
-        try runRequestAction(allocator, io, locked, deps, call)
+    } else if (isInternalTool(call.tool))
+        try runInternalTool(allocator, io, locked, session, deps, call, gated_action)
     else if (deps.tool_runner.dispatch(allocator, io, call, gated_action)) |ran| good: {
         failing.clear(allocator);
         break :good ran;
@@ -1792,6 +1838,78 @@ fn runTool(
         .role = .tool,
         .content = feedback[0..parts],
     } });
+}
+
+fn isInternalTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, spawn_tool_name) or
+        std.mem.eql(u8, name, plan_tool_name) or
+        std.mem.eql(u8, name, restrict_tool_name) or
+        std.mem.eql(u8, name, fetch_tool_name) or
+        std.mem.eql(u8, name, search_tool_name) or
+        std.mem.eql(u8, name, ask_tool_name) or
+        std.mem.eql(u8, name, title_tool_name) or
+        std.mem.eql(u8, name, request_tool_name);
+}
+
+fn runInternalTool(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    locked: anytype,
+    session: *chock_proto.state.Session,
+    deps: Deps,
+    call: event.ToolCall,
+    action: []const u8,
+) Error!event.ToolResult {
+    if (deps.internal_tool_tape) |tape| {
+        if (try tape.start(allocator, call, action)) |captured| {
+            errdefer freeInternalResult(allocator, captured.result);
+            var effects_arena = std.heap.ArenaAllocator.init(allocator);
+            defer effects_arena.deinit();
+            for (captured.effects_json) |json| {
+                const effect = try std.json.parseFromSliceLeaky(
+                    event.Event,
+                    effects_arena.allocator(),
+                    json,
+                    .{ .ignore_unknown_fields = true },
+                );
+                _ = try appendAndApply(allocator, io, locked, session, deps, effect);
+            }
+            return captured.result;
+        }
+    }
+
+    const result = if (std.mem.eql(u8, call.tool, spawn_tool_name))
+        try runSpawn(allocator, io, locked, session, deps, call)
+    else if (std.mem.eql(u8, call.tool, plan_tool_name))
+        try runPlanUpdate(allocator, io, locked, session, deps, call)
+    else if (std.mem.eql(u8, call.tool, restrict_tool_name))
+        try runRestrictSelf(allocator, io, locked, session, deps, call)
+    else if (std.mem.eql(u8, call.tool, fetch_tool_name))
+        try runFetch(allocator, io, locked, session, deps, call)
+    else if (std.mem.eql(u8, call.tool, search_tool_name))
+        try runSearch(allocator, io, session, deps, call)
+    else if (std.mem.eql(u8, call.tool, ask_tool_name))
+        try runAskUser(allocator, io, deps, call)
+    else if (std.mem.eql(u8, call.tool, title_tool_name))
+        try runSetTitle(allocator, io, locked, session, deps, call)
+    else if (std.mem.eql(u8, call.tool, request_tool_name))
+        try runRequestAction(allocator, io, locked, deps, call)
+    else
+        unreachable;
+    errdefer freeInternalResult(allocator, result);
+    if (deps.internal_tool_tape) |tape| try tape.finish(allocator, result);
+    return result;
+}
+
+fn freeInternalResult(allocator: std.mem.Allocator, result: event.ToolResult) void {
+    allocator.free(result.call_id);
+    allocator.free(result.output);
+    if (result.note.len != 0) allocator.free(result.note);
+    if (result.image) |image| {
+        allocator.free(image.media_type);
+        allocator.free(image.content_hash);
+        allocator.free(image.data);
+    }
 }
 
 pub const spawn_tool_name = @tagName(tools.Tool.spawn_agent);
@@ -2878,6 +2996,7 @@ fn appendAndApply(
     const time_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
     const offset = try locked.append(allocator, io, clean, time_ms);
     try session.apply(.{ .id = offset, .session = "", .time_ms = time_ms, .event = clean });
+    if (deps.internal_tool_tape) |tape| try tape.observe(allocator, clean);
     if (deps.observer) |watching| watching.onEvent(offset, clean);
     return offset;
 }
@@ -6596,6 +6715,7 @@ const SpawnCase = struct {
     arguments: []const u8 = "{\"agent_kind\":\"reviewer\",\"task\":\"read the diff\"}",
     budget: ?chock_cost.budget.Budget = null,
     spent: f64 = 0,
+    internal_tool_tape: ?InternalToolTape = null,
 };
 
 fn attemptSpawn(allocator: std.mem.Allocator, io: std.Io, case: SpawnCase) !SpawnAttempt {
@@ -6640,6 +6760,7 @@ fn attemptSpawn(allocator: std.mem.Allocator, io: std.Io, case: SpawnCase) !Spaw
     deps.spawn_chain = case.chain;
     deps.spawner = case.spawner;
     deps.budget = case.budget;
+    deps.internal_tool_tape = case.internal_tool_tape;
     try run(allocator, io, deps);
 
     var attempt = SpawnAttempt{
@@ -6691,6 +6812,85 @@ fn attemptSpawn(allocator: std.mem.Allocator, io: std.Io, case: SpawnCase) !Spaw
     }
     if (!found) return error.NoSpawnResult;
     return attempt;
+}
+
+const ReplayedSpawnTape = struct {
+    effects_json: []const []const u8,
+    starts: usize = 0,
+    finishes: usize = 0,
+
+    fn tape(self: *ReplayedSpawnTape) InternalToolTape {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = InternalToolTape.VTable{
+        .start = start,
+        .observe = observe,
+        .finish = finish,
+    };
+
+    fn start(
+        raw: *anyopaque,
+        allocator: std.mem.Allocator,
+        call: event.ToolCall,
+        _: []const u8,
+    ) InternalToolTape.TapeError!?CapturedInternalTool {
+        const self: *ReplayedSpawnTape = @ptrCast(@alignCast(raw));
+        self.starts += 1;
+        if (!std.mem.eql(u8, call.tool, spawn_tool_name)) return error.ReplayMismatch;
+        return .{
+            .result = .{
+                .call_id = try allocator.dupe(u8, call.call_id),
+                .output = try allocator.dupe(u8, "reviewer finished: captured result"),
+                .is_error = false,
+                .truncated = false,
+            },
+            .effects_json = self.effects_json,
+        };
+    }
+
+    fn observe(_: *anyopaque, _: std.mem.Allocator, _: event.Event) InternalToolTape.TapeError!void {}
+
+    fn finish(
+        raw: *anyopaque,
+        _: std.mem.Allocator,
+        _: event.ToolResult,
+    ) InternalToolTape.TapeError!void {
+        const self: *ReplayedSpawnTape = @ptrCast(@alignCast(raw));
+        self.finishes += 1;
+        return error.ReplayMismatch;
+    }
+};
+
+test "captured spawn effects restore child state without starting a child" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const spawn_json = try std.json.Stringify.valueAlloc(arena, event.Event{ .session_spawn = .{
+        .child_session = "01CAPTURED",
+        .child_agent_kind = "reviewer",
+        .reason = "inspect",
+    } }, .{});
+    const complete_json = try std.json.Stringify.valueAlloc(arena, event.Event{ .agent_complete = .{
+        .child_session = "01CAPTURED",
+        .child_agent_kind = "reviewer",
+        .outcome = .finished,
+        .result = "captured result",
+    } }, .{});
+    var tape = ReplayedSpawnTape{ .effects_json = &.{ spawn_json, complete_json } };
+
+    const attempt = try attemptSpawn(testing.allocator, testing.io, .{
+        .spawner = null,
+        .internal_tool_tape = tape.tape(),
+    });
+    defer testing.allocator.free(attempt.output);
+
+    try testing.expectEqual(@as(usize, 1), tape.starts);
+    try testing.expectEqual(@as(usize, 0), tape.finishes);
+    try testing.expectEqual(@as(usize, 1), attempt.spawn_events);
+    try testing.expectEqual(@as(usize, 1), attempt.complete_events);
+    try testing.expectEqual(@as(usize, 0), attempt.runner_calls);
+    try testing.expectEqualStrings("reviewer finished: captured result", attempt.output);
 }
 
 test "a spawn under a limit of zero is refused, names the limit, and starts nothing" {

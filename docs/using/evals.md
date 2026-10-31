@@ -17,9 +17,13 @@ chock eval suite evals/train.zon --output rollouts/run-001 --parallel 8
 `run` starts `chock run --output json` with the task, provider and model from
 the spec and records the neutral provider and tool exchanges named by
 `capture`. `replay` runs a fresh Chock session against only those exchanges: it
-does not send a provider request or dispatch a captured generic tool call.
-Every request is matched by digest, the capture itself has an integrity digest,
-and an exhausted, divergent, truncated, or partly unused capture fails closed.
+does not send a provider request, dispatch a captured generic tool call, start
+a captured subagent, repeat a network request, or perform another captured
+Chock-owned tool action. The redacted log effects of Chock-owned tools are
+restored in order, so child completion, plans, policy, and other session state
+remain visible to evaluation scoring. Every request is matched by digest, the
+capture itself has an integrity digest, and an exhausted, divergent, truncated,
+reordered, or partly unused capture fails closed.
 
 `check` does not contact a provider. It replays the named audit log, checks its
 hash chain, inspects the resulting repository, and runs the declared commands.

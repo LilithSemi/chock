@@ -33,6 +33,8 @@ pub const TrainingTrace = Client.TrainingTrace;
 pub const ToolExchange = struct {
     request_sha256: []const u8,
     result: event.ToolResult,
+    internal: bool = false,
+    effects_json: []const []const u8 = &.{},
 };
 
 pub const Payload = struct {
@@ -110,6 +112,12 @@ pub const Recorder = struct {
     policy: redact.Policy,
     provider_exchanges: std.ArrayList(ProviderExchange) = .empty,
     tool_exchanges: std.ArrayList(ToolExchange) = .empty,
+    active_internal: ?ActiveInternal = null,
+
+    const ActiveInternal = struct {
+        request_sha256: [64]u8,
+        effects_json: std.ArrayList([]const u8) = .empty,
+    };
 
     pub fn payload(self: *const Recorder) Payload {
         return .{ .providers = self.provider_exchanges.items, .tools = self.tool_exchanges.items };
@@ -122,7 +130,57 @@ pub const Recorder = struct {
     pub fn tools(self: *Recorder, inner: Loop.ToolRunner) RecordingTools {
         return .{ .recorder = self, .inner = inner };
     }
+
+    pub fn internalTape(self: *Recorder) Loop.InternalToolTape {
+        return .{ .ptr = self, .vtable = &recording_tape_vtable };
+    }
 };
+
+const recording_tape_vtable = Loop.InternalToolTape.VTable{
+    .start = recordingTapeStart,
+    .observe = recordingTapeObserve,
+    .finish = recordingTapeFinish,
+};
+
+fn recordingTapeStart(
+    raw: *anyopaque,
+    _: std.mem.Allocator,
+    call: event.ToolCall,
+    action: []const u8,
+) Loop.InternalToolTape.TapeError!?Loop.CapturedInternalTool {
+    const self: *Recorder = @ptrCast(@alignCast(raw));
+    if (self.active_internal != null) return error.ReplayMismatch;
+    self.active_internal = .{ .request_sha256 = toolDigest(call, action) };
+    return null;
+}
+
+fn recordingTapeObserve(
+    raw: *anyopaque,
+    _: std.mem.Allocator,
+    ev: event.Event,
+) Loop.InternalToolTape.TapeError!void {
+    const self: *Recorder = @ptrCast(@alignCast(raw));
+    if (self.active_internal) |*active| {
+        const json = try std.json.Stringify.valueAlloc(self.arena, ev, .{});
+        try active.effects_json.append(self.arena, json);
+    }
+}
+
+fn recordingTapeFinish(
+    raw: *anyopaque,
+    _: std.mem.Allocator,
+    result: event.ToolResult,
+) Loop.InternalToolTape.TapeError!void {
+    const self: *Recorder = @ptrCast(@alignCast(raw));
+    const active = self.active_internal orelse return error.ReplayMismatch;
+    self.active_internal = null;
+    try self.tool_exchanges.append(self.arena, .{
+        .request_sha256 = try self.arena.dupe(u8, &active.request_sha256),
+        .result = try cloneResult(self, result),
+        .internal = true,
+        .effects_json = active.effects_json.items,
+    });
+}
 
 pub const RecordingProvider = struct {
     recorder: *Recorder,
@@ -198,6 +256,7 @@ pub const RecordingTools = struct {
         self.recorder.tool_exchanges.append(self.recorder.arena, .{
             .request_sha256 = try self.recorder.arena.dupe(u8, &digest),
             .result = try cloneResult(self.recorder, result),
+            .internal = false,
         }) catch |err| {
             freeToolResult(allocator, result);
             return err;
@@ -220,12 +279,21 @@ pub const Replay = struct {
         return .{ .ptr = self, .vtable = &tool_vtable };
     }
 
+    pub fn internalTape(self: *Replay) Loop.InternalToolTape {
+        return .{ .ptr = self, .vtable = &replay_tape_vtable };
+    }
+
     pub fn complete(self: *const Replay) bool {
         return self.mismatch.len == 0 and self.provider_at == self.payload.providers.len and self.tool_at == self.payload.tools.len;
     }
 
     const provider_vtable = Client.Client.VTable{ .send = send };
     const tool_vtable = Loop.ToolRunner.VTable{ .dispatch = dispatch };
+    const replay_tape_vtable = Loop.InternalToolTape.VTable{
+        .start = tapeStart,
+        .observe = tapeObserve,
+        .finish = tapeFinish,
+    };
 
     fn send(raw: *anyopaque, allocator: std.mem.Allocator, request: message.Request, on_delta: Client.OnDelta, ctx: ?*anyopaque) Client.SendError!Client.SendResult {
         const self: *Replay = @ptrCast(@alignCast(raw));
@@ -259,6 +327,10 @@ pub const Replay = struct {
             return error.Unexpected;
         }
         const expected = self.payload.tools[self.tool_at];
+        if (expected.internal) {
+            self.mismatch = "an internal tool was replayed through the sandbox tool runner";
+            return error.Unexpected;
+        }
         const digest = toolDigest(call, action);
         if (!std.mem.eql(u8, expected.request_sha256, &digest)) {
             self.mismatch = "the tool request differs from its fixture";
@@ -266,6 +338,46 @@ pub const Replay = struct {
         }
         self.tool_at += 1;
         return dupeResult(allocator, expected.result);
+    }
+
+    fn tapeStart(
+        raw: *anyopaque,
+        allocator: std.mem.Allocator,
+        call: event.ToolCall,
+        action: []const u8,
+    ) Loop.InternalToolTape.TapeError!?Loop.CapturedInternalTool {
+        const self: *Replay = @ptrCast(@alignCast(raw));
+        if (self.tool_at >= self.payload.tools.len) {
+            self.mismatch = "the internal tool fixture is exhausted";
+            return error.ReplayExhausted;
+        }
+        const expected = self.payload.tools[self.tool_at];
+        if (!expected.internal) {
+            self.mismatch = "a sandbox tool was replayed as a Chock-owned tool";
+            return error.ReplayMismatch;
+        }
+        const digest = toolDigest(call, action);
+        if (!std.mem.eql(u8, expected.request_sha256, &digest)) {
+            self.mismatch = "the internal tool request differs from its fixture";
+            return error.ReplayMismatch;
+        }
+        self.tool_at += 1;
+        return .{
+            .result = try dupeResult(allocator, expected.result),
+            .effects_json = expected.effects_json,
+        };
+    }
+
+    fn tapeObserve(_: *anyopaque, _: std.mem.Allocator, _: event.Event) Loop.InternalToolTape.TapeError!void {}
+
+    fn tapeFinish(
+        raw: *anyopaque,
+        _: std.mem.Allocator,
+        _: event.ToolResult,
+    ) Loop.InternalToolTape.TapeError!void {
+        const self: *Replay = @ptrCast(@alignCast(raw));
+        self.mismatch = "a replayed internal tool unexpectedly ran live";
+        return error.ReplayMismatch;
     }
 };
 
@@ -483,4 +595,56 @@ test "tool recording redacts and replay never calls the live runner" {
     defer freeToolResult(std.testing.allocator, repeated);
     try std.testing.expect(std.mem.indexOf(u8, repeated.output, "supersecret") == null);
     try std.testing.expect(replay.complete());
+}
+
+test "Chock-owned tools replay their ordered log effects" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var recorder = Recorder{ .arena = arena, .policy = .{} };
+    const call = event.ToolCall{
+        .call_id = "spawn-1",
+        .tool = Loop.spawn_tool_name,
+        .arguments = "{\"agent_kind\":\"reviewer\",\"task\":\"inspect\"}",
+    };
+
+    const tape = recorder.internalTape();
+    try std.testing.expect((try tape.start(arena, call, "agent.spawn")) == null);
+    try tape.observe(arena, .{ .session_spawn = .{
+        .child_session = "01CHILD",
+        .child_agent_kind = "reviewer",
+        .reason = "inspect",
+    } });
+    try tape.observe(arena, .{ .agent_complete = .{
+        .child_session = "01CHILD",
+        .child_agent_kind = "reviewer",
+        .outcome = .finished,
+        .result = "looks good",
+    } });
+    try tape.finish(arena, .{
+        .call_id = "spawn-1",
+        .output = "reviewer finished: looks good",
+        .is_error = false,
+        .truncated = false,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.payload().tools.len);
+    try std.testing.expect(recorder.payload().tools[0].internal);
+    try std.testing.expectEqual(@as(usize, 2), recorder.payload().tools[0].effects_json.len);
+
+    var replay = Replay{ .payload = recorder.payload() };
+    const captured = (try replay.internalTape().start(std.testing.allocator, call, "agent.spawn")).?;
+    defer freeToolResult(std.testing.allocator, captured.result);
+    try std.testing.expectEqualStrings("reviewer finished: looks good", captured.result.output);
+    try std.testing.expectEqual(@as(usize, 2), captured.effects_json.len);
+    const first = try std.json.parseFromSliceLeaky(event.Event, arena, captured.effects_json[0], .{});
+    try std.testing.expect(first == .session_spawn);
+    try std.testing.expectEqualStrings("01CHILD", first.session_spawn.child_session);
+    try std.testing.expect(replay.complete());
+
+    var wrong = Replay{ .payload = recorder.payload() };
+    try std.testing.expectError(
+        error.ReplayMismatch,
+        wrong.internalTape().start(std.testing.allocator, call, "different.action"),
+    );
 }

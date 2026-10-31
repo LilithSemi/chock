@@ -11954,11 +11954,18 @@ fn runSession(
         one.runner()
     else
         plugin_aware.runner();
+    const eval_internal_tape: ?chock_core.Loop.InternalToolTape = if (fixture_replay) |*one|
+        one.internalTape()
+    else if (fixture_recorder) |*one|
+        one.internalTape()
+    else
+        null;
 
     var deps = chock_core.Loop.Deps{
         .client = eval_client,
         .storage = started.storage,
         .tool_runner = eval_tools,
+        .internal_tool_tape = eval_internal_tape,
         .give_locked = give_locked.giveLocked(),
         .tool_definitions = tool_definitions,
         .model = started.model,
