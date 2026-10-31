@@ -44,6 +44,14 @@ fixture for either command.
     .model = "coder",
     .base_commit = "refs/tags/eval-fixture-v1",
     .capture = "captures/parser.json",
+    .provenance = .{
+        .model_profile = "qwen3.5-4b",
+        .checkpoint = "Qwen/Qwen3.5-4B",
+        .trainer = "verl-grpo",
+        .seed = 42,
+        .intervention = "residual-stream personality vector, layer 20, strength 0.75",
+        .intervention_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    },
     .expect = .{
         .end_reason = "finished",
         .max_turns = 8,
@@ -137,6 +145,14 @@ when every provider turn has all four arrays and the response-shaped arrays
 have identical lengths. Ordinary hosted-provider captures therefore remain
 valid evaluation evidence without pretending to be policy-gradient input; an
 RL rollout adapter supplies the token-level fields at generation time.
+
+`provenance` keeps policy and inference interventions separate from the task.
+Use `model_profile` for the tokenizer/chat/tool protocol, `checkpoint` for the
+exact weights or adapter revision, and `trainer` for the optimization recipe.
+An activation-steering run should name the layer, representation and strength
+in `intervention`, and pin the actual vector or configuration bytes with
+`intervention_sha256`. Reports, trajectories and dataset entries retain these
+fields, so a steered rollout cannot silently join an unsteered comparison.
 
 ## Batched RL rollouts
 

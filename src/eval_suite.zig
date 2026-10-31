@@ -71,6 +71,12 @@ const Entry = struct {
     base_commit: []const u8 = "",
     reward: f64 = 0,
     trainable: bool = false,
+    model_profile: []const u8 = "",
+    checkpoint: []const u8 = "",
+    trainer: []const u8 = "",
+    seed: ?u64 = null,
+    intervention: []const u8 = "",
+    intervention_sha256: []const u8 = "",
 };
 
 const Dataset = struct {
@@ -127,7 +133,10 @@ pub fn main(
     if (std.Io.Dir.cwd().statFile(io, index_path, .{})) |_| {
         tty.print(.err, "chock eval suite: {s} already exists; choose a fresh output directory\n", .{index_path});
         return Exit.usage.code();
-    } else |_| {}
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
     const parallelism: usize = @intCast(options.parallelism orelse suite.parallelism);
     const suite_sha256 = try sha256(arena, source);
 
@@ -265,7 +274,20 @@ fn sha256(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
 }
 
 fn readSummary(arena: std.mem.Allocator, io: std.Io, entry: *Entry) !void {
-    const Report = struct { session_id: []const u8 = "", base_commit: []const u8 = "", reward: f64 = 0 };
+    const Provenance = struct {
+        model_profile: []const u8 = "",
+        checkpoint: []const u8 = "",
+        trainer: []const u8 = "",
+        seed: ?u64 = null,
+        intervention: []const u8 = "",
+        intervention_sha256: []const u8 = "",
+    };
+    const Report = struct {
+        session_id: []const u8 = "",
+        base_commit: []const u8 = "",
+        reward: f64 = 0,
+        provenance: Provenance = .{},
+    };
     const report_bytes = try std.Io.Dir.cwd().readFileAlloc(io, entry.report, arena, .limited(max_artifact_bytes));
     const report = try std.json.parseFromSliceLeaky(Report, arena, report_bytes, .{ .ignore_unknown_fields = true });
     const Trajectory = struct { trainable: bool = false };
@@ -275,6 +297,12 @@ fn readSummary(arena: std.mem.Allocator, io: std.Io, entry: *Entry) !void {
     entry.base_commit = report.base_commit;
     entry.reward = report.reward;
     entry.trainable = trajectory.trainable;
+    entry.model_profile = report.provenance.model_profile;
+    entry.checkpoint = report.provenance.checkpoint;
+    entry.trainer = report.provenance.trainer;
+    entry.seed = report.provenance.seed;
+    entry.intervention = report.provenance.intervention;
+    entry.intervention_sha256 = report.provenance.intervention_sha256;
 }
 
 fn writeJson(arena: std.mem.Allocator, io: std.Io, path: []const u8, value: anytype) !void {

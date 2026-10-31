@@ -106,6 +106,15 @@ const RewardWeights = struct {
     tests: f64 = 1,
 };
 
+const RolloutProvenance = struct {
+    model_profile: []const u8 = "",
+    checkpoint: []const u8 = "",
+    trainer: []const u8 = "",
+    seed: ?u64 = null,
+    intervention: []const u8 = "",
+    intervention_sha256: []const u8 = "",
+};
+
 const Expectations = struct {
     end_reason: []const u8 = "finished",
     max_turns: ?u64 = null,
@@ -138,6 +147,7 @@ const Spec = struct {
     model: []const u8 = "",
     base_commit: []const u8 = "HEAD",
     capture: []const u8 = "",
+    provenance: RolloutProvenance = .{},
     expect: Expectations = .{},
     reward_weights: RewardWeights = .{},
     tests: []const Test = &.{},
@@ -157,6 +167,7 @@ const Report = struct {
     eval: []const u8,
     session_id: []const u8,
     base_commit: []const u8 = "",
+    provenance: RolloutProvenance = .{},
     passed: bool,
     checks: usize,
     failures: usize,
@@ -213,6 +224,7 @@ const Trajectory = struct {
     audit_jsonl: []const u8,
     capture: ?chock_core.eval_fixture.Payload,
     trainable: bool,
+    provenance: RolloutProvenance = .{},
     report: Report,
 };
 
@@ -334,6 +346,7 @@ pub fn main(
         .eval = spec.name,
         .session_id = session,
         .base_commit = if (observed.session.workspace) |workspace| workspace.base_commit else pinned_base,
+        .provenance = spec.provenance,
         .passed = failures == 0,
         .checks = checks,
         .failures = failures,
@@ -554,6 +567,8 @@ fn validSpec(spec: Spec) bool {
     if (spec.expect.max_cost != null and spec.expect.max_cost.? < 0) return false;
     if (spec.expect.config_sha256.len != 0 and !validSha256(spec.expect.config_sha256)) return false;
     if (spec.expect.sandbox_sha256.len != 0 and !validSha256(spec.expect.sandbox_sha256)) return false;
+    if ((spec.provenance.intervention.len == 0) != (spec.provenance.intervention_sha256.len == 0)) return false;
+    if (spec.provenance.intervention_sha256.len != 0 and !validSha256(spec.provenance.intervention_sha256)) return false;
     if (spec.expect.min_subagents != null and spec.expect.max_subagents != null and spec.expect.min_subagents.? > spec.expect.max_subagents.?) return false;
     inline for (@typeInfo(RewardWeights).@"struct".field_names) |field| {
         const weight = @field(spec.reward_weights, field);
@@ -877,6 +892,7 @@ fn writeTrajectory(
         .audit_jsonl = observed.audit_jsonl,
         .capture = capture,
         .trainable = trainable,
+        .provenance = spec.provenance,
         .report = report,
     };
     try writeJsonFile(arena, io, path, trajectory);
@@ -922,6 +938,18 @@ test "evaluation paths cannot leave their fixture" {
     try testing.expect(!safeRelative(""));
     try testing.expect(validSha256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
     try testing.expect(!validSha256("not-a-digest"));
+
+    const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    try testing.expect(validSpec(.{
+        .name = "steered",
+        .task = "answer consistently",
+        .provenance = .{ .intervention = "layer 14 neuron 8949 +1", .intervention_sha256 = digest },
+    }));
+    try testing.expect(!validSpec(.{
+        .name = "unbound intervention",
+        .task = "answer consistently",
+        .provenance = .{ .intervention = "layer 14 neuron 8949 +1" },
+    }));
 }
 
 test "audit scoring preserves failure ownership" {
