@@ -241,12 +241,6 @@ them as not built.
   [remote-mcp.md](using/remote-mcp.md) says what else that transport leaves
   out, including the listening stream and a server on this machine.
 
-- A remote MCP exchange has no deadline inside one read. The budget is read
-  before each read of an answer, so a server that answers and then goes quiet
-  is held by that read rather than by the budget. This is the gap a model call
-  has, for the same reason: the HTTP client reads through its own reader and
-  not through the timeout seam `chock_core.helper.Channel` uses.
-
 - The DNS rebinding window is closed for IPv4 and open for an IPv6-only name.
   `fetch_url` resolves a permitted host, checks every address it answers with,
   and then holds the connection to a checked address, so the HTTP client cannot

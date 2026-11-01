@@ -110,7 +110,7 @@ a line for each.
 
 | Case | What happens |
 |---|---|
-| The session times out | 10 seconds to read a server's tools and 60 seconds a call, the budgets a local server has |
+| The session times out | 10 seconds to read a server's tools and 60 seconds a call, the budgets a local server has. The deadline interrupts a body read even when a server sent headers and then went quiet |
 | A session the server dropped | a 404 opens a session again and puts the question once more. Twice is a server that holds no session, and the call fails |
 | The stream ends early | the call fails and says so. A reply that did not arrive is never a half answer handed to the model |
 | The server will not stop sending | refused at the reply bound, which is a megabyte, so a server cannot stream the context away |

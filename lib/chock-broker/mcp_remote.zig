@@ -96,9 +96,6 @@ pub const Live = struct {
 
     pub const ReadError = error{ Late, Gone };
 
-    /// The deadline is read between answers and not inside one. A server that
-    /// answers and then goes quiet is held by the read, the same gap the
-    /// provider client has.
     pub fn read(
         self: *Live,
         io: std.Io,
@@ -108,7 +105,7 @@ pub const Live = struct {
         if (self.ended) return 0;
         if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return error.Late;
 
-        const count = self.reader.readSliceShort(into) catch return error.Gone;
+        const count = try readBefore(self.reader, io, into, deadline);
         if (count == 0) self.ended = true;
         return count;
     }
@@ -120,6 +117,39 @@ pub const Live = struct {
         gpa.destroy(self);
     }
 };
+
+fn readBefore(
+    reader: *std.Io.Reader,
+    io: std.Io,
+    into: []u8,
+    deadline: std.Io.Clock.Timestamp,
+) Live.ReadError!usize {
+    const Race = union(enum) {
+        read: error{Gone}!usize,
+        deadline: std.Io.Cancelable!void,
+    };
+    var completed: [2]Race = undefined;
+    var race: std.Io.Select(Race) = .init(io, &completed);
+    defer race.cancelDiscard();
+    race.async(.read, readOne, .{ reader, into });
+    race.async(.deadline, waitUntil, .{ deadline, io });
+
+    return switch (race.await() catch return error.Gone) {
+        .read => |result| result catch return error.Gone,
+        .deadline => |result| {
+            result catch return error.Gone;
+            return error.Late;
+        },
+    };
+}
+
+fn readOne(reader: *std.Io.Reader, into: []u8) error{Gone}!usize {
+    return reader.readSliceShort(into) catch error.Gone;
+}
+
+fn waitUntil(deadline: std.Io.Clock.Timestamp, io: std.Io) std.Io.Cancelable!void {
+    return deadline.wait(io);
+}
 
 pub const Session = struct {
     gpa: std.mem.Allocator,
@@ -255,7 +285,7 @@ pub const Session = struct {
             else => return error.Failed,
         };
 
-        const status = @intFromEnum(live.response.head.status);
+        const status = @backingInt(live.response.head.status);
         if (status >= 300 and status < 400) return error.Redirected;
 
         // Read before the reader is taken: it writes over the head's strings.
@@ -301,7 +331,7 @@ pub const Session = struct {
 const identity_only = blk: {
     const count = @typeInfo(std.http.ContentEncoding).@"enum".field_names.len;
     var result: [count]bool = @splat(false);
-    result[@intFromEnum(std.http.ContentEncoding.identity)] = true;
+    result[@backingInt(std.http.ContentEncoding.identity)] = true;
     break :blk result;
 };
 
@@ -344,6 +374,58 @@ fn isVisibleAscii(value: []const u8) bool {
 }
 
 const testing = std.testing;
+
+const SlowReader = struct {
+    io: std.Io,
+    reader: std.Io.Reader = undefined,
+    buffer: [1]u8 = undefined,
+
+    fn init(self: *SlowReader) void {
+        self.reader = .{
+            .vtable = &.{ .stream = stream },
+            .buffer = &self.buffer,
+            .seek = 0,
+            .end = 0,
+        };
+    }
+
+    fn stream(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        _ = writer;
+        _ = limit;
+        const self: *SlowReader = @fieldParentPtr("reader", reader);
+        std.Io.sleep(self.io, .fromSeconds(1), .awake) catch return error.ReadFailed;
+        return error.EndOfStream;
+    }
+};
+
+test "an HTTP body read is interrupted at its deadline" {
+    const io = testing.io;
+    var slow = SlowReader{ .io = io };
+    slow.init();
+    var into: [1]u8 = undefined;
+    const deadline = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{
+        .raw = .fromMilliseconds(5),
+        .clock = .awake,
+    });
+    try testing.expectError(error.Late, readBefore(&slow.reader, io, &into, deadline));
+}
+
+test "an HTTP body read that answers before its deadline wins the race" {
+    const io = testing.io;
+    var source = std.Io.Reader.fixed("answer");
+    var into: [6]u8 = undefined;
+    const deadline = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{
+        .raw = .fromSeconds(1),
+        .clock = .awake,
+    });
+    const count = try readBefore(&source, io, &into, deadline);
+    try testing.expectEqual(@as(usize, 6), count);
+    try testing.expectEqualStrings("answer", into[0..count]);
+}
 
 const StubResolver = struct {
     answers: []const actions.Resolver.Address,
