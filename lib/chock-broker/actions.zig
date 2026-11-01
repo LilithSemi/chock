@@ -1063,20 +1063,18 @@ fn performNetFetch(
     };
 
     return .{ .net_fetch = .{
-        .status = @intFromEnum(response.head.status),
+        .status = @backingInt(response.head.status),
         .body = body,
         .location = location,
     } };
 }
 
-const max_ip4_text = "255.255.255.255".len;
+const max_ip_text = 64;
 
 const not_pinned: ?*std.http.Client.Connection = null;
 
 /// Pins the checked address, closing the DNS rebinding window a second resolve would open.
 ///
-/// Only IPv4 can be pinned: `HostName.validate` refuses a colon, so an
-/// IPv6-only answer stays unpinned rather than refuse an IPv6/NAT64 network.
 pub fn pinnedConnection(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1088,11 +1086,8 @@ pub fn pinnedConnection(
 ) PerformError!?*std.http.Client.Connection {
     if (std.Io.net.IpAddress.parse(host, port)) |_| return not_pinned else |_| {}
 
-    const pin = firstIp4(checked) orelse return not_pinned;
-    var text: [max_ip4_text]u8 = undefined;
-    const written = std.fmt.bufPrint(&text, "{d}.{d}.{d}.{d}", .{
-        pin.bytes[0], pin.bytes[1], pin.bytes[2], pin.bytes[3],
-    }) catch return error.FetchFailed;
+    var text: [max_ip_text]u8 = undefined;
+    const pinned_host = pinnedHost(checked, &text) orelse return not_pinned;
 
     if (protocol == .tls) {
         // `Connection.Tls.create` asserts the time is set, so the bundle is made before `Client.request`.
@@ -1107,7 +1102,7 @@ pub fn pinnedConnection(
     }
 
     return client.connectTcpOptions(.{
-        .host = std.Io.net.HostName.init(written) catch return error.FetchFailed,
+        .host = pinned_host,
         .port = port,
         .protocol = protocol,
         // The certificate is checked against this, and the pool is keyed on it.
@@ -1116,10 +1111,25 @@ pub fn pinnedConnection(
     }) catch return error.FetchFailed;
 }
 
-fn firstIp4(checked: []const Resolver.Address) ?std.Io.net.Ip4Address {
+fn pinnedHost(checked: []const Resolver.Address, text: *[max_ip_text]u8) ?std.Io.net.HostName {
     for (checked) |address| switch (address) {
-        .ip4 => |ip4| return ip4,
-        .ip6 => |ip6| if (std.Io.net.Ip4Address.fromIp6(ip6)) |ip4| return ip4,
+        .ip4 => |ip4| {
+            const written = std.fmt.bufPrint(text, "{d}.{d}.{d}.{d}", .{
+                ip4.bytes[0], ip4.bytes[1], ip4.bytes[2], ip4.bytes[3],
+            }) catch return null;
+            return std.Io.net.HostName.init(written) catch return null;
+        },
+        .ip6 => |ip6| {
+            var writer = std.Io.Writer.fixed(text);
+            ip6.format(&writer) catch return null;
+            const formatted = writer.buffered();
+            const close = std.mem.indexOfScalar(u8, formatted, ']') orelse return null;
+            if (formatted.len == 0 or formatted[0] != '[' or close <= 1) return null;
+            // HostName's public constructor admits DNS names only. Its network
+            // lookup also accepts numeric IPv6, so use that already-validated
+            // address text directly and avoid a second DNS lookup.
+            return .{ .bytes = formatted[1..close] };
+        },
     };
     return null;
 }

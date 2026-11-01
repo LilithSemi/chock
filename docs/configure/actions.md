@@ -101,6 +101,14 @@ a site's own `robots.txt` is honoured. There is no way to send a header, a
 credential, or a body: `fetch_url` reads, and it never writes to a remote
 service.
 
+Before connecting, Chock resolves the name, checks every returned IPv4 and
+IPv6 address, and pins the HTTP connection to one of those checked addresses.
+The original hostname remains the TLS certificate identity. Loopback,
+link-local, multicast, unspecified and cloud metadata addresses are refused;
+IPv4-mapped IPv6 and the well-known `64:ff9b::/96` NAT64 prefix are evaluated
+by the IPv4 rules. Other network-specific NAT64 prefixes cannot be inferred
+from address bytes and remain ordinary IPv6 addresses.
+
 Only `allow` reads a host with no question. A host that no rule names answers
 `ask`, and when the agent itself named the host, that `ask` reaches you while
 the agent waits: you answer once and the fetch goes on.

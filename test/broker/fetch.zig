@@ -302,7 +302,7 @@ const loopback_on_the_internet = [_]NamedAddresses.Entry{
 fn loopbackCounts(address: actions.Resolver.Address) bool {
     switch (address) {
         .ip4 => |ip4| if (ip4.bytes[0] == 127) return true,
-        .ip6 => {},
+        .ip6 => |ip6| if (ip6.isLoopBack()) return true,
     }
     return chock_broker.network.addressIsReachable(address);
 }
@@ -1215,12 +1215,11 @@ const allows_the_docs_name: [:0]const u8 =
     \\}
 ;
 
-test "a name that answers IPv6 addresses only is read rather than refused" {
-    // The URL names `localhost`, so the client's own second lookup lands on this machine.
+test "a name that answers IPv6 addresses only is pinned to the checked address" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const page = try okReply(gpa, "the ordinary path answered\n");
+    const page = try okReply(gpa, "the checked IPv6 address answered\n");
     defer gpa.free(page);
     const robots = try okReply(gpa, "User-agent: *\nDisallow: /private\n");
     defer gpa.free(robots);
@@ -1228,13 +1227,13 @@ test "a name that answers IPv6 addresses only is read rather than refused" {
         .{ .path = "/robots.txt", .raw = robots },
         .{ .path = "/manual", .raw = page },
     };
-    const server = try TestServer.start(gpa, io, "127.0.0.1", &routes);
+    const server = try TestServer.start(gpa, io, "::1", &routes);
     defer server.deinit();
 
     const only_ip6 = [_]NamedAddresses.Entry{
-        .{ .host = "localhost", .address = "2606:4700:10::6814:179a" },
+        .{ .host = "localhost", .address = "::1" },
     };
-    var harness = try Harness.initWithNames(gpa, allows_localhost, &only_ip6);
+    var harness = try Harness.initReachingLoopback(gpa, allows_localhost, &only_ip6);
     defer harness.deinit();
 
     const url = try std.fmt.allocPrint(gpa, "http://localhost:{d}/manual", .{server.port});
@@ -1245,9 +1244,11 @@ test "a name that answers IPv6 addresses only is read rather than refused" {
     server.stop();
 
     try testing.expect(outcome == .fetched);
-    try testing.expectEqualStrings("the ordinary path answered\n", outcome.fetched.body);
+    try testing.expectEqualStrings("the checked IPv6 address answered\n", outcome.fetched.body);
     try testing.expectEqual(@as(usize, 2), server.served());
     try testing.expect(server.sawPath("/manual"));
+    // One checked lookup for robots.txt and one for the page. Neither request
+    // performs a second lookup inside the HTTP client.
     try testing.expectEqual(@as(usize, 2), harness.addresses.lookups);
 }
 
@@ -1356,36 +1357,10 @@ test "the EC2 metadata address over IPv6 is refused, and nothing opens" {
     try testing.expectEqual(@as(usize, 0), server.served());
 }
 
-test "an ordinary unique local address is still read" {
+test "an ordinary unique local address is still permitted by the address policy" {
     // Unique local addressing is the IPv6 form of `10.0.0.0/8`.
-    const gpa = testing.allocator;
-    const io = testing.io;
-
-    const page = try okReply(gpa, "the internal API answered\n");
-    defer gpa.free(page);
-    const robots = try okReply(gpa, "User-agent: *\nDisallow: /private\n");
-    defer gpa.free(robots);
-    const routes = [_]Route{
-        .{ .path = "/robots.txt", .raw = robots },
-        .{ .path = "/manual", .raw = page },
-    };
-    const server = try TestServer.start(gpa, io, "127.0.0.1", &routes);
-    defer server.deinit();
-
-    const answers = [_]NamedAddresses.Entry{.{ .host = "localhost", .address = "fd12:3456:789a::1" }};
-    var harness = try Harness.initWithNames(gpa, allows_localhost, &answers);
-    defer harness.deinit();
-
-    const url = try std.fmt.allocPrint(gpa, "http://localhost:{d}/manual", .{server.port});
-    defer gpa.free(url);
-
-    var outcome = try harness.read(io, url);
-    defer outcome.deinit(gpa);
-    server.stop();
-
-    try testing.expect(outcome == .fetched);
-    try testing.expectEqualStrings("the internal API answered\n", outcome.fetched.body);
-    try testing.expectEqual(@as(usize, 2), server.served());
+    const address = try std.Io.net.IpAddress.parse("fd12:3456:789a::1", 443);
+    try testing.expect(chock_broker.network.addressIsReachable(address));
 }
 
 /// A resolver that answers this machine for the first lookup of a session, and an internet address after it.

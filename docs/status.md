@@ -215,26 +215,3 @@ them as not built.
   one, and a server that will take nothing else cannot be reached today.
   [remote-mcp.md](using/remote-mcp.md) says what else that transport leaves
   out, including the listening stream and a server on this machine.
-
-- The DNS rebinding window is closed for IPv4 and open for an IPv6-only name.
-  `fetch_url` resolves a permitted host, checks every address it answers with,
-  and then holds the connection to a checked address, so the HTTP client cannot
-  resolve the name a second time and reach an answer nobody checked. That pin
-  needs the address written where the client wants a host name, and Zig 0.16
-  refuses a colon there, so an IPv6 address cannot be written into one. A name
-  that answers with IPv6 addresses only is therefore read by the ordinary path,
-  and the window is open for it. Whoever runs the zone decides which records it
-  answers, so an attacker picks when this applies. It is allowed because
-  refusing such a name leaves Chock unable to read anything on an IPv6-only or
-  a NAT64 network.
-
-  The address check still runs over every address, IPv6 included, before
-  anything opens, and it reads the two IPv6 spellings of an IPv4 address that a
-  NAT64 network makes real: `64:ff9b::/96` is unwrapped and answered by the
-  IPv4 rules, and `fd00:ec2::254` is refused by name. The rest of `fc00::/7`
-  stays reachable, because unique local addressing is the IPv6 form of the
-  private IPv4 ranges a permitted host is most often on. Only the well known
-  NAT64 prefix is read that way. RFC 6052 lets a network pick its own prefix at
-  several lengths, and such a prefix cannot be told from an ordinary global
-  address by its bytes alone, so reading one needs the network to say what it
-  is. Until that is configuration, a site with its own prefix gets no unwrap.
