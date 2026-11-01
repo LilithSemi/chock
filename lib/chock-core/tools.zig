@@ -1113,7 +1113,7 @@ fn timeoutFor(asked_ms: ?i64, session_ns: u64) u64 {
     return @min(wanted, session_ns);
 }
 
-const ReadFileArgs = struct {
+pub const ReadFileArgs = struct {
     path: []const u8,
 
     pub const docs = .{
@@ -1167,7 +1167,7 @@ const WriteFileArgs = struct {
     };
 };
 
-const EditFileArgs = struct {
+pub const EditFileArgs = struct {
     path: []const u8,
     old_string: []const u8,
     new_string: []const u8,
@@ -2141,6 +2141,54 @@ pub fn fileHashIn(output: []const u8) ?[]const u8 {
     const to = std.mem.indexOfScalarPos(u8, line, from, ']') orelse return null;
     if (to - from != content_hash_length) return null;
     return line[from..to];
+}
+
+/// The exact file bytes carried by a successful read_file result. Hook notes
+/// may follow the result, so the byte count in the header is the boundary.
+pub fn fileBytesInReadResult(output: []const u8) ?[]const u8 {
+    const line_end = std.mem.indexOfScalar(u8, output, '\n') orelse return null;
+    const header = output[0..line_end];
+    const prefix = if (std.mem.startsWith(u8, header, "[chock: the first "))
+        "[chock: the first "
+    else if (std.mem.startsWith(u8, header, "[chock: "))
+        "[chock: "
+    else
+        return null;
+    const from = prefix.len;
+    const end = std.mem.indexOfScalarPos(u8, header, from, ' ') orelse return null;
+    const count = std.fmt.parseInt(usize, header[from..end], 10) catch return null;
+    const body = output[line_end + 1 ..];
+    if (body.len < count) return null;
+    return body[0..count];
+}
+
+pub const SeenEdit = struct {
+    path: []u8,
+    old_string: []u8,
+    file_hash: ?[]u8,
+
+    pub fn deinit(self: SeenEdit, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.old_string);
+        if (self.file_hash) |hash| allocator.free(hash);
+    }
+};
+
+pub fn seenEditIn(allocator: std.mem.Allocator, arguments: []const u8) std.mem.Allocator.Error!?SeenEdit {
+    const parsed = std.json.parseFromSlice(EditFileArgs, allocator, arguments, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    var out = SeenEdit{
+        .path = try allocator.dupe(u8, parsed.value.path),
+        .old_string = undefined,
+        .file_hash = null,
+    };
+    errdefer allocator.free(out.path);
+    out.old_string = try allocator.dupe(u8, parsed.value.old_string);
+    errdefer allocator.free(out.old_string);
+    if (parsed.value.file_hash) |hash| out.file_hash = try allocator.dupe(u8, hash);
+    return out;
 }
 
 pub fn readPathIn(allocator: std.mem.Allocator, arguments: []const u8) std.mem.Allocator.Error!?[]u8 {

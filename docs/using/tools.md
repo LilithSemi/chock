@@ -35,6 +35,12 @@ prompt. `ask_user` puts one question to the person who started the session, and
 it grants nothing: a yes there permits no act. `set_title` names the session,
 so `chock sessions` reads as more than a list of identifiers.
 
+`edit_file` only replaces text a successful `read_file` result actually showed
+for that path. The guard is rebuilt from the durable session log, so compaction,
+resume and handover do not forget it. Hook notes attached to a read are outside
+the byte range in the read header and do not count as file text. The existing
+uniqueness and optional `file_hash` checks still apply after this guard.
+
 `read_skill` reads one skill: somebody's written procedure for a task, found on
 disk at session start. It is offered only to a session that found at least one,
 and the answer says who wrote it, because a skill from a repository or a package

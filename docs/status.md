@@ -118,16 +118,6 @@ them as not built.
   state. Those sessions keep their workspace too, and adopting one is a
   separate decision with its own refusal.
 
-- There is no seen-line guard on `edit_file`. An edit is anchored two ways: the
-  text it replaces must be unique in the file, and the `file_hash` that
-  `read_file` printed must still match, so a file that changed after the model
-  read it is refused before anything is written. The hash is optional, so an
-  edit that sends none is held by the uniqueness rule alone. What is missing is
-  the stronger rule, that the line being edited was one a tool actually showed
-  the model. That needs a record of what each read returned, and the tool
-  runner is a fresh process per call, so the record belongs at the loop's tool
-  seam.
-
 - macOS runs a real session, and two limits there are permanent. Seatbelt holds
   the paths, the network including unix sockets, the signals and shared memory.
   A whole session ran on the Darwin box on 2026-08-25: `read_file`,

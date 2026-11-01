@@ -709,11 +709,12 @@ fn emptyReplyDetail(
     }
     const words = try stopWords(allocator, stop);
     defer allocator.free(words);
-    return std.fmt.allocPrint(
+    const refusal = try std.fmt.allocPrint(
         allocator,
         opening ++ ", and said it stopped because of {s}{s}",
         .{ which, stop.reason, words },
     );
+    return refusal;
 }
 
 fn sendPrepared(
@@ -919,12 +920,13 @@ fn waitingNotice(
     attempts: usize,
     wait_ms: u64,
 ) std.mem.Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
+    const refusal = try std.fmt.allocPrint(
         allocator,
         "the model backend answered {t}, so this turn waits {d}.{d:0>1} seconds and asks again " ++
             "(attempt {d} of {d})",
         .{ class, wait_ms / 1000, (wait_ms % 1000) / 100, attempts + 1, policy.max_attempts },
     );
+    return refusal;
 }
 
 fn endIfCanceled(
@@ -1743,6 +1745,9 @@ fn runTool(
     });
     defer before.deinit(allocator);
 
+    const unseen_edit = try unseenEditRefusal(allocator, io, deps.storage, call);
+    defer if (unseen_edit) |text| allocator.free(text);
+
     // Nothing ran in the three branches that refuse, which is what a
     // `tool.after` hook has to be able to tell: it is about a call that
     // happened.
@@ -1754,6 +1759,9 @@ fn runTool(
             call,
             try hooks_mod.refusalText(allocator, before.refused_by, .tool_before),
         );
+    } else if (unseen_edit) |text| unseen: {
+        never_ran = true;
+        break :unseen try gateRefusal(allocator, call, try allocator.dupe(u8, text));
     } else if (!deps.role.holdsTools()) held: {
         never_ran = true;
         break :held event.ToolResult{
@@ -1844,6 +1852,74 @@ fn runTool(
         .role = .tool,
         .content = feedback[0..parts],
     } });
+}
+
+fn unseenEditRefusal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    call: event.ToolCall,
+) Error!?[]u8 {
+    if (!std.mem.eql(u8, call.tool, @tagName(tools.Tool.edit_file))) return null;
+    const edit = (try tools.seenEditIn(allocator, call.arguments)) orelse return null;
+    defer edit.deinit(allocator);
+    if (edit.old_string.len == 0) return null;
+
+    var matching_calls: std.ArrayList([]u8) = .empty;
+    defer {
+        for (matching_calls.items) |id| allocator.free(id);
+        matching_calls.deinit(allocator);
+    }
+
+    var replay = try storage.replay(allocator, io, 0);
+    defer replay.deinit();
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .tool_call => |prior| {
+                if (!std.mem.eql(u8, prior.tool, @tagName(tools.Tool.read_file))) continue;
+                const path = (try tools.readPathIn(allocator, prior.arguments)) orelse continue;
+                defer allocator.free(path);
+                if (!try sameToolPath(allocator, path, edit.path)) continue;
+                try matching_calls.append(allocator, try allocator.dupe(u8, prior.call_id));
+            },
+            .tool_result => |result| {
+                if (result.is_error) continue;
+                var matches = false;
+                for (matching_calls.items) |id| {
+                    if (std.mem.eql(u8, id, result.call_id)) {
+                        matches = true;
+                        break;
+                    }
+                }
+                if (!matches) continue;
+                if (edit.file_hash) |wanted| {
+                    const shown_hash = tools.fileHashIn(result.output) orelse continue;
+                    if (!std.mem.eql(u8, wanted, shown_hash)) continue;
+                }
+                const shown = tools.fileBytesInReadResult(result.output) orelse continue;
+                if (std.mem.indexOf(u8, shown, edit.old_string) != null) return null;
+            },
+            else => {},
+        }
+    }
+
+    const unseen = try std.fmt.allocPrint(
+        allocator,
+        "nothing was edited: edit_file may replace only text a successful read_file call showed " ++
+            "for {s}. Read the file, then copy old_string exactly from that result and pass its " ++
+            "file_hash.",
+        .{edit.path},
+    );
+    return unseen;
+}
+
+fn sameToolPath(allocator: std.mem.Allocator, a: []const u8, b: []const u8) std.mem.Allocator.Error!bool {
+    const normalized_a = try std.fs.path.resolve(allocator, &.{ "/", a });
+    defer allocator.free(normalized_a);
+    const normalized_b = try std.fs.path.resolve(allocator, &.{ "/", b });
+    defer allocator.free(normalized_b);
+    return std.mem.eql(u8, normalized_a, normalized_b);
 }
 
 fn isInternalTool(name: []const u8) bool {
@@ -3296,6 +3372,43 @@ fn testDeps(client: chock_provider.Client.Client, storage: chock_proto.storage.S
         .system_prompt = "you are a test agent",
         .arbiter = AlwaysPermitArbiter.arbiter(),
     };
+}
+
+test "edit_file is limited to exact text a prior read_file result showed" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var backing = try chock_proto.storage.Memory.init(allocator, "01SEEN");
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    _ = try locked.append(allocator, io, .{ .tool_call = .{
+        .call_id = "read1",
+        .tool = "read_file",
+        .arguments = "{\"path\":\"src/main.zig\"}",
+    } }, 1);
+    _ = try locked.append(allocator, io, .{ .tool_result = .{
+        .call_id = "read1",
+        .output = "[chock: 19 bytes, file_hash 0123456789abcdef]\nconst answer = 42;\n\nignored hook note",
+        .is_error = false,
+        .truncated = false,
+    } }, 2);
+    try locked.unlock(io);
+
+    const allowed = event.ToolCall{
+        .call_id = "edit1",
+        .tool = "edit_file",
+        .arguments = "{\"path\":\"src/main.zig\",\"old_string\":\"answer = 42\",\"new_string\":\"answer = 43\",\"file_hash\":\"0123456789abcdef\"}",
+    };
+    try testing.expectEqual(@as(?[]u8, null), try unseenEditRefusal(allocator, io, store, allowed));
+
+    const unseen = event.ToolCall{
+        .call_id = "edit2",
+        .tool = "edit_file",
+        .arguments = "{\"path\":\"src/main.zig\",\"old_string\":\"ignored hook note\",\"new_string\":\"anything\"}",
+    };
+    const refusal = (try unseenEditRefusal(allocator, io, store, unseen)).?;
+    defer allocator.free(refusal);
+    try testing.expect(std.mem.indexOf(u8, refusal, "successful read_file") != null);
 }
 
 test "the same dispatch failure three times in a row ends the session" {
