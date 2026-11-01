@@ -297,6 +297,7 @@ fn describe(instance: chock_auth.config.Instance, config: *const chock_auth.conf
     if (features.tool_calls) tty.out(.plain, ", tools", .{});
     if (features.reasoning) tty.out(.plain, ", reasoning", .{});
     if (features.cache_accounting) tty.out(.plain, ", cache accounting", .{});
+    if (features.provider_search) tty.out(.plain, ", provider search", .{});
     if (features.image_results and instance.capabilities.images) tty.out(.plain, ", images", .{});
     tty.out(.plain, "\n", .{});
     if (features.image_results and !instance.capabilities.images) {

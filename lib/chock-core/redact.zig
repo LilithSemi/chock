@@ -105,6 +105,7 @@ pub fn request(arena: std.mem.Allocator, policy: Policy, req: message.Request) E
         .system = try text(arena, policy, req.system),
         .messages = messages,
         .tools = req.tools,
+        .provider_search = req.provider_search,
     };
 }
 

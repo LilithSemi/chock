@@ -221,6 +221,7 @@ pub const Deps = struct {
     internal_tool_tape: ?InternalToolTape = null,
     give_locked: ?GiveLocked = null,
     tool_definitions: []const message.ToolDefinition,
+    provider_search: ?message.ProviderSearch = null,
     model: []const u8,
     model_alias: []const u8,
     agent_kind: []const u8,
@@ -489,6 +490,7 @@ fn runTurn(
         .system = deps.system_prompt,
         .messages = try withNotice(allocator, arena, io, session, deps, telling, turn_index, messages),
         .tools = deps.tool_definitions,
+        .provider_search = deps.provider_search,
     };
 
     var piece_watcher: ?PieceWatcher = if (deps.observer) |watching|

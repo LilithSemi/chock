@@ -10,6 +10,7 @@ pub const Request = struct {
     system: []const u8,
     messages: []const message.Message,
     tools: []const message.ToolDefinition = &.{},
+    provider_search: ?message.ProviderSearch = null,
 };
 
 pub fn buildRequest(allocator: std.mem.Allocator, request: Request) std.mem.Allocator.Error![]u8 {
@@ -27,6 +28,19 @@ pub fn buildRequest(allocator: std.mem.Allocator, request: Request) std.mem.Allo
         try object.put(arena, "name", .{ .string = tool.name });
         try object.put(arena, "description", .{ .string = tool.description });
         try object.put(arena, "parameters", tool.parameters);
+        try tools.append(arena, .{ .object = object });
+    }
+    if (request.provider_search) |search| {
+        var filters: std.json.ObjectMap = .empty;
+        var domains = std.json.Array.init(arena);
+        for (search.allowed_domains) |domain| {
+            try domains.append(.{ .string = domain });
+        }
+        try filters.put(arena, "allowed_domains", .{ .array = domains });
+
+        var object: std.json.ObjectMap = .empty;
+        try object.put(arena, "type", .{ .string = "web_search" });
+        try object.put(arena, "filters", .{ .object = filters });
         try tools.append(arena, .{ .object = object });
     }
 
@@ -126,6 +140,14 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!Piece
     const kind = kind_value.string;
 
     if (std.mem.eql(u8, kind, "response.output_text.delta")) return stringPiece(allocator, object, "delta", .text);
+    if (std.mem.eql(u8, kind, "response.output_text.annotation.added")) {
+        const annotation = object.get("annotation") orelse return .none;
+        if (annotation != .object or
+            !std.mem.eql(u8, string(annotation.object, "type") orelse "", "url_citation")) return .none;
+        const url = string(annotation.object, "url") orelse return .none;
+        const title = string(annotation.object, "title") orelse url;
+        return .{ .text = try std.fmt.allocPrint(allocator, " ([{s}]({s}))", .{ title, url }) };
+    }
     if (std.mem.eql(u8, kind, "response.reasoning_text.delta") or
         std.mem.eql(u8, kind, "response.reasoning_summary_text.delta")) return stringPiece(allocator, object, "delta", .reasoning);
     if (std.mem.eql(u8, kind, "response.function_call_arguments.delta")) {
@@ -192,6 +214,33 @@ test "request uses Responses history and disables storage" {
     try std.testing.expectEqual(false, parsed.value.object.get("store").?.bool);
     try std.testing.expectEqual(true, parsed.value.object.get("stream").?.bool);
     try std.testing.expectEqualStrings("hello", parsed.value.object.get("input").?.array.items[0].object.get("content").?.string);
+}
+
+test "provider search is constrained to the supplied domains" {
+    const domains = [_][]const u8{ "example.com", "docs.ziglang.org" };
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-test",
+        .system = "",
+        .messages = &.{},
+        .provider_search = .{ .allowed_domains = &domains },
+    });
+    defer std.testing.allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const tool = parsed.value.object.get("tools").?.array.items[0].object;
+    try std.testing.expectEqualStrings("web_search", tool.get("type").?.string);
+    const allowed = tool.get("filters").?.object.get("allowed_domains").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), allowed.len);
+    try std.testing.expectEqualStrings("example.com", allowed[0].string);
+    try std.testing.expectEqualStrings("docs.ziglang.org", allowed[1].string);
+}
+
+test "a search citation becomes a visible clickable markdown link" {
+    const piece = try decode(std.testing.allocator,
+        \\{"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.com/a","title":"Example"}}
+    );
+    defer piece.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(" ([Example](https://example.com/a))", piece.text);
 }
 
 test "stream text and function arguments become neutral deltas" {

@@ -618,6 +618,78 @@ pub const Table = struct {
         return into[0..count];
     }
 
+    /// The finite domain subtrees a provider-side search may read. Provider
+    /// allowlists include subdomains, so a literal host permission is not
+    /// enough: the policy must allow both the domain itself and its whole
+    /// subtree, with no narrower refusal in any effective layer.
+    pub fn allowedFetchDomains(
+        self: *const Table,
+        allocator: std.mem.Allocator,
+        chain: []const []const u8,
+        key: Key,
+        limit: usize,
+    ) std.mem.Allocator.Error![]const []const u8 {
+        var domains: std.ArrayList([]const u8) = .empty;
+        errdefer domains.deinit(allocator);
+
+        for ([_][]const Rule{ self.given, self.policy.rules }) |rules| {
+            for (rules) |rule| {
+                if (domains.items.len == limit) return domains.toOwnedSlice(allocator);
+                if (!ruleAppliesOutsideAction(rule, key)) continue;
+                const action = rule.action orelse continue;
+                const base = fetchDomainAction(action) orelse continue;
+
+                const domain = (try domainFromFetchAction(allocator, base)) orelse continue;
+                defer if (domain.len != 0) allocator.free(domain);
+
+                var held = false;
+                for (domains.items) |existing| {
+                    if (std.mem.eql(u8, existing, domain)) held = true;
+                }
+                if (held) continue;
+
+                var asked = key;
+                asked.action = base;
+                if (self.evaluateChain(chain, asked, null) != .allow) continue;
+
+                const probe = try std.fmt.allocPrint(allocator, "{s}.__chock_provider_probe", .{base});
+                defer allocator.free(probe);
+                asked.action = probe;
+                if (self.evaluateChain(chain, asked, null) != .allow) continue;
+                if (self.fetchSubtreeHasRefusal(chain, key, base)) continue;
+
+                // Provider domain filters are DNS domains, not single labels,
+                // IP literals, or local host names.
+                if (std.mem.indexOfScalar(u8, domain, '.') == null) continue;
+                try domains.append(allocator, try allocator.dupe(u8, domain));
+            }
+        }
+        return domains.toOwnedSlice(allocator);
+    }
+
+    fn fetchSubtreeHasRefusal(
+        self: *const Table,
+        chain: []const []const u8,
+        key: Key,
+        base: []const u8,
+    ) bool {
+        for ([_][]const Rule{ self.given, self.policy.rules, self.org }) |rules| {
+            for (rules) |rule| {
+                if (rule.decision == .allow) continue;
+                const action = rule.action orelse continue;
+                if (action.len <= base.len or
+                    !std.mem.startsWith(u8, action, base) or
+                    action[base.len] != '.') continue;
+                for (chain) |kind| {
+                    var link = key;
+                    link.agent_kind = kind;
+                    if (ruleAppliesOutsideAction(rule, link)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /// An existence question: no caller may read a `true` here as a
     /// permission. A `deny` rule is skipped, or a refusal would resolve a host.
     pub fn permitsSomethingUnder(self: *const Table, key: Key) bool {
@@ -811,6 +883,53 @@ fn ruleMatches(rule: Rule, key: Key) bool {
         patternMatches(rule.tool, key.tool) and
         patternMatches(rule.model, key.model) and
         patternMatches(rule.agent_kind, key.agent_kind);
+}
+
+fn ruleAppliesOutsideAction(rule: Rule, key: Key) bool {
+    return patternMatches(rule.tool, key.tool) and
+        patternMatches(rule.model, key.model) and
+        patternMatches(rule.agent_kind, key.agent_kind);
+}
+
+const fetch_action_prefix = "net.fetch.";
+
+fn fetchDomainAction(action: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, action, fetch_action_prefix)) return null;
+    var base = action;
+    if (std.mem.endsWith(u8, base, ".*")) base = base[0 .. base.len - 2];
+    if (base.len == fetch_action_prefix.len or
+        std.mem.eql(u8, base[fetch_action_prefix.len..], "*")) return null;
+    return base;
+}
+
+fn domainFromFetchAction(
+    allocator: std.mem.Allocator,
+    action: []const u8,
+) std.mem.Allocator.Error!?[]u8 {
+    const reversed = action[fetch_action_prefix.len..];
+    if (reversed.len == 0) return null;
+    const domain = try allocator.alloc(u8, reversed.len);
+    errdefer allocator.free(domain);
+
+    var written: usize = 0;
+    var end = reversed.len;
+    while (end != 0) {
+        const before = std.mem.lastIndexOfScalar(u8, reversed[0..end], '.') orelse 0;
+        const start = if (before == 0) 0 else before + 1;
+        const label = reversed[start..end];
+        if (written != 0) {
+            domain[written] = '.';
+            written += 1;
+        }
+        for (label) |byte| {
+            domain[written] = std.ascii.toLower(byte);
+            written += 1;
+        }
+        if (start == 0) break;
+        end = before;
+    }
+    std.debug.assert(written == domain.len);
+    return domain;
 }
 
 fn ruleBeats(candidate: Rule, best: Rule) bool {
@@ -2788,6 +2907,38 @@ test "the port a serve action names is read from digits alone" {
     try std.testing.expectEqual(@as(?u16, null), portNamedBy("net.serve.99999"));
     try std.testing.expectEqual(@as(?u16, null), portNamedBy("net.connect.3000"));
     try std.testing.expectEqual(@as(?u16, null), portNamedBy("net.serve.80a"));
+}
+
+test "provider search domains require a wholly allowed fetch subtree" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "net.fetch.com.example", .decision = .allow },
+        \\            .{ .action = "net.fetch.com.example.*", .decision = .allow },
+        \\            .{ .action = "net.fetch.org.ziglang.docs", .decision = .allow },
+        \\            .{ .action = "net.fetch.org.ziglang.docs.*", .decision = .allow },
+        \\            .{ .action = "net.fetch.org.ziglang.docs.private", .decision = .deny },
+        \\            .{ .action = "net.fetch.net.lonely", .decision = .allow },
+        \\            .{ .action = "net.fetch.net.lonely.*", .decision = .ask },
+        \\        },
+        \\    },
+        \\}
+    ;
+    const parsed = try Table.parse(gpa, source, null);
+    defer Table.destroy(gpa, parsed);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+
+    const domains = try parsed.allowedFetchDomains(
+        arena_state.allocator(),
+        &.{"main"},
+        .{ .agent_kind = "main", .model = "m", .tool = "web_search", .action = "" },
+        100,
+    );
+    try std.testing.expectEqual(@as(usize, 1), domains.len);
+    try std.testing.expectEqualStrings("example.com", domains[0]);
 }
 
 test "a published port is counted once, and the list stops at what the caller can hold" {

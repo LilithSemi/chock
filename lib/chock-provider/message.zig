@@ -32,11 +32,18 @@ pub const ToolDefinition = struct {
     parameters: std.json.Value,
 };
 
+pub const ProviderSearch = struct {
+    /// Bare domain names. The provider may search these domains and their
+    /// subdomains, and no others.
+    allowed_domains: []const []const u8,
+};
+
 pub const Request = struct {
     model: []const u8,
     system: []const u8,
     messages: []const Message,
     tools: []const ToolDefinition = &.{},
+    provider_search: ?ProviderSearch = null,
 };
 
 pub const ToolCallFragment = struct {

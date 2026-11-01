@@ -239,6 +239,44 @@ Allow it outright in a project that does a lot of reading:
 The engine's own host is not gated separately. You chose the engine, so a
 project does not have to name it in `net.fetch`.
 
+## Letting the provider search
+
+An OpenAI instance that uses the Responses adapter can offer OpenAI's native
+`web_search` tool as well as Chock's `web_search` tool. Chock does that only
+when `web.search` is already `allow` at session start. The shipped `ask` value
+does not offer it: a provider tool list is fixed before a call, when nobody is
+waiting to answer a question.
+
+The provider receives an `allowed_domains` filter derived from the effective
+`net.fetch` policy. Provider filters include subdomains, so Chock includes a
+domain only when both the domain and its whole subtree are allowed and no
+narrower rule asks or denies. For example, these two rows make `example.com`
+eligible:
+
+```zon
+.{
+    .policy = .{
+        .rules = .{
+            .{ .action = "web.search", .decision = .allow },
+            .{ .action = "net.fetch.com.example", .decision = .allow },
+            .{ .action = "net.fetch.com.example.*", .decision = .allow },
+        },
+    },
+}
+```
+
+An exact-host row alone does not become a provider filter, because the
+provider would also be able to search below that host. A broad
+`net.fetch.*` row does not become an unrestricted provider search either:
+the allowlist must be finite. Chock passes at most 100 domains. Organization
+ceilings, command-line policy rows, agent inheritance, model/tool scopes, and
+narrower exceptions all take part in the decision.
+
+OpenAI citation annotations are appended to the answer as visible Markdown
+links. Anthropic's server search is not offered yet: its search-result blocks
+must survive the streamed transcript exactly for a later turn, and Chock's
+neutral stream does not carry those opaque blocks yet.
+
 ## Reading a result
 
 A search gives back a title, a URL, and a bounded snippet, with at most 8

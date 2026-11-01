@@ -11907,6 +11907,29 @@ fn runSession(
     var fetch_arena = std.heap.ArenaAllocator.init(gpa);
     defer fetch_arena.deinit();
 
+    const provider_search: ?chock_provider.message.ProviderSearch = provider: {
+        if (!started.adapter.features().provider_search) break :provider null;
+        const search_key = chock_policy.table.Key{
+            .agent_kind = options.agent_kind,
+            .model = started.model,
+            .tool = chock_core.Loop.search_tool_name,
+            .action = "web.search",
+        };
+        if (started.policy.evaluateChain(tool_network_chain, search_key, null) != .allow) {
+            break :provider null;
+        }
+        var fetch_key = search_key;
+        fetch_key.action = "";
+        const domains = try started.policy.allowedFetchDomains(
+            fetch_arena.allocator(),
+            tool_network_chain,
+            fetch_key,
+            100,
+        );
+        if (domains.len == 0) break :provider null;
+        break :provider .{ .allowed_domains = domains };
+    };
+
     var fetcher = SessionFetcher{
         .gpa = gpa,
         .session = .{
@@ -12031,6 +12054,7 @@ fn runSession(
         .internal_tool_tape = eval_internal_tape,
         .give_locked = give_locked.giveLocked(),
         .tool_definitions = tool_definitions,
+        .provider_search = provider_search,
         .model = started.model,
         .model_alias = started.model_alias,
         .agent_kind = options.agent_kind,

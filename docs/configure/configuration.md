@@ -59,8 +59,10 @@ default model, context limits, and the features each adapter can faithfully
 carry. `chock models --provider <name>` narrows that report to one instance.
 The command does not read credentials or contact the provider, so it reports
 configured and adapter capabilities rather than making an unverified claim
-about a remote model. Provider-side search is named as unavailable; web search
-continues to use Chock's separately configured, policy-controlled tool.
+about a remote model. The OpenAI Responses adapter reports provider-side
+search; the compatible and Anthropic adapters do not. Whether a session
+actually offers native search also depends on its policy-controlled domain
+allowlist. [search.md](search.md) describes that stricter runtime check.
 
 Add `--probe` to opt into credential lookup and one authenticated `GET
 /models` request per selected provider. The returned model identifiers are

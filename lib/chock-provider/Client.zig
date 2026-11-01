@@ -26,7 +26,7 @@ pub const Adapter = enum {
     /// cannot make an adapter support a wire feature it does not implement.
     pub fn features(self: Adapter) Features {
         return switch (self) {
-            .openai_compatible, .openai_responses, .anthropic => .{
+            .openai_compatible, .anthropic => .{
                 .tool_calls = true,
                 .image_results = true,
                 .reasoning = true,
@@ -34,6 +34,13 @@ pub const Adapter = enum {
                 // Search is a brokered Chock tool today, never a provider-side
                 // tool selected by the model API.
                 .provider_search = false,
+            },
+            .openai_responses => .{
+                .tool_calls = true,
+                .image_results = true,
+                .reasoning = true,
+                .cache_accounting = true,
+                .provider_search = true,
             },
         };
     }
@@ -54,7 +61,7 @@ test "adapter features name only behavior the neutral client carries" {
         try std.testing.expect(supported.image_results);
         try std.testing.expect(supported.reasoning);
         try std.testing.expect(supported.cache_accounting);
-        try std.testing.expect(!supported.provider_search);
+        try std.testing.expectEqual(adapter == .openai_responses, supported.provider_search);
     }
 }
 
@@ -320,6 +327,7 @@ pub const HttpClient = struct {
                 .system = request.system,
                 .messages = request.messages,
                 .tools = request.tools,
+                .provider_search = request.provider_search,
             }),
         };
         defer allocator.free(body);
