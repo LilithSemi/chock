@@ -79,9 +79,16 @@ line that says what was written.
 | `write_file` | `write_memory`, because a note an agent keeps is not the project's source |
 | `edit_file`, against the content the edit would leave behind | a file no grammar of this project covers |
 | | a file a person edits, because Chock gates the agent and not the person |
+| | a file changed by `run_command`, because the program writes through its own file descriptors |
 
 The content is checked, not the file on disk, so an edit is measured against
 what it would leave behind and not against what was there.
+
+A style rule is a pre-write guard on structured model output. It is not a
+repository invariant: Chock cannot refuse a program's write before that
+program makes it, and rolling a command's arbitrary filesystem effects back
+afterward would be a different transaction model. Formatters, compiler checks,
+hooks, and CI remain the right controls for `run_command` and human writes.
 
 ## A check that cannot finish refuses
 

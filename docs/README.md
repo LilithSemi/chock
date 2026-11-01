@@ -1,13 +1,10 @@
 # Documentation
 
-Start with [running.md](running.md) for a session end to end, and
-[status.md](status.md) for what is not built yet.
+Start with [running.md](running.md) for a session end to end.
 
 - [running.md](running.md) - `chock run` from the command line to the exit
   code: the session log, devices, getting the work back out of the workspace,
   cost, the task list, and `chock doctor`.
-- [status.md](status.md) - what is not built yet, and the faults Chock is known
-  to have.
 
 ## Using a session
 
@@ -44,6 +41,8 @@ Start with [running.md](running.md) for a session end to end, and
   it refuses to do.
 - [using/style.md](using/style.md) - a tree-sitter query plus one bound, the
   write it refuses before a byte lands, and why the project writes the rules.
+- [using/migrate.md](using/migrate.md) - importing configuration, a transcript,
+  or memory from another harness without silently widening its permissions.
 
 ## Configuring a project
 

@@ -84,3 +84,11 @@ a rule in `chock.zon` is the way to answer without a person there, which
 
 A background subagent does not keep a handover waiting. Its durable supervisor
 and output receipt outlive the session process, and the daemon adopts its lease.
+
+The process-tree, policy-ratchet, budget, concurrency, reviewer, resume, and
+durable-lease paths are exercised with real child processes in the test suite.
+Those tests use deterministic provider stand-ins rather than spending hosted
+model calls: they prove Chock's tree mechanics, not the quality or behavior of
+a particular model when several real agents collaborate. Provider-backed tree
+behavior belongs in versioned evaluations, whose model and harness findings
+are kept separate as [evals.md](evals.md) describes.

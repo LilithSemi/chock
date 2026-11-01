@@ -92,8 +92,9 @@ Name your providers in `~/.config/chock/config.zon`, which Chock reads and
 never writes. See
 [docs/configure/configuration.md](docs/configure/configuration.md).
 
-Chock is a pre-alpha project. See [docs/status.md](docs/status.md) for what is
-not built yet and the faults it is known to have.
+Chock is a pre-alpha project. Its documentation describes the implemented
+behavior and names platform limits where they apply; the issue tracker holds
+planned work and known faults.
 
 ## Documentation
 

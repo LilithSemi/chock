@@ -42,6 +42,13 @@ large, the context is compacted and the turn is taken again, rather than the
 session ending. Either way the session log keeps every turn, so a compaction
 shortens what the model reads and nothing else.
 
+Provider status failures are retried before a reply starts. Rate limits and
+5xx answers get up to six attempts over about a minute, and `Retry-After` wins
+when the provider supplies it. A stream that breaks after part of a reply has
+arrived is not retried: that turn has partly happened, and replaying it could
+duplicate words or tool calls. The incomplete turn stays in the session log so
+the failure is visible instead of being disguised as a fresh answer.
+
 ## What one instance can do
 
 `.capabilities` says what an instance can do beyond answering with words.

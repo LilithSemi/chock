@@ -469,6 +469,19 @@ writes into a file names a directory that is deleted with the session, while
 `TMPDIR` and `CHOCK_SCRATCHPAD` name one directory, and a file written through
 either survives the call. `chock doctor` reports both.
 
+### What the macOS CI jobs prove
+
+Nix runs macOS builders under `sandbox-exec`, and Seatbelt profiles cannot be
+nested. The `aarch64-darwin` part of `nix flake check` therefore proves the
+Darwin code compiles, while tests that need to enter their own profile detect
+the surrounding profile and skip.
+
+The separate `test-sandbox` job runs on a macOS runner outside a Nix builder.
+It first proves the runner can enter a profile and fails, rather than skips, if
+it cannot. That job then runs the Darwin escape suites with the native sandbox
+active. A green cross-platform build and a green `test-sandbox` job are both
+required because they establish different facts.
+
 ## Checking a machine
 
 ```
