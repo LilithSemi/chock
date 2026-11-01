@@ -685,7 +685,7 @@ test "a different spelling of the same subcommand still asks, and an option the 
     try testing.expectEqual(Reason.option_not_read, exec_path.ask.reason);
 }
 
-test "the shim tells the user what saying yes does, and never offers to do the act outside the sandbox" {
+test "the shim tells the user what saying yes to networked git does" {
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -698,13 +698,13 @@ test "the shim tells the user what saying yes does, and never offers to do the a
     );
     defer run.deinit(gpa);
 
-    try testing.expect(std.mem.indexOf(u8, run.detail, "the subcommand runs inside the sandbox") != null);
+    try testing.expect(std.mem.indexOf(u8, run.detail, "real git runs inside the sandbox") != null);
     try testing.expect(std.mem.indexOf(u8, run.detail, "does not hold your own repository") != null);
     try testing.expect(std.mem.indexOf(u8, run.detail, "net.connect rules name") != null);
     try testing.expect(std.mem.indexOf(u8, run.detail, "has no network") == null);
     try testing.expect(std.mem.indexOf(u8, run.detail, "request_action") == null);
-    try testing.expect(std.mem.indexOf(u8, run.detail, "no tool that asks for one") != null);
-    try testing.expect(std.mem.indexOf(u8, run.detail, "git.push") != null);
+    try testing.expect(std.mem.indexOf(u8, run.detail, "credential exists for this call alone") != null);
+    try testing.expectEqualStrings("git.push", run.action);
 
     const effect_at = std.mem.indexOf(u8, run.detail, "what happens if you say yes").?;
     const vector_at = std.mem.indexOf(u8, run.detail, "what the agent ran").?;

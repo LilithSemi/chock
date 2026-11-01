@@ -32,6 +32,16 @@ The callback listener binds only to `127.0.0.1`, uses a new random port and
 state for each login, and stops after one request. A returning login reuses the
 client ID and host ID OpenAI issued for that account.
 
+## Remote Git credentials
+
+An approved `git push`, `clone`, `fetch`, `pull` or `ls-remote` runs the real
+git inside the sandbox. For HTTPS, Chock prompts for a password and exposes the
+internal `chock askpass` helper only for that tool call. The password is held in
+memory, covered by output redaction, and overwritten when the call ends; it is
+never put in this credential store. For SSH, Chock proxies the host SSH agent,
+so the sandbox can request a signature but never receives a private key. Both
+sockets close at the end of the call.
+
 ## Where a credential is kept
 
 Name the store in `~/.config/chock/config.zon`:

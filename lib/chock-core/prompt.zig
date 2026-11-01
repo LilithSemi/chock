@@ -554,7 +554,7 @@ test "a session with no instructions, no guidance and no notes gets none of thos
     try std.testing.expect(text.len < fixed_floor + 512);
 }
 
-test "the one act the rules say can be asked for is the one the tool really takes" {
+test "the rules name request_action and its workspace apply exception" {
     const tools = @import("tools.zig");
     const handback = @import("handback.zig");
 
@@ -567,7 +567,7 @@ test "the one act the rules say can be asked for is the one the tool really take
 
     try std.testing.expect(std.mem.indexOf(u8, text, @tagName(tools.Tool.request_action)) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, handback.apply_action) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "You do not decide it") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "not decide an act") != null);
 
     const bare = try build(allocator, .{}, &.{}, .{});
     defer allocator.free(bare);

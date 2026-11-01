@@ -4530,7 +4530,7 @@ test "an alternation of two calls ends the session no_progress" {
     try testing.expectEqual(event.SessionEndReason.no_progress, std.meta.activeTag(reason));
 }
 
-test "build, edit, build, edit, build is work and is not stopped" {
+test "build, write, build, write, build is work and is not stopped" {
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -4547,14 +4547,14 @@ test "build, edit, build, edit, build is work and is not stopped" {
     const first_fix = FakeTurn{ .deltas = &.{.{ .tool_call = .{
         .index = 0,
         .id = "fix1",
-        .name = "edit_file",
-        .arguments = "{\"path\":\"a.zig\",\"old_string\":\"u8\",\"new_string\":\"u16\"}",
+        .name = "write_file",
+        .arguments = "{\"path\":\"a.zig\",\"content\":\"const A = u16;\"}",
     } }} };
     const second_fix = FakeTurn{ .deltas = &.{.{ .tool_call = .{
         .index = 0,
         .id = "fix2",
-        .name = "edit_file",
-        .arguments = "{\"path\":\"b.zig\",\"old_string\":\"i32\",\"new_string\":\"i64\"}",
+        .name = "write_file",
+        .arguments = "{\"path\":\"b.zig\",\"content\":\"const B = i64;\"}",
     } }} };
     var fake_client = FakeClient{ .turns = &.{
         build,
@@ -4575,7 +4575,7 @@ test "build, edit, build, edit, build is work and is not stopped" {
     try testing.expectEqual(event.SessionEndReason.finished, std.meta.activeTag(reason));
 }
 
-test "read, edit, read of one file is not a loop" {
+test "read, write, read of one file is not a loop" {
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -4592,8 +4592,8 @@ test "read, edit, read of one file is not a loop" {
     const edit = FakeTurn{ .deltas = &.{.{ .tool_call = .{
         .index = 0,
         .id = "edit",
-        .name = "edit_file",
-        .arguments = "{\"path\":\"a.zig\",\"old_string\":\"u8\",\"new_string\":\"u16\"}",
+        .name = "write_file",
+        .arguments = "{\"path\":\"a.zig\",\"content\":\"const A = u16;\"}",
     } }} };
     var fake_client = FakeClient{ .turns = &.{
         read,
