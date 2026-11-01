@@ -1,6 +1,7 @@
 //! The git shim: a `git` first in the `PATH` inside the sandbox. A read only
-//! subcommand runs the real git. A subcommand that changes state asks first.
-//! The shim prevents a mistake. It does not prevent an attack.
+//! local subcommand runs the real git. A subcommand that changes state or
+//! reaches a host asks first. The shim prevents a mistake. It does not prevent
+//! an attack.
 
 const std = @import("std");
 const chock_proto = @import("chock-proto");
@@ -42,6 +43,10 @@ pub const Ask = struct {
     }
 
     pub fn advice(self: Ask, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        if (needsNetwork(self.subcommand)) return gpa.dupe(
+            u8,
+            "if approved, the real git runs inside the sandbox; its destination is still held by the network policy, and any credential exists for this call alone",
+        );
         const kind = self.kind orelse return gpa.dupe(
             u8,
             "the answer to this question only lets the subcommand run inside the sandbox",
@@ -234,24 +239,6 @@ const needs_network: []const []const u8 = &.{
 
 pub fn needsNetwork(subcommand: []const u8) bool {
     return isOneOf(subcommand, needs_network);
-}
-
-/// Never blame the sandbox network here: the router gives a sandbox the hosts
-/// `net.connect` names. What is missing is a caller that performs the act.
-pub fn hostReachingRefusal(gpa: std.mem.Allocator, subcommand: []const u8) std.mem.Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
-        gpa,
-        "git {s} was not run, and this is not a refusal: the part of it that reaches another " ++
-            "host is not built yet. Chock performs an act that leaves the sandbox on the host " ++
-            "itself, out of a payload that names the effect, and no caller builds one of those " ++
-            "for a git subcommand today. This is not a missing program, and it is not the " ++
-            "sandbox's network, so there is nothing here to configure and no proxy to find. " ++
-            "Work with what is already in the workspace: the project's own history is here, so " ++
-            "git log, git show, git diff and git status all work. Commit your work in the " ++
-            "workspace as usual, and the user is asked at the end of the session whether to " ++
-            "carry that commit into their own repository.",
-        .{subcommand},
-    );
 }
 
 fn isOneOf(needle: []const u8, haystack: []const []const u8) bool {
@@ -550,25 +537,6 @@ test "every subcommand that has to reach another host is one classify already st
     for ([_][]const u8{ "commit", "add", "status", "log", "checkout", "branch", "diff" }) |subcommand| {
         try testing.expect(!needsNetwork(subcommand));
     }
-}
-
-test "the answer for a host reaching subcommand blames the missing caller, and never the network" {
-    const gpa = testing.allocator;
-
-    const text = try hostReachingRefusal(gpa, "fetch");
-    defer gpa.free(text);
-
-    try testing.expect(std.mem.indexOf(u8, text, "git fetch") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "not built yet") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "no caller") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "not a refusal") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "not a missing program") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "no proxy to find") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "not the sandbox's network") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "has no network") == null);
-    try testing.expect(std.mem.indexOf(u8, text, "reaches a remote") == null);
-    try testing.expect(std.mem.indexOf(u8, text, "git log") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "Commit your work") != null);
 }
 
 test "a subcommand that changes state sends a request, and the request names the act" {

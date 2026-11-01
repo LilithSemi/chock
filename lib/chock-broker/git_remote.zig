@@ -1,4 +1,5 @@
-//! Which credential a `git push` needs; every doubt answers `unreadable`, so the caller prompts, which a person can stop.
+//! Which remote and credential a networked git command needs. Every doubt
+//! answers unreadable, so the command never receives a guessed credential.
 
 const std = @import("std");
 
@@ -10,6 +11,97 @@ pub const Credential = enum {
 };
 
 pub const default_remote = "origin";
+
+pub const Purpose = enum { read, write };
+
+pub fn targetIn(subcommand: []const u8, rest: []const []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, subcommand, "push")) return remoteNameIn(rest);
+    if (std.mem.eql(u8, subcommand, "fetch")) return firstOperand(rest, fetch_no_value, fetch_value);
+    if (std.mem.eql(u8, subcommand, "pull")) return firstOperand(rest, pull_no_value, pull_value);
+    if (std.mem.eql(u8, subcommand, "clone")) return firstOperand(rest, clone_no_value, clone_value);
+    if (std.mem.eql(u8, subcommand, "ls-remote")) return firstOperand(rest, ls_remote_no_value, ls_remote_value);
+    return null;
+}
+
+pub fn purposeFor(subcommand: []const u8) Purpose {
+    return if (std.mem.eql(u8, subcommand, "push")) .write else .read;
+}
+
+fn firstOperand(
+    rest: []const []const u8,
+    no_value: []const []const u8,
+    value: []const []const u8,
+) ?[]const u8 {
+    var index: usize = 0;
+    while (index < rest.len) {
+        const arg = rest[index];
+        if (arg.len == 0) return null;
+        if (arg[0] != '-') return arg;
+        if (std.mem.eql(u8, arg, "--")) {
+            index += 1;
+            if (index >= rest.len or rest[index].len == 0) return null;
+            return rest[index];
+        }
+        if (optionWithAttachedValue(arg, value)) {
+            index += 1;
+            continue;
+        }
+        if (isOneOf(arg, no_value)) {
+            index += 1;
+            continue;
+        }
+        if (isOneOf(arg, value)) {
+            index += 2;
+            if (index > rest.len) return null;
+            continue;
+        }
+        return null;
+    }
+    return null;
+}
+
+fn optionWithAttachedValue(arg: []const u8, options: []const []const u8) bool {
+    const at = std.mem.indexOfScalar(u8, arg, '=') orelse return false;
+    return isOneOf(arg[0..at], options) and at + 1 < arg.len;
+}
+
+const fetch_no_value: []const []const u8 = &.{
+    "--all",            "--append", "-a",           "--atomic", "--dry-run",          "-n",                    "--force",    "-f",
+    "--ipv4",           "-4",       "--ipv6",       "-6",       "--keep",             "-k",                    "--multiple", "--no-tags",
+    "--prune",          "-p",       "--prune-tags", "--quiet",  "-q",                 "--show-forced-updates", "--tags",     "-t",
+    "--update-head-ok", "-u",       "--verbose",    "-v",       "--write-fetch-head",
+};
+const fetch_value: []const []const u8 = &.{
+    "--deepen",             "--depth",         "--filter",          "--jobs",          "-j",                 "--negotiation-tip", "--refmap",
+    "--recurse-submodules", "--server-option", "--shallow-exclude", "--shallow-since", "--submodule-prefix", "--upload-pack",
+};
+const pull_no_value: []const []const u8 = &.{
+    "--all",     "--append", "-a",             "--atomic",    "--autostash", "--commit", "--dry-run",   "-n",
+    "--edit",    "-e",       "--ff",           "--ff-only",   "--force",     "-f",       "--ipv4",      "-4",
+    "--ipv6",    "-6",       "--no-autostash", "--no-commit", "--no-edit",   "--no-ff",  "--no-rebase", "--no-stat",
+    "--no-tags", "--prune",  "-p",             "--quiet",     "-q",          "--rebase", "-r",          "--signoff",
+    "--squash",  "--stat",   "--tags",         "-t",          "--verbose",   "-v",
+};
+const pull_value: []const []const u8 = &.{
+    "--cleanup",         "--deepen", "--depth",              "--filter",        "--gpg-sign",        "-S",              "--jobs",     "-j",
+    "--log",             "--rebase", "--recurse-submodules", "--server-option", "--shallow-exclude", "--shallow-since", "--strategy", "-s",
+    "--strategy-option", "-X",       "--upload-pack",
+};
+const clone_no_value: []const []const u8 = &.{
+    "--bare",   "--dissociate",  "--ipv4",           "-4",                   "--ipv6",              "-6",                 "--local",   "-l",
+    "--mirror", "--no-checkout", "-n",               "--no-hardlinks",       "--no-reject-shallow", "--no-single-branch", "--no-tags", "--progress",
+    "--quiet",  "-q",            "--reject-shallow", "--shallow-submodules", "--single-branch",     "--sparse",           "--verbose", "-v",
+};
+const clone_value: []const []const u8 = &.{
+    "--branch",        "-b",         "--config",      "-c",                  "--depth",              "--filter",           "--jobs",          "-j",
+    "--origin",        "-o",         "--reference",   "--reference-if-able", "--recurse-submodules", "--separate-git-dir", "--server-option", "--shallow-exclude",
+    "--shallow-since", "--template", "--upload-pack", "-u",
+};
+const ls_remote_no_value: []const []const u8 = &.{
+    "--exit-code", "--get-url", "--heads", "-h", "--quiet", "-q", "--refs",
+    "--symref",    "--tags",    "-t",
+};
+const ls_remote_value: []const []const u8 = &.{ "--server-option", "--sort", "--upload-pack" };
 
 pub const max_config_bytes: usize = 256 * 1024;
 
@@ -73,6 +165,10 @@ fn isOneOf(needle: []const u8, list: []const []const u8) bool {
 
 /// Runs no program: some configuration values make git run one.
 pub fn remoteUrlIn(text: []const u8, name: []const u8) ?[]const u8 {
+    return remoteUrlInFor(text, name, .write);
+}
+
+pub fn remoteUrlInFor(text: []const u8, name: []const u8, purpose: Purpose) ?[]const u8 {
     // `insteadOf` and `include` both change the URL git really uses; this file can't follow either.
     if (containsIgnoreCase(text, "insteadof")) return null;
     if (containsIgnoreCase(text, "[include")) return null;
@@ -99,8 +195,10 @@ pub fn remoteUrlIn(text: []const u8, name: []const u8) ?[]const u8 {
         if (std.ascii.eqlIgnoreCase(key, "url")) url = value;
         if (std.ascii.eqlIgnoreCase(key, "pushurl")) push_url = value;
     }
-    // A push uses `pushurl` when the remote holds one.
-    return push_url orelse url;
+    return switch (purpose) {
+        .read => url,
+        .write => push_url orelse url,
+    };
 }
 
 /// Git folds a section name for case and keeps a subsection name exact.
@@ -196,6 +294,27 @@ test "a push names its remote, and an option this file cannot read stops the rea
     try testing.expectEqual(@as(?[]const u8, null), remoteNameIn(&.{""}));
 }
 
+test "each networked git command names its remote without mistaking option values for one" {
+    try testing.expectEqualStrings("upstream", targetIn("fetch", &.{ "--depth", "2", "upstream" }).?);
+    try testing.expectEqualStrings("upstream", targetIn("pull", &.{ "--rebase=merges", "upstream", "main" }).?);
+    try testing.expectEqualStrings("https://example.com/p.git", targetIn("clone", &.{
+        "--branch",
+        "main",
+        "https://example.com/p.git",
+        "p",
+    }).?);
+    try testing.expectEqualStrings("ssh://example.com/p.git", targetIn("ls-remote", &.{
+        "--sort=-version:refname",
+        "ssh://example.com/p.git",
+    }).?);
+    try testing.expectEqualStrings("origin", targetIn("push", &.{}).?);
+
+    try testing.expectEqual(@as(?[]const u8, null), targetIn("fetch", &.{}));
+    try testing.expectEqual(@as(?[]const u8, null), targetIn("pull", &.{}));
+    try testing.expectEqual(@as(?[]const u8, null), targetIn("clone", &.{ "--branch", "main" }));
+    try testing.expectEqual(@as(?[]const u8, null), targetIn("ls-remote", &.{"--unknown"}));
+}
+
 test "the url of a remote is read out of a configuration, and a rewriting one is not read at all" {
     const config =
         \\[core]
@@ -226,6 +345,10 @@ test "the url of a remote is read out of a configuration, and a rewriting one is
     try testing.expectEqualStrings(
         "https://write.example.com/p.git",
         remoteUrlIn(with_push, "origin").?,
+    );
+    try testing.expectEqualStrings(
+        "https://read.example.com/p.git",
+        remoteUrlInFor(with_push, "origin", .read).?,
     );
 
     const rewritten =

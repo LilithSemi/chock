@@ -332,17 +332,14 @@ own workspace, `git.commit` among them, so a project with no `chock.zon` gains
 no new prompt. It ships none for `git.push`, `git.clone`, `git.fetch`,
 `git.pull` or `git.unknown`, so each of those asks.
 
-An approved `git push` runs. It is the one subcommand that reaches another host
-and is carried out: the real git runs inside the sandbox, reaches the remote
-through the network router, and gets its credential over a socket for that one
-call. An `https` remote prompts a person for a password, an `ssh` remote arms
-the agent proxy, and both are closed again when the call ends.
+An approved `git push`, `git clone`, `git fetch`, `git pull` or `git ls-remote`
+runs. The real git runs inside the sandbox, reaches the remote through the
+network router, and gets its credential over a socket for that one call. An
+`https` remote prompts a person for a password, an `ssh` remote arms the agent
+proxy, and both are closed again when the call ends. Chock reads only known
+option shapes; if it cannot identify the remote without guessing, it refuses
+the command and asks the agent to name the remote explicitly.
 [credentials.md](../operate/credentials.md) has the rest.
-
-Every other subcommand that reaches another host is asked about and still does
-not run, even when a person says yes. `git clone`, `git fetch` and `git pull`
-have no act that carries the effect out, so the agent is told what is missing
-rather than just told no. Nothing in a session asks `file.write`.
 
 ### `model.select` and `nix.build`
 

@@ -98,31 +98,6 @@ them as not built.
   A broken stream is a different fault: the turn half happened, and sending it
   again is a larger change than the wait was.
 
-- An approved `git push` runs. The real git runs inside the sandbox, reaches
-  the remote through the network router, and is given its credential over a
-  socket for that one call: git runs `chock askpass`, which carries the prompt
-  to the broker and carries one answer back. Which credential is chosen by the
-  remote's own scheme, read on the host at approval time. An `https` remote
-  prompts a person for a password, an `ssh` remote arms the agent proxy, and a
-  remote that cannot be read refuses the push rather than guessing. Both are
-  closed again when the call ends, so the capability lasts as long as the act
-  and no longer. Every other subcommand that reaches another host is asked
-  about and still does not run.
-
-  A password is prompted live and never stored. There is no credential store
-  entry for one, no configuration field, and nothing written to disk. The value
-  is held for one tool call, covered by the redaction funnel for exactly as
-  long as it exists, and overwritten when the call ends. A private key is never
-  copied: an ssh agent signs and never hands a key out, so the sandbox gets
-  "can sign with this key" and not the key.
-
-  The agent cannot use the socket as a credential oracle. A helper reachable
-  from any tool call would let the agent ask for a password for any host
-  `secret.password.*` permits, as often as it likes, with no git involved. Live
-  prompting is what removes that: nothing can be had without a person seeing a
-  prompt, so the worst an agent can do is make noise, which is visible and
-  refusable.
-
 - `chock migrate` reads a Claude Code, Codex, OpenCode, Zed or oh-my-pi
   configuration. It is a one shot, offline command: no session, no model, no
   network, no sandbox. `--from <harness>` names a harness, and a name this

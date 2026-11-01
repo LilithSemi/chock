@@ -7308,11 +7308,12 @@ const GitCredentials = struct {
         io: std.Io,
         project_root: []const u8,
         call_id: []const u8,
+        subcommand: []const u8,
         rest: []const []const u8,
     ) std.mem.Allocator.Error!Outcome {
         std.debug.assert(self.armed_call == null);
 
-        const resolved = self.remoteUrl(gpa, io, project_root, rest) catch null;
+        const resolved = self.remoteUrl(gpa, io, project_root, subcommand, rest) catch null;
         defer if (resolved) |url| gpa.free(url);
 
         const url = resolved orelse return .{ .refused = try gpa.dupe(u8, unreadable_remote_text) };
@@ -7320,7 +7321,7 @@ const GitCredentials = struct {
         switch (chock_broker.git_remote.credentialFor(url)) {
             .none => return .ready,
             .unreadable => return .{ .refused = try gpa.dupe(u8, unreadable_remote_text) },
-            .password => return self.armPassword(gpa, io, call_id, url),
+            .password => return self.armPassword(gpa, io, call_id, subcommand, url),
             .agent => return self.armAgent(gpa, io, call_id, url),
         }
     }
@@ -7330,10 +7331,11 @@ const GitCredentials = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         project_root: []const u8,
+        subcommand: []const u8,
         rest: []const []const u8,
     ) !?[]u8 {
         _ = self;
-        const named = chock_broker.git_remote.remoteNameIn(rest) orelse return null;
+        const named = chock_broker.git_remote.targetIn(subcommand, rest) orelse return null;
         if (chock_broker.git_remote.namesAUrl(named)) return try gpa.dupe(u8, named);
 
         const path = try projectConfigPath(gpa, project_root);
@@ -7348,7 +7350,11 @@ const GitCredentials = struct {
         ) catch return null;
         defer gpa.free(text);
 
-        const url = chock_broker.git_remote.remoteUrlIn(text, named) orelse return null;
+        const url = chock_broker.git_remote.remoteUrlInFor(
+            text,
+            named,
+            chock_broker.git_remote.purposeFor(subcommand),
+        ) orelse return null;
         return try gpa.dupe(u8, url);
     }
 
@@ -7357,6 +7363,7 @@ const GitCredentials = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         call_id: []const u8,
+        subcommand: []const u8,
         url: []const u8,
     ) std.mem.Allocator.Error!Outcome {
         const host = chock_broker.git_remote.hostIn(url) orelse
@@ -7366,8 +7373,8 @@ const GitCredentials = struct {
         if (self.asker.mayPrompt(host)) |refusal| {
             return .{ .refused = try std.fmt.allocPrint(
                 gpa,
-                "git push was not run: {s}",
-                .{refusal.text()},
+                "git {s} was not run: {s}",
+                .{ subcommand, refusal.text() },
             ) };
         }
 
@@ -7380,8 +7387,8 @@ const GitCredentials = struct {
 
         const question = try std.fmt.allocPrint(
             gpa,
-            "password for {s} (git push, nothing is stored): ",
-            .{host},
+            "password for {s} (git {s}, nothing is stored): ",
+            .{ host, subcommand },
         );
         defer gpa.free(question);
 
@@ -7559,28 +7566,28 @@ fn isPlainHost(host: []const u8) bool {
     return true;
 }
 
-const unreadable_remote_text = "git push was not run: chock could not read which remote this " ++
-    "push goes to, and it will not guess. A credential is armed from the remote's scheme, so a " ++
+const unreadable_remote_text = "the git command was not run: chock could not read which remote it " ++
+    "goes to, and it will not guess. A credential is armed from the remote's scheme, so a " ++
     "remote it cannot read is one it cannot arm the right thing for. Name the remote's URL on " ++
-    "the command line, as in git push https://host/project.git HEAD:main, and run it again.";
+    "the command line and run it again.";
 
-const no_agent_text = "git push was not run: this remote authenticates with an ssh key, and " ++
+const no_agent_text = "the git command was not run: this remote authenticates with an ssh key, and " ++
     "there is no ssh agent for chock to proxy. chock never copies a key into the sandbox, so an " ++
     "agent is the only way a key can sign for it. Start one and add the key, as in ssh-add, and " ++
     "run chock again. An https remote is prompted for instead and needs no agent.";
 
-const no_socket_text = "git push was not run: chock could not open the socket the credential " ++
+const no_socket_text = "the git command was not run: chock could not open the socket the credential " ++
     "travels on. Nothing was sent anywhere. This is a fault on this machine and not a refusal.";
 
-const no_helper_text = "git push was not run: chock could not resolve its own path, so it " ++
+const no_helper_text = "the git command was not run: chock could not resolve its own path, so it " ++
     "could not put the password helper inside the sandbox. This is a fault on this machine and " ++
     "not a refusal.";
 
-const credentials_not_wired_text = "git push was not run: this session has no way to hold a " ++
+const credentials_not_wired_text = "the git command was not run: this session has no way to hold a " ++
     "credential, so nothing could authenticate. This is a fault in how the session was started " ++
     "and not a refusal. Report it, and work with what is already in the workspace.";
 
-const nothing_typed_text = "git push was not run: chock asked for the password and nobody " ++
+const nothing_typed_text = "the git command was not run: chock asked for the password and nobody " ++
     "typed one, so the push was declined. Nothing was sent anywhere. Ask the user whether they " ++
     "want this push to happen at all before trying it again.";
 
@@ -7608,7 +7615,7 @@ const GitToolRunner = struct {
         action: []const u8,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *GitToolRunner = @ptrCast(@alignCast(ptr));
-        defer self.finishPush(gpa, io);
+        defer self.finishRemoteGit(gpa, io);
 
         if (try self.gitAnswer(gpa, io, call)) |output| {
             return .{
@@ -7621,7 +7628,7 @@ const GitToolRunner = struct {
         return self.inner.dispatch(gpa, io, call, action);
     }
 
-    fn finishPush(self: *GitToolRunner, gpa: std.mem.Allocator, io: std.Io) void {
+    fn finishRemoteGit(self: *GitToolRunner, gpa: std.mem.Allocator, io: std.Io) void {
         const creds = self.credentials orelse return;
         if (creds.armed_call == null) return;
         creds.record(gpa, io, if (self.asker) |one| one.locked else null);
@@ -7670,25 +7677,22 @@ const GitToolRunner = struct {
 
         if (!answer.permitted) return try chock_core.arbiter.refusalText(gpa, action, answer);
 
-        if (std.mem.eql(u8, ask.subcommand, "push")) {
-            return try self.armPush(gpa, io, call, ask.rest);
-        }
-
         if (chock_broker.git_shim.needsNetwork(ask.subcommand)) {
-            return try chock_broker.git_shim.hostReachingRefusal(gpa, ask.subcommand);
+            return try self.armRemoteGit(gpa, io, call, ask.subcommand, ask.rest);
         }
         return null;
     }
 
-    fn armPush(
+    fn armRemoteGit(
         self: *GitToolRunner,
         gpa: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        subcommand: []const u8,
         rest: []const []const u8,
     ) std.mem.Allocator.Error!?[]u8 {
         const creds = self.credentials orelse return try gpa.dupe(u8, credentials_not_wired_text);
-        return switch (try creds.arm(gpa, io, self.project_root, call.call_id, rest)) {
+        return switch (try creds.arm(gpa, io, self.project_root, call.call_id, subcommand, rest)) {
             .ready => null,
             .refused => |text| text,
         };
@@ -14877,14 +14881,14 @@ test "the question a git subcommand asks names the act, the tool that ran it, an
     try testing.expect(std.mem.indexOf(
         u8,
         arbitrator.detail.read(),
-        "the subcommand runs inside the sandbox",
+        "real git runs inside the sandbox",
     ) != null);
     try testing.expect(std.mem.indexOf(u8, result.output, "git.push") != null);
     try testing.expect(std.mem.indexOf(u8, result.output, "refused_by_user") != null);
     try testing.expectEqual(@as(usize, 0), inner.calls);
 }
 
-test "a subcommand that reaches another host is asked about, and an approved one still does not run" {
+test "an approved networked git command that cannot identify or arm its remote is refused" {
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -14903,9 +14907,53 @@ test "a subcommand that reaches another host is asked about, and an approved one
         try testing.expectEqual(@as(usize, 1), arbitrator.asks);
         try testing.expectEqual(@as(usize, 0), inner.calls);
         try testing.expect(result.is_error);
-        try testing.expect(std.mem.indexOf(u8, result.output, "not built yet") != null);
-        try testing.expect(std.mem.indexOf(u8, result.output, "not a refusal") != null);
+        try testing.expect(std.mem.indexOf(u8, result.output, "not run") != null);
         try testing.expect(std.mem.indexOf(u8, result.output, "has no network") == null);
+    }
+}
+
+test "each approved networked git command reaches git when its remote needs no credential" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    for ([_][]const u8{
+        "{\"argv\":[\"git\",\"push\",\"file:///tmp/repo.git\",\"main\"]}",
+        "{\"argv\":[\"git\",\"fetch\",\"file:///tmp/repo.git\"]}",
+        "{\"argv\":[\"git\",\"pull\",\"file:///tmp/repo.git\",\"main\"]}",
+        "{\"argv\":[\"git\",\"clone\",\"file:///tmp/repo.git\"]}",
+        "{\"argv\":[\"git\",\"ls-remote\",\"file:///tmp/repo.git\"]}",
+    }) |arguments| {
+        var log = try PermittingLog.init(gpa);
+        defer log.deinit(io);
+        try log.arm(io);
+
+        var arbitrator = CountingArbiter{ .permitted = true };
+        var inner = CountingToolRunner{};
+        var credentials = GitCredentials{
+            .gpa = gpa,
+            .io = io,
+            .dir = "",
+            .helper = "",
+            .secrets = .{ .io = io },
+            .asker = undefined,
+            .host_agent = "",
+        };
+        var shim = GitToolRunner{
+            .inner = inner.runner(),
+            .asker = arbitrator.asker(&log.locked),
+            .credentials = &credentials,
+        };
+        const result = try shim.runner().dispatch(gpa, io, .{
+            .call_id = "call1",
+            .tool = "run_command",
+            .arguments = arguments,
+        }, "");
+        defer gpa.free(result.call_id);
+        defer gpa.free(result.output);
+
+        try testing.expectEqual(@as(usize, 1), arbitrator.asks);
+        try testing.expectEqual(@as(usize, 1), inner.calls);
+        try testing.expect(!result.is_error);
     }
 }
 
@@ -15036,6 +15084,7 @@ test "a project with no chock.zon answers allow for git commit and ask for a pus
         "git.clone",
         "git.fetch",
         "git.pull",
+        "git.ls-remote",
         chock_broker.git_shim.unreadable_action,
         "git.frobnicate",
     }) |action| {
