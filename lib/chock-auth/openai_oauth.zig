@@ -78,7 +78,7 @@ pub fn authorizationUrl(
     return out.toOwnedSlice(allocator);
 }
 
-fn addQuery(
+pub fn addQuery(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(u8),
     name: []const u8,

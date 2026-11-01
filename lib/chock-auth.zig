@@ -10,6 +10,7 @@ pub const signing = @import("chock-auth/signing.zig");
 pub const search = @import("chock-auth/search.zig");
 pub const check = @import("chock-auth/check.zig");
 pub const openai_oauth = @import("chock-auth/openai_oauth.zig");
+pub const mcp_oauth = @import("chock-auth/mcp_oauth.zig");
 
 pub const darwin_status = @import("chock-auth/darwin/status.zig");
 

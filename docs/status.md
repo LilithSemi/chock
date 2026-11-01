@@ -190,11 +190,3 @@ them as not built.
   own file descriptors, and the gate is in the one function the structured
   write tools funnel through. A rule is a guard on what the model produces in
   the turn, so it is not a substitute for a formatter or a check in CI.
-
-- A remote MCP server gets no OAuth. Chock carries a token from the credential
-  store, under `bind = "header"`, and runs no browser flow: no protected
-  resource metadata, no dynamic client registration and no PKCE. The
-  specification makes authorization optional, so a token is a legal way to hold
-  one, and a server that will take nothing else cannot be reached today.
-  [remote-mcp.md](using/remote-mcp.md) says what else that transport leaves
-  out, including the listening stream and a server on this machine.

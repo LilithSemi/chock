@@ -92,6 +92,42 @@ break, is not sent at all: the server starts without it.
 The model never sees the value. It is held by Chock and not by the sandbox, it
 is masked in everything the session writes, and no event of the log carries it.
 
+### OAuth
+
+A server that implements MCP's OAuth 2.1 authorization flow can issue that
+header instead. Log in with the secret name and the exact URL from the
+`mcp_servers` entry:
+
+```
+chock login --mcp NOTION_OAUTH=https://mcp.notion.com/mcp
+```
+
+Chock makes an unauthenticated MCP initialize request and reads the protected
+resource metadata URL from its `WWW-Authenticate` challenge. It then reads the
+resource metadata and authorization-server metadata, dynamically registers
+Chock as a public client, and opens the authorization-code flow in a browser.
+The loopback callback verifies `state`; the code exchange uses PKCE S256. Both
+the authorization and token requests carry the exact MCP URL as their
+`resource`.
+
+Bind the stored credential like any other header secret:
+
+```zon
+.{
+    .secrets = .{
+        .{ .name = "NOTION_OAUTH", .to = "mcp.notion.*", .bind = "header" },
+    },
+}
+```
+
+The stored value contains the access token, refresh token, client ID, token
+endpoint, issuer, expiry, and exact resource. It is never written to
+`chock.zon`. Before a session starts, Chock refreshes a token with less than
+five minutes left and stores a rotated refresh token before using it. A
+credential bound to any URL other than the one it was issued for is refused,
+not sent. Authorization servers without dynamic client registration are not
+supported by this command; use a manually obtained bearer token in that case.
+
 ## What the log records
 
 Each exchange appends one `mcp.request`, beside the ordinary `tool.call` and
@@ -126,9 +162,6 @@ truncation.
 
 ## What this does not do
 
-- **No OAuth.** Chock carries a token from the credential store and runs no
-  browser flow. A server that answers 401 is reported, and the specification
-  makes authorization optional, so a token is a legal way to hold one.
 - **No listening stream.** Chock opens no long-lived GET, because every message
   such a stream can carry is one the harness refuses or counts.
 - **No server on this machine.** The address check refuses loopback, so a

@@ -8194,6 +8194,7 @@ const ServerSecrets = struct {
         keep: std.mem.Allocator,
         policy: *TablePolicy,
         server: []const u8,
+        resource: []const u8,
     ) std.mem.Allocator.Error!?chock_broker.mcp_remote.Header {
         if (self.block.entries.len == 0) return null;
 
@@ -8222,8 +8223,13 @@ const ServerSecrets = struct {
             }
             if (!try self.allowed(policy, server, one)) continue;
 
-            const value = self.read(server, one) orelse continue;
-            defer wipeAndFree(self.gpa, value);
+            const stored = self.read(server, one) orelse continue;
+            const value = try self.mcpAccessToken(server, resource, one.name, stored) orelse {
+                wipeAndFree(self.gpa, stored);
+                continue;
+            };
+            defer if (value.ptr != stored.ptr) wipeAndFree(self.gpa, value);
+            defer wipeAndFree(self.gpa, stored);
 
             if (!chock_policy.secrets.headerValueIsSendable(value)) {
                 tty.print(
@@ -8259,6 +8265,61 @@ const ServerSecrets = struct {
             return .{ .name = name, .value = carried };
         }
         return null;
+    }
+
+    fn mcpAccessToken(
+        self: *ServerSecrets,
+        server: []const u8,
+        resource: []const u8,
+        name: []const u8,
+        stored: []u8,
+    ) std.mem.Allocator.Error!?[]u8 {
+        if (std.mem.indexOf(u8, stored, "\"kind\":\"mcp_oauth\"") == null) return stored;
+        var parsed = chock_auth.mcp_oauth.Credential.parse(self.gpa, stored) catch |err| {
+            tty.print(.warn, "chock: the OAuth credential {s} for MCP server {s} is not valid ({t}), so it was not sent.\n", .{ name, server, err });
+            return null;
+        };
+        defer parsed.deinit();
+        var credential = parsed.value;
+        if (!std.mem.eql(u8, credential.resource, resource)) {
+            tty.print(.warn, "chock: the OAuth credential {s} is bound to {s}, not MCP server {s} at {s}, so it was not sent.\n", .{ name, credential.resource, server, resource });
+            return null;
+        }
+        if (!std.ascii.eqlIgnoreCase(credential.token_type, "Bearer")) {
+            tty.print(.warn, "chock: the OAuth credential {s} has token type {s}, not Bearer, so it was not sent.\n", .{ name, credential.token_type });
+            return null;
+        }
+
+        const now = @divTrunc(std.Io.Timestamp.now(self.io, .real).toMilliseconds(), 1000);
+        if (credential.expires_at > now + 300) return try self.gpa.dupe(u8, credential.access_token);
+
+        var refreshed = chock_auth.mcp_oauth.refresh(self.gpa, self.io, credential) catch |err| {
+            tty.print(.warn, "chock: refreshing OAuth for MCP server {s} failed ({t}); run `chock login --mcp {s}={s} --replace`.\n", .{ server, err, name, resource });
+            return null;
+        };
+        defer refreshed.deinit();
+        const token = refreshed.value;
+        credential.access_token = token.access_token;
+        credential.refresh_token = if (token.refresh_token.len == 0) credential.refresh_token else token.refresh_token;
+        credential.token_type = token.token_type;
+        credential.expires_at = now + token.expires_in;
+        credential.scope = if (token.scope.len == 0) credential.scope else token.scope;
+        const serialized = try credential.serialize(self.gpa);
+        defer {
+            std.crypto.secureZero(u8, serialized);
+            self.gpa.free(serialized);
+        }
+        var diag: ?chock_auth.store.Diagnostic = null;
+        defer if (diag) |*d| d.deinit(self.gpa);
+        self.store.secrets.put(self.gpa, self.io, name, serialized, &diag) catch |err| {
+            if (diag) |*d| {
+                tty.print(.warn, "chock: the refreshed MCP OAuth credential could not be stored: {f}\n", .{d});
+            } else {
+                tty.print(.warn, "chock: the refreshed MCP OAuth credential could not be stored: {t}\n", .{err});
+            }
+            return null;
+        };
+        return try self.gpa.dupe(u8, token.access_token);
     }
 
     fn permitted(
@@ -8456,7 +8517,7 @@ fn startRemote(
         return;
     }
 
-    state.remotes[index].header = try secrets.headerForServer(keep, policy, one.name);
+    state.remotes[index].header = try secrets.headerForServer(keep, policy, one.name, remote.url);
 
     const slot = state.count;
     state.bridges[slot] = .{ .session = &state.remotes[index] };

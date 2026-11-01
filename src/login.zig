@@ -12,6 +12,7 @@ const usage_text =
     \\Usage: chock login --provider <kind>[=<url>] [options]
     \\       chock login --search <name> [options]
     \\       chock login --tool-secret <name> [options]
+    \\       chock login --mcp <name>=<https-url> [options]
     \\
     \\Kinds: anthropic, aiand, openai, openai-compat=<url>
     \\
@@ -20,6 +21,8 @@ const usage_text =
     \\                             which is the name your config.zon gives as .credential.
     \\  --tool-secret <name>       Store a secret a tool call may be given under this name,
     \\                             which is the name your chock.zon secrets block gives.
+    \\  --mcp <name>=<https-url>   Authorize a remote MCP server with OAuth and store its
+    \\                             resource-bound credential under this secret name.
     \\  --name <name>              Name this instance. Omitted, the kind is the name.
     \\  --replace                  Replace a credential of this name without asking.
     \\                             A second instance of one kind needs a name of its own.
@@ -51,6 +54,7 @@ const Options = struct {
     provider: []const u8 = "",
     search: ?[]const u8 = null,
     secret: ?[]const u8 = null,
+    mcp: ?[]const u8 = null,
     name: ?[]const u8 = null,
     method: ?Method = null,
     replace: bool = false,
@@ -102,6 +106,10 @@ pub fn main(
 
     if (options.secret) |secret_name| {
         return secretLogin(gpa, io, store, data_dir, secret_name, options);
+    }
+
+    if (options.mcp) |mcp| {
+        return mcpLogin(arena, gpa, io, &env, store, data_dir, mcp, options);
     }
 
     const kind_and_url = splitProvider(options.provider) catch return Exit.usage.code();
@@ -549,6 +557,143 @@ fn secretLogin(
     return Exit.finished.code();
 }
 
+fn mcpLogin(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    store: chock_auth.store.Store,
+    data_dir: []const u8,
+    target: []const u8,
+    options: Options,
+) !u8 {
+    const equals = std.mem.indexOfScalar(u8, target, '=') orelse return Exit.usage.code();
+    const name = target[0..equals];
+    const resource = target[equals + 1 ..];
+    var diag: ?chock_auth.store.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+    chock_auth.store.ensureDir(io, data_dir, &diag) catch |err| {
+        reportStoreFault("the credential store could not be made", &diag, err);
+        return Exit.usage.code();
+    };
+    if (try store.get(gpa, io, name, &diag)) |held| {
+        var existing = held;
+        defer existing.deinit();
+        tty.print(.err, "chock login: {s} already names a provider credential, not an MCP secret.\n", .{name});
+        return Exit.usage.code();
+    }
+    if (!options.replace) {
+        if (try store.secrets.get(gpa, io, name, &diag)) |value| {
+            defer {
+                std.crypto.secureZero(u8, value);
+                gpa.free(value);
+            }
+            tty.print(.warn, "chock login: there is already a secret stored under \"{s}\". Say it was meant:\n\n  chock login --mcp {s} --replace\n", .{ name, target });
+            return Exit.usage.code();
+        }
+    }
+
+    const address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch return Exit.usage.code();
+    var listener = address.listen(io, .{ .reuse_address = true }) catch |err| {
+        tty.print(.err, "chock login: the OAuth callback could not listen on 127.0.0.1: {t}\n", .{err});
+        return Exit.usage.code();
+    };
+    defer listener.deinit(io);
+    const callback_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/auth/callback", .{listener.socket.address.getPort()});
+
+    tty.print(.plain, "chock login: discovering OAuth for {s}...\n", .{resource});
+    const discovery = chock_auth.mcp_oauth.discover(arena, io, resource) catch |err| {
+        tty.print(.err, "chock login: the MCP server's OAuth metadata was not accepted: {t}\n", .{err});
+        return Exit.usage.code();
+    };
+    const registration_endpoint = discovery.authorization.registration_endpoint orelse {
+        tty.print(.err, "chock login: the authorization server offers no dynamic client registration endpoint.\n", .{});
+        return Exit.usage.code();
+    };
+    const registration = chock_auth.mcp_oauth.register(arena, io, registration_endpoint, callback_url) catch |err| {
+        tty.print(.err, "chock login: dynamic client registration failed: {t}\n", .{err});
+        return Exit.usage.code();
+    };
+    const scope = try chock_auth.mcp_oauth.scopes(arena, discovery.resource.scopes_supported);
+    var attempt = chock_auth.openai_oauth.Attempt.init(io);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&attempt));
+    const url = try chock_auth.mcp_oauth.authorizationUrl(
+        arena,
+        discovery.authorization.authorization_endpoint,
+        resource,
+        callback_url,
+        registration.client_id,
+        scope,
+        &attempt,
+    );
+    tty.print(.plain, "chock login: opening the authorization server in your browser. Waiting for the callback on 127.0.0.1...\n", .{});
+    openBrowser(io, env, url) catch reportBrowserFailure(url);
+
+    var stream = listener.accept(io) catch |err| {
+        tty.print(.err, "chock login: accepting the OAuth callback failed: {t}\n", .{err});
+        return Exit.usage.code();
+    };
+    defer stream.close(io);
+    var read_buffer: [16 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var write_buffer: [4 * 1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    var server = std.http.Server.init(&reader.interface, &writer.interface);
+    var request = server.receiveHead() catch |err| {
+        tty.print(.err, "chock login: reading the OAuth callback failed: {t}\n", .{err});
+        return Exit.usage.code();
+    };
+    const callback = chock_auth.openai_oauth.parseCallback(arena, request.head.target, &attempt.state) catch |err| {
+        request.respond("MCP authorization was not accepted. You can close this page.\n", .{
+            .status = .bad_request,
+            .keep_alive = false,
+        }) catch {};
+        tty.print(.err, "chock login: the OAuth callback was not accepted: {t}\n", .{err});
+        return Exit.usage.code();
+    };
+    request.respond("The MCP server returned to Chock. You can close this page.\n", .{ .keep_alive = false }) catch {};
+
+    var token_set = chock_auth.mcp_oauth.exchangeCode(
+        arena,
+        io,
+        discovery.authorization.token_endpoint,
+        resource,
+        callback.code,
+        registration.client_id,
+        &attempt.verifier,
+        callback_url,
+    ) catch |err| {
+        tty.print(.err, "chock login: exchanging the authorization code failed: {t}\n", .{err});
+        return Exit.usage.code();
+    };
+    defer token_set.deinit();
+    const now = @divTrunc(std.Io.Timestamp.now(io, .real).toMilliseconds(), 1000);
+    const token = token_set.value;
+    const credential = chock_auth.mcp_oauth.Credential{
+        .resource = resource,
+        .issuer = discovery.authorization.issuer,
+        .client_id = registration.client_id,
+        .token_endpoint = discovery.authorization.token_endpoint,
+        .access_token = token.access_token,
+        .refresh_token = token.refresh_token,
+        .token_type = token.token_type,
+        .expires_at = now + token.expires_in,
+        .scope = token.scope,
+    };
+    const serialized = try credential.serialize(gpa);
+    defer {
+        std.crypto.secureZero(u8, serialized);
+        gpa.free(serialized);
+    }
+    store.secrets.put(gpa, io, name, serialized, &diag) catch |err| {
+        reportStoreFault("the MCP OAuth credential could not be stored", &diag, err);
+        return Exit.usage.code();
+    };
+    tty.print(.plain, "chock login: stored an OAuth credential for {s} under \"{s}\".\n", .{ resource, name });
+    tty.print(.plain, "\nBind it to that remote server in chock.zon:\n\n  .secrets = .{{ .{{ .name = \"{s}\", .to = \"mcp.<server>.*\", .bind = \"header\" }} }}\n", .{name});
+    return Exit.finished.code();
+}
+
 fn reportStoreFault(
     what: []const u8,
     diag: *?chock_auth.store.Diagnostic,
@@ -901,6 +1046,18 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             continue;
         }
 
+        if (std.mem.eql(u8, name, "--mcp")) {
+            options.mcp = inline_value orelse next: {
+                index += 1;
+                if (index >= args.len) {
+                    tty.print(.err, "chock login: --mcp needs <name>=<https-url>.\n\n{s}", .{usage_text});
+                    return error.BadArguments;
+                }
+                break :next args[index];
+            };
+            continue;
+        }
+
         if (std.mem.eql(u8, name, "--replace")) {
             options.replace = true;
             continue;
@@ -945,15 +1102,35 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
         if (options.provider.len != 0) named += 1;
         if (options.search != null) named += 1;
         if (options.secret != null) named += 1;
+        if (options.mcp != null) named += 1;
         if (named > 1) {
             tty.print(
                 .err,
-                "chock login: --provider, --search and --tool-secret store different things, so one " ++
+                "chock login: --provider, --search, --tool-secret and --mcp store different things, so one " ++
                     "command does one of them. Run it again for the next.\n",
                 .{},
             );
             return error.BadArguments;
         }
+    }
+    if (options.mcp) |target| {
+        if (options.name != null or options.method != null) {
+            tty.print(.err, "chock login: --mcp already names its stored credential and uses a browser, so --name and --password-method do not apply.\n", .{});
+            return error.BadArguments;
+        }
+        const equals = std.mem.indexOfScalar(u8, target, '=') orelse {
+            tty.print(.err, "chock login: --mcp needs <name>=<https-url>.\n", .{});
+            return error.BadArguments;
+        };
+        const secret_name = target[0..equals];
+        const url = target[equals + 1 ..];
+        if (!chock_policy.secrets.nameIsWellFormed(secret_name) or
+            !std.mem.startsWith(u8, url, "https://"))
+        {
+            tty.print(.err, "chock login: --mcp needs a usable secret name and an https URL.\n", .{});
+            return error.BadArguments;
+        }
+        return options;
     }
     if (options.secret) |secret_name| {
         if (options.name != null) {
@@ -998,7 +1175,7 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
         return options;
     }
     if (options.provider.len == 0) {
-        tty.print(.err, "chock login: --provider, --search or --tool-secret is needed.\n\n", .{});
+        tty.print(.err, "chock login: --provider, --search, --tool-secret or --mcp is needed.\n\n", .{});
         tty.print(.err, "{s}", .{usage_text});
         return error.BadArguments;
     }
@@ -1202,7 +1379,7 @@ test "an instance with no name takes the kind, and --name names one of its own" 
 
     said.clear();
     try testing.expectError(error.BadArguments, parseOptions(&.{}));
-    try testing.expect(std.mem.indexOf(u8, said.err(), "--provider, --search or --tool-secret is needed") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "--provider, --search, --tool-secret or --mcp is needed") != null);
     try testing.expectEqualStrings("", said.out());
 }
 
@@ -1339,6 +1516,26 @@ test "--name says nothing next to --tool-secret either" {
         parseOptions(&.{ "--tool-secret", "GITHUB_TOKEN", "--name", "work" }),
     );
     try testing.expect(std.mem.indexOf(u8, said.err(), "--name") != null);
+}
+
+test "--mcp names one stored secret and one exact HTTPS resource" {
+    const separated = try parseOptions(&.{ "--mcp", "NOTION=https://mcp.notion.com/mcp" });
+    try testing.expectEqualStrings("NOTION=https://mcp.notion.com/mcp", separated.mcp.?);
+    const inline_form = try parseOptions(&.{"--mcp=NOTION=https://mcp.notion.com/mcp"});
+    try testing.expectEqualStrings(separated.mcp.?, inline_form.mcp.?);
+
+    for ([_][]const []const u8{
+        &.{ "--mcp", "NOTION" },
+        &.{ "--mcp", "has-dash=https://mcp.example/mcp" },
+        &.{ "--mcp", "NOTION=http://mcp.example/mcp" },
+        &.{ "--mcp", "NOTION=https://mcp.example/mcp", "--password-method", "stdin" },
+        &.{ "--mcp", "NOTION=https://mcp.example/mcp", "--tool-secret", "OTHER" },
+    }) |bad| {
+        var said: tty.Capture = undefined;
+        said.start(testing.io, testing.allocator);
+        defer said.stop(testing.io);
+        try testing.expectError(error.BadArguments, parseOptions(bad));
+    }
 }
 
 // --secret takes a value on the command line, which ps shows to every other user, so --tool-secret's name must not be reached by it.
