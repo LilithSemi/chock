@@ -8,6 +8,7 @@ const chock_provider = @import("chock-provider");
 const Session = chock_proto.state.Session;
 const Message = chock_provider.message.Message;
 const ContentPart = chock_provider.message.ContentPart;
+const provider_proto = chock_provider.proto;
 
 pub const Error = std.mem.Allocator.Error;
 
@@ -17,11 +18,11 @@ pub fn build(allocator: std.mem.Allocator, session: *const Session) Error![]Mess
 
     for (session.context.items) |entry| {
         switch (entry.data) {
-            .message => |m| try messages.append(allocator, .{
-                .role = m.role,
-                .content = m.content,
-                .model_alias = entry.model_alias,
-            }),
+            .message => |m| {
+                var converted = try provider_proto.fromOwnedMessage(allocator, m);
+                converted.model_alias = entry.model_alias;
+                try messages.append(allocator, converted);
+            },
             .summary => |text| {
                 const parts = try allocator.alloc(ContentPart, 1);
                 parts[0] = .{ .text = text };

@@ -390,21 +390,10 @@ pub fn build(b: *std.Build) void {
     // the `Cost` and `Usage` types the log already carries, and nothing else:
     // it reads `chock.zon` and does arithmetic, so it needs no sandbox, no
     // workspace, and no session.
-    // The Agent Client Protocol, from the agent's side. Like chock-net,
-    // chock-io and chock-policy, it imports no other chock library: it is the
-    // wire and nothing else, so the command that answers ACP is the only thing
-    // that knows both this and a session.
-    const chock_acp = b.addModule("chock-acp", .{
-        .root_source_file = b.path("lib/chock-acp.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const acp_tests = b.addTest(.{ .root_module = chock_acp });
-    const run_acp_tests = b.addRunArtifact(acp_tests);
-    // Same reasoning as run_net_tests above.
-    run_acp_tests.skip_foreign_checks = true;
-    test_step.dependOn(&run_acp_tests.step);
+    // The Agent Client Protocol is package-owned; Chock only maps session
+    // events onto its public wire types.
+    const acp_dependency = b.dependency("acp", .{ .target = target, .optimize = optimize });
+    const acp = acp_dependency.module("acp");
 
     const chock_cost = b.addModule("chock-cost", .{
         .root_source_file = b.path("lib/chock-cost.zig"),
@@ -422,15 +411,19 @@ pub fn build(b: *std.Build) void {
     run_cost_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_cost_tests.step);
 
-    // The neutral message type and the provider adapters. It imports
-    // chock-proto for the message type: chock-proto already has a message type
-    // with content parts for exactly this reason, so chock-provider re-exports
-    // it instead of keeping a second copy that could drift from it.
+    // The provider package owns model wire formats, streaming, and its neutral
+    // message types. This small Chock module converts those neutral records to
+    // and from the durable session-log types.
+    const llm_provider_dependency = b.dependency("llm_provider", .{ .target = target, .optimize = optimize });
+    const llm_provider = llm_provider_dependency.module("llm-provider");
     const chock_provider = b.addModule("chock-provider", .{
         .root_source_file = b.path("lib/chock-provider.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "chock-proto", .module = chock_proto }},
+        .imports = &.{
+            .{ .name = "chock-proto", .module = chock_proto },
+            .{ .name = "llm-provider", .module = llm_provider },
+        },
     });
 
     const provider_tests = b.addTest(.{ .root_module = chock_provider });
@@ -438,13 +431,8 @@ pub fn build(b: *std.Build) void {
     run_provider_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_provider_tests.step);
 
-    // Client.zig's own tests need a real socket server, test/core/fake_provider.zig,
-    // to drive std.http.Client against. Zig 0.16 refuses a relative @import that
-    // reaches outside a file's own module, so lib/chock-provider/Client.zig cannot
-    // import a file under test/ directly. This gives those tests their own module,
-    // rooted at test/core/client.zig, which imports chock_provider by name and
-    // fake_provider.zig by its own, in-bounds, relative path. Mirrors why
-    // test/proto/lock.zig is its own test target instead of living inside chock-proto.
+    // A consumer-boundary test drives the package's real HTTP client against
+    // Chock's deterministic local server.
     const client_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/core/client.zig"),
@@ -775,11 +763,10 @@ pub fn build(b: *std.Build) void {
     // drives, and Sandbox.spawn refuses on Darwin with error.NoMountNamespace,
     // so there is no sandbox for these tests to ask a question of there.
     if (linux_only) {
-        // A real HTTP server on 127.0.0.1, the same one
-        // lib/chock-provider/Client.zig's own tests drive. Named as a module
-        // rather than reached by a relative path, because Zig 0.16 refuses a
-        // relative @import that leaves a module's own root and
-        // test/broker/actions.zig is its own root.
+        // A real HTTP server on 127.0.0.1, shared with Chock's provider
+        // consumer-boundary tests. Named as a module rather than reached by a
+        // relative path, because Zig refuses a relative @import that leaves a
+        // module's own root and test/broker/actions.zig is its own root.
         const fake_provider = b.createModule(.{
             .root_source_file = b.path("test/core/fake_provider.zig"),
             .target = target,
@@ -1044,21 +1031,22 @@ pub fn build(b: *std.Build) void {
     run_nix_real_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_nix_real_tests.step);
 
-    // The sibling of chock-nix, for a person with no Nix: what a container
-    // image states, and the directories the sandbox mounts for it. It answers
-    // the same two questions and hands back the same shape of value. Like
-    // chock-nix it imports no other chock library, for the same reason: an
-    // image is read before a session, a workspace, or a sandbox exists.
+    // OCI image loading is package-owned. Chock keeps only the adapter that
+    // reads the container block from chock.zon.
     //
     // **A tool call never runs inside a container.** The image is a source of
     // files, exactly as a Nix closure is, and Chock's own sandbox is still the
-    // whole boundary. See lib/chock-container.zig's own top comment for the
-    // decision and the measurement behind it.
+    // whole boundary.
+    const oci_dependency = b.dependency("oci", .{ .target = target, .optimize = optimize });
+    const oci = oci_dependency.module("oci");
     const chock_container = b.addModule("chock-container", .{
         .root_source_file = b.path("lib/chock-container.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "chock-zon", .module = chock_zon }},
+        .imports = &.{
+            .{ .name = "chock-zon", .module = chock_zon },
+            .{ .name = "oci", .module = oci },
+        },
     });
 
     const container_tests = b.addTest(.{ .root_module = chock_container });
@@ -1866,7 +1854,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "chock-proto", .module = chock_proto },
         // `chock acp` is the one caller. It is the wire and holds no session, so
         // the binary is where it meets one.
-        .{ .name = "chock-acp", .module = chock_acp },
+        .{ .name = "acp", .module = acp },
         .{ .name = "chock-provider", .module = chock_provider },
         .{ .name = "chock-policy", .module = chock_policy },
         // `chock sessions seal` writes a seal beside a log and `chock sessions

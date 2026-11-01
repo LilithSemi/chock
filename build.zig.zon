@@ -40,6 +40,18 @@
             .url = "git+https://git.lilithsemi.com/LilithSemi/pcsc.zig#9fa2f723e7747db81b4b238da23d85be37bcb88b",
             .hash = "pcsc-0.1.0-gLk7KYtLBADXZWuczfJ0lEH-JNmJUfwtwehmgV2vZeVT",
         },
+        .oci = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/oci.zig#79ce8eb7b107c34441b4a8c5c9543a56ab23da0a",
+            .hash = "oci-0.1.0-WYNuAvpYAQAecIUSzYRLoSmjlkoStEPHqZ7N_mlgIaZj",
+        },
+        .acp = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/acp.zig#157ce06ba43ec9485ecff264e8aec0baac89a50e",
+            .hash = "acp-0.1.0-f34XQcb9AABu6at3rSkRPKHPeSzRK12QY6ZG84d3WKfR",
+        },
+        .llm_provider = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/llm-provider.zig#f3fd74b25f56b242957b9ed0e0c45beef36bbb8f",
+            .hash = "llm_provider-0.1.0-P6m-95CdBgDvDArAXHpkn-JNNj4QDY5mzU3i1fEtrfFq",
+        },
     },
     .paths = .{
         "build.zig",

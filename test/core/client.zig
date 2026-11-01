@@ -1,6 +1,6 @@
-//! Tests for `lib/chock-provider/Client.zig`. They live here because Zig 0.16
-//! refuses a relative `@import` outside a module's root directory, so
-//! `Client.zig` cannot import `fake_provider.zig` under `test/`.
+//! Consumer-boundary tests for llm-provider.zig's HTTP client. They remain in
+//! Chock to prove the package client against the deterministic provider used by
+//! Chock's broader integration tests.
 
 const std = @import("std");
 const provider = @import("chock-provider");

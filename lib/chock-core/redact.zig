@@ -174,7 +174,7 @@ fn anything(
 ) Error!T {
     if (T == []const u8) return try text(arena, policy, given);
     if (T == std.json.Value) return try value(arena, policy, given);
-    if (T == log_event.Reasoning) return given;
+    if (T == log_event.Reasoning or T == message.Reasoning) return given;
 
     switch (@typeInfo(T)) {
         .bool, .int, .float, .void, .@"enum" => return given,

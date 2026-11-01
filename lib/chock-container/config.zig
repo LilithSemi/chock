@@ -4,7 +4,7 @@
 const std = @import("std");
 const chock_zon = @import("chock-zon");
 
-const ref = @import("reference.zig");
+const ref = @import("oci").reference;
 
 pub const file_name = "chock.zon";
 

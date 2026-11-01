@@ -1,14 +1,17 @@
-//! Model adapters and streaming. Chock uses a neutral internal message type
-//! that each adapter converts to and from its own wire format.
+//! Chock's durable-log adapter around the package-owned provider clients.
 
-pub const failure = @import("chock-provider/failure.zig");
-pub const retry = @import("chock-provider/retry.zig");
-pub const message = @import("chock-provider/message.zig");
-pub const anthropic = @import("chock-provider/anthropic.zig");
-pub const openai = @import("chock-provider/openai.zig");
-pub const responses = @import("chock-provider/responses.zig");
-pub const sse = @import("chock-provider/sse.zig");
-pub const Client = @import("chock-provider/Client.zig");
+const provider = @import("llm-provider");
+
+pub const failure = provider.failure;
+pub const retry = provider.retry;
+pub const message = provider.message;
+pub const anthropic = provider.anthropic;
+pub const openai = provider.openai;
+pub const responses = provider.responses;
+pub const sse = provider.sse;
+pub const Client = provider.Client;
+
+pub const proto = @import("chock-provider/proto.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

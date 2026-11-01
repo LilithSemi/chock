@@ -2,15 +2,15 @@
 
 const std = @import("std");
 
-const chock_acp = @import("chock-acp");
+const acp = @import("acp");
 const chock_auth = @import("chock-auth");
 const chock_proto = @import("chock-proto");
 
 const control = chock_proto.control;
 const event = chock_proto.event;
 
-const jsonrpc = chock_acp.jsonrpc;
-const updates = chock_acp.update;
+const jsonrpc = acp.jsonrpc;
+const updates = acp.update;
 
 const Exit = @import("exit.zig").Exit;
 const session_paths = @import("session.zig");
@@ -290,7 +290,7 @@ const Agent = struct {
     daemon: control.Address,
     project: []const u8,
 
-    version: ?chock_acp.Version = null,
+    version: ?acp.Version = null,
     client_features: ClientFeatures = .{},
     sessions: std.ArrayList(Live) = .empty,
     queue: Queue = undefined,
@@ -385,12 +385,12 @@ const Agent = struct {
         };
         return switch (version) {
             .v1 => switch (which) {
-                .session_update => chock_acp.v1.Method.session_update.wireName(),
-                .request_permission => chock_acp.v1.Method.session_request_permission.wireName(),
+                .session_update => acp.v1.Method.session_update.wireName(),
+                .request_permission => acp.v1.Method.session_request_permission.wireName(),
             },
             .v2 => switch (which) {
-                .session_update => chock_acp.v2.Method.session_update.wireName(),
-                .request_permission => chock_acp.v2.Method.session_request_permission.wireName(),
+                .session_update => acp.v2.Method.session_update.wireName(),
+                .request_permission => acp.v2.Method.session_request_permission.wireName(),
             },
         };
     }
@@ -490,7 +490,7 @@ const Agent = struct {
             .string => |text| text,
             else => return false,
         };
-        const kind = chock_acp.common.PermissionKind.fromWireName(chosen) orelse return false;
+        const kind = acp.common.PermissionKind.fromWireName(chosen) orelse return false;
         return kind.permits();
     }
 
@@ -672,7 +672,7 @@ const Agent = struct {
             self.fail(arena, id, .invalid_params, "initialize needs a protocolVersion");
             return;
         };
-        const version = chock_acp.negotiate(std.math.cast(u16, asked) orelse 0) orelse {
+        const version = acp.negotiate(std.math.cast(u16, asked) orelse 0) orelse {
             self.fail(arena, id, .invalid_request, "this agent does not speak that protocol version");
             return;
         };
@@ -1119,7 +1119,7 @@ const Agent = struct {
         };
     }
 
-    fn endTurn(self: *Agent, reason: chock_acp.common.StopReason) void {
+    fn endTurn(self: *Agent, reason: acp.common.StopReason) void {
         var state = std.heap.ArenaAllocator.init(self.gpa);
         defer state.deinit();
         const arena = state.allocator();
@@ -1127,7 +1127,7 @@ const Agent = struct {
         const turn = self.turn orelse return;
 
         // A cancel that was sent wins over what the log says: the turn can finish between the signal and the handler.
-        const said = if (turn.cancelled) chock_acp.common.StopReason.cancelled else reason;
+        const said = if (turn.cancelled) acp.common.StopReason.cancelled else reason;
 
         self.send(arena, .{ .state = .{
             .state = .idle,
@@ -1222,14 +1222,14 @@ const Agent = struct {
     }
 };
 
-fn capabilities(arena: std.mem.Allocator, version: chock_acp.Version) ![]u8 {
+fn capabilities(arena: std.mem.Allocator, version: acp.Version) ![]u8 {
     const info = .{ .name = agent_name, .version = @import("chock-version").text };
 
     const Present = struct {};
 
     return switch (version) {
         .v1 => std.json.Stringify.valueAlloc(arena, .{
-            .protocolVersion = chock_acp.v1.protocol_version,
+            .protocolVersion = acp.v1.protocol_version,
             .agentCapabilities = .{
                 .loadSession = true,
                 .promptCapabilities = .{
@@ -1247,7 +1247,7 @@ fn capabilities(arena: std.mem.Allocator, version: chock_acp.Version) ![]u8 {
             .agentInfo = info,
         }, .{}),
         .v2 => std.json.Stringify.valueAlloc(arena, .{
-            .protocolVersion = chock_acp.v2.protocol_version,
+            .protocolVersion = acp.v2.protocol_version,
             .capabilities = .{
                 .session = .{
                     .list = Present{},
@@ -1306,7 +1306,7 @@ fn numberField(arena: std.mem.Allocator, params: []const u8, name: []const u8) ?
 fn clientFeatures(
     arena: std.mem.Allocator,
     params: []const u8,
-    version: chock_acp.Version,
+    version: acp.Version,
 ) ClientFeatures {
     if (version == .v2) return .{ .subagents = true, .compaction = true };
     const parsed = std.json.parseFromSlice(std.json.Value, arena, params, .{}) catch return .{};
@@ -1338,12 +1338,12 @@ const ReplayCursorError = error{ Malformed, Unsupported };
 
 fn replayAfter(
     arena: std.mem.Allocator,
-    version: chock_acp.Version,
+    version: acp.Version,
     method: []const u8,
     params: []const u8,
 ) ReplayCursorError!?u64 {
     if (version == .v1) {
-        if (std.mem.eql(u8, method, chock_acp.v1.Method.session_load.wireName())) return 0;
+        if (std.mem.eql(u8, method, acp.v1.Method.session_load.wireName())) return 0;
         return null;
     }
 
@@ -1440,7 +1440,7 @@ fn stopReasonForAgent(outcome: event.AgentOutcome) []const u8 {
 
 fn permissionParams(
     arena: std.mem.Allocator,
-    version: chock_acp.Version,
+    version: acp.Version,
     session_id: []const u8,
     one: event.ApprovalRequest,
 ) std.mem.Allocator.Error![]u8 {
@@ -1481,8 +1481,8 @@ fn permissionParams(
     };
 }
 
-fn toolKindFor(tool: []const u8) chock_acp.common.ToolKind {
-    const known = [_]struct { []const u8, chock_acp.common.ToolKind }{
+fn toolKindFor(tool: []const u8) acp.common.ToolKind {
+    const known = [_]struct { []const u8, acp.common.ToolKind }{
         .{ "read_file", .read },
         .{ "list_directory", .read },
         .{ "read_image", .read },
@@ -1536,7 +1536,7 @@ fn stepStatusFor(status: event.PlanStatus) updates.StepStatus {
     };
 }
 
-fn stopReasonFor(reason: event.SessionEndReason) chock_acp.common.StopReason {
+fn stopReasonFor(reason: event.SessionEndReason) acp.common.StopReason {
     return switch (reason) {
         .finished, .handed_over, .empty_response => .end_turn,
         .canceled_by_user => .cancelled,
@@ -1563,12 +1563,12 @@ const Method = enum {
     session_delete,
     session_close,
 
-    fn fromWireName(version: ?chock_acp.Version, name: []const u8) ?Method {
+    fn fromWireName(version: ?acp.Version, name: []const u8) ?Method {
         const which = version orelse {
             return if (std.mem.eql(u8, name, "initialize")) .initialize else null;
         };
         return switch (which) {
-            .v1 => switch (chock_acp.v1.Method.fromWireName(name) orelse return null) {
+            .v1 => switch (acp.v1.Method.fromWireName(name) orelse return null) {
                 .initialize => .initialize,
                 .authenticate => .authenticate,
                 .session_new => .session_new,
@@ -1580,7 +1580,7 @@ const Method = enum {
                 .session_close => .session_close,
                 else => null,
             },
-            .v2 => switch (chock_acp.v2.Method.fromWireName(name) orelse return null) {
+            .v2 => switch (acp.v2.Method.fromWireName(name) orelse return null) {
                 .initialize => .initialize,
                 .auth_login => .authenticate,
                 .session_new => .session_new,
@@ -1638,19 +1638,19 @@ test "a method is read in the spelling of the version that was agreed" {
 test "every reason a session can end has a stop reason, and none of them lies" {
     const finished = [_]event.SessionEndReason{ .finished, .handed_over, .empty_response };
     for (finished) |reason| try testing.expectEqual(
-        chock_acp.common.StopReason.end_turn,
+        acp.common.StopReason.end_turn,
         stopReasonFor(reason),
     );
 
-    try testing.expectEqual(chock_acp.common.StopReason.cancelled, stopReasonFor(.canceled_by_user));
-    try testing.expectEqual(chock_acp.common.StopReason.max_turn_requests, stopReasonFor(.turn_limit));
+    try testing.expectEqual(acp.common.StopReason.cancelled, stopReasonFor(.canceled_by_user));
+    try testing.expectEqual(acp.common.StopReason.max_turn_requests, stopReasonFor(.turn_limit));
 
     const declined = [_]event.SessionEndReason{
         .refused_by_model,                                 .budget_reached, .no_progress, .rate_limited, .errored,
         .{ .unknown = "something a later version knows" },
     };
     for (declined) |reason| try testing.expectEqual(
-        chock_acp.common.StopReason.refusal,
+        acp.common.StopReason.refusal,
         stopReasonFor(reason),
     );
 
@@ -1664,14 +1664,14 @@ test "every reason a session can end has a stop reason, and none of them lies" {
 }
 
 test "a tool is drawn as what it does, and one nobody knows is other" {
-    try testing.expectEqual(chock_acp.common.ToolKind.execute, toolKindFor("run_command"));
-    try testing.expectEqual(chock_acp.common.ToolKind.read, toolKindFor("read_file"));
-    try testing.expectEqual(chock_acp.common.ToolKind.edit, toolKindFor("write_file"));
-    try testing.expectEqual(chock_acp.common.ToolKind.search, toolKindFor("web_search"));
-    try testing.expectEqual(chock_acp.common.ToolKind.fetch, toolKindFor("web_fetch"));
+    try testing.expectEqual(acp.common.ToolKind.execute, toolKindFor("run_command"));
+    try testing.expectEqual(acp.common.ToolKind.read, toolKindFor("read_file"));
+    try testing.expectEqual(acp.common.ToolKind.edit, toolKindFor("write_file"));
+    try testing.expectEqual(acp.common.ToolKind.search, toolKindFor("web_search"));
+    try testing.expectEqual(acp.common.ToolKind.fetch, toolKindFor("web_fetch"));
 
-    try testing.expectEqual(chock_acp.common.ToolKind.other, toolKindFor("create_issue"));
-    try testing.expectEqual(chock_acp.common.ToolKind.other, toolKindFor(""));
+    try testing.expectEqual(acp.common.ToolKind.other, toolKindFor("create_issue"));
+    try testing.expectEqual(acp.common.ToolKind.other, toolKindFor(""));
 }
 
 test "a logged patch identifies additions and deletions without guessing fragments" {
@@ -1844,9 +1844,9 @@ test "v2 replay accepts start and Chock offsets but refuses unknown cursors" {
 }
 
 test "the version answered is the newest both sides speak" {
-    try testing.expectEqual(chock_acp.Version.v1, chock_acp.negotiate(1).?);
-    try testing.expectEqual(chock_acp.Version.v2, chock_acp.negotiate(2).?);
-    try testing.expectEqual(@as(?chock_acp.Version, null), chock_acp.negotiate(0));
+    try testing.expectEqual(acp.Version.v1, acp.negotiate(1).?);
+    try testing.expectEqual(acp.Version.v2, acp.negotiate(2).?);
+    try testing.expectEqual(@as(?acp.Version, null), acp.negotiate(0));
 }
 
 test "only a selected allow option permits, and anything unreadable refuses" {
@@ -1890,7 +1890,7 @@ test "only a selected allow option permits, and anything unreadable refuses" {
 
 test "the option identifiers offered are the kinds the protocol names" {
     for ([_][]const u8{ "allow_once", "allow_always", "reject_once" }) |offered| {
-        try testing.expect(chock_acp.common.PermissionKind.fromWireName(offered) != null);
+        try testing.expect(acp.common.PermissionKind.fromWireName(offered) != null);
     }
 }
 

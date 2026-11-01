@@ -568,11 +568,10 @@ fn runTurn(
         .message => |reply_message| {
             defer chock_provider.Client.freeAssembledMessage(allocator, reply_message);
 
-            _ = try appendAndApply(allocator, io, locked, session, deps, .{ .message = .{
-                .role = .assistant,
-                .content = reply_message.content,
-                .model_alias = deps.model_alias,
-            } });
+            var logged_reply = try chock_provider.proto.toEventMessage(arena, reply_message);
+            logged_reply.role = .assistant;
+            logged_reply.model_alias = deps.model_alias;
+            _ = try appendAndApply(allocator, io, locked, session, deps, .{ .message = logged_reply });
             telling.observeEvent(nowMs(io, deps), true);
 
             if (reply.stop().isRefusal()) {
@@ -594,7 +593,7 @@ fn runTurn(
             }
 
             var ran_a_tool = false;
-            for (reply_message.content) |part| {
+            for (logged_reply.content) |part| {
                 if (part != .tool_use) continue;
                 const observed = try progress.observe(
                     allocator,
@@ -1114,8 +1113,11 @@ fn appendUsage(
     locked: anytype,
     session: *chock_proto.state.Session,
     deps: Deps,
-    reported: event.Usage,
+    reported_neutral: message.Usage,
 ) Error!void {
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const reported = try chock_provider.proto.toEventUsage(arena_state.allocator(), reported_neutral);
     var usage = reported;
     usage.model = deps.model;
     usage.model_alias = deps.model_alias;
@@ -1723,7 +1725,7 @@ fn runTool(
     deps: Deps,
     telling: *notices.State,
     failing: *Failing,
-    tool_use: message.ToolCall,
+    tool_use: event.ToolUse,
 ) Error!void {
     const call = event.ToolCall{
         .call_id = tool_use.call_id,

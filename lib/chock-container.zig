@@ -1,27 +1,20 @@
-//! Reads a container image and gives back an environment and a set of
-//! directories to mount. The sandbox is unchanged by it.
+//! Chock's configuration adapter around the package-owned OCI runtime.
 
 const std = @import("std");
+const oci = @import("oci");
 
-const diagnostic = @import("chock-container/diagnostic.zig");
-
-pub const Diagnostic = diagnostic.Diagnostic;
-
-pub const Sink = diagnostic.Sink;
-
-pub const sinkOf = diagnostic.sinkOf;
+pub const Diagnostic = oci.Diagnostic;
+pub const Sink = oci.Sink;
+pub const sinkOf = oci.sinkOf;
 
 pub const config = @import("chock-container/config.zig");
-pub const Image = @import("chock-container/Image.zig");
-pub const proc = @import("chock-container/proc.zig");
-pub const reference = @import("chock-container/reference.zig");
-pub const Runtime = @import("chock-container/Runtime.zig");
+pub const Image = oci.Image;
+pub const proc = oci.proc;
+pub const reference = oci.reference;
+pub const Runtime = oci.Runtime;
 
 test {
     std.testing.refAllDecls(@This());
     _ = config;
-    _ = Image;
-    _ = proc;
-    _ = reference;
-    _ = Runtime;
+    _ = oci;
 }

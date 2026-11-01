@@ -17,10 +17,12 @@ agree to uphold it.
   event log, `chock-policy` the rules, `chock-core` the agent loop,
   `chock-broker` the arbitration, `chock-nix` the toolchain, and `chock-ui` the
   widget tree the terminal, a window and a browser all draw.
-  `chock-acp`, `chock-auth`, `chock-container`, `chock-cost`, `chock-io`,
-  `chock-provider`, `chock-workspace`, `chock-plugin-core` and
-  `chock-plugin-sdk` complete the set. Smart-card transport and sealing live in
-  the external `pcsc.zig` package.
+  `chock-auth`, `chock-container`, `chock-cost`, `chock-io`, `chock-provider`,
+  `chock-workspace`, `chock-plugin-core` and `chock-plugin-sdk` complete the
+  set. The small container and provider modules adapt Chock configuration and
+  durable log records to the external `oci.zig` and `llm-provider.zig`
+  packages. ACP, smart-card transport and sealing likewise live in the
+  external `acp.zig` and `pcsc.zig` packages.
 - `src/` - the command line. One file for each command, with `main.zig` above
   them.
 - `test/` - the tests that need more than one process, or more of the
