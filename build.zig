@@ -458,59 +458,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_client_tests.step);
 
     // The seal over a session log's chain head, and the smart card that can hold
-    // the key. Like chock-net, chock-io and chock-policy, it imports no other
-    // chock library: verification is std.crypto plus a public key, and a module
-    // an auditor uses must not need the log reader, the workspace or a
-    // credential store to be present. It links no platform library either, which
-    // keeps `zig build` the only tool a build needs: see lib/chock-pcsc.zig's own
-    // top comment for that decision and why the transport refuses instead.
-    const chock_pcsc = b.addModule("chock-pcsc", .{
-        .root_source_file = b.path("lib/chock-pcsc.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const pcsc_tests = b.addTest(.{ .root_module = chock_pcsc });
-    const run_pcsc_tests = b.addRunArtifact(pcsc_tests);
-    // Same reasoning as run_net_tests above.
-    run_pcsc_tests.skip_foreign_checks = true;
-    test_step.dependOn(&run_pcsc_tests.step);
-
-    // The seal read against a real hash chain, and a certificate chain the
-    // library itself must not carry. This is its own target for the reason
-    // test/proto/lock.zig is: the tests need chock-proto, and chock-pcsc must
-    // not import it. Nothing here needs a card, a reader or a daemon.
-    const pcsc_verify_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/pcsc/verify.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "chock-pcsc", .module = chock_pcsc },
-                .{ .name = "chock-proto", .module = chock_proto },
-            },
-        }),
-    });
-    const run_pcsc_verify_tests = b.addRunArtifact(pcsc_verify_tests);
-    run_pcsc_verify_tests.skip_foreign_checks = true;
-    test_step.dependOn(&run_pcsc_verify_tests.step);
-
-    // The Linux transport against a real `pcscd`. Its own target because it
-    // starts a daemon, which is the one thing every other test in this module
-    // is built to avoid needing, and because a target that spawns a program
-    // must be able to skip on a machine that has none. It still needs no card
-    // and no reader: see the file's own top comment.
-    const pcsc_daemon_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/pcsc/pcscd.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "chock-pcsc", .module = chock_pcsc }},
-        }),
-    });
-    const run_pcsc_daemon_tests = b.addRunArtifact(pcsc_daemon_tests);
-    run_pcsc_daemon_tests.skip_foreign_checks = true;
-    test_step.dependOn(&run_pcsc_daemon_tests.step);
+    // the key. pcsc.zig owns its protocol, transport, crypto, and hardware-facing
+    // tests; Chock's session tests cover the integration with its hash chain.
+    const pcsc_dependency = b.dependency("pcsc", .{ .target = target, .optimize = optimize });
+    const pcsc = pcsc_dependency.module("pcsc");
 
     const policy_tests = b.addTest(.{ .root_module = chock_policy });
     const run_policy_tests = b.addRunArtifact(policy_tests);
@@ -537,7 +488,7 @@ pub fn build(b: *std.Build) void {
     //
     // Not gated behind `linux_only`: `test/devices/udev.zig` carries its own
     // runtime check and skips itself on a target with no kernel netlink to
-    // open, the same shape `pcsc_daemon_tests` above already follows.
+    // open.
     const udev = b.dependency("udev", .{ .target = target, .optimize = optimize });
 
     // The proof and not a library test: it opens a real netlink monitor and
@@ -1921,8 +1872,8 @@ pub fn build(b: *std.Build) void {
         // `chock sessions seal` writes a seal beside a log and `chock sessions
         // verify` reads it. The binary is where the two halves meet: the key
         // comes from chock-auth and the log's digests come from chock-proto,
-        // and chock-pcsc must import neither.
-        .{ .name = "chock-pcsc", .module = chock_pcsc },
+        // and pcsc.zig must import neither.
+        .{ .name = "pcsc", .module = pcsc },
         .{ .name = "chock-broker", .module = chock_broker },
         .{ .name = "chock-workspace", .module = chock_workspace },
         .{ .name = "chock-core", .module = chock_core },

@@ -18,14 +18,15 @@ agree to uphold it.
   `chock-broker` the arbitration, `chock-nix` the toolchain, and `chock-ui` the
   widget tree the terminal, a window and a browser all draw.
   `chock-acp`, `chock-auth`, `chock-container`, `chock-cost`, `chock-io`,
-  `chock-pcsc`, `chock-provider`, `chock-workspace`, `chock-plugin-core` and
-  `chock-plugin-sdk` complete the set.
+  `chock-provider`, `chock-workspace`, `chock-plugin-core` and
+  `chock-plugin-sdk` complete the set. Smart-card transport and sealing live in
+  the external `pcsc.zig` package.
 - `src/` - the command line. One file for each command, with `main.zig` above
   them.
 - `test/` - the tests that need more than one process, or more of the
   repository than the library they test, by area: `auth`, `broker`, `cli`,
-  `container`, `core`, `devices`, `docs`, `nix`, `pcsc`, `plugin`, `proto`,
-  `redteam`, `sandbox` and `workspace`.
+  `container`, `core`, `devices`, `docs`, `nix`, `plugin`, `proto`, `redteam`,
+  `sandbox` and `workspace`.
 - `docs/` - the documentation. Start at [docs/README.md](docs/README.md).
 
 ## The rules that hold the model together

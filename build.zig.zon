@@ -36,6 +36,10 @@
             .url = "git+https://git.lilithsemi.com/LilithSemi/ziggit#52a7deaf438c677b670e8f2af0d208bd29bfb92b",
             .hash = "ziggit-0.1.0-KYLpgYHNFADuTovcF0_Zr68pzPsJi57KekNX3OHtW0GR",
         },
+        .pcsc = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/pcsc.zig#9fa2f723e7747db81b4b238da23d85be37bcb88b",
+            .hash = "pcsc-0.1.0-gLk7KYtLBADXZWuczfJ0lEH-JNmJUfwtwehmgV2vZeVT",
+        },
     },
     .paths = .{
         "build.zig",

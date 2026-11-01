@@ -5,7 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const chock_auth = @import("chock-auth");
 const chock_core = @import("chock-core");
-const chock_pcsc = @import("chock-pcsc");
+const pcsc = @import("pcsc");
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
 const chock_workspace = @import("chock-workspace");
@@ -22,8 +22,8 @@ const tty = @import("tty.zig");
 const chain = chock_proto.chain;
 const event = chock_proto.event;
 const state = chock_proto.state;
-const seal = chock_pcsc.seal;
-const sidecar = chock_pcsc.sidecar;
+const seal = pcsc.seal;
+const sidecar = pcsc.sidecar;
 
 const log_suffix = ".jsonl";
 const work_suffix = ".work";
@@ -1101,11 +1101,11 @@ fn verifySessions(
 const Choice = struct {
     signer: seal.Signer,
     level: seal.Level,
-    card: chock_pcsc.attempt.Outcome,
+    card: pcsc.attempt.Outcome,
     reader: []const u8 = "",
     detail: []const u8 = "",
     pin_bytes: ?usize = null,
-    tries: ?chock_pcsc.piv.Tries = null,
+    tries: ?pcsc.piv.Tries = null,
     require_card: bool = false,
 
     fn fallback(self: Choice) Fallback {
@@ -1247,7 +1247,7 @@ fn signedWithText(
                 "PIV slot {X:0>2}, and that is {s}: {s}.",
             .{
                 subject,
-                @backingInt(chock_pcsc.attempt.seal_slot),
+                @backingInt(pcsc.attempt.seal_slot),
                 levelRank(choice.level),
                 levelText(choice.level),
             },
@@ -1259,14 +1259,14 @@ fn signedWithText(
             .{
                 subject,
                 choice.reader,
-                @backingInt(chock_pcsc.attempt.seal_slot),
+                @backingInt(pcsc.attempt.seal_slot),
                 levelRank(choice.level),
                 levelText(choice.level),
             },
         );
     }
 
-    var room: [chock_pcsc.attempt.max_sentence_len]u8 = undefined;
+    var room: [pcsc.attempt.max_sentence_len]u8 = undefined;
     const why = choice.card.sentenceWith(choice.pin_bytes, &room);
 
     if (choice.detail.len == 0) return std.fmt.allocPrint(
@@ -1315,10 +1315,10 @@ fn sealMain(
     };
 
     // It must not move: the attempt below points at it, and the signer points at the attempt.
-    var transport = chock_pcsc.default(io);
+    var transport = pcsc.default(io);
     defer transport.deinit();
-    var scratch: [chock_pcsc.piv.max_object_len]u8 = undefined;
-    var attempt = chock_pcsc.attempt.Attempt.init(transport.pcsc(), &scratch);
+    var scratch: [pcsc.piv.max_object_len]u8 = undefined;
+    var attempt = pcsc.attempt.Attempt.init(transport.pcsc(), &scratch);
     defer attempt.deinit();
 
     var asking = TerminalPin{ .io = io, .at_terminal = approval.hasTerminal(io) };
@@ -1328,7 +1328,7 @@ fn sealMain(
     if (attempt.metadata) |slot| tty.detail(
         "PIV slot {X:0>2}: {s}, PIN policy {s}, touch policy {s}\n",
         .{
-            @backingInt(chock_pcsc.attempt.seal_slot),
+            @backingInt(pcsc.attempt.seal_slot),
             slot.algorithm.text(),
             @tagName(slot.pin_policy),
             @tagName(slot.touch_policy),
@@ -1367,9 +1367,9 @@ fn sealMain(
 }
 
 const Fallback = struct {
-    found: chock_pcsc.attempt.Outcome,
+    found: pcsc.attempt.Outcome,
     require_card: bool,
-    tries: ?chock_pcsc.piv.Tries = null,
+    tries: ?pcsc.piv.Tries = null,
     pin_bytes: ?usize = null,
     detail: []const u8 = "",
 };
@@ -1380,12 +1380,12 @@ fn sealRefusal(
 ) std.mem.Allocator.Error!?[]u8 {
     if (fallback.found == .ready) return null;
 
-    var room: [chock_pcsc.attempt.max_sentence_len]u8 = undefined;
+    var room: [pcsc.attempt.max_sentence_len]u8 = undefined;
     const why = fallback.found.sentenceWith(fallback.pin_bytes, &room);
 
     if (fallback.found.pinAttemptFailed()) {
         var left_room: [64]u8 = undefined;
-        const left = switch (fallback.tries orelse chock_pcsc.piv.Tries.unknown) {
+        const left = switch (fallback.tries orelse pcsc.piv.Tries.unknown) {
             .left => |count| std.fmt.bufPrint(
                 &left_room,
                 "The card has {d} {s} left. ",
@@ -1432,17 +1432,17 @@ const TerminalPin = struct {
     at_terminal: bool,
     asked: usize = 0,
 
-    fn asker(self: *TerminalPin) chock_pcsc.pin.Asker {
+    fn asker(self: *TerminalPin) pcsc.pin.Asker {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = chock_pcsc.pin.Asker.VTable{ .ask = askFn };
+    const vtable = pcsc.pin.Asker.VTable{ .ask = askFn };
 
     fn askFn(
         ptr: *anyopaque,
-        question: chock_pcsc.pin.Question,
-        out: *chock_pcsc.pin.Buffer,
-    ) chock_pcsc.pin.Answer {
+        question: pcsc.pin.Question,
+        out: *pcsc.pin.Buffer,
+    ) pcsc.pin.Answer {
         const self: *TerminalPin = @ptrCast(@alignCast(ptr));
         if (!self.at_terminal) return .nobody;
         self.asked += 1;
@@ -1462,7 +1462,7 @@ const TerminalPin = struct {
     }
 };
 
-fn answerFor(err: tty.SecretError) chock_pcsc.pin.Answer {
+fn answerFor(err: tty.SecretError) pcsc.pin.Answer {
     return switch (err) {
         error.Empty => .declined,
         error.NotATerminal => .nobody,
@@ -1471,7 +1471,7 @@ fn answerFor(err: tty.SecretError) chock_pcsc.pin.Answer {
     };
 }
 
-fn sayTries(question: chock_pcsc.pin.Question) void {
+fn sayTries(question: pcsc.pin.Question) void {
     if (question.reader.len != 0) {
         tty.print(.plain, "\nA card in reader \"{s}\" wants its PIN before it will sign.\n", .{question.reader});
     } else {
@@ -1498,10 +1498,10 @@ fn sayTries(question: chock_pcsc.pin.Question) void {
 
 fn transportDetail(
     arena: std.mem.Allocator,
-    transport: *chock_pcsc.Driver,
-    found: chock_pcsc.attempt.Outcome,
+    transport: *pcsc.Driver,
+    found: pcsc.attempt.Outcome,
 ) []const u8 {
-    if (comptime !@hasDecl(chock_pcsc.platform, "Failure")) {
+    if (comptime !@hasDecl(pcsc.platform, "Failure")) {
         return "";
     } else {
         if (!found.fromTransport()) return "";
@@ -1515,7 +1515,7 @@ fn signingKey(
     io: std.Io,
     data_dir: []const u8,
     secrets: chock_auth.store.Secrets,
-) ?chock_pcsc.software.Key {
+) ?pcsc.software.Key {
     var diag: ?chock_auth.store.Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
 
@@ -1523,7 +1523,7 @@ fn signingKey(
         reportKeyFault(err, diag);
         return null;
     }) |secret| {
-        return chock_pcsc.software.Key.fromSecret(secret) catch {
+        return pcsc.software.Key.fromSecret(secret) catch {
             tty.print(
                 .err,
                 "chock sessions seal: the stored signing key is not a key on the curve. " ++
@@ -1534,7 +1534,7 @@ fn signingKey(
         };
     }
 
-    const made = chock_pcsc.software.Key.generate(io);
+    const made = pcsc.software.Key.generate(io);
     chock_auth.store.ensureDir(io, data_dir, &diag) catch |err| {
         reportKeyFault(err, diag);
         return null;
@@ -3651,7 +3651,7 @@ fn repairLog(
 const test_seal_seed = @as([32]u8, @splat(0x5e));
 
 fn sealForTest(arena: std.mem.Allocator, dir: []const u8, id: []const u8) !u8 {
-    var key = try chock_pcsc.software.Key.fromSeed(test_seal_seed);
+    var key = try pcsc.software.Key.fromSeed(test_seal_seed);
     return sealSessions(arena, testing.io, dir, "/home/somebody/work/parser", id, .{
         .signer = key.signer(),
         .level = .software,
@@ -4003,8 +4003,8 @@ test "the line that says which key signed is built from what the run measured" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var key = try chock_pcsc.software.Key.fromSeed(test_seal_seed);
-    const cases = [_]struct { outcome: chock_pcsc.attempt.Outcome, words: []const u8 }{
+    var key = try pcsc.software.Key.fromSeed(test_seal_seed);
+    const cases = [_]struct { outcome: pcsc.attempt.Outcome, words: []const u8 }{
         .{ .outcome = .no_reader, .words = "no reader is attached" },
         .{ .outcome = .no_card, .words = "holds no card" },
         .{ .outcome = .no_key, .words = "it says its signature slot holds no key" },
@@ -4067,7 +4067,7 @@ test "the line says the number of bytes that were typed, and only where a length
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var key = try chock_pcsc.software.Key.fromSeed(test_seal_seed);
+    var key = try pcsc.software.Key.fromSeed(test_seal_seed);
     const counted = try signedWithText(arena, .{
         .signer = key.signer(),
         .level = .software,
@@ -4102,7 +4102,7 @@ test "a PIN was answered and no card signed, so nothing is sealed and the run fa
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const allowed = [_]chock_pcsc.attempt.Outcome{
+    const allowed = [_]pcsc.attempt.Outcome{
         .no_transport,
         .no_daemon,
         .not_authorized,
@@ -4127,7 +4127,7 @@ test "a PIN was answered and no card signed, so nothing is sealed and the run fa
         );
     }
 
-    const refused = [_]chock_pcsc.attempt.Outcome{
+    const refused = [_]pcsc.attempt.Outcome{
         .pin_too_long,
         .pin_unreadable,
         .pin_too_short,
@@ -4178,7 +4178,7 @@ test "--require-card refuses every software seal, including the one nobody chose
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    for ([_]chock_pcsc.attempt.Outcome{ .no_reader, .no_card, .pin_declined, .pin_blocked }) |one| {
+    for ([_]pcsc.attempt.Outcome{ .no_reader, .no_card, .pin_declined, .pin_blocked }) |one| {
         try testing.expectEqual(
             @as(?[]u8, null),
             try sealRefusal(arena, .{ .found = one, .require_card = false }),
@@ -4218,7 +4218,7 @@ test "a refused card attempt writes no seal file at all, so the next run is a cl
     said.start(testing.io, testing.allocator);
     defer said.stop(testing.io);
 
-    var key = try chock_pcsc.software.Key.fromSeed(test_seal_seed);
+    var key = try pcsc.software.Key.fromSeed(test_seal_seed);
     const code = try sealSessions(arena, testing.io, dir, "/home/somebody/work/parser", id, .{
         .signer = key.signer(),
         .level = .software,
@@ -4246,7 +4246,7 @@ test "one seal is not called every seal, because a reader looks for the set and 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var key = try chock_pcsc.software.Key.fromSeed(test_seal_seed);
+    var key = try pcsc.software.Key.fromSeed(test_seal_seed);
     const choice = Choice{ .signer = key.signer(), .level = .software, .card = .no_reader };
 
     const one = try signedWithText(arena, choice, 1);
@@ -4293,7 +4293,7 @@ test "a card seal names the card on the row, and the fallback line is not printe
     said.start(testing.io, testing.allocator);
     defer said.stop(testing.io);
 
-    var key = try chock_pcsc.software.Key.fromSeed(test_seal_seed);
+    var key = try pcsc.software.Key.fromSeed(test_seal_seed);
     _ = try sealSessions(arena, testing.io, dir, "/home/somebody/work/parser", id, .{
         .signer = key.signer(),
         .level = .card,
@@ -4311,7 +4311,7 @@ test "a card seal names the card on the row, and the fallback line is not printe
 }
 
 const RefusingSigner = struct {
-    key: chock_pcsc.software.Key,
+    key: pcsc.software.Key,
     good: usize,
     signed: usize = 0,
     why: []const u8,
@@ -4371,9 +4371,9 @@ test "a signer that refuses part way through says why, and the run stops asking"
     said.start(testing.io, testing.allocator);
     defer said.stop(testing.io);
 
-    const sentence = chock_pcsc.attempt.Outcome.pin_too_long.sentence();
+    const sentence = pcsc.attempt.Outcome.pin_too_long.sentence();
     var refusing = RefusingSigner{
-        .key = try chock_pcsc.software.Key.fromSeed(test_seal_seed),
+        .key = try pcsc.software.Key.fromSeed(test_seal_seed),
         .good = 1,
         .why = sentence,
     };
@@ -4561,7 +4561,7 @@ test "the signing key is made once and read back after, so two runs share one si
     };
     defer broken.deinit();
     try testing.expectEqual(
-        @as(?chock_pcsc.software.Key, null),
+        @as(?pcsc.software.Key, null),
         signingKey(testing.allocator, testing.io, data_dir, broken.secrets()),
     );
     try testing.expectEqualStrings("not a secret", broken.value);
@@ -5039,21 +5039,21 @@ test "nobody at a keyboard is a refusal, decided before a byte is written" {
     defer said.stop(testing.io);
 
     var asking = TerminalPin{ .io = testing.io, .at_terminal = false };
-    var buffer: chock_pcsc.pin.Buffer = undefined;
+    var buffer: pcsc.pin.Buffer = undefined;
     const answer = asking.asker().ask(.{
         .reader = "Yubico YubiKey OTP+FIDO+CCID 00 00",
         .slot = .digital_signature,
         .tries = .{ .left = 3 },
     }, &buffer);
 
-    try testing.expectEqual(chock_pcsc.pin.Answer.nobody, answer);
+    try testing.expectEqual(pcsc.pin.Answer.nobody, answer);
     try testing.expectEqualStrings("", said.out());
     try testing.expectEqualStrings("", said.err());
     try testing.expectEqual(@as(usize, 0), asking.asked);
 }
 
 test "a read that failed says what happened, and only an empty answer is a decline" {
-    const cases = [_]struct { err: tty.SecretError, want: chock_pcsc.pin.Answer }{
+    const cases = [_]struct { err: tty.SecretError, want: pcsc.pin.Answer }{
         .{ .err = error.Empty, .want = .declined },
         .{ .err = error.NotATerminal, .want = .nobody },
         .{ .err = error.EchoStuck, .want = .unreadable },

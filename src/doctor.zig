@@ -8,7 +8,7 @@ const chock_container = @import("chock-container");
 const chock_core = @import("chock-core");
 const chock_io = @import("chock-io");
 const chock_nix = @import("chock-nix");
-const chock_pcsc = @import("chock-pcsc");
+const pcsc = @import("pcsc");
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
 const palisade = @import("palisade");
@@ -1270,12 +1270,12 @@ fn defaultModel(
 }
 
 fn measureCardSeal(arena: std.mem.Allocator, io: std.Io, m: *Measured) void {
-    if (comptime !@hasDecl(chock_pcsc.platform, "Failure")) {
+    if (comptime !@hasDecl(pcsc.platform, "Failure")) {
         m.card_seal = .{ .absent = "this build has no PC/SC transport: macOS reaches a card " ++
             "through a framework that has to be linked, and Chock links no platform library" };
         return;
     } else {
-        var driver = chock_pcsc.default(io);
+        var driver = pcsc.default(io);
         defer driver.deinit();
 
         driver.establish() catch |err| {
@@ -1296,7 +1296,7 @@ fn measureCardSeal(arena: std.mem.Allocator, io: std.Io, m: *Measured) void {
             return;
         };
 
-        var list = chock_pcsc.ReaderList.init(names[0..written]);
+        var list = pcsc.ReaderList.init(names[0..written]);
         var counted: usize = 0;
         while (list.next()) |_| counted += 1;
         m.card_readers = counted;
