@@ -153,20 +153,26 @@ An organisation can close this road for every project at once with one
 
 ### The agent can ask for the same thing
 
-`request_action` is the one act an agent may ask for by name, and it takes
-`workspace.apply` and nothing else. An agent that believes it has finished calls
-it, and you get the question above, with the agent's own reason in it, without
-waiting for the session to end. Everything else is identical: the same table
-decides, the same diff is shown, and the work lands on the same
-`refs/chock/<session>` ref. An agent gains nothing by asking, and it cannot
-choose how the work lands. The mode comes from
+`request_action` lets an agent ask about one of the brokered action classes:
+`git.commit`, `git.push`, `git.branch.delete`, `net.fetch`, `nix.build`,
+`file.write`, `model.select` or `workspace.apply`. For every act except
+`workspace.apply`, the call reports the broker's answer and performs no
+operation. The agent must next use the tool or command that performs it, and
+that path checks the concrete target under the ordinary policy rules. An
+unknown action name is refused before anybody is asked.
+
+`workspace.apply` is the one request that performs the act itself. An agent
+that believes it has finished calls it, and you get the question above, with
+the agent's own reason in it, without waiting for the session to end.
+Everything else is identical: the same table decides, the same diff is shown,
+and the work lands on the same `refs/chock/<session>` ref. An agent gains
+nothing by asking, and it cannot choose how the work lands. The mode comes from
 `chock.zon` and from the policy row above it, both read outside the sandbox, and
 the one thing an agent fills in for an apply is its reason. There is no field of
 the request a mode could arrive in, and the build fails if one is ever added.
 
-Two answers never reach you at all: an agent that asks for any other action is
-refused by name, and an agent that asks having made no commit is told how many
-files it has left uncommitted, because there is nothing to put in front of you.
+An agent that asks to apply having made no commit is told how many files it has
+left uncommitted, because there is nothing to put in front of you.
 
 ## How a question reaches a person
 

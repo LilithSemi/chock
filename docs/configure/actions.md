@@ -51,6 +51,13 @@ the program it runs. `spawn_agent`, `update_plan`, `restrict_self`,
 that fits them better, so a `call.` rule for one of those would read as a
 control and do nothing.
 
+`request_action` can put `git.commit`, `git.push`, `git.branch.delete`,
+`net.fetch`, `nix.build`, `file.write`, `model.select` or `workspace.apply` to
+the broker. Except for `workspace.apply`, its answer does not perform the act;
+the later tool or command is still checked with its concrete target. This
+keeps a broad question from becoming authority over a host, path, attribute or
+model the question did not name.
+
 ## `exec.*`, running a program
 
 `run_command` names a program by the class it belongs to, and the store is two

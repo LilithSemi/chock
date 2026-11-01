@@ -59,7 +59,7 @@ The last eleven are described here or on a page of their own:
 | `restrict_self` | a promise the agent cannot take back | [policy.md](../configure/policy.md) |
 | `fetch_url` | one page over http or https | [actions.md](../configure/actions.md) |
 | `web_search` | one query against a search engine | [search.md](../configure/search.md) |
-| `request_action` | your work carried back into your repository | [approvals.md](approvals.md) |
+| `request_action` | whether a brokered act is available | [approvals.md](approvals.md) |
 | `update_plan` | a task list you can watch | [running.md](../running.md) |
 
 ## Every call is gated
@@ -71,13 +71,14 @@ prompt, and a project rule of `ask` on one of them reaches a person mid
 session. [actions.md](../configure/actions.md) has every name and what ships
 with it.
 
-`request_action` is the one act an agent can ask for by name, and it takes
-`workspace.apply` and nothing else. An agent that believes it is finished calls
-it, and your policy, or you, answer. It never moves a branch of yours: the work
-lands on a ref of the session's own, which you read with `git log` and take
-with `git merge`. An agent that has made no commit is told so and nobody is
-asked, because only a commit is carried back. [status.md](../status.md) lists
-what an agent still cannot ask for.
+`request_action` can ask about `git.commit`, `git.push`, `git.branch.delete`,
+`net.fetch`, `nix.build`, `file.write`, `model.select` or `workspace.apply`.
+For the first seven it only returns the broker's answer: the agent must then
+use the tool or command that performs the act, where the concrete target is
+checked again. `workspace.apply` is the exception. It carries the session's
+commit to its own ref in your repository, which you can inspect with `git log`
+and take with `git merge`; it never moves one of your branches by itself. An
+agent with no commit is told so and nobody is asked.
 
 ## A program the agent has not got
 

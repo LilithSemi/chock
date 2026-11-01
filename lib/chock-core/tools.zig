@@ -715,11 +715,12 @@ pub const Tool = enum {
                 "later name is the one a person sees, so if the work turns out to be something " ++
                 "else, say so. Everything you write here is kept in the session log and a person " ++
                 "reads it, so write it for them.",
-            .request_action => "Ask for the work you have done to be carried back into the " ++
-                "user's own repository, and wait for the answer. **Call it when you believe you " ++
-                "are finished**, so the user is told rather than left to find out. The only " ++
-                "action this takes is \"" ++ handback.apply_action ++ "\", and every other name " ++
-                "is refused.\n" ++
+            .request_action => "Ask whether one brokered act is available, and wait for the " ++
+                "answer. It can ask for git.commit, git.push, git.branch.delete, net.fetch, " ++
+                "nix.build, file.write, model.select, or \"" ++ handback.apply_action ++ "\". " ++
+                "An answer does not perform a generic act: call the tool or command that needs " ++
+                "it afterwards. workspace.apply is the exception because this tool carries the " ++
+                "finished commit itself.\n" ++
                 "**Commit first.** Only a commit is carried back: the workspace you work in is " ++
                 "thrown away at the end of the session, and a changed file that is not in a " ++
                 "commit goes with it. A call made with no commit carries nothing, tells you how " ++
@@ -1388,14 +1389,38 @@ pub const RequestActionArgs = struct {
     reason: []const u8,
 
     pub const docs = .{
-        .action = "The act you are asking for. The only one offered is \"" ++
-            handback.apply_action ++ "\", which carries your commit back into the user's own " ++
-            "repository. Any other name is refused and nothing happens.",
-        .reason = "Why the work is ready, in one or two sentences, written for the person who " ++
-            "will read the diff and answer. Say what you did and what you did not do. This is " ++
-            "the only account of your side of it that they see.",
+        .action = "The brokered act to ask about: " ++ requestable_actions_text ++ ".",
+        .reason = "Why this act is needed, in one or two sentences, written for the person or " ++
+            "policy that answers it.",
     };
 };
+
+pub const requestable_actions = [_][]const u8{
+    "git.commit",
+    "git.push",
+    "git.branch.delete",
+    "net.fetch",
+    "nix.build",
+    "file.write",
+    "workspace.apply",
+    "model.select",
+};
+
+pub const requestable_actions_text = blk: {
+    var text: []const u8 = "";
+    for (requestable_actions) |action| {
+        if (text.len != 0) text = text ++ ", ";
+        text = text ++ action;
+    }
+    break :blk text;
+};
+
+pub fn actionIsRequestable(action: []const u8) bool {
+    for (requestable_actions) |known| {
+        if (std.mem.eql(u8, known, action)) return true;
+    }
+    return false;
+}
 
 const ceiling_names_text = chock_policy.ratchet.ceiling_names_text;
 

@@ -2900,22 +2900,60 @@ fn runRequestAction(
             "fields, \"action\" and \"reason\".",
     ));
 
-    if (!std.mem.eql(u8, parsed.value.action, handback_mod.apply_action)) {
+    if (!tools.actionIsRequestable(parsed.value.action)) {
         return requestRefusal(allocator, call, try std.fmt.allocPrint(
             allocator,
-            "nothing was asked for: \"{s}\" is not an act you can request. The only one is " ++
-                "\"{s}\", which carries your commit back into the user's repository. Nothing " ++
-                "else was put to anybody.",
-            .{ parsed.value.action, handback_mod.apply_action },
+            "nothing was asked for: \"{s}\" is not a brokered act request_action can name. " ++
+                "The requestable acts are: {s}. Nothing was put to anybody.",
+            .{ parsed.value.action, tools.requestable_actions_text },
         ));
     }
 
     if (std.mem.trim(u8, parsed.value.reason, " \t\r\n").len == 0) {
         return requestRefusal(allocator, call, try allocator.dupe(
             u8,
-            "nothing was asked for: say why the work is ready. A person reads your reason " ++
-                "beside the diff, and a request with none is one they cannot weigh.",
+            "nothing was asked for: say why this act is needed. A person or policy reads your " ++
+                "reason, and a request with none is one they cannot weigh.",
         ));
+    }
+
+    if (!std.mem.eql(u8, parsed.value.action, handback_mod.apply_action)) {
+        const arbiter = deps.arbiter orelse return requestRefusal(allocator, call, try allocator.dupe(
+            u8,
+            "nothing was asked for: this session has no approval broker attached.",
+        ));
+        const summary = try std.fmt.allocPrint(allocator, "allow this session to perform {s}", .{parsed.value.action});
+        defer allocator.free(summary);
+        const detail = try std.fmt.allocPrint(
+            allocator,
+            "the agent asked about {s} before attempting the operation.\nthe agent's reason: {s}\n",
+            .{ parsed.value.action, parsed.value.reason },
+        );
+        defer allocator.free(detail);
+        const answer = arbiter.decide(allocator, io, locked, .{
+            .action = parsed.value.action,
+            .summary = summary,
+            .detail = detail,
+            .reason = parsed.value.reason,
+            .tool = request_tool_name,
+            .tool_call_id = call.call_id,
+        });
+        return .{
+            .call_id = try allocator.dupe(u8, call.call_id),
+            .output = try std.fmt.allocPrint(
+                allocator,
+                "the answer for {s} was \"{s}\".{s}{s} This call performed no operation; " ++
+                    "use the tool or command that needs the act next.",
+                .{
+                    parsed.value.action,
+                    answer.outcome,
+                    if (answer.review_text.len == 0) "" else " ",
+                    answer.review_text,
+                },
+            ),
+            .is_error = !answer.permitted,
+            .truncated = false,
+        };
     }
 
     const handback = deps.handback orelse return requestRefusal(
@@ -9474,7 +9512,38 @@ test "an agent cannot answer its own request, whatever it writes in one" {
     try testing.expectEqual(@as(usize, 2), @typeInfo(tools.RequestActionArgs).@"struct".field_names.len);
 }
 
-test "a request for any other action is refused by name, and nothing is put to anybody" {
+test "a request for an unknown action is refused by name, and nothing is put to anybody" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fake = FakeHandback{ .allocator = allocator, .carried = true, .text = "carried back" };
+    defer fake.deinit();
+
+    const outcome = try runRequestSession(allocator, arena, io, &.{
+        .{ .tool = request_tool_name, .arguments =
+        \\{"action":"workspace","reason":"close enough to the real name"}
+        },
+        .{ .tool = request_tool_name, .arguments =
+        \\{"action":"frobnicate","reason":"not an action class"}
+        },
+        .{ .tool = request_tool_name, .arguments =
+        \\{"action":"","reason":"no name at all"}
+        },
+    }, fake.handback());
+
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+    for (outcome.refused, outcome.outputs) |refused, output| {
+        try testing.expect(refused);
+        try testing.expect(std.mem.indexOf(u8, output, handback_mod.apply_action) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "\"workspace\"") != null);
+    try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"frobnicate\"") != null);
+}
+
+test "a request for a brokered act reaches the arbiter without performing it" {
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -9488,21 +9557,13 @@ test "a request for any other action is refused by name, and nothing is put to a
         .{ .tool = request_tool_name, .arguments =
         \\{"action":"git.push","reason":"the branch is ready for review"}
         },
-        .{ .tool = request_tool_name, .arguments =
-        \\{"action":"workspace","reason":"close enough to the real name"}
-        },
-        .{ .tool = request_tool_name, .arguments =
-        \\{"action":"","reason":"no name at all"}
-        },
     }, fake.handback());
 
     try testing.expectEqual(@as(usize, 0), fake.calls);
-    for (outcome.refused, outcome.outputs) |refused, output| {
-        try testing.expect(refused);
-        try testing.expect(std.mem.indexOf(u8, output, handback_mod.apply_action) != null);
-    }
+    try testing.expect(!outcome.refused[0]);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "git.push") != null);
-    try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"workspace\"") != null);
+    try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "allowed_by_policy") != null);
+    try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "performed no operation") != null);
 }
 
 test "a request with no reason is refused, because a person cannot weigh one" {
@@ -9524,7 +9585,7 @@ test "a request with no reason is refused, because a person cannot weigh one" {
 
     try testing.expectEqual(@as(usize, 0), fake.calls);
     try testing.expect(outcome.refused[0]);
-    try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "why the work is ready") != null);
+    try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "why this act is needed") != null);
     try testing.expect(outcome.refused[1]);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"action\"") != null);
 }

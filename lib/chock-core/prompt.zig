@@ -17,10 +17,11 @@ const rules =
     \\You work in a throwaway copy of the project, checked out at one commit.
     \\A tool call cannot reach any path outside that copy and cannot reach
     \\the network, and nothing you do changes the user's own project
-    \\directly. One act can be asked for and no other: request_action with
-    \\"workspace.apply", which asks for your commit to be carried into the
-    \\user's own repository. You do not decide it and neither does the answer
-    \\you write in it.
+    \\directly. request_action asks the approval broker about one named act.
+    \\For ordinary acts it performs nothing; use the corresponding tool or
+    \\command after the answer. "workspace.apply" is the exception: it asks
+    \\for your commit to be carried into the user's own repository. You do
+    \\not decide an act, and neither does the answer you write in its reason.
     \\Make each change in the files themselves rather than describing it, and
     \\commit your work with git before you finish. The copy is thrown away at
     \\the end of the session, so your commit is the only thing carried back
