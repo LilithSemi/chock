@@ -238,11 +238,3 @@ them as not built.
   several lengths, and such a prefix cannot be told from an ordinary global
   address by its bytes alone, so reading one needs the network to say what it
   is. Until that is configuration, a site with its own prefix gets no unwrap.
-
-- A reverse proxy talks to `chock serve` over `--host`, not over the socket.
-  The socket check is the peer's user id, so a proxy under its own account,
-  such as nginx as `www-data`, cannot open it. That is deliberate. Access by
-  group is not built, and the answer for a proxy is `--host 127.0.0.1`. Bind
-  the proxy to that address, and keep the port closed to everything else. The
-  socket stays the default because it is what makes a bare `chock serve` safe
-  with no proxy at all.

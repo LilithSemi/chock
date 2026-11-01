@@ -122,16 +122,24 @@ Its own browser facing listener is a unix socket by default, `serve.sock` in the
 state directory. `--socket <path>` names another one. `serve` checks the peer's
 user id on that socket and refuses anybody else with `403 Forbidden`.
 
+`--socket-group <name-or-gid>` admits a reverse proxy running in that group.
+Chock binds the socket privately first, changes its group and mode to `0660`,
+and only then accepts connections, so there is no permissive interval while it
+starts. The kernel's socket permission check includes supplementary groups.
+The default remains owner-only when this option is absent.
+
 `--host <addr>` swaps the socket for a TCP listener. TCP carries no peer
 identity, so `serve` checks nobody there and authentication is the job of a
 proxy in front of it. A browser cannot speak a unix socket, but nginx, Caddy and
 Authelia all proxy to one, which is why the socket is the default.
 
-A proxy that runs under its own account cannot open that socket, because the
-check is the peer's user id. Run the proxy as the user that started `chock
-serve`, or give the proxy a `--host 127.0.0.1` address and accept what that
-address means. A person who wants a browser pointed straight at Chock types the
-same `--host 127.0.0.1`. `--port` with no `--host` is refused by name.
+A proxy that runs under its own account uses `--socket-group`; add the proxy
+account to that group and point it at the socket. Alternatively give the proxy
+a `--host 127.0.0.1` address and accept what that address means. A person who
+wants a browser pointed straight at Chock types the same
+`--host 127.0.0.1`. `--port` with no `--host` is refused by name, and
+`--socket-group` with `--host` is refused because TCP has no socket file to
+protect.
 
 ## Handing a session over
 

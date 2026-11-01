@@ -1,6 +1,7 @@
 //! `chock serve`: a browser in front of a daemon.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const chock_auth = @import("chock-auth");
 const chock_proto = @import("chock-proto");
 
@@ -65,10 +66,9 @@ const usage_text =
     \\of `chock daemon`, which may be on this machine or on another one.
     \\
     \\Binds a unix socket in the state directory, and nothing else until --host
-    \\names an address. The socket serves the user that started this command, and
-    \\every other peer is refused by the credential the kernel puts on the
-    \\connection. A reverse proxy such as nginx, Caddy or Authelia proxies to that
-    \\socket, which is the supported way to put authentication in front of this.
+    \\names an address. The socket serves the user that started this command.
+    \\--socket-group can also admit a reverse proxy group, which is the supported
+    \\way to put nginx, Caddy or Authelia authentication in front of this.
     \\
     \\Options:
     \\  --daemon <address>  Where the daemon is. `unix:/path` or `host:port`.
@@ -77,6 +77,8 @@ const usage_text =
     \\  --project <dir>     The project to show. Default is the working directory.
     \\  --socket <path>     The unix socket. Default is serve.sock in the state
     \\                      directory.
+    \\  --socket-group <g>  Let this group connect to the unix socket. A group
+    \\                      name or numeric gid. The socket is made mode 0660.
     \\  --host <addr>       Bind this address, over TCP, instead of the socket.
     \\                      Off by default. Write `--host 127.0.0.1` to point a
     \\                      browser straight at this.
@@ -93,6 +95,7 @@ const Options = struct {
     daemon: ?[]const u8 = null,
     project: ?[]const u8 = null,
     socket: ?[]const u8 = null,
+    socket_group: ?[]const u8 = null,
     host: ?[]const u8 = null,
     port: u16 = default_port,
 };
@@ -103,6 +106,7 @@ const Serve = struct {
     daemon: control.Address,
     project: []const u8,
     owner_uid: std.posix.uid_t,
+    group_socket: bool = false,
     live: std.atomic.Value(usize) = .init(0),
 };
 
@@ -202,7 +206,15 @@ pub fn main(
     };
 
     const bind = bindAddress(socket_path, options);
+    // Keep the bind private until a requested group owns the socket. This
+    // closes the interval between bind and chmod in which the process umask
+    // might otherwise make a connection possible.
+    const old_umask = if (options.socket_group != null and options.host == null)
+        changeUmask(0o077)
+    else
+        null;
     var listener = bind.listen(io) catch |err| {
+        if (old_umask) |mode| _ = changeUmask(mode);
         tty.print(.err, "chock serve: {f} could not be listened on: {t}\n", .{ bind, err });
         if (err == error.PathTooLong) tty.print(
             .err,
@@ -212,7 +224,24 @@ pub fn main(
         );
         return Exit.usage.code();
     };
+    if (old_umask) |mode| _ = changeUmask(mode);
     defer listener.close(io);
+
+    if (options.socket_group) |named| {
+        const gid = groupId(arena, io, named) orelse {
+            tty.print(.err, "chock serve: --socket-group names no group: {s}\n", .{named});
+            return Exit.usage.code();
+        };
+        configureGroupSocket(io, socket_path, gid) catch |err| {
+            tty.print(
+                .err,
+                "chock serve: {s} could not be made available to group {s}: {t}\n",
+                .{ socket_path, named, err },
+            );
+            return Exit.usage.code();
+        };
+        serve_state.group_socket = true;
+    }
 
     if (options.host) |host| {
         tty.print(.plain, "chock serve: open http://{s}:{d}/\n", .{
@@ -237,7 +266,7 @@ pub fn main(
             continue;
         };
 
-        if (listener.unix_path != null and
+        if (listener.unix_path != null and !serve_state.group_socket and
             !control.peerAllowed(control.peerUid(stream.socket.handle), serve_state.owner_uid))
         {
             var buffer: [forbidden_response.len]u8 = undefined;
@@ -269,6 +298,42 @@ pub fn main(
 fn bindAddress(socket_path: []const u8, options: Options) control.Address {
     const host = options.host orelse return .{ .unix = socket_path };
     return .{ .ip = .{ .host = host, .port = options.port } };
+}
+
+fn changeUmask(mode: std.c.mode_t) std.c.mode_t {
+    return switch (builtin.os.tag) {
+        .linux => @intCast(std.os.linux.syscall1(.umask, mode)),
+        .macos => std.c.umask(mode),
+        else => @compileError("chock serve has no unix socket support for this target"),
+    };
+}
+
+fn groupId(gpa: std.mem.Allocator, io: std.Io, named: []const u8) ?std.c.gid_t {
+    if (std.fmt.parseInt(std.c.gid_t, named, 10)) |gid| return gid else |_| {}
+    if (named.len == 0) return null;
+    const text = std.Io.Dir.readFileAlloc(.cwd(), io, "/etc/group", gpa, .limited(1 << 20)) catch return null;
+    defer gpa.free(text);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ':');
+        const name = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        const gid_text = fields.next() orelse continue;
+        if (!std.mem.eql(u8, name, named)) continue;
+        return std.fmt.parseInt(std.c.gid_t, gid_text, 10) catch null;
+    }
+    return null;
+}
+
+fn configureGroupSocket(io: std.Io, path: []const u8, gid: std.c.gid_t) !void {
+    const cwd = std.Io.Dir.cwd();
+    try cwd.setFileOwner(io, path, null, gid, .{ .follow_symlinks = false });
+    try cwd.setFilePermissions(
+        io,
+        path,
+        @fromBackingInt(0o660),
+        .{ .follow_symlinks = false },
+    );
 }
 
 const forbidden_response = forbidden: {
@@ -1052,7 +1117,7 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
         const argument = args[index];
         if (std.mem.eql(u8, argument, "--help") or std.mem.eql(u8, argument, "-h")) return error.HelpWanted;
 
-        const takes_value = [_][]const u8{ "--daemon", "--project", "--socket", "--host", "--port" };
+        const takes_value = [_][]const u8{ "--daemon", "--project", "--socket", "--socket-group", "--host", "--port" };
         var named: ?[]const u8 = null;
         for (takes_value) |one| {
             if (std.mem.eql(u8, argument, one)) named = one;
@@ -1068,6 +1133,7 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             if (std.mem.eql(u8, flag, "--daemon")) options.daemon = value;
             if (std.mem.eql(u8, flag, "--project")) options.project = value;
             if (std.mem.eql(u8, flag, "--socket")) options.socket = value;
+            if (std.mem.eql(u8, flag, "--socket-group")) options.socket_group = value;
             if (std.mem.eql(u8, flag, "--host")) options.host = value;
             if (std.mem.eql(u8, flag, "--port")) {
                 port_named = true;
@@ -1094,6 +1160,15 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             "chock serve: --port names the port of the TCP listener --host turns on, and there " ++
                 "is no TCP listener without --host. Write `--host 127.0.0.1 --port <n>`, or drop " ++
                 "--port and use the unix socket.\n",
+            .{},
+        );
+        return error.BadArguments;
+    }
+    if (options.socket_group != null and options.host != null) {
+        tty.print(
+            .err,
+            "chock serve: --socket-group controls a unix socket, and --host selects TCP. " ++
+                "Use one or the other.\n",
             .{},
         );
         return error.BadArguments;
@@ -1432,6 +1507,7 @@ test "the options parse, and a value that is not one is refused by name" {
     try testing.expect(plain.daemon == null);
     try testing.expect(plain.project == null);
     try testing.expect(plain.socket == null);
+    try testing.expect(plain.socket_group == null);
     try testing.expect(plain.host == null);
     try testing.expectEqual(default_port, plain.port);
     try testing.expect(default_port != control.default_port);
@@ -1446,11 +1522,16 @@ test "the options parse, and a value that is not one is refused by name" {
     try testing.expectEqualStrings("10.0.0.4:7373", named.daemon.?);
     try testing.expectEqualStrings("/home/ross/chock", named.project.?);
     try testing.expectEqualStrings("/run/chock/other.sock", named.socket.?);
+    try testing.expect(named.socket_group == null);
     try testing.expectEqualStrings("0.0.0.0", named.host.?);
     try testing.expectEqual(@as(u16, 8080), named.port);
     try testing.expectEqualStrings("", said.err());
 
-    for ([_][]const u8{ "--daemon", "--project", "--socket", "--host", "--port" }) |flag| {
+    const grouped = try parseOptions(&.{ "--socket", "/run/chock/serve.sock", "--socket-group", "chock-web" });
+    try testing.expectEqualStrings("/run/chock/serve.sock", grouped.socket.?);
+    try testing.expectEqualStrings("chock-web", grouped.socket_group.?);
+
+    for ([_][]const u8{ "--daemon", "--project", "--socket", "--socket-group", "--host", "--port" }) |flag| {
         said.clear();
         try testing.expectError(error.BadArguments, parseOptions(&.{flag}));
         try testing.expect(std.mem.indexOf(u8, said.err(), flag) != null);
@@ -1464,6 +1545,15 @@ test "the options parse, and a value that is not one is refused by name" {
     try testing.expectError(error.BadArguments, parseOptions(&.{ "--port", "8080" }));
     try testing.expect(std.mem.indexOf(u8, said.err(), "--host") != null);
 
+    said.clear();
+    try testing.expectError(error.BadArguments, parseOptions(&.{
+        "--host",
+        "127.0.0.1",
+        "--socket-group",
+        "chock-web",
+    }));
+    try testing.expect(std.mem.indexOf(u8, said.err(), "--socket-group") != null);
+
     try testing.expectEqual(
         @as(u16, 0),
         (try parseOptions(&.{ "--host", "127.0.0.1", "--port", "0" })).port,
@@ -1473,6 +1563,16 @@ test "the options parse, and a value that is not one is refused by name" {
     try testing.expectError(error.BadArguments, parseOptions(&.{"--nonsense"}));
     try testing.expect(std.mem.indexOf(u8, said.err(), "--nonsense") != null);
     try testing.expectEqualStrings("", said.out());
+}
+
+test "a numeric socket group is read exactly" {
+    try testing.expectEqual(@as(std.c.gid_t, 123), groupId(testing.allocator, testing.io, "123").?);
+    try testing.expect(groupId(testing.allocator, testing.io, "") == null);
+    try testing.expect(groupId(
+        testing.allocator,
+        testing.io,
+        "a-group-that-does-not-exist-in-this-test",
+    ) == null);
 }
 
 test "a request whose body cannot be discarded gets an answer and not a panic" {
