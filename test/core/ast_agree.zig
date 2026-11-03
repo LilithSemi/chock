@@ -7,8 +7,8 @@
 //! `tree-sitter query` against the same grammar.
 //!
 //! The engine compiles every function in the module before the first answer,
-//! which is minutes for a debug build, so `build.zig` builds this test only
-//! where the module directory is in the environment, which is the dev shell.
+//! which is why `build.zig` builds this test only where the module directory
+//! is in the environment, which is the dev shell.
 
 const std = @import("std");
 
@@ -59,9 +59,9 @@ fn bigSource(arena: std.mem.Allocator) ![]const u8 {
     return text.items;
 }
 
-/// Both parsers over one source and one query. The wasm side is given its own
-/// budget, because the first answer waits for the engine to compile. It reads
-/// no deadline, so this says what a session would ask for.
+/// Both parsers over one source and one query, with the same budget. The wasm
+/// parser reads no deadline, so that number says what a session asks for
+/// rather than what bounds the parse.
 fn matchesFromBoth(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -80,7 +80,7 @@ fn matchesFromBoth(
         .language = "zig",
         .source = source,
         .query_text = query,
-        .deadline = shared.deadlineIn(io, 20 * std.time.ns_per_min),
+        .deadline = shared.deadlineIn(io, 30 * std.time.ns_per_s),
     });
     return .{ by_command, by_wasm };
 }

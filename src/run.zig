@@ -9125,7 +9125,7 @@ fn wasmParser(
 
     tty.detail(
         "chock: {d} style rules check a write, parsed by a wasm module for {s}. The engine " ++
-            "compiles it at the first write, which takes about a minute.\n",
+            "compiles it at the first write, and that write waits for it.\n",
         .{ started.style.rules.len, found.language },
     );
     return state.wasm.parser();

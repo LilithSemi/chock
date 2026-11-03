@@ -102,12 +102,11 @@ did not run, the write goes ahead, and the `style.check` row says `no_parser`.
 That is a setup this host is missing rather than a check that failed, and a
 missing grammar would otherwise stop every write of that language.
 
-The two parsers differ after a timeout. The command runs once a parse, so a
-timeout costs that one write. The wasm parser is one process a session, and a
-check it gave up on is still being worked on inside it, so a timeout stops
-that parser for the rest of the session and every write after it is refused by
-name. A parse that cannot finish in ten seconds is doing something no file in
-this repository does.
+The two parsers differ over time. The command is a program with a deadline,
+and a parse that passes it costs that one write. The wasm parser is a call in
+this process that cannot be interrupted, so it reads no deadline: what holds a
+parse down there is the module's own bounds, the megabyte of source and the
+4096 matches below.
 
 ## The parsers directory
 
@@ -190,10 +189,10 @@ over one file, with the same rules, and fails when the two answers differ.
 Three things about this engine are worth knowing before turning it on.
 
 **The first write waits.** The engine compiles every function in the module
-before the first answer, which is about half a minute on the machine this was
-built on, and the module holds 269 functions. The cost is paid once a session,
-because the parser is one process that stays alive, so later writes are
-answered in milliseconds. A write that arrives during the wait waits with it.
+before the first answer, and the module carries a parser runtime, so that wait
+is long enough to notice. It is paid once a session, because the module is
+kept, and every write after it is answered without the wait. The write that
+arrives during it waits with it.
 
 **One language a session.** A module carries tree-sitter's runtime plus one
 grammar. `modules` names an environment variable holding a directory of
@@ -209,8 +208,7 @@ and exports `CHOCK_PARSER_MODULES`. A variable that names no directory, or a
 directory with a module for none of the project's grammars, turns the rules
 off for the session and says which.
 
-The parser runs in the same sandbox the command runs in, started the way a
-plugin host is started: Chock itself and the module are each bound read only
-at one path, and the parse has no network and no other file. A host needs a
-sandbox of its own, and macOS has none that nests, so this engine is Linux
-only and a Mac takes the command. The session says so at the start.
+The parse runs in the session's own process. The module imports nothing at
+all, so it reaches no file and no socket, and its memory is the linear memory
+the engine gives it, which is what keeps a parser fault inside the module. The
+command parser is the one that runs in the sandbox, because a program must.

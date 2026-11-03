@@ -1908,7 +1908,7 @@ pub fn build(b: *std.Build) void {
     // The module directory is the gate, the way the kernel path gates the
     // guest: a shell without it does not build this test, because the engine
     // compiles every function in the module before the first answer, and that
-    // is minutes for a debug build.
+    // is the slowest step in this suite.
     if (ast_module_dir) |module_dir| {
         const ast_agree_path_options = b.addOptions();
         ast_agree_path_options.addOption(?[]const u8, "tree_sitter_path", tree_sitter_path);
