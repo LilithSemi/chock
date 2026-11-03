@@ -4,6 +4,8 @@
 
 const std = @import("std");
 const chock_auth = @import("chock-auth");
+const oauth = @import("oauth-core");
+const oauth_openai = @import("oauth-openai");
 const chock_provider = @import("chock-provider");
 
 const Exit = @import("exit.zig").Exit;
@@ -184,7 +186,7 @@ fn probe(
 
     var openai_credential: ?std.json.Parsed(chock_auth.openai_oauth.Credential) = null;
     defer if (openai_credential) |*parsed| parsed.deinit();
-    var renewed_set: ?chock_auth.openai_oauth.TokenSet = null;
+    var renewed_set: ?oauth.TokenSet = null;
     defer if (renewed_set) |*held| held.deinit();
     var token: []const u8 = credential.token;
     if (instance.kind == .openai and credential.token.len != 0) {
@@ -203,30 +205,30 @@ fn probe(
                 tty.print(.err, "  catalogue: the OpenAI login needs renewal but is not in the login store; run `chock login --provider openai --name {s} --replace`\n", .{instance.name});
                 return false;
             }
-            renewed_set = chock_auth.openai_oauth.refresh(
-                gpa,
-                io,
-                current.client_id,
-                current.refresh_token,
-            ) catch |err| {
+            var zurl_transport: oauth.ZurlTransport = .init(io);
+            renewed_set = oauth.refresh(gpa, .{
+                .transport = zurl_transport.transport(),
+                .endpoints = oauth_openai.endpoints,
+                .client = .{ .id = current.client_id },
+                .extra = oauth_openai.token_extra,
+            }, current.refresh_token) catch |err| {
                 tty.print(.err, "  catalogue: the OpenAI login could not be renewed ({t})\n", .{err});
                 return false;
             };
-            const renewed = renewed_set.?.value;
-            current = .{
-                .email = current.email,
-                .issuer = current.issuer,
-                .subject = current.subject,
-                .client_id = current.client_id,
-                .ext_agent_host_id = current.ext_agent_host_id,
-                .id_token = renewed.id_token,
+            const renewed = renewed_set.?.value();
+            var extension_arena: std.heap.ArenaAllocator = .init(gpa);
+            defer extension_arena.deinit();
+            const extension = renewed_set.?.extension(extension_arena.allocator(), oauth_openai.Extension) catch
+                oauth_openai.Extension{};
+            current = current.renewed(.{
                 .access_token = renewed.access_token,
-                .refresh_token = renewed.refresh_token,
                 .token_type = renewed.token_type,
-                .expires_at = now + renewed.expires_in,
-                .earliest_refresh_at = renewed.earliest_refresh_at,
+                .expires_at = now + (renewed.expires_in orelse 3600),
+                .id_token = renewed.id_token,
+                .refresh_token = renewed.refresh_token,
                 .scope = renewed.scope,
-            };
+                .earliest_refresh_at = extension.earliest_refresh_at,
+            });
             const serialized = try current.serialize(gpa);
             defer {
                 std.crypto.secureZero(u8, serialized);

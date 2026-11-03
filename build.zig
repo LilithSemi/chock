@@ -1841,7 +1841,16 @@ pub fn build(b: *std.Build) void {
     // reaching through fix's private dependency graph.
     const ziggit = b.dependency("ziggit", .{ .target = target, .optimize = optimize });
 
+    // OAuth lives outside Chock. The binary is where the flows run, because
+    // `chock login` owns the browser and the loopback socket, and the store
+    // keeps only the credential a flow produced. So chock-auth imports none of
+    // these and no library test binary links them.
+    const oauth = b.dependency("oauth", .{ .target = target, .optimize = optimize });
+
     const exe_imports = [_]std.Build.Module.Import{
+        .{ .name = "oauth-core", .module = oauth.module("oauth-core") },
+        .{ .name = "oauth-mcp", .module = oauth.module("oauth-mcp") },
+        .{ .name = "oauth-openai", .module = oauth.module("oauth-openai") },
         .{ .name = "chock-vmm", .module = vmm_module },
         .{ .name = "phantom", .module = phantom.module("phantom") },
         .{ .name = "chock-ui", .module = chock_ui },

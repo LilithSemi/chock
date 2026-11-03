@@ -4,6 +4,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const chock_auth = @import("chock-auth");
 const chock_policy = @import("chock-policy");
+const oauth = @import("oauth-core");
+const oauth_mcp = @import("oauth-mcp");
+const oauth_openai = @import("oauth-openai");
 
 const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
@@ -255,27 +258,26 @@ fn openAiCredential(
     store: chock_auth.store.Store,
     name: []const u8,
 ) ![]u8 {
-    const oauth = chock_auth.openai_oauth;
     var previous: ?chock_auth.store.Stored = try store.get(gpa, io, name, null);
     defer if (previous) |*held| held.deinit();
 
-    var previous_credential: ?std.json.Parsed(oauth.Credential) = null;
+    var previous_credential: ?std.json.Parsed(chock_auth.openai_oauth.Credential) = null;
     defer if (previous_credential) |*held| held.deinit();
     if (previous) |held| {
         if (std.mem.eql(u8, held.kind, "openai")) {
-            previous_credential = oauth.Credential.parse(gpa, held.token) catch null;
+            previous_credential = chock_auth.openai_oauth.Credential.parse(gpa, held.token) catch null;
         }
     }
 
     const host_id = if (previous_credential) |*held|
         try arena.dupe(u8, held.value.ext_agent_host_id)
     else
-        try oauth.hostId(arena, io);
-    const registration: oauth.Registration = if (previous_credential) |*held| .{
+        try oauth_openai.hostId(arena, io);
+    const registration: oauth_openai.Registration = if (previous_credential) |*held| .{ .stored = .{
         .client_id = held.value.client_id,
         .host_id = host_id,
         .login_hint = if (held.value.email.len == 0) null else held.value.email,
-    } else .{ .host_id = host_id };
+    } } else .{ .initial = .{ .agent_name = "Chock", .host_id = host_id } };
 
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try address.listen(io, .{ .reuse_address = true });
@@ -283,8 +285,15 @@ fn openAiCredential(
     const port = listener.socket.address.getPort();
     const callback_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/auth/callback", .{port});
     var attempt = oauth.Attempt.init(io);
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&attempt));
-    const url = try oauth.authorizationUrl(arena, callback_url, &attempt, registration);
+    defer attempt.wipe();
+    var extra: [6]oauth.Param = undefined;
+    const url = try oauth.authorizeUrl(
+        arena,
+        oauth_openai.endpoints.authorization.?,
+        registration.client(),
+        &attempt,
+        oauth_openai.authorizeOptions(registration, callback_url, &extra),
+    );
 
     tty.print(.plain, "chock login: opening OpenAI in your browser. Waiting for the callback on 127.0.0.1...\n", .{});
     openBrowser(io, env, url) catch {
@@ -299,7 +308,7 @@ fn openAiCredential(
     var writer = stream.writer(io, &write_buffer);
     var server = std.http.Server.init(&reader.interface, &writer.interface);
     var request = try server.receiveHead();
-    const callback = oauth.parseCallback(arena, request.head.target, &attempt.state) catch |err| {
+    const callback = oauth.parseCallback(arena, request.head.target, "/auth/callback", &attempt) catch |err| {
         request.respond("OpenAI login was not accepted. You can close this page.\n", .{
             .status = .bad_request,
             .keep_alive = false,
@@ -312,31 +321,41 @@ fn openAiCredential(
         .extra_headers = &.{.{ .name = "content-type", .value = "text/plain; charset=utf-8" }},
     });
 
-    const client_id = if (registration.isInitial())
-        callback.client_id orelse return error.MissingIssuedClientId
-    else blk: {
-        if (callback.client_id) |given| if (!std.mem.eql(u8, given, registration.client_id)) return error.ClientIdChanged;
-        break :blk registration.client_id;
+    const client_id = try oauth_openai.issuedClientId(registration, callback);
+    var zurl_transport: oauth.ZurlTransport = .init(io);
+    const call: oauth.Call = .{
+        .transport = zurl_transport.transport(),
+        .endpoints = oauth_openai.endpoints,
+        .client = .{ .id = client_id },
+        .extra = oauth_openai.token_extra,
     };
-    var token_set = try oauth.exchangeCode(arena, io, callback.code, client_id, &attempt.verifier, callback_url);
+    var token_set = try oauth.exchangeCode(gpa, call, callback.code(), &attempt.verifier, callback_url);
     defer token_set.deinit();
-    const token = token_set.value;
-    const jwks = try oauth.fetchJwks(arena, io);
+    const token = token_set.value();
+    const extension = token_set.extension(arena, oauth_openai.Extension) catch oauth_openai.Extension{};
+    const id_token = token.id_token orelse return error.IdTokenMissing;
+    const jwks = try oauth.oidc.fetchJwks(arena, zurl_transport.transport(), oauth_openai.jwks_uri);
     const now = @divTrunc(std.Io.Timestamp.now(io, .real).toMilliseconds(), 1000);
-    const identity = try oauth.verifyIdToken(arena, token.id_token, jwks, client_id, &attempt.nonce, now);
-    const saved = oauth.Credential{
-        .email = identity.email,
-        .issuer = oauth.issuer,
+    const identity = try oauth.oidc.verifyIdToken(arena, id_token, jwks, .{
+        .issuer = oauth_openai.issuer,
+        .client_id = client_id,
+        .nonce = &attempt.nonce,
+        .now = now,
+        .algs = oauth_openai.algs,
+    });
+    const saved = chock_auth.openai_oauth.Credential{
+        .email = identity.email orelse "",
+        .issuer = oauth_openai.issuer,
         .subject = identity.subject,
         .client_id = client_id,
         .ext_agent_host_id = host_id,
-        .id_token = token.id_token,
+        .id_token = id_token,
         .access_token = token.access_token,
-        .refresh_token = token.refresh_token,
+        .refresh_token = token.refresh_token orelse return error.RefreshTokenMissing,
         .token_type = token.token_type,
-        .expires_at = now + token.expires_in,
-        .earliest_refresh_at = token.earliest_refresh_at,
-        .scope = token.scope,
+        .expires_at = now + (token.expires_in orelse return error.ExpiryMissing),
+        .earliest_refresh_at = extension.earliest_refresh_at,
+        .scope = token.scope orelse "",
     };
     if (!saved.hasInferenceScope()) return error.InferenceScopeNotGranted;
     return saved.serialize(gpa);
@@ -602,29 +621,49 @@ fn mcpLogin(
     const callback_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/auth/callback", .{listener.socket.address.getPort()});
 
     tty.print(.plain, "chock login: discovering OAuth for {s}...\n", .{resource});
-    const discovery = chock_auth.mcp_oauth.discover(arena, io, resource) catch |err| {
+    var zurl_transport: oauth.ZurlTransport = .init(io);
+    const transport = zurl_transport.transport();
+    const discovery = oauth_mcp.discover(arena, transport, resource, .{ .client_name = "Chock" }) catch |err| {
         tty.print(.err, "chock login: the MCP server's OAuth metadata was not accepted: {t}\n", .{err});
         return Exit.usage.code();
     };
-    const registration_endpoint = discovery.authorization.registration_endpoint orelse {
+    const registration_endpoint = discovery.registration_endpoint orelse {
         tty.print(.err, "chock login: the authorization server offers no dynamic client registration endpoint.\n", .{});
         return Exit.usage.code();
     };
-    const registration = chock_auth.mcp_oauth.register(arena, io, registration_endpoint, callback_url) catch |err| {
-        tty.print(.err, "chock login: dynamic client registration failed: {t}\n", .{err});
-        return Exit.usage.code();
+    const client = oauth_mcp.register(arena, transport, registration_endpoint, .{
+        .client_name = "Chock",
+        .redirect_uris = &.{callback_url},
+    }) catch |err| switch (err) {
+        // A server that asks for client authentication, and one that does not
+        // say, both leave Chock without a usable public client. Only the
+        // second is a server that said nothing, so the advice differs.
+        error.ConfidentialClientUnsupported => {
+            tty.print(.err, "chock login: the authorization server requires client authentication, which Chock has nowhere to keep. Use a manually obtained bearer token instead: chock login --tool-secret <name>\n", .{});
+            return Exit.usage.code();
+        },
+        error.AuthMethodUnspecified => {
+            tty.print(.err, "chock login: the authorization server did not say how a client authenticates, so RFC 7591 reads it as needing a secret. Use a manually obtained bearer token instead: chock login --tool-secret <name>\n", .{});
+            return Exit.usage.code();
+        },
+        else => |other| {
+            tty.print(.err, "chock login: dynamic client registration failed: {t}\n", .{other});
+            return Exit.usage.code();
+        },
     };
-    const scope = try chock_auth.mcp_oauth.scopes(arena, discovery.resource.scopes_supported);
-    var attempt = chock_auth.openai_oauth.Attempt.init(io);
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&attempt));
-    const url = try chock_auth.mcp_oauth.authorizationUrl(
+    const scope = try oauth_mcp.scopeString(arena, discovery.scopes_supported);
+    var attempt = oauth.Attempt.init(io);
+    defer attempt.wipe();
+    const url = try oauth.authorizeUrl(
         arena,
-        discovery.authorization.authorization_endpoint,
-        resource,
-        callback_url,
-        registration.client_id,
-        scope,
+        discovery.endpoints.authorization.?,
+        client,
         &attempt,
+        .{
+            .redirect_uri = callback_url,
+            .scope = scope,
+            .extra = &.{oauth_mcp.resourceParam(discovery.resource)},
+        },
     );
     tty.print(.plain, "chock login: opening the authorization server in your browser. Waiting for the callback on 127.0.0.1...\n", .{});
     openBrowser(io, env, url) catch reportBrowserFailure(url);
@@ -643,7 +682,7 @@ fn mcpLogin(
         tty.print(.err, "chock login: reading the OAuth callback failed: {t}\n", .{err});
         return Exit.usage.code();
     };
-    const callback = chock_auth.openai_oauth.parseCallback(arena, request.head.target, &attempt.state) catch |err| {
+    const callback = oauth.parseCallback(arena, request.head.target, "/auth/callback", &attempt) catch |err| {
         request.respond("MCP authorization was not accepted. You can close this page.\n", .{
             .status = .bad_request,
             .keep_alive = false,
@@ -653,32 +692,29 @@ fn mcpLogin(
     };
     request.respond("The MCP server returned to Chock. You can close this page.\n", .{ .keep_alive = false }) catch {};
 
-    var token_set = chock_auth.mcp_oauth.exchangeCode(
-        arena,
-        io,
-        discovery.authorization.token_endpoint,
-        resource,
-        callback.code,
-        registration.client_id,
-        &attempt.verifier,
-        callback_url,
-    ) catch |err| {
+    const call: oauth.Call = .{
+        .transport = transport,
+        .endpoints = discovery.endpoints,
+        .client = client,
+        .extra = &.{oauth_mcp.resourceParam(discovery.resource)},
+    };
+    var token_set = oauth.exchangeCode(gpa, call, callback.code(), &attempt.verifier, callback_url) catch |err| {
         tty.print(.err, "chock login: exchanging the authorization code failed: {t}\n", .{err});
         return Exit.usage.code();
     };
     defer token_set.deinit();
     const now = @divTrunc(std.Io.Timestamp.now(io, .real).toMilliseconds(), 1000);
-    const token = token_set.value;
+    const token = token_set.value();
     const credential = chock_auth.mcp_oauth.Credential{
-        .resource = resource,
-        .issuer = discovery.authorization.issuer,
-        .client_id = registration.client_id,
-        .token_endpoint = discovery.authorization.token_endpoint,
+        .resource = discovery.resource,
+        .issuer = discovery.issuer,
+        .client_id = client.id,
+        .token_endpoint = discovery.endpoints.token,
         .access_token = token.access_token,
-        .refresh_token = token.refresh_token,
+        .refresh_token = token.refresh_token orelse "",
         .token_type = token.token_type,
-        .expires_at = now + token.expires_in,
-        .scope = token.scope,
+        .expires_at = now + (token.expires_in orelse 3600),
+        .scope = token.scope orelse "",
     };
     const serialized = try credential.serialize(gpa);
     defer {

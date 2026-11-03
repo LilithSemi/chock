@@ -125,8 +125,12 @@ endpoint, issuer, expiry, and exact resource. It is never written to
 `chock.zon`. Before a session starts, Chock refreshes a token with less than
 five minutes left and stores a rotated refresh token before using it. A
 credential bound to any URL other than the one it was issued for is refused,
-not sent. Authorization servers without dynamic client registration are not
-supported by this command; use a manually obtained bearer token in that case.
+not sent. This command needs an authorization server that offers dynamic
+client registration and accepts a public client. A server that asks a client to
+authenticate with a secret is refused, because Chock has nowhere to keep one.
+A server that does not say which method it wants is refused for the same
+reason, because RFC 7591 reads silence as a request for a secret. Use a
+manually obtained bearer token in each of those cases.
 
 ## What the log records
 

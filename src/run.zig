@@ -4,6 +4,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const chock_auth = @import("chock-auth");
+const oauth = @import("oauth-core");
+const oauth_mcp = @import("oauth-mcp");
+const oauth_openai = @import("oauth-openai");
 const chock_broker = @import("chock-broker");
 const chock_container = @import("chock-container");
 const chock_core = @import("chock-core");
@@ -1380,7 +1383,7 @@ fn start(
     }
 
     if (instance.kind == .openai and credential.token.len != 0) {
-        var oauth = chock_auth.openai_oauth.Credential.parse(arena, credential.token) catch {
+        var stored_openai = chock_auth.openai_oauth.Credential.parse(arena, credential.token) catch {
             tty.print(
                 .err,
                 "chock run: the credential for {s} is not an OpenAI web-login credential. " ++
@@ -1389,8 +1392,8 @@ fn start(
             );
             return error.Reported;
         };
-        defer oauth.deinit();
-        var current = oauth.value;
+        defer stored_openai.deinit();
+        var current = stored_openai.value;
         if (!current.hasInferenceScope()) {
             tty.print(
                 .err,
@@ -1401,7 +1404,7 @@ fn start(
             return error.Reported;
         }
         const now = @divTrunc(std.Io.Timestamp.now(io, .real).toMilliseconds(), 1000);
-        var renewed_set: ?chock_auth.openai_oauth.TokenSet = null;
+        var renewed_set: ?oauth.TokenSet = null;
         defer if (renewed_set) |*held| held.deinit();
         if (current.expires_at <= now + 300) {
             if (credential.source != .login_store) {
@@ -1413,12 +1416,13 @@ fn start(
                 );
                 return error.Reported;
             }
-            renewed_set = chock_auth.openai_oauth.refresh(
-                arena,
-                io,
-                current.client_id,
-                current.refresh_token,
-            ) catch |err| {
+            var zurl_transport: oauth.ZurlTransport = .init(io);
+            renewed_set = oauth.refresh(arena, .{
+                .transport = zurl_transport.transport(),
+                .endpoints = oauth_openai.endpoints,
+                .client = .{ .id = current.client_id },
+                .extra = oauth_openai.token_extra,
+            }, current.refresh_token) catch |err| {
                 tty.print(
                     .err,
                     "chock run: the OpenAI login for {s} could not be renewed ({t}). " ++
@@ -1427,21 +1431,20 @@ fn start(
                 );
                 return error.Reported;
             };
-            const renewed = renewed_set.?.value;
-            current = .{
-                .email = current.email,
-                .issuer = current.issuer,
-                .subject = current.subject,
-                .client_id = current.client_id,
-                .ext_agent_host_id = current.ext_agent_host_id,
-                .id_token = renewed.id_token,
+            const renewed = renewed_set.?.value();
+            // The server's own refresh hint, stored and never read back, so a
+            // value Chock cannot parse must not end the session.
+            const extension = renewed_set.?.extension(arena, oauth_openai.Extension) catch
+                oauth_openai.Extension{};
+            current = current.renewed(.{
                 .access_token = renewed.access_token,
-                .refresh_token = renewed.refresh_token,
                 .token_type = renewed.token_type,
-                .expires_at = now + renewed.expires_in,
-                .earliest_refresh_at = renewed.earliest_refresh_at,
+                .expires_at = now + (renewed.expires_in orelse 3600),
+                .id_token = renewed.id_token,
+                .refresh_token = renewed.refresh_token,
                 .scope = renewed.scope,
-            };
+                .earliest_refresh_at = extension.earliest_refresh_at,
+            });
             const serialized = try current.serialize(arena);
             var refresh_diag: ?chock_auth.store.Diagnostic = null;
             defer if (refresh_diag) |*d| d.deinit(arena);
@@ -8293,17 +8296,29 @@ const ServerSecrets = struct {
         const now = @divTrunc(std.Io.Timestamp.now(self.io, .real).toMilliseconds(), 1000);
         if (credential.expires_at > now + 300) return try self.gpa.dupe(u8, credential.access_token);
 
-        var refreshed = chock_auth.mcp_oauth.refresh(self.gpa, self.io, credential) catch |err| {
+        if (credential.refresh_token.len == 0) {
+            tty.print(.warn, "chock: the OAuth credential {s} for MCP server {s} has expired and holds no refresh token; run `chock login --mcp {s}={s} --replace`.\n", .{ name, server, name, resource });
+            return null;
+        }
+        var zurl_transport: oauth.ZurlTransport = .init(self.io);
+        var refreshed = oauth.refresh(self.gpa, .{
+            .transport = zurl_transport.transport(),
+            .endpoints = .{ .token = credential.token_endpoint },
+            .client = .{ .id = credential.client_id },
+            .extra = &.{oauth_mcp.resourceParam(credential.resource)},
+        }, credential.refresh_token) catch |err| {
             tty.print(.warn, "chock: refreshing OAuth for MCP server {s} failed ({t}); run `chock login --mcp {s}={s} --replace`.\n", .{ server, err, name, resource });
             return null;
         };
         defer refreshed.deinit();
-        const token = refreshed.value;
-        credential.access_token = token.access_token;
-        credential.refresh_token = if (token.refresh_token.len == 0) credential.refresh_token else token.refresh_token;
-        credential.token_type = token.token_type;
-        credential.expires_at = now + token.expires_in;
-        credential.scope = if (token.scope.len == 0) credential.scope else token.scope;
+        const token = refreshed.value();
+        credential = credential.renewed(.{
+            .access_token = token.access_token,
+            .token_type = token.token_type,
+            .expires_at = now + (token.expires_in orelse 3600),
+            .refresh_token = token.refresh_token,
+            .scope = token.scope,
+        });
         const serialized = try credential.serialize(self.gpa);
         defer {
             std.crypto.secureZero(u8, serialized);
