@@ -335,6 +335,39 @@ fn containsString(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// Reads the names from a plain `enum { ... }` declaration. Report status
+/// enums stay plain so this test can compare their live wire values with the
+/// documentation without maintaining another list.
+fn simpleEnumFields(
+    arena: std.mem.Allocator,
+    source: []const u8,
+    declaration: []const u8,
+) ![]const []const u8 {
+    const prefix = try std.fmt.allocPrint(arena, "{s} = enum {{", .{declaration});
+    const start = (std.mem.indexOf(u8, source, prefix) orelse return error.MissingEnum) + prefix.len;
+    const relative_end = std.mem.indexOf(u8, source[start..], "};") orelse return error.UnclosedEnum;
+    const body = source[start .. start + relative_end];
+
+    var fields: std.ArrayList([]const u8) = .empty;
+    var split = std.mem.splitScalar(u8, body, ',');
+    while (split.next()) |part| {
+        const field = std.mem.trim(u8, part, " \t\r\n");
+        if (field.len == 0) continue;
+        if (!isMadeOf(field, "_")) return error.NonPlainEnum;
+        try fields.append(arena, field);
+    }
+    if (fields.items.len == 0) return error.EmptyEnum;
+    return fields.items;
+}
+
+fn textBetween(text: []const u8, start_marker: []const u8, end_marker: []const u8) ![]const u8 {
+    const start = std.mem.indexOf(u8, text, start_marker) orelse return error.MissingStartMarker;
+    const after_start = start + start_marker.len;
+    const relative_end = std.mem.indexOf(u8, text[after_start..], end_marker) orelse
+        return error.MissingEndMarker;
+    return text[after_start .. after_start + relative_end];
+}
+
 test "Markdown headings become the anchors local links use" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -845,6 +878,42 @@ test "the policy page names every decision and every field of a rule, and counts
     // Only this page: `fields` and `decisions` are ordinary words elsewhere.
     try checkCount(arena, docs, "docs/configure/policy.md", "decisions", decisions.len, &wrong);
     try checkCount(arena, docs, "docs/configure/policy.md", "fields", rule_fields.len, &wrong);
+
+    try testing.expectEqualStrings("", wrong.items);
+}
+
+test "automation report pages name every stable status value" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{});
+    defer root.close(testing.io);
+    const models_source = try root.readFileAlloc(testing.io, "src/models.zig", arena, .limited(max_source_bytes));
+    const doctor_source = try root.readFileAlloc(testing.io, "src/doctor.zig", arena, .limited(max_source_bytes));
+
+    const configuration = try docText(docs, "docs/configure/configuration.md");
+    const catalogue_section = try textBetween(configuration, "Catalogue status values are:", "## Naming a credential");
+    const running = try docText(docs, "docs/running.md");
+    const doctor_section = try textBetween(running, "The report verdict is", "On an installation an organisation manages");
+
+    var wrong: std.ArrayList(u8) = .empty;
+    for (try simpleEnumFields(arena, models_source, "const CatalogueStatus")) |field| {
+        if (!try namesInTicks(catalogue_section, field, arena)) {
+            try wrong.print(arena, "docs/configure/configuration.md names no catalogue status `{s}`\n", .{field});
+        }
+    }
+    for (try simpleEnumFields(arena, doctor_source, "pub const Verdict")) |field| {
+        if (!try namesInTicks(doctor_section, field, arena)) {
+            try wrong.print(arena, "docs/running.md names no doctor verdict `{s}`\n", .{field});
+        }
+    }
+    for (try simpleEnumFields(arena, doctor_source, "const RowStatus")) |field| {
+        if (!try namesInTicks(doctor_section, field, arena)) {
+            try wrong.print(arena, "docs/running.md names no doctor row status `{s}`\n", .{field});
+        }
+    }
 
     try testing.expectEqualStrings("", wrong.items);
 }
