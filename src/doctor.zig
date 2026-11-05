@@ -957,7 +957,7 @@ fn credentialRow(arena: std.mem.Allocator, state: CredentialState) std.mem.Alloc
             .name = "credential",
             .state = .unavailable,
             .means = try std.fmt.allocPrint(arena, "no session can be started: {s}", .{reason}),
-            .fix = "Write a provider and a model into config.zon, then run chock login.",
+            .fix = "Run chock config init, edit its provider and model, then run chock login if that provider needs a credential.",
             .blocks = true,
         },
         .unreadable => |reason| .{
@@ -968,6 +968,15 @@ fn credentialRow(arena: std.mem.Allocator, state: CredentialState) std.mem.Alloc
             .blocks = true,
         },
     };
+}
+
+test "an unconfigured credential points to the safe configuration initializer" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const row = try credentialRow(arena_state.allocator(), .{ .unconfigured = "there is no configuration" });
+    try testing.expect(std.mem.indexOf(u8, row.fix, "chock config init") != null);
+    try testing.expect(row.blocks);
 }
 
 fn cacheRow(arena: std.mem.Allocator, probe: Probe) std.mem.Allocator.Error!Row {

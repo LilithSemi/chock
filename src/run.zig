@@ -35,7 +35,6 @@ const Exit = @import("exit.zig").Exit;
 const exitFor = @import("main.zig").exitFor;
 const plugin_process = @import("plugin-host.zig");
 const guest_limits = @import("guest_limits.zig");
-const config_cmd = @import("config.zig");
 
 const usage_text =
     \\Usage: chock run [options] [message...]
@@ -1257,13 +1256,9 @@ fn start(
         error.NoConfigFile => {
             tty.print(
                 .err,
-                "chock run: there is no configuration at {s}/{s}. Write one, for example:\n\n",
+                "chock run: there is no configuration at {s}/{s}; " ++
+                    "run `chock config init` to write a starter, then edit its provider and model\n",
                 .{ config_dir, chock_auth.config.file_name },
-            );
-            tty.print(
-                .err,
-                "{s}",
-                .{config_cmd.example_text},
             );
             return error.Reported;
         },
