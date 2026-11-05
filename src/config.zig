@@ -171,6 +171,8 @@ fn missingDefault(config: *const chock_auth.config.Config) ?[]const u8 {
 }
 
 const CheckReport = struct {
+    schema: []const u8 = "chock.config-check",
+    version: u32 = 1,
     path: []const u8,
     valid: bool = true,
     provider_instances: usize = 0,
@@ -345,6 +347,8 @@ test "a JSON report is structured and exposes no credential" {
 
     const parsed = try std.json.parseFromSlice(CheckReport, gpa, output, .{});
     defer parsed.deinit();
+    try std.testing.expectEqualStrings("chock.config-check", parsed.value.schema);
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.version);
     try std.testing.expect(parsed.value.valid);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.provider_instances);
     try std.testing.expectEqualStrings("local", parsed.value.default_provider.?);

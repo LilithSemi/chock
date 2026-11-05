@@ -200,6 +200,8 @@ test "the documented configuration starter passes the real CLI check" {
     const gpa = testing.allocator;
     const io = testing.io;
     const Report = struct {
+        schema: []const u8,
+        version: u32,
         path: []const u8,
         valid: bool,
         provider_instances: usize,
@@ -218,6 +220,8 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expect(std.mem.indexOf(u8, missing.err, "there is no configuration") != null);
     const invalid = try std.json.parseFromSlice(Report, gpa, missing.out, .{});
     defer invalid.deinit();
+    try testing.expectEqualStrings("chock.config-check", invalid.value.schema);
+    try testing.expectEqual(@as(u32, 1), invalid.value.version);
     try testing.expectEqualStrings(expected_path, invalid.value.path);
     try testing.expect(!invalid.value.valid);
 
