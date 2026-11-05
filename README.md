@@ -73,18 +73,23 @@ Download the build for your platform from
 archives and their checksums, and shows how to put the `chock` binary on your
 path.
 
-Download `SHA256SUMS` beside the archive, set its exact file name, and verify
-the bytes before unpacking it. `shasum` is available on macOS and in common
-Linux installations:
+Download `SHA256SUMS` beside the archive. With the GitHub CLI, first verify that
+the checksum manifest came from this repository's workflow:
+
+```sh
+gh attestation verify SHA256SUMS --repo LilithSemi/chock
+```
+
+Then set the archive's exact file name and verify its bytes before unpacking
+it. `shasum` is available on macOS and in common Linux installations:
 
 ```sh
 archive=chock-VERSION-PLATFORM.tar.gz
 grep -F "  $archive" SHA256SUMS | shasum -a 256 --check
 ```
 
-Release archives also carry signed build provenance. With the GitHub CLI,
-verify that an archive came from this repository's workflow before you unpack
-it:
+Each release archive also carries signed build provenance. Verify the archive
+itself before you unpack it:
 
 ```
 gh attestation verify chock-<version>-<platform>.tar.gz --repo LilithSemi/chock

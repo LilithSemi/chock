@@ -390,6 +390,22 @@ test "every external action in CI is pinned to an immutable revision" {
     try testing.expectEqualStrings("", wrong.items);
 }
 
+test "release provenance covers archives and their checksum manifest" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{});
+    defer root.close(testing.io);
+    const workflow = try root.readFileAlloc(testing.io, ".github/workflows/ci.yml", arena, .limited(max_doc_bytes));
+    const subjects =
+        \\          subject-path: |
+        \\            artifacts/chock-*.tar.gz
+        \\            artifacts/SHA256SUMS
+    ;
+    try testing.expect(std.mem.indexOf(u8, workflow, subjects) != null);
+}
+
 test "the documentation index names every page under docs/" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

@@ -299,15 +299,18 @@ jobs:
           ls -l artifacts
           cat artifacts/SHA256SUMS
 
-      # A digest detects a damaged download. Provenance also binds that digest
-      # to this repository, commit and workflow through GitHub's Sigstore
-      # signer. Pull requests still build every archive, but an untrusted
-      # change cannot ask this repository to attest what it made.
-      - name: Attest the release archives
+      # A digest detects a damaged download. Provenance also binds every
+      # archive and the digest manifest itself to this repository, commit and
+      # workflow through GitHub's Sigstore signer. Pull requests still build
+      # every artifact, but an untrusted change cannot ask this repository to
+      # attest what it made.
+      - name: Attest the release artifacts
         if: github.event_name != 'pull_request'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-path: artifacts/chock-*.tar.gz
+          subject-path: |
+            artifacts/chock-*.tar.gz
+            artifacts/SHA256SUMS
 
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
