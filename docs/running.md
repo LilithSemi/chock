@@ -197,6 +197,11 @@ hides something this Chock does not understand. Torn records, undecodable
 records, and broken hash chains are likewise printed at their byte offset and
 return an audit gap.
 
+In JSON output, an audit gap is a `chock_show` version 1 diagnostic row with
+`offset`, `problem`, and `detail` fields. The stable `problem` values are
+`log_unreadable`, `header_invalid`, `event_undecodable`, `event_torn`,
+`hash_chain_broken`, and `event_unknown`.
+
 `chock sessions tree <session>` follows every `session.spawn` from that root.
 Each row keeps a branch separate and shows its agent kind, current or terminal
 status, delegated cost budget, actual token use and priced cost. A child whose

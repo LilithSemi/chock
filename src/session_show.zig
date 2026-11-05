@@ -117,7 +117,7 @@ pub fn show(
     const fd = std.posix.openatZ(std.posix.AT.FDCWD, path, flags, 0) catch |err| switch (err) {
         error.FileNotFound => return .not_found,
         else => {
-            try writeDiagnostic(arena, options.format, 0, "unreadable", @errorName(err));
+            try writeDiagnostic(arena, options.format, 0, .log_unreadable, @errorName(err));
             return .invalid;
         },
     };
@@ -128,7 +128,7 @@ pub fn show(
     defer log.close(io);
 
     const header = log.headerDigest(io) catch |err| {
-        try writeDiagnostic(arena, options.format, 0, "bad header", @errorName(err));
+        try writeDiagnostic(arena, options.format, 0, .header_invalid, @errorName(err));
         return .invalid;
     };
     var verifier = chain.Verifier.init(header);
@@ -153,13 +153,13 @@ pub fn show(
         const parsed = replay.next(io) catch |err| {
             ending = .undecodable;
             ending_at = at;
-            try writeDiagnostic(scratch, options.format, at, "undecodable event", @errorName(err));
+            try writeDiagnostic(scratch, options.format, at, .event_undecodable, @errorName(err));
             break;
         } orelse {
             if (replay.truncated) {
                 ending = .torn;
                 ending_at = replay.truncated_at;
-                try writeDiagnostic(scratch, options.format, ending_at, "torn event", "the final line is unfinished");
+                try writeDiagnostic(scratch, options.format, ending_at, .event_torn, "the final line is unfinished");
             }
             break;
         };
@@ -188,7 +188,7 @@ pub fn show(
             "the hash chain breaks after event {d}",
             .{report.after},
         );
-        try writeDiagnostic(scratch, options.format, report.at, "edited log", detail);
+        try writeDiagnostic(scratch, options.format, report.at, .hash_chain_broken, detail);
         return .invalid;
     }
     if (report.verdict == .torn or report.verdict == .undecodable) return .invalid;
@@ -198,7 +198,7 @@ pub fn show(
             scratch_state.allocator(),
             options.format,
             at,
-            "unknown event",
+            .event_unknown,
             "this Chock cannot validate that event kind",
         );
     }
@@ -547,10 +547,30 @@ fn displayText(
     return out.toOwnedSlice(arena);
 }
 
+const ShowProblem = enum {
+    log_unreadable,
+    header_invalid,
+    event_undecodable,
+    event_torn,
+    hash_chain_broken,
+    event_unknown,
+};
+
+fn showProblemLabel(problem: ShowProblem) []const u8 {
+    return switch (problem) {
+        .log_unreadable => "unreadable",
+        .header_invalid => "bad header",
+        .event_undecodable => "undecodable event",
+        .event_torn => "torn event",
+        .hash_chain_broken => "edited log",
+        .event_unknown => "unknown event",
+    };
+}
+
 const Diagnostic = struct {
     chock_show: u32 = 1,
     offset: u64,
-    error_name: []const u8,
+    problem: ShowProblem,
     detail: []const u8,
 };
 
@@ -558,13 +578,13 @@ fn writeDiagnostic(
     arena: std.mem.Allocator,
     format: Format,
     offset: u64,
-    name: []const u8,
+    problem: ShowProblem,
     detail: []const u8,
 ) !void {
     if (format == .json) {
         const text = try std.json.Stringify.valueAlloc(arena, Diagnostic{
             .offset = offset,
-            .error_name = name,
+            .problem = problem,
             .detail = detail,
         }, .{});
         tty.out(.plain, "{s}\n", .{text});
@@ -572,7 +592,7 @@ fn writeDiagnostic(
     }
     tty.out(.err, "[{d}] {s}: {s}\n", .{
         offset,
-        try inlineText(arena, name),
+        showProblemLabel(problem),
         try inlineText(arena, detail),
     });
 }
@@ -742,6 +762,17 @@ test "unknown and undecodable events are visible audit gaps" {
     try std.testing.expectEqual(Outcome.invalid, try show(arena, gpa, io, dir, corrupt_id, .{}));
     try std.testing.expect(std.mem.indexOf(u8, capture.out(), "undecodable event") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture.out(), "[") != null);
+
+    capture.clear();
+    try std.testing.expectEqual(Outcome.invalid, try show(arena, gpa, io, dir, corrupt_id, .{ .format = .json }));
+    const diagnostic = try std.json.parseFromSlice(
+        Diagnostic,
+        gpa,
+        std.mem.trimEnd(u8, capture.out(), "\n"),
+        .{},
+    );
+    defer diagnostic.deinit();
+    try std.testing.expectEqual(ShowProblem.event_undecodable, diagnostic.value.problem);
 
     capture.clear();
     const torn_id = "01JQ" ++ @as([22]u8, @splat('T'));

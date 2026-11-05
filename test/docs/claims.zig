@@ -930,6 +930,7 @@ test "automation report pages name every stable status value" {
     const config_source = try root.readFileAlloc(testing.io, "src/config.zig", arena, .limited(max_source_bytes));
     const models_source = try root.readFileAlloc(testing.io, "src/models.zig", arena, .limited(max_source_bytes));
     const doctor_source = try root.readFileAlloc(testing.io, "src/doctor.zig", arena, .limited(max_source_bytes));
+    const show_source = try root.readFileAlloc(testing.io, "src/session_show.zig", arena, .limited(max_source_bytes));
     const tree_source = try root.readFileAlloc(testing.io, "src/session_tree.zig", arena, .limited(max_source_bytes));
     const run_source = try root.readFileAlloc(testing.io, "src/run.zig", arena, .limited(max_source_bytes));
 
@@ -939,6 +940,7 @@ test "automation report pages name every stable status value" {
     const running = try docText(docs, "docs/running.md");
     const run_result_section = try textBetween(running, "The contract is named `chock.run-result`", "## The tools");
     const doctor_section = try textBetween(running, "The report verdict is", "On an installation an organisation manages");
+    const show_section = try textBetween(running, "`chock sessions show` reads only", "`chock sessions tree <session>`");
     const tree_section = try textBetween(running, "`chock sessions tree <session>`", "### What reached the model");
 
     var wrong: std.ArrayList(u8) = .empty;
@@ -960,6 +962,11 @@ test "automation report pages name every stable status value" {
     for (try simpleEnumFields(arena, doctor_source, "const RowStatus")) |field| {
         if (!try namesInTicks(doctor_section, field, arena)) {
             try wrong.print(arena, "docs/running.md names no doctor row status `{s}`\n", .{field});
+        }
+    }
+    for (try simpleEnumFields(arena, show_source, "const ShowProblem")) |field| {
+        if (!try namesInTicks(show_section, field, arena)) {
+            try wrong.print(arena, "docs/running.md names no session-show problem `{s}`\n", .{field});
         }
     }
     for (try simpleEnumFields(arena, tree_source, "const TreeProblem")) |field| {
