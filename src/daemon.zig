@@ -107,7 +107,7 @@ const Daemon = struct {
     io: std.Io,
     exe_path: []const u8,
     environ: std.process.Environ = .empty,
-    env: *std.process.Environ.Map,
+    env: *const std.process.Environ.Map,
     owner_uid: std.posix.uid_t = 0,
     mutex: std.Io.Mutex = .init,
     sessions: std.ArrayList(Session) = .empty,
@@ -332,6 +332,7 @@ pub fn main(
     const gpa = init.gpa;
     const io = init.io;
     const environ = init.minimal.environ;
+    const env = init.environ_map.*;
 
     const options = parseOptions(args) catch |err| switch (err) {
         error.HelpWanted => {
@@ -340,8 +341,6 @@ pub fn main(
         },
         error.BadArguments => return Exit.usage.code(),
     };
-
-    var env = try environ.createMap(arena);
 
     var daemon = Daemon{
         .gpa = gpa,
@@ -417,7 +416,7 @@ fn readSandbox(
     gpa: std.mem.Allocator,
     io: std.Io,
     arena: std.mem.Allocator,
-    env: *std.process.Environ.Map,
+    env: *const std.process.Environ.Map,
 ) ?chock_policy.sandbox.Block {
     const dir = chock_auth.paths.configDir(arena, env) catch return .{};
     const path = std.fs.path.joinZ(arena, &.{ dir, chock_auth.config.file_name }) catch return .{};
