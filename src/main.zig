@@ -140,10 +140,7 @@ fn setUpOutput(
 }
 
 pub const Run = *const fn (
-    arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    environ: std.process.Environ,
+    init: std.process.Init,
     exe_path: []const u8,
     args: []const []const u8,
 ) anyerror!u8;
@@ -314,7 +311,6 @@ fn namesNoCommand(first: []const u8) bool {
 
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
-    const gpa = init.gpa;
 
     const args = try init.minimal.args.toSlice(arena);
 
@@ -325,13 +321,13 @@ pub fn main(init: std.process.Init) !u8 {
     defer tty.flushOut();
 
     if (std.mem.eql(u8, std.fs.path.basename(args[0]), chock_broker.askpass.link_name)) {
-        return askpass_cmd.main(arena, gpa, init.io, init.minimal.environ, args[0], args[1..]);
+        return askpass_cmd.main(init, args[0], args[1..]);
     }
 
     if (args.len < 2 or namesNoCommand(args[1])) {
         const rest = (try setUpOutput(arena, init.io, init.environ_map, args[1..])) orelse
             return Exit.usage.code();
-        return ui.start(arena, gpa, init.io, init.minimal.environ, init.environ_map, args[0], rest);
+        return ui.start(init, args[0], rest);
     }
 
     const command = args[1];
@@ -352,7 +348,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     for (commands) |entry| {
         if (!std.mem.eql(u8, command, entry.name)) continue;
-        if (entry.run) |go| return go(arena, gpa, init.io, init.minimal.environ, args[0], rest);
+        if (entry.run) |go| return go(init, args[0], rest);
         tty.print(.err, "chock {s}: not implemented yet, because {s}\n", .{ entry.name, entry.why });
         return Exit.not_implemented.code();
     }

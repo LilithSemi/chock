@@ -162,13 +162,15 @@ pub const Display = struct {
 const ForkRequest = struct { at: ?u64 };
 
 pub fn main(
-    arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    environ: std.process.Environ,
+    init: std.process.Init,
     exe_path: []const u8,
     args: []const []const u8,
 ) !u8 {
+    const arena = init.arena.allocator();
+    const gpa = init.gpa;
+    const io = init.io;
+    const environ = init.minimal.environ;
+
     // Session setup is torn down before fork, and the session runtime cannot
     // own worker threads that would be stranded in the child.
     _ = io;

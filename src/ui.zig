@@ -173,14 +173,16 @@ fn namesADisplay(env: *const std.process.Environ.Map) bool {
 }
 
 pub fn start(
-    arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    environ: std.process.Environ,
-    env: *const std.process.Environ.Map,
+    init: std.process.Init,
     exe_path: []const u8,
     args: []const []const u8,
 ) !u8 {
+    const arena = init.arena.allocator();
+    const gpa = init.gpa;
+    const io = init.io;
+    const environ = init.minimal.environ;
+    const env = init.environ_map;
+
     const asked = (try run.readOptions(arena, args)) orelse return main_cmd.Exit.usage.code();
     if (asked.help_wanted) return main_cmd.Exit.finished.code();
 
@@ -232,14 +234,14 @@ pub fn start(
 
     if (plan == .usage) {
         if (asked.message_words.len != 0) {
-            return run.main(arena, gpa, io, environ, exe_path, args);
+            return run.main(init, exe_path, args);
         }
         if (piped) |message| {
             const with_message = try std.mem.concat(arena, []const u8, &.{
                 args,
                 &.{ "--", message },
             });
-            return run.main(arena, gpa, io, environ, exe_path, with_message);
+            return run.main(init, exe_path, with_message);
         }
         main_cmd.printUsage(.err);
         return main_cmd.Exit.usage.code();

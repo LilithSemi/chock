@@ -324,13 +324,15 @@ const Daemon = struct {
 };
 
 pub fn main(
-    arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    environ: std.process.Environ,
+    init: std.process.Init,
     exe_path: []const u8,
     args: []const []const u8,
 ) !u8 {
+    const arena = init.arena.allocator();
+    const gpa = init.gpa;
+    const io = init.io;
+    const environ = init.minimal.environ;
+
     const options = parseOptions(args) catch |err| switch (err) {
         error.HelpWanted => {
             tty.out(.plain, "{s}", .{usage_text});
