@@ -1187,8 +1187,12 @@ test "the sandbox page counts the calls it blocks and the proc entries it masks"
     try testing.expectEqualStrings("", wrong.items);
 }
 
-/// Every ```` ```zon ```` block of one page, with the line its fence opened on.
-fn zonBlocksIn(arena: std.mem.Allocator, doc: Doc) ![]const Span {
+/// Every fenced block of one language, with the line its fence opened on.
+fn fencedBlocksIn(
+    arena: std.mem.Allocator,
+    doc: Doc,
+    language: []const u8,
+) ![]const Span {
     var out: std.ArrayList(Span) = .empty;
     var lines = std.mem.splitScalar(u8, doc.text, '\n');
     var number: usize = 0;
@@ -1208,7 +1212,7 @@ fn zonBlocksIn(arena: std.mem.Allocator, doc: Doc) ![]const Span {
                 inside = false;
                 continue;
             }
-            if (!std.mem.eql(u8, std.mem.trim(u8, line, "`\r\n "), "zon")) continue;
+            if (!std.mem.eql(u8, std.mem.trim(u8, line, "`\r\n "), language)) continue;
             inside = true;
             opened = number;
             continue;
@@ -1218,6 +1222,34 @@ fn zonBlocksIn(arena: std.mem.Allocator, doc: Doc) ![]const Span {
         try body.append(arena, '\n');
     }
     return out.items;
+}
+
+fn zonBlocksIn(arena: std.mem.Allocator, doc: Doc) ![]const Span {
+    return fencedBlocksIn(arena, doc, "zon");
+}
+
+test "every documented JSON block is valid JSON" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    var wrong: std.ArrayList(u8) = .empty;
+    var checked: usize = 0;
+    for (docs) |doc| {
+        for (try fencedBlocksIn(arena, doc, "json")) |block| {
+            checked += 1;
+            const parsed = std.json.parseFromSlice(std.json.Value, gpa, block.text, .{}) catch |err| {
+                try wrong.print(arena, "{s}:{d}: {t}\n", .{ block.doc, block.line, err });
+                continue;
+            };
+            parsed.deinit();
+        }
+    }
+
+    if (checked == 0) try wrong.appendSlice(arena, "no documented JSON blocks were found\n");
+    try testing.expectEqualStrings("", wrong.items);
 }
 
 test "every documented ZON block is valid ZON" {
