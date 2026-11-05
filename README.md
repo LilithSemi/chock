@@ -73,6 +73,14 @@ Download the build for your platform from
 archives and their checksums, and shows how to put the `chock` binary on your
 path.
 
+Release archives also carry signed build provenance. With the GitHub CLI,
+verify that an archive came from this repository's workflow before you unpack
+it:
+
+```
+gh attestation verify chock-<version>-<platform>.tar.gz --repo LilithSemi/chock
+```
+
 With [Nix](https://nixos.org), install the current build from the project's
 flake into your user profile:
 
