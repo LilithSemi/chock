@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+scratch=$(mktemp -d)
+trap 'rm -rf -- "$scratch"' EXIT HUP INT TERM
+
+mkdir -p "$scratch/input" "$scratch/artifacts" "$scratch/stage"
+printf 'binary\n' > "$scratch/input/chock"
+printf 'license\n' > "$scratch/input/LICENSE"
+chmod +x "$scratch/input/chock"
+
+"$here/package-release" \
+  "$scratch/artifacts" "$scratch/stage" chock-test-linux \
+  "$scratch/input/chock" "$scratch/input/LICENSE"
+cp "$scratch/artifacts/chock-test-linux.tar.gz" "$scratch/first.tar.gz"
+
+touch -t 203801190314 "$scratch/input/chock" "$scratch/input/LICENSE"
+(
+  umask 077
+  "$here/package-release" \
+    "$scratch/artifacts" "$scratch/stage" chock-test-linux \
+    "$scratch/input/chock" "$scratch/input/LICENSE"
+)
+cmp "$scratch/first.tar.gz" "$scratch/artifacts/chock-test-linux.tar.gz"
+
+tar -tzf "$scratch/artifacts/chock-test-linux.tar.gz" > "$scratch/members"
+printf '%s\n' \
+  chock-test-linux/ \
+  chock-test-linux/LICENSE \
+  chock-test-linux/chock > "$scratch/expected-members"
+diff -u "$scratch/expected-members" "$scratch/members"
+mkdir "$scratch/unpacked"
+tar -xzf "$scratch/artifacts/chock-test-linux.tar.gz" -C "$scratch/unpacked"
+test -x "$scratch/unpacked/chock-test-linux/chock"
+test ! -x "$scratch/unpacked/chock-test-linux/LICENSE"
+
+mkdir -p "$scratch/other"
+printf 'collision\n' > "$scratch/other/chock"
+if "$here/package-release" \
+  "$scratch/artifacts" "$scratch/stage" chock-collision \
+  "$scratch/input/chock" "$scratch/other/chock" 2>/dev/null; then
+  echo "package-release accepted two files with the same name" >&2
+  exit 1
+fi
+
+if "$here/package-release" \
+  "$scratch/artifacts" "$scratch/stage" ../outside \
+  "$scratch/input/chock" 2>/dev/null; then
+  echo "package-release accepted a path as an archive shape" >&2
+  exit 1
+fi

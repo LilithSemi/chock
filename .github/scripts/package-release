@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+artifacts=${1:?usage: package-release <artifacts-dir> <stage-dir> <shape> <file>...}
+stage=${2:?usage: package-release <artifacts-dir> <stage-dir> <shape> <file>...}
+shape=${3:?usage: package-release <artifacts-dir> <stage-dir> <shape> <file>...}
+shift 3
+test "$#" -gt 0 || {
+  echo "package-release: no files were given" >&2
+  exit 1
+}
+
+case "$shape" in
+  *[!A-Za-z0-9._-]* | .* | *..*)
+    echo "package-release: invalid archive shape: $shape" >&2
+    exit 1
+    ;;
+esac
+
+mkdir -p "$artifacts" "$stage"
+root="$stage/$shape"
+archive="$artifacts/$shape.tar.gz"
+temporary="$archive.tmp.$$"
+
+if ! mkdir "$root"; then
+  echo "package-release: staging path already exists: $root" >&2
+  exit 1
+fi
+chmod 755 "$root"
+cleanup() {
+  rm -rf -- "$root"
+  rm -f -- "$temporary"
+}
+trap cleanup EXIT HUP INT TERM
+
+for source do
+  name=${source##*/}
+  if [ -e "$root/$name" ]; then
+    echo "package-release: two inputs are named $name" >&2
+    exit 1
+  fi
+  cp "$source" "$root/$name"
+  if [ -x "$source" ]; then
+    chmod 755 "$root/$name"
+  else
+    chmod 644 "$root/$name"
+  fi
+done
+
+tar --sort=name \
+    --owner=0 --group=0 --numeric-owner \
+    --mtime="@${SOURCE_DATE_EPOCH:-0}" \
+    -C "$stage" -cf - "$shape" \
+  | gzip -n > "$temporary"
+mv -f -- "$temporary" "$archive"

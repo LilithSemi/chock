@@ -45,6 +45,9 @@ jobs:
 
       - uses: DeterminateSystems/flakehub-cache-action@3ac6f3c19fc52eeb1408fd434bd1b4ed4266bf25 # v3
 
+      - name: Test reproducible release packaging
+        run: nix shell nixpkgs#gnutar nixpkgs#gzip -c .github/scripts/test-package-release
+
       - name: Permit the nested user namespace
         if: runner.os == 'Linux'
         run: |
@@ -217,11 +220,11 @@ jobs:
           # directory they happened to be standing in. One path segment is a
           # small price for never doing that.
           #
-          # **Built for reproducibility**: a fixed owner, group and time, a
-          # sorted member order, and `gzip -n` so the archive carries no
+          # **Built for reproducibility**: fixed modes, owner, group and time,
+          # a sorted member order, and `gzip -n` so the archive carries no
           # timestamp of its own. Two builds of the same commit then give the
-          # same digest, which is what makes SHA256SUMS worth publishing for
-          # a tool whose whole claim is about boundaries.
+          # same digest, which is what makes SHA256SUMS worth publishing for a
+          # tool whose whole claim is about boundaries.
           #
           # **GNU tar by name, and never the runner's own.** macOS ships bsdtar,
           # which has none of those four options, so the flags are not portable
@@ -232,18 +235,9 @@ jobs:
             shapes+=("chock-${{ matrix.target }}")
           fi
           for shape in "${shapes[@]}"; do
-            rm -rf "stage/${shape}"
-            mkdir -p "stage/${shape}"
-            cp result/bin/chock "stage/${shape}/chock"
-            chmod u+w "stage/${shape}/chock"
-            cp LICENSE README.md "stage/${shape}/"
-            nix shell nixpkgs#gnutar nixpkgs#gzip -c sh -c "
-              tar --sort=name \
-                  --owner=0 --group=0 --numeric-owner \
-                  --mtime='@${SOURCE_DATE_EPOCH:-0}' \
-                  -C stage -cf - '${shape}' \
-                | gzip -n > 'artifacts/${shape}.tar.gz'
-            "
+            nix shell nixpkgs#gnutar nixpkgs#gzip -c \
+              ./.github/scripts/package-release artifacts stage "${shape}" \
+              result/bin/chock LICENSE README.md
           done
 
           if [ -n "${guest_kernel_name}" ]; then
@@ -252,18 +246,10 @@ jobs:
               guest_shapes+=("chock-guest-${{ matrix.target }}")
             fi
             for shape in "${guest_shapes[@]}"; do
-              rm -rf "stage/${shape}"
-              mkdir -p "stage/${shape}"
-              cp "result-guest-kernel/${guest_kernel_name}" "stage/${shape}/"
-              cp result-guest-initrd/initrd "stage/${shape}/"
-              cp LICENSE README.md "stage/${shape}/"
-              nix shell nixpkgs#gnutar nixpkgs#gzip -c sh -c "
-                tar --sort=name \
-                    --owner=0 --group=0 --numeric-owner \
-                    --mtime='@${SOURCE_DATE_EPOCH:-0}' \
-                    -C stage -cf - '${shape}' \
-                  | gzip -n > 'artifacts/${shape}.tar.gz'
-              "
+              nix shell nixpkgs#gnutar nixpkgs#gzip -c \
+                ./.github/scripts/package-release artifacts stage "${shape}" \
+                "result-guest-kernel/${guest_kernel_name}" \
+                result-guest-initrd/initrd LICENSE README.md
             done
           fi
 

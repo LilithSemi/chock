@@ -419,8 +419,9 @@ test "Linux releases package both microVM guest images" {
         "nix build .#guest-kernel --out-link result-guest-kernel",
         "nix build .#guest-initrd --out-link result-guest-initrd",
         "chock-${version}-guest-${{ matrix.target }}",
-        "cp \"result-guest-kernel/${guest_kernel_name}\"",
-        "cp result-guest-initrd/initrd",
+        "./.github/scripts/package-release artifacts stage",
+        "\"result-guest-kernel/${guest_kernel_name}\"",
+        "result-guest-initrd/initrd LICENSE README.md",
     }) |required| {
         try testing.expect(std.mem.indexOf(u8, workflow, required) != null);
     }
