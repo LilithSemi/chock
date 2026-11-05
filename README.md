@@ -112,26 +112,23 @@ flake into your user profile:
 nix profile install github:LilithSemi/chock
 ```
 
-Then check which sandbox layers this machine provides:
-
-```
-chock doctor
-```
+Then continue with the configuration and first-run checks below.
 
 ## Getting started
 
 ```
-chock doctor                               # can this machine contain a session
 chock config init                          # save a local-provider starter
 chock config check                         # check it before a session
 chock models                               # show the effective provider and model
+chock doctor                               # can this configuration run here
 cd ~/some-project
 chock run "add a test for the parser"
 chock -- add a test for the parser         # the same task, with no subcommand
 chock                                      # the interface, which asks for the task
 ```
 
-`chock doctor` tries each sandbox layer for real and says which are on.
+`chock doctor` tries each sandbox layer for real and checks the configuration
+needed for a first session, so run it after creating or linking that file.
 `chock run` names the session before it starts, and `chock run --verbose` adds
 the session log's path. Bare `chock` brings up a full screen interface and asks
 for the task in it.

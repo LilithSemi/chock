@@ -810,6 +810,21 @@ test "the README names the declared Zig toolchain" {
     try testing.expect(std.mem.indexOf(u8, readme, documented) != null);
 }
 
+test "the README creates configuration before the first doctor check" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+    const readme = try docText(docs, "README.md");
+    const getting_started = try textBetween(readme, "## Getting started", "## Documentation");
+
+    const init_at = std.mem.indexOf(u8, getting_started, "chock config init") orelse
+        return error.MissingConfigInit;
+    const doctor_at = std.mem.indexOf(u8, getting_started, "chock doctor") orelse
+        return error.MissingDoctor;
+    try testing.expect(init_at < doctor_at);
+}
+
 test "the exit code table has one row for each code, with the number the code has" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
