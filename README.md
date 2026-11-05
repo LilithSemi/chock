@@ -87,11 +87,15 @@ gh attestation verify SHA256SUMS --repo LilithSemi/chock
 ```
 
 Then set the archive's exact file name and verify its bytes before unpacking
-it. `shasum` is available on macOS and in common Linux installations:
+it. Linux commonly provides `sha256sum`, while macOS provides `shasum`:
 
 ```sh
 archive=chock-VERSION-PLATFORM.tar.gz
-grep -F "  $archive" SHA256SUMS | shasum -a 256 --check
+if command -v sha256sum >/dev/null 2>&1; then
+  grep -F "  $archive" SHA256SUMS | sha256sum --check
+else
+  grep -F "  $archive" SHA256SUMS | shasum -a 256 --check
+fi
 ```
 
 Each release archive also carries signed build provenance. Verify the archive
