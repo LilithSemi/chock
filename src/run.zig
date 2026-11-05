@@ -5436,6 +5436,7 @@ const Approvers = struct {
                 .storage = started.storage,
                 .locked = locked,
                 .screen = one,
+                .owner = std.Thread.getCurrentId(),
             };
         }
 
@@ -5518,6 +5519,8 @@ const QuestionConsole = struct {
 
 const DisplayPump = struct {
     screen: *ui.Ui,
+    io: std.Io,
+    network: ?*ToolNetwork = null,
 
     fn coreIdle(self: *DisplayPump) chock_core.idle.Idle {
         return .{ .ptr = self, .vtable = &core_vtable };
@@ -5527,12 +5530,27 @@ const DisplayPump = struct {
         return .{ .ptr = self, .vtable = &provider_vtable };
     }
 
-    const core_vtable = chock_core.idle.Idle.VTable{ .step = stepFn };
+    const core_vtable = chock_core.idle.Idle.VTable{ .step = toolStepFn };
     const provider_vtable = chock_provider.Client.Idle.VTable{ .step = stepFn };
 
     fn stepFn(ptr: *anyopaque) void {
         const self: *DisplayPump = @ptrCast(@alignCast(ptr));
         self.screen.pumpStep();
+    }
+
+    /// A tool call is the one time another thread asks for an approval, so
+    /// this step puts up what the network router logged before it paints.
+    fn toolStepFn(ptr: *anyopaque) void {
+        const self: *DisplayPump = @ptrCast(@alignCast(ptr));
+        if (self.asking()) return;
+        self.screen.pumpStep();
+    }
+
+    fn asking(self: *DisplayPump) bool {
+        const net = self.network orelse return false;
+        const display = net.display() orelse return false;
+        _ = display.step(self.io, ui.Ui.look_ms);
+        return display.shown != null;
     }
 };
 
@@ -5736,6 +5754,9 @@ const ToolNetwork = struct {
     folded_at: u64 = 0,
     approvers: Approvers = undefined,
     broker: chock_broker.Broker = undefined,
+    /// Set once the loop has handed over a log lock, which it keeps for the
+    /// whole of a tool call.
+    lock_given: bool = false,
 
     fn seam(self: *ToolNetwork) chock_core.tools.NetSeam {
         return .{ .ptr = self, .vtable = &seam_vtable };
@@ -5799,6 +5820,16 @@ const ToolNetwork = struct {
             .locked = locked,
             .approval_wait_ns = &self.approval_wait_ns,
         };
+        self.lock_given = true;
+    }
+
+    /// The display, once a tool call has the log lock. A connection is
+    /// approved on the network router's own thread, which may not paint, so
+    /// the question goes up through the pump on the thread that owns it.
+    fn display(self: *ToolNetwork) ?*approval.Display {
+        if (!self.lock_given) return null;
+        if (!self.approvers.has_display) return null;
+        return &self.approvers.display;
     }
 
     fn deinit(self: *ToolNetwork) void {
@@ -12074,7 +12105,11 @@ fn runSession(
         .agent_kind = options.agent_kind,
     };
 
-    var pump = DisplayPump{ .screen = screen orelse undefined };
+    var pump = DisplayPump{
+        .screen = screen orelse undefined,
+        .io = io,
+        .network = &tool_network,
+    };
     if (screen != null) {
         http.idle = pump.providerIdle();
         tool_runner.context.idle = pump.coreIdle();

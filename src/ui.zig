@@ -3912,6 +3912,7 @@ fn droveDisplay(
         .locked = &locked,
         .screen = h.screen,
         .stop = Typist.neverStopped,
+        .owner = std.Thread.getCurrentId(),
     };
 
     const policy = try chock_policy.table.Table.parse(gpa, ask_everything, null);
@@ -4032,6 +4033,56 @@ test "n in the region is a refusal in the log, and the act does not happen" {
         std.meta.Tag(chock_proto.event.ApprovalDecision).refused_by_user,
         drove.answers[0],
     );
+}
+
+test "an approval a helper thread logged goes up on the thread that owns the display" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const h = try Headless.open(gpa);
+    defer h.close();
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01DISPLAYONETHREAD");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    _ = try locked.append(gpa, io, .{ .approval_request = .{
+        .action = "net.connect.io.crates.index.443",
+        .summary = "reach index.crates.io on port 443",
+        .detail = "reach index.crates.io on port 443",
+        .reason = "",
+        .agent_kind = "main",
+        .spawn_chain = &.{},
+        .timeout_at_ms = std.math.maxInt(i64),
+        .tool_call_id = "call1",
+        .source = "the sandbox",
+    } }, 0);
+
+    var display = approval.Display{
+        .gpa = gpa,
+        .storage = store,
+        .locked = &locked,
+        .screen = h.screen,
+        .stop = Typist.neverStopped,
+        .owner = std.Thread.getCurrentId(),
+    };
+
+    const Elsewhere = struct {
+        fn step(one: *approval.Display, machine: std.Io) void {
+            _ = one.step(machine, 1);
+        }
+    };
+    var thread = try std.Thread.spawn(.{}, Elsewhere.step, .{ &display, io });
+    thread.join();
+    try testing.expectEqual(@as(?u64, null), display.shown);
+    try testing.expect(h.screen.approval == null);
+
+    _ = display.step(io, 1);
+    try testing.expect(display.shown != null);
+    try testing.expect(h.screen.approval != null);
+    h.screen.clearApproval();
 }
 
 test "the chain a person reads begins with them and ends with the agent that asked" {

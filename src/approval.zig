@@ -242,6 +242,9 @@ pub const Display = struct {
     storage: chock_proto.storage.Storage,
     locked: *Locked,
     screen: *ui.Ui,
+    /// The thread that may paint. Phantom reconciles and frees the element
+    /// tree without a lock, so a second thread in there is a use after free.
+    owner: std.Thread.Id,
     stop: *const fn () bool = interrupt.requested,
     shown: ?u64 = null,
     deadline_ms: i64 = 0,
@@ -264,6 +267,13 @@ pub const Display = struct {
     }
 
     pub fn step(self: *Display, io: std.Io, budget_ms: u64) Broker.Waiter.Wake {
+        // The broker that asked may be on a helper thread. Its request is in
+        // the log already, so it waits here and the owner of the display puts
+        // the question up and writes the answer back.
+        if (self.owner != std.Thread.getCurrentId()) {
+            return Broker.SystemWaiter.waiter().wait(io, budget_ms);
+        }
+
         if (self.stop()) {
             self.takeDown();
             return .canceled;
