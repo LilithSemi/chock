@@ -428,11 +428,9 @@ test "import from derivation through a real engine is refused by name" {
     var driver = Driver.init(testing.allocator, fake.noBuildSeam());
     defer driver.deinit();
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
     var engine = try expr.Engine.init(testing.allocator, .{ .worker_count = 1 });
     defer engine.deinit();
-    engine.setFileIo(threaded.io());
+    engine.setFileIo(testing.io);
     try engine.setPureEval(true, &.{});
     try engine.setStoreBackend(driver.backend());
     engine.enableStoreWrites();

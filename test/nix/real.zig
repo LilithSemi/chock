@@ -146,9 +146,7 @@ fn drvPathOf(driver: *chock_nix.backend.Driver) ?[]const u8 {
 test "the derivation this session evaluated is in the host store, at the path fix computed" {
     const gpa = testing.allocator;
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     // A machine with no daemon to write to can claim nothing.
     var store_writer = chock_nix.build.DaemonWriter.connect(
@@ -183,9 +181,7 @@ test "a real nix that will not build answers in its own words, and the model rea
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var store_writer = chock_nix.build.DaemonWriter.connect(
         gpa,
@@ -243,9 +239,7 @@ test "a build of a path this session never produced never reaches the nix on thi
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var driver = chock_nix.backend.Driver.init(gpa, chock_nix.backend.Seam.refusing);
     defer driver.deinit();
@@ -281,9 +275,7 @@ test "a real closure holding a fixed output derivation names its host, and a no 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var store_writer = chock_nix.build.DaemonWriter.connect(
         gpa,
@@ -409,9 +401,7 @@ test "a real mirrors list of this store turns the gnu site into one host, and a 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const found = (try findMirrorsList(arena, io)) orelse return error.SkipZigTest;
 
@@ -516,9 +506,7 @@ test "a real fetchurl derivation has its mirrors list read, realised first when 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const drv = (try findFetchDerivation(arena, io)) orelse return error.SkipZigTest;
 
@@ -639,9 +627,7 @@ test "a flake input that is in the store already is evaluated with no fetcher at
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -711,9 +697,7 @@ test "an evaluation that wanted an input asks about its hosts, and evaluates aft
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -797,9 +781,7 @@ test "a no refuses the fetch, and every host of the lock was in the one question
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -835,9 +817,7 @@ test "the provenance this machine records is read by the reader that judges it" 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     // The nix program is itself in the store, so this machine always has one
     // path to ask about.

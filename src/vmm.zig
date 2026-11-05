@@ -1922,9 +1922,7 @@ test "snapshot transport state round trips without host pointers" {
 }
 
 test "snapshot filesystem nodes are rebound to the receiving session" {
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const source_shares = [_]shares_mod.Share{
         .{ .name = "work", .host_path = "/old/session", .writable = true },
@@ -1994,9 +1992,7 @@ test "a signalled child reads as signalled, and one that will not stop is killed
 }
 
 test "the ready line carries which memory encryption the guest came up under" {
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     for ([_]Sev{ .off, .sev }) |said| {
         var pair: [2]i32 = undefined;
@@ -2027,9 +2023,7 @@ test "the ready line carries which memory encryption the guest came up under" {
 }
 
 test "the child's ready line is what a parent waits on, and its fault is what it reads" {
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     {
         var pair: [2]i32 = undefined;
@@ -2069,16 +2063,13 @@ test "the child's ready line is what a parent waits on, and its fault is what it
 }
 
 test "a child that says nothing inside the limit is slow and not gone" {
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-
     var pair: [2]i32 = undefined;
     try testing.expect(sys.channelPair(&pair));
     defer sys.close(pair[0]);
     defer sys.close(pair[1]);
 
     var child: Child = .{ .pid = 0, .control = pair[0] };
-    try testing.expectError(error.GuestSlow, child.waitReady(threaded.io(), 20));
+    try testing.expectError(error.GuestSlow, child.waitReady(testing.io, 20));
 }
 
 test "a refusal names the layer and what the kernel answered" {

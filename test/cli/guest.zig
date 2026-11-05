@@ -433,9 +433,7 @@ fn expectAGuestRanTheCall(gpa: std.mem.Allocator, run: *const Run) !void {
 
 test "a project with no flake.nix boots a guest through the daemon and runs a routed call in it" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     if (whyNoGuest(io) != null) return error.SkipZigTest;
 
@@ -452,9 +450,7 @@ test "a project with no flake.nix boots a guest through the daemon and runs a ro
 
 test "a project with a flake.nix boots a guest through the daemon and runs a routed call in it" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     if (whyNoGuest(io) != null) return error.SkipZigTest;
 

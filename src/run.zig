@@ -15662,9 +15662,7 @@ test "a quiet start says less than a verbose one and still names every instructi
 
 test "a display opens on the conversation the log already holds" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var backing = try chock_proto.storage.Memory.init(gpa, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
     defer backing.deinit();

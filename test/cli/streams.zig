@@ -160,9 +160,7 @@ fn sessionDirOf(gpa: std.mem.Allocator, io: std.Io, box: *Sandbox) ![]u8 {
 
 test "a diagnostic is on standard error while standard output stays empty" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -177,9 +175,7 @@ test "a diagnostic is on standard error while standard output stays empty" {
 
 test "the help a person asked for is on standard output and the help after a mistyped command is on standard error" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
@@ -200,9 +196,7 @@ test "the help a person asked for is on standard output and the help after a mis
 
 test "the documented configuration starter passes the real CLI check" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     const Report = struct {
         path: []const u8,
         valid: bool,
@@ -363,9 +357,7 @@ test "a JSON model probe stays one document and reports the sorted remote catalo
 
 test "a piped stream gets no escape sequence, and --color=always still paints one" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -401,9 +393,7 @@ test "a piped stream gets no escape sequence, and --color=always still paints on
 test "standard output is flushed before standard error, so one file holds them in the written order" {
     // Standard output is buffered and standard error is not, so `tty.print` must call `flushOut()` first.
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -447,9 +437,7 @@ test "standard output is flushed before standard error, so one file holds them i
 
 test "every command still exits with the code it did, including the refusals" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -593,9 +581,7 @@ test "chock run never takes the alternate screen, whatever the colour flags say"
     if (git_path.len == 0) return error.SkipZigTest;
 
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -622,9 +608,7 @@ test "chock run JSON mode writes one result object and keeps diagnostics on stan
     if (git_path.len == 0) return error.SkipZigTest;
 
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -684,9 +668,7 @@ test "eval records once and replays after its provider is gone" {
     if (git_path.len == 0) return error.SkipZigTest;
 
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const response_head =
         "HTTP/1.1 200 OK\r\n" ++
@@ -835,9 +817,7 @@ test "a message on standard input runs a session with no display and no escape b
     if (git_path.len == 0) return error.SkipZigTest;
 
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -890,9 +870,7 @@ fn optionsRunAdvertises(gpa: std.mem.Allocator, text: []const u8) ![]const []con
 
 test "every option chock run advertises is an option on bare chock, and not a missing command" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -922,9 +900,7 @@ test "every option chock run advertises is an option on bare chock, and not a mi
 
 test "an option nobody knows gets the same answer from bare chock as from chock run" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -943,9 +919,7 @@ test "an option nobody knows gets the same answer from bare chock as from chock 
 test "the two words chock answers itself still open with a dash and are still not options" {
     // `--help` and `--version` are `src/main.zig`'s own, so the rule has to let them through.
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -1028,9 +1002,7 @@ const doctor_absent_layer_names: []const []const u8 = switch (builtin.os.tag) {
 
 test "chock doctor refuses a machine that cannot run a session, with a code a script can read" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -1067,9 +1039,7 @@ test "chock doctor refuses a machine that cannot run a session, with a code a sc
 
 test "chock doctor prints a column of layers or the one sentence about the driver, never both" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -1098,9 +1068,7 @@ test "chock doctor prints a column of layers or the one sentence about the drive
 test "chock doctor leaves nothing of its own behind" {
     // The kernel makes the overlay's own `work/work` with mode 0, which stops a plain `deleteTree` halfway.
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);

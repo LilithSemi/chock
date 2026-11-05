@@ -1963,9 +1963,7 @@ test "a warning written while the display is up is a row of the transcript and n
 
 test "a diagnostic reaches the real terminal before the display takes it and after it gives it back" {
     const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var frames: Sink = .{ .gpa = gpa };
     defer frames.deinit();
@@ -3031,9 +3029,7 @@ test "a flush of a frame reaches the descriptor and does not stop at the standar
     var buffer: [4096]u8 = undefined;
     var held = sink.tapWith(&buffer);
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     tty.useStreams(io, &held.writer, null);
     defer tty.useStreams(io, null, null);
