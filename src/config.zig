@@ -99,7 +99,12 @@ pub fn main(
     defer if (diag) |*one| one.deinit(gpa);
     var loaded = chock_auth.config.load(gpa, io, config_dir, &diag) catch |err| switch (err) {
         error.NoConfigFile => {
-            tty.print(.err, "chock config check: there is no configuration at {s}\n", .{path});
+            tty.print(
+                .err,
+                "chock config check: there is no configuration at {s}; " ++
+                    "run `chock config example` to print a starter\n",
+                .{path},
+            );
             return Exit.usage.code();
         },
         else => {
