@@ -1238,6 +1238,43 @@ test "regression: a tool call that fails in setup leaves the session root fit fo
     try std.testing.expect(std.mem.indexOf(u8, second.output, "workspace content") != null);
 }
 
+test "a toolchain path that is not there is left out, and the call still runs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    const ov = workspace.kind.overlay;
+    const hello_path = try std.fs.path.join(allocator, &.{ ov.project, "hello.txt" });
+    defer allocator.free(hello_path);
+    try writeFile(std.testing.io, hello_path, "workspace content\n");
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    const gone = try std.fs.path.join(allocator, &.{ ov.project, "a-toolchain-path-that-is-not-here" });
+    defer allocator.free(gone);
+
+    var ran = try runToolCallWith(
+        allocator,
+        &workspace,
+        root_tmp,
+        "run_command",
+        "{\"argv\":[\"cat\",\"hello.txt\"]}",
+        .{ .store_paths = &.{ "/nix/store", gone } },
+    );
+    defer ran.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u8, null), ran.fault);
+    try std.testing.expect(!ran.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, ran.output, "workspace content") != null);
+}
+
 test "an ordinary tool failure leaves the session root fit for the next call too" {
     // `namespace.makePath` treats an existing mount target as already made, so the next call builds on it.
     const allocator = std.testing.allocator;

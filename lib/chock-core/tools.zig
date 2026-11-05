@@ -3798,14 +3798,28 @@ pub fn withStore(
     store_paths: []const []const u8,
     read_only_mounts: []const ToolchainMount,
 ) std.mem.Allocator.Error!chock_net.Call {
-    const added = store_paths.len + read_only_mounts.len;
+    // A toolchain path that is not there, because the Nix garbage collector took
+    // it or a provisioned build was never realised, cannot be bound. A bind that
+    // fails ends the whole call, and every later call the same way, so the path
+    // is left out instead. That can only make less available inside.
+    const Held = struct { path: []const u8, is_file: bool };
+    const held = try allocator.alloc(Held, store_paths.len);
+    defer allocator.free(held);
+    var held_len: usize = 0;
+    for (store_paths) |path| {
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch continue;
+        held[held_len] = .{ .path = path, .is_file = stat.kind != .directory };
+        held_len += 1;
+    }
+
+    const added = held_len + read_only_mounts.len;
 
     var mounts = try allocator.alloc(palisade.linux.namespace.Mount, workspace_config.config.mounts.len + added);
     errdefer allocator.free(mounts);
     @memcpy(mounts[0..workspace_config.config.mounts.len], workspace_config.config.mounts);
     var next = workspace_config.config.mounts.len;
-    for (store_paths) |path| {
-        mounts[next] = .{ .bind = .{ .source = path, .target = path, .read_only = true } };
+    for (held[0..held_len]) |one| {
+        mounts[next] = .{ .bind = .{ .source = one.path, .target = one.path, .read_only = true } };
         next += 1;
     }
     for (read_only_mounts) |one| {
@@ -3817,14 +3831,10 @@ pub fn withStore(
     errdefer allocator.free(rules);
     @memcpy(rules[0..workspace_config.config.rules.len], workspace_config.config.rules);
     next = workspace_config.config.rules.len;
-    for (store_paths) |path| {
-        const is_file = if (std.Io.Dir.cwd().statFile(io, path, .{})) |stat|
-            stat.kind != .directory
-        else |_|
-            false;
+    for (held[0..held_len]) |one| {
         rules[next] = .{
-            .path = path,
-            .access = if (is_file)
+            .path = one.path,
+            .access = if (one.is_file)
                 palisade.linux.landlock.AccessFs.read_only_file
             else
                 palisade.linux.landlock.AccessFs.read_only,
