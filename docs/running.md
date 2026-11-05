@@ -200,6 +200,9 @@ process died can have no complete child log; the parent's durable
 with neither a live log nor a terminal parent record is instead reported as an
 audit gap. `--format compact` and `--format json` write one row per session for
 scripts that need to inspect or total one branch without mixing in siblings.
+Each JSONL row has schema `chock.session-tree` version 1. A row for a missing or
+unreadable child uses its `problem` field and keeps the same fields as every
+other row.
 
 ### What reached the model
 

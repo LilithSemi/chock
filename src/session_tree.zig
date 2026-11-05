@@ -32,6 +32,26 @@ const Totals = struct {
     spend: state.Spend = .{},
 };
 
+const JsonRow = struct {
+    schema: []const u8 = "chock.session-tree",
+    version: u32 = 1,
+    depth: usize,
+    session: []const u8,
+    parent: []const u8,
+    agent_kind: []const u8,
+    status: []const u8,
+    reason: []const u8 = "",
+    problem: ?[]const u8 = null,
+    budget_max_cost: f64 = 0,
+    budget_currency: []const u8 = "",
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    cache_creation_input_tokens: u64 = 0,
+    cache_read_input_tokens: u64 = 0,
+    cost: f64 = 0,
+    currency: []const u8 = "",
+};
+
 pub fn show(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -212,7 +232,7 @@ fn writeNode(
             session.spend.output_tokens,
         }),
         .json => {
-            const row = .{
+            const row = JsonRow{
                 .depth = depth,
                 .session = id,
                 .parent = edge.parent,
@@ -252,7 +272,7 @@ fn writeMissing(
             depth, id, edge.parent, edge.agent_kind, status, problem,
         }),
         .json => {
-            try std.json.Stringify.value(.{
+            try std.json.Stringify.value(JsonRow{
                 .depth = depth,
                 .session = id,
                 .parent = edge.parent,
@@ -371,6 +391,8 @@ test "tree keeps sibling outcomes separate and reconciles delegated usage" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"budget_max_cost\":2.5") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"input_tokens\":100") != null);
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, output.written(), "\n"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, output.written(), "\"schema\":\"chock.session-tree\""));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, output.written(), "\"version\":1"));
 }
 
 test "an idle child without agent.complete makes the tree an audit gap" {
