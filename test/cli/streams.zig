@@ -254,6 +254,7 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expectEqual(@as(u8, 0), initialized.code);
     try testing.expectEqualStrings("", initialized.err);
     try testing.expect(std.mem.indexOf(u8, initialized.out, expected_path) != null);
+    try testing.expect(std.mem.indexOf(u8, initialized.out, "run `chock config check`") != null);
 
     const saved = try std.Io.Dir.readFileAlloc(.cwd(), io, expected_path, gpa, .limited(1 << 16));
     defer gpa.free(saved);

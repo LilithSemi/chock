@@ -107,6 +107,7 @@ pub fn main(
             return Exit.usage.code();
         }
         tty.out(.plain, "chock config init: wrote {s}\n", .{path});
+        tty.out(.plain, "Edit its endpoint and model, then run `chock config check`.\n", .{});
         return Exit.finished.code();
     }
 
