@@ -355,6 +355,58 @@ test "a JSON model probe stays one document and reports the sorted remote catalo
     try testing.expect(catalogue.reason == null);
 }
 
+test "a failed JSON model probe returns a document and a fault exit" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const loopback = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var unused = try loopback.listen(io, .{ .reuse_address = true });
+    const port = unused.socket.address.getPort();
+    unused.deinit(io);
+
+    var box = try Sandbox.init(gpa, io);
+    defer box.deinit(gpa);
+    const config_dir = try std.fmt.allocPrint(gpa, "{s}/chock", .{box.root});
+    defer gpa.free(config_dir);
+    try std.Io.Dir.cwd().createDirPath(io, config_dir);
+    const config_path = try std.fmt.allocPrint(gpa, "{s}/config.zon", .{config_dir});
+    defer gpa.free(config_path);
+    const config = try std.fmt.allocPrint(gpa,
+        \\.{{
+        \\    .providers = .{{
+        \\        .{{ .name = "offline", .kind = "openai-compat",
+        \\           .base_url = "http://127.0.0.1:{d}/v1" }},
+        \\    }},
+        \\    .defaults = .{{ .provider = "offline", .model = "example" }},
+        \\}}
+        \\
+    , .{port});
+    defer gpa.free(config);
+    {
+        var config_file = try std.Io.Dir.createFileAbsolute(io, config_path, .{
+            .permissions = .fromMode(0o600),
+        });
+        defer config_file.close(io);
+        try config_file.writeStreamingAll(io, config);
+    }
+
+    var models = try runChock(gpa, io, &box.env, &.{ "models", "--probe", "--format", "json" });
+    defer models.deinit(gpa);
+
+    try testing.expect(models.code != 0);
+    try testing.expect(std.mem.indexOf(u8, models.err, "provider could not be reached") != null);
+    const report = try std.json.parseFromSlice(ModelReport, gpa, models.out, .{});
+    defer report.deinit();
+    try testing.expect(report.value.probed);
+    try testing.expectEqual(@as(usize, 1), report.value.providers.len);
+    const catalogue = report.value.providers[0].catalogue.?;
+    try testing.expectEqualStrings("not_reached", catalogue.status);
+    try testing.expectEqual(@as(usize, 0), catalogue.models.len);
+    try testing.expect(catalogue.http_status == null);
+    try testing.expect(catalogue.reason != null);
+    try testing.expect(catalogue.reason.?.len != 0);
+}
+
 test "a piped stream gets no escape sequence, and --color=always still paints one" {
     const gpa = testing.allocator;
     const io = testing.io;
