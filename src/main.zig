@@ -169,7 +169,7 @@ pub const commands = [_]Command{
     },
     .{
         .name = "config",
-        .summary = "Check the user configuration without reading credentials.",
+        .summary = "Inspect the user configuration without reading credentials.",
         .run = config_cmd.main,
     },
     .{
