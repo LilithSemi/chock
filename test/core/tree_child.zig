@@ -25,17 +25,15 @@ const rendezvous_prefix = "rv-";
 
 pub const order_leaf = "order";
 
-pub fn main(init: std.process.Init.Minimal) !u8 {
+pub fn main(init: std.process.Init) !u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded = std.Io.Threaded.init(arena, .{ .environ = init.environ });
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = init.io;
 
-    const args = try init.args.toSlice(arena);
-    var env = try init.environ.createMap(arena);
+    const args = try init.minimal.args.toSlice(arena);
+    var env = try init.minimal.environ.createMap(arena);
 
     const dir = env.get(session_dir_variable) orelse {
         std.debug.print("tree_child: {s} names no directory\n", .{session_dir_variable});
@@ -50,7 +48,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var agent = Agent{
         .arena = arena,
         .io = io,
-        .environ = init.environ,
+        .environ = init.minimal.environ,
         .env = &env,
         .exe_path = args[0],
         .session_dir = dir,

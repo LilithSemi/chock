@@ -13,7 +13,7 @@ const source_text = "const x = 1";
 /// The driver builds its URI from the sandbox side of the mount.
 const sandbox_project = "/srv/project";
 
-pub fn main(init: std.process.Init.Minimal) !u8 {
+pub fn main(init: std.process.Init) !u8 {
     return runOperation(init) catch |err| {
         // Nothing is printed: build.zig fails the build on a byte a test binary writes to stderr.
         if (err == error.NamespaceFailed) return palisade.linux.namespace.nothing_measured_exit_status;
@@ -21,12 +21,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
 }
 
-fn runOperation(init: std.process.Init.Minimal) !u8 {
+fn runOperation(init: std.process.Init) !u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const args = try init.args.toSlice(arena);
+    const args = try init.minimal.args.toSlice(arena);
     if (args.len < 2) {
         std.debug.print("usage: lsp_probe <serve|drive> [root] [work]\n", .{});
         return 2;
@@ -38,7 +38,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             std.debug.print("usage: lsp_probe drive <root> <work>\n", .{});
             return 2;
         }
-        return drive(arena, args[2], args[3]);
+        return drive(arena, init.io, args[2], args[3]);
     }
 
     std.debug.print("unknown operation: {s}\n", .{args[1]});
@@ -157,15 +157,11 @@ fn writeFramed(body: []const u8) bool {
 }
 
 /// `work` is the host side of the workspace, which nothing inside ever sees.
-fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8) !u8 {
+fn drive(arena: std.mem.Allocator, io: std.Io, root: []const u8, work: []const u8) !u8 {
     // Asked in a child, the only way to ask without spending this process's own namespace.
     if (!palisade.linux.namespace.probeAvailability().available()) {
         return palisade.linux.namespace.nothing_measured_exit_status;
     }
-
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
 
     var work_dir = try std.Io.Dir.cwd().openDir(io, work, .{});
     defer work_dir.close(io);

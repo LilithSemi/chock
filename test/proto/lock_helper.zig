@@ -4,17 +4,14 @@
 const std = @import("std");
 const chock_proto = @import("chock-proto");
 
-pub fn main(init: std.process.Init.Minimal) !u8 {
-    // `Init.Minimal` carries no `Io`, so this process builds its own.
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+pub fn main(init: std.process.Init) !u8 {
+    const io = init.io;
 
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const args = try init.args.toSlice(arena);
+    const args = try init.minimal.args.toSlice(arena);
     if (args.len != 2) {
         std.debug.print("usage: lock-helper <log-path>\n", .{});
         return 2;

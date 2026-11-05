@@ -15,17 +15,15 @@ const log_path_variable = "CHOCK_TEST_CHILD_LOG";
 
 const asked_action = "git.push";
 
-pub fn main(init: std.process.Init.Minimal) !u8 {
+pub fn main(init: std.process.Init) !u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded = std.Io.Threaded.init(arena, .{ .environ = init.environ });
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = init.io;
 
-    const args = try init.args.toSlice(arena);
-    const env = try init.environ.createMap(arena);
+    const args = try init.minimal.args.toSlice(arena);
+    const env = try init.minimal.environ.createMap(arena);
 
     const log_path = env.get(log_path_variable) orelse {
         std.debug.print("subagent_child: {s} names no path\n", .{log_path_variable});

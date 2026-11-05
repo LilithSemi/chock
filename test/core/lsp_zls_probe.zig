@@ -15,7 +15,7 @@ const ascii_source = "const x = 1\n";
 /// `zls` counts `character` in UTF-16 units, so this reports column 26, not the 29th byte.
 const unicode_source = "const a = \"\u{1F363}\"; const x = 1\n";
 
-pub fn main(init: std.process.Init.Minimal) !u8 {
+pub fn main(init: std.process.Init) !u8 {
     return runOperation(init) catch |err| {
         // build.zig fails the build on any byte a test binary writes to stderr.
         if (err == error.NamespaceFailed) return palisade.linux.namespace.nothing_measured_exit_status;
@@ -23,29 +23,25 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
 }
 
-fn runOperation(init: std.process.Init.Minimal) !u8 {
+fn runOperation(init: std.process.Init) !u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const args = try init.args.toSlice(arena);
+    const args = try init.minimal.args.toSlice(arena);
     if (args.len != 5 or !std.mem.eql(u8, args[1], "drive")) {
         std.debug.print("usage: lsp_zls_probe drive <root> <work> <zls>\n", .{});
         return 2;
     }
-    return drive(arena, args[2], args[3], args[4]);
+    return drive(arena, init.io, args[2], args[3], args[4]);
 }
 
 /// `zls` is a path build.zig found on the dev shell's `PATH`.
-fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8, zls: []const u8) !u8 {
+fn drive(arena: std.mem.Allocator, io: std.Io, root: []const u8, work: []const u8, zls: []const u8) !u8 {
     // Asked in a child, the only way to ask without spending this process's own namespace.
     if (!palisade.linux.namespace.probeAvailability().available()) {
         return palisade.linux.namespace.nothing_measured_exit_status;
     }
-
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
 
     var work_dir = try std.Io.Dir.cwd().openDir(io, work, .{});
     defer work_dir.close(io);
