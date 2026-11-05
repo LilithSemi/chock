@@ -44,10 +44,13 @@ pub const DialError = error{
 pub fn main(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
+    io: std.Io,
     environ: std.process.Environ,
     exe_path: []const u8,
     args: []const []const u8,
 ) anyerror!u8 {
+    _ = arena;
+    _ = environ;
     _ = exe_path;
 
     if (!is_linux) {
@@ -59,10 +62,6 @@ pub fn main(
         );
         return 1;
     }
-
-    var threaded = std.Io.Threaded.init(arena, .{ .environ = environ });
-    defer threaded.deinit();
-    const io = threaded.io();
 
     const port = portFrom(args) catch {
         tty.print(

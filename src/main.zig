@@ -143,6 +143,7 @@ fn setUpOutput(
 pub const Run = *const fn (
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
+    io: std.Io,
     environ: std.process.Environ,
     exe_path: []const u8,
     args: []const []const u8,
@@ -331,7 +332,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer tty.flushOut();
 
     if (std.mem.eql(u8, std.fs.path.basename(args[0]), chock_broker.askpass.link_name)) {
-        return askpass_cmd.main(arena, gpa, init.minimal.environ, args[0], args[1..]);
+        return askpass_cmd.main(arena, gpa, init.io, init.minimal.environ, args[0], args[1..]);
     }
 
     if (args.len < 2 or namesNoCommand(args[1])) {
@@ -358,7 +359,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     for (commands) |entry| {
         if (!std.mem.eql(u8, command, entry.name)) continue;
-        if (entry.run) |go| return go(arena, gpa, init.minimal.environ, args[0], rest);
+        if (entry.run) |go| return go(arena, gpa, init.io, init.minimal.environ, args[0], rest);
         tty.print(.err, "chock {s}: not implemented yet, because {s}\n", .{ entry.name, entry.why });
         return Exit.not_implemented.code();
     }

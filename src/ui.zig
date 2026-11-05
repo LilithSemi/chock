@@ -232,14 +232,14 @@ pub fn start(
 
     if (plan == .usage) {
         if (asked.message_words.len != 0) {
-            return run.main(arena, gpa, environ, exe_path, args);
+            return run.main(arena, gpa, io, environ, exe_path, args);
         }
         if (piped) |message| {
             const with_message = try std.mem.concat(arena, []const u8, &.{
                 args,
                 &.{ "--", message },
             });
-            return run.main(arena, gpa, environ, exe_path, with_message);
+            return run.main(arena, gpa, io, environ, exe_path, with_message);
         }
         main_cmd.printUsage(.err);
         return main_cmd.Exit.usage.code();

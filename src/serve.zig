@@ -113,6 +113,7 @@ const Serve = struct {
 pub fn main(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
+    io: std.Io,
     environ: std.process.Environ,
     exe_path: []const u8,
     args: []const []const u8,
@@ -128,10 +129,6 @@ pub fn main(
     };
 
     var env = try environ.createMap(arena);
-
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
-    defer threaded.deinit();
-    const io = threaded.io();
 
     const daemon_text = options.daemon orelse env.get(control.address_env) orelse text: {
         const state = chock_auth.paths.stateDir(arena, &env) catch |err| {

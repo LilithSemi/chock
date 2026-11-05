@@ -164,10 +164,14 @@ const ForkRequest = struct { at: ?u64 };
 pub fn main(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
+    io: std.Io,
     environ: std.process.Environ,
     exe_path: []const u8,
     args: []const []const u8,
 ) !u8 {
+    // Session setup is torn down before fork, and the session runtime cannot
+    // own worker threads that would be stranded in the child.
+    _ = io;
     return mainWith(arena, gpa, environ, exe_path, args, null, true);
 }
 

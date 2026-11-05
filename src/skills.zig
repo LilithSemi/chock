@@ -68,15 +68,13 @@ const Finding = struct {
 pub fn main(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
+    io: std.Io,
     environ: std.process.Environ,
     exe_path: []const u8,
     args: []const []const u8,
 ) anyerror!u8 {
+    _ = environ;
     _ = exe_path;
-
-    var threaded = std.Io.Threaded.init(arena, .{ .environ = environ });
-    defer threaded.deinit();
-    const io = threaded.io();
 
     const options = parseOptions(arena, args) catch |err| switch (err) {
         error.HelpWanted => {

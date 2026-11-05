@@ -29,16 +29,13 @@ const usage_text =
 pub fn main(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
+    io: std.Io,
     environ: std.process.Environ,
     exe_path: []const u8,
     args: []const []const u8,
 ) anyerror!u8 {
     _ = exe_path;
     _ = gpa;
-
-    var threaded = std.Io.Threaded.init(arena, .{ .environ = environ });
-    defer threaded.deinit();
-    const io = threaded.io();
 
     var env = try environ.createMap(arena);
     defer env.deinit();

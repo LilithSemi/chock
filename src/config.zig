@@ -52,18 +52,12 @@ const Options = struct {
 pub fn main(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
+    io: std.Io,
     environ: std.process.Environ,
     exe_path: []const u8,
     args: []const []const u8,
 ) anyerror!u8 {
     _ = exe_path;
-
-    var threaded = std.Io.Threaded.init(arena, .{ .environ = environ });
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var env = try environ.createMap(arena);
-    defer env.deinit();
 
     const options = parseOptions(args) catch |err| switch (err) {
         error.HelpWanted => {
@@ -80,6 +74,9 @@ pub fn main(
         tty.out(.plain, "{s}", .{example_text});
         return Exit.finished.code();
     }
+
+    var env = try environ.createMap(arena);
+    defer env.deinit();
 
     const config_dir = chock_auth.paths.configDir(arena, &env) catch |err| {
         tty.print(.err, "chock config {s}: the configuration directory is unknown: {t}\n", .{

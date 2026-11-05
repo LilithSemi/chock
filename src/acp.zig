@@ -75,6 +75,7 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
 pub fn main(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
+    io: std.Io,
     environ: std.process.Environ,
     exe_path: []const u8,
     args: []const []const u8,
@@ -88,10 +89,6 @@ pub fn main(
         },
         error.BadArguments => return Exit.usage.code(),
     };
-
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
-    defer threaded.deinit();
-    const io = threaded.io();
 
     var env = try environ.createMap(arena);
 
