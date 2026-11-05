@@ -175,6 +175,8 @@ const ProviderReport = struct {
 };
 
 const ModelsReport = struct {
+    schema: []const u8 = "chock.models",
+    version: u32 = 1,
     default_provider: ?[]const u8,
     default_model: ?[]const u8,
     probed: bool,
@@ -582,6 +584,8 @@ test "the JSON model report is structured and contains no connection or credenti
     const parsed = try std.json.parseFromSlice(ModelsReport, gpa, output, .{});
     defer parsed.deinit();
 
+    try std.testing.expectEqualStrings("chock.models", parsed.value.schema);
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.version);
     try std.testing.expectEqualStrings("local", parsed.value.default_provider.?);
     try std.testing.expectEqualStrings("test-model", parsed.value.default_model.?);
     try std.testing.expect(!parsed.value.probed);

@@ -111,10 +111,10 @@ search; the compatible and Anthropic adapters do not. Whether a session
 actually offers native search also depends on its policy-controlled domain
 allowlist. [search.md](search.md) describes that stricter runtime check.
 
-Use `chock models --format json` for the same offline facts in scripts. Each
-provider record has its name, kind, default status, default model, context
-limit, and effective capability booleans. It omits endpoint URLs and credential
-material.
+Use `chock models --format json` for the same offline facts in scripts. The
+document has schema `chock.models` version 1. Each provider record has its name,
+kind, default status, default model, context limit, and effective capability
+booleans. It omits endpoint URLs and credential material.
 
 Add `--probe` to opt into credential lookup and one authenticated `GET
 /models` request per selected provider. The returned model identifiers are

@@ -53,6 +53,8 @@ const ModelReport = struct {
         catalogue: ?Catalogue,
     };
 
+    schema: []const u8,
+    version: u32,
     default_provider: ?[]const u8,
     default_model: ?[]const u8,
     probed: bool,
@@ -273,6 +275,8 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expectEqualStrings("", models.err);
     const model_report = try std.json.parseFromSlice(ModelReport, gpa, models.out, .{});
     defer model_report.deinit();
+    try testing.expectEqualStrings("chock.models", model_report.value.schema);
+    try testing.expectEqual(@as(u32, 1), model_report.value.version);
     try testing.expectEqualStrings("local", model_report.value.default_provider.?);
     try testing.expectEqualStrings("glm4.7-flash:A3B", model_report.value.default_model.?);
     try testing.expect(!model_report.value.probed);
