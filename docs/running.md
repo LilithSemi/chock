@@ -90,6 +90,9 @@ remained uncommitted, failed, or had nothing to apply. A setup failure after
 machine-output options have been accepted still emits the same schema with
 null session, answer, and audit-log fields.
 
+The exact `workspace.outcome` values are `landed`, `refused`, `uncommitted`,
+`failed`, and `nothing_to_apply`.
+
 `--output jsonl` writes live `chock.run-event` version `1` objects as the
 session records them, then writes the `chock.run-result` object as the final
 line. Each event line carries `session_id`, the byte-offset `event_id` used by
