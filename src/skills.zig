@@ -73,9 +73,6 @@ pub fn main(
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
-    const environ = init.minimal.environ;
-
-    _ = environ;
     _ = exe_path;
 
     const options = parseOptions(arena, args) catch |err| switch (err) {

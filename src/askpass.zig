@@ -32,12 +32,10 @@ pub fn main(
     args: []const []const u8,
 ) anyerror!u8 {
     const arena = init.arena.allocator();
-    const gpa = init.gpa;
     const io = init.io;
     const env = init.environ_map.*;
 
     _ = exe_path;
-    _ = gpa;
 
     const prompt = readArgs(args) catch |err| switch (err) {
         error.HelpWanted => {

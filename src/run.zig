@@ -167,12 +167,10 @@ pub fn main(
 ) !u8 {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
-    const io = init.io;
     const environ = init.minimal.environ;
 
     // Session setup is torn down before fork, and the session runtime cannot
     // own worker threads that would be stranded in the child.
-    _ = io;
     return mainWith(arena, gpa, environ, exe_path, args, null, true);
 }
 

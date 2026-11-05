@@ -38,11 +38,9 @@ pub fn main(
     args: []const []const u8,
 ) anyerror!u8 {
     const arena = init.arena.allocator();
-    const gpa = init.gpa;
     const io = init.io;
     const env = init.environ_map.*;
 
-    _ = gpa;
     _ = exe_path;
 
     const options = parseOptions(args) catch |err| switch (err) {
