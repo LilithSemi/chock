@@ -39,11 +39,18 @@ const usage_text =
     \\
     \\Options:
     \\  --project <dir>   The project. Defaults to the current directory.
+    \\  --format <kind>   human (default) or json.
     \\
 ++ tty.options_text;
 
+const Format = enum {
+    human,
+    json,
+};
+
 const Options = struct {
     project: ?[]const u8 = null,
+    format: Format = .human,
 };
 
 pub const Probe = union(enum) {
@@ -1044,6 +1051,90 @@ fn freeSpaceRow(arena: std.mem.Allocator, free: ?u64) std.mem.Allocator.Error!Ro
 }
 
 const name_width = 17;
+
+const RowSection = enum {
+    sandbox,
+    first_run,
+};
+
+const RowStatus = enum {
+    ok,
+    off,
+    unsupported,
+    degraded,
+    blocked,
+};
+
+const DoctorRowReport = struct {
+    section: RowSection,
+    name: []const u8,
+    status: RowStatus,
+    means: ?[]const u8,
+    why: ?[]const u8,
+    fix: ?[]const u8,
+};
+
+const DoctorReport = struct {
+    schema: []const u8 = "chock.doctor",
+    version: u32 = 1,
+    project: []const u8,
+    verdict: Verdict,
+    can_start: bool,
+    sandbox_driver: LayerFamily,
+    not_on_rows: usize,
+    blocking_rows: usize,
+    driver_refusal: ?[]const u8,
+    rows: []const DoctorRowReport,
+};
+
+fn statusFor(row: Row) RowStatus {
+    if (row.state == .on) return .ok;
+    if (row.blocks) return .blocked;
+    return switch (row.state) {
+        .on => unreachable,
+        .off => .off,
+        .unsupported => .unsupported,
+        .unavailable => .degraded,
+    };
+}
+
+fn reportJson(
+    arena: std.mem.Allocator,
+    project_root: []const u8,
+    measured: Measured,
+    rows: []const Row,
+    verdict: Verdict,
+) !void {
+    const reports = try arena.alloc(DoctorRowReport, rows.len);
+    for (rows, reports) |row, *report| {
+        report.* = .{
+            .section = if (isFirstRunRow(row)) .first_run else .sandbox,
+            .name = row.name,
+            .status = statusFor(row),
+            .means = if (row.means.len == 0) null else row.means,
+            .why = if (row.why.len == 0) null else row.why,
+            .fix = if (row.fix.len == 0) null else row.fix,
+        };
+    }
+    const encoded = try std.json.Stringify.valueAlloc(arena, DoctorReport{
+        .project = project_root,
+        .verdict = verdict,
+        .can_start = verdict != .blocked,
+        .sandbox_driver = measured.family,
+        .not_on_rows = countNotOn(rows),
+        .blocking_rows = countBlocking(rows),
+        .driver_refusal = if (measured.family == .none) refuses_outright else null,
+        .rows = reports,
+    }, .{});
+    tty.out(.plain, "{s}\n", .{encoded});
+
+    if (measured.family == .none) tty.print(.err, "{s}\n\n", .{refuses_outright});
+    if (verdict == .blocked) tty.print(
+        .err,
+        "chock doctor: a session cannot start here. Rows that stop a first run: {d} of {d}.\n",
+        .{ countBlocking(rows), rows.len },
+    );
+}
 
 fn printReport(project_root: []const u8, m: Measured, rows: []const Row, verdict: Verdict) void {
     tty.out(.plain, "{s}\n", .{version_line});
@@ -2381,7 +2472,11 @@ pub fn main(
     const measured = measure(arena, gpa, io, &env, project_root);
     const rows = try rowsFor(arena, measured);
     const verdict = verdictFor(rows);
-    printReport(project_root, measured, rows, verdict);
+    if (options.format == .json) {
+        try reportJson(arena, project_root, measured, rows, verdict);
+    } else {
+        printReport(project_root, measured, rows, verdict);
+    }
     return exitFor(verdict).code();
 }
 
@@ -2389,6 +2484,7 @@ const ParseError = error{ HelpWanted, BadArguments };
 
 fn parseOptions(args: []const []const u8) ParseError!Options {
     var options = Options{};
+    var format_set = false;
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const argument = args[index];
@@ -2398,6 +2494,17 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             if (index >= args.len) return error.BadArguments;
             options.project = args[index];
             continue;
+        }
+        if (std.mem.eql(u8, argument, "--format")) {
+            index += 1;
+            if (index >= args.len or format_set) return error.BadArguments;
+            format_set = true;
+            if (std.mem.eql(u8, args[index], "human")) continue;
+            if (std.mem.eql(u8, args[index], "json")) {
+                options.format = .json;
+                continue;
+            }
+            return error.BadArguments;
         }
         return error.BadArguments;
     }
@@ -2714,6 +2821,56 @@ test "the printed report says BLOCKED as many times as its own footer counts" {
     try testing.expectEqual(countBlocking(rows), std.mem.count(u8, said.out(), "BLOCKED"));
     try testing.expect(std.mem.indexOf(u8, said.err(), "Rows that stop a first run: 1 of") != null);
     try testing.expect(std.mem.indexOf(u8, said.out(), "DEGRADED") != null);
+}
+
+test "the JSON report gives automation a versioned verdict and sectioned rows" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var measured = healthy();
+    measured.dev_shell = .{ .failed = "nix could not evaluate it" };
+    measured.credential = .{ .unconfigured = "no provider is named in config.zon" };
+    const rows = try rowsFor(arena, measured);
+    const verdict = verdictFor(rows);
+    try testing.expectEqual(Verdict.blocked, verdict);
+
+    tty.configure(.{});
+    defer tty.configure(.{});
+    var capture: tty.Capture = undefined;
+    capture.start(testing.io, testing.allocator);
+    defer capture.stop(testing.io);
+
+    try reportJson(arena, "/some/project", measured, rows, verdict);
+    tty.flushOut();
+
+    const parsed = try std.json.parseFromSlice(DoctorReport, testing.allocator, capture.out(), .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("chock.doctor", parsed.value.schema);
+    try testing.expectEqual(@as(u32, 1), parsed.value.version);
+    try testing.expectEqualStrings("/some/project", parsed.value.project);
+    try testing.expectEqual(Verdict.blocked, parsed.value.verdict);
+    try testing.expect(!parsed.value.can_start);
+    try testing.expectEqual(LayerFamily.namespaces, parsed.value.sandbox_driver);
+    try testing.expectEqual(countNotOn(rows), parsed.value.not_on_rows);
+    try testing.expectEqual(countBlocking(rows), parsed.value.blocking_rows);
+    try testing.expect(parsed.value.driver_refusal == null);
+    try testing.expectEqual(rows.len, parsed.value.rows.len);
+
+    var saw_sandbox = false;
+    var saw_first_run = false;
+    var saw_blocked_credential = false;
+    for (parsed.value.rows) |row| {
+        saw_sandbox = saw_sandbox or row.section == .sandbox;
+        saw_first_run = saw_first_run or row.section == .first_run;
+        if (std.mem.eql(u8, row.name, "credential")) {
+            saw_blocked_credential = row.status == .blocked and row.fix != null;
+        }
+    }
+    try testing.expect(saw_sandbox);
+    try testing.expect(saw_first_run);
+    try testing.expect(saw_blocked_credential);
+    try testing.expect(std.mem.indexOf(u8, capture.err(), "a session cannot start here") != null);
 }
 
 test "a machine where no tool call could work does not read as a machine a session can start on" {
@@ -3258,10 +3415,16 @@ test "a required sink is reached through the shipper's own transport, and the pr
     try testing.expect(down.why().len != 0);
 }
 
-test "the command line takes a project and nothing else" {
+test "the command line takes a project and an output format" {
     try testing.expectEqual(@as(?[]const u8, null), (try parseOptions(&.{})).project);
     try testing.expectEqualStrings("/somewhere", (try parseOptions(&.{ "--project", "/somewhere" })).project.?);
+    try testing.expectEqual(Format.json, (try parseOptions(&.{ "--format", "json" })).format);
+    try testing.expectEqual(Format.human, (try parseOptions(&.{ "--format", "human" })).format);
+    try testing.expectEqual(Format.json, (try parseOptions(&.{ "--project", "/somewhere", "--format", "json" })).format);
     try testing.expectError(error.BadArguments, parseOptions(&.{"--project"}));
+    try testing.expectError(error.BadArguments, parseOptions(&.{"--format"}));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "--format", "yaml" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "--format", "json", "--format", "human" }));
     try testing.expectError(error.BadArguments, parseOptions(&.{"list"}));
     try testing.expectError(error.HelpWanted, parseOptions(&.{"--help"}));
     try testing.expectError(error.HelpWanted, parseOptions(&.{"-h"}));

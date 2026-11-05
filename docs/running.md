@@ -514,6 +514,12 @@ which are on. It exits `0` when a first run can work here, even with a layer
 missing, and `2` when it cannot. [sandbox.md](security/sandbox.md) says what
 the rows mean.
 
+Use `chock doctor --format json` in an installer or CI check. It writes one
+`chock.doctor` version 1 document with the project, verdict, driver family,
+blocking and not-on counts, and every row. Each row has a `sandbox` or
+`first_run` section and a stable status. A blocked report still exits `2` and
+writes its diagnostic to standard error.
+
 On an installation an organisation manages, it also reports what that
 organisation's policy bundle imposes: the audit sinks it requires, and every
 ceiling it sets on spending, on how far a spawn tree may grow, and on the paths

@@ -1097,6 +1097,71 @@ test "chock doctor refuses a machine that cannot run a session, with a code a sc
     try testing.expectEqual(footer, counted);
 }
 
+test "chock doctor JSON is one versioned report with the same verdict" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const Report = struct {
+        const Row = struct {
+            section: []const u8,
+            name: []const u8,
+            status: []const u8,
+            means: ?[]const u8,
+            why: ?[]const u8,
+            fix: ?[]const u8,
+        };
+
+        schema: []const u8,
+        version: u32,
+        project: []const u8,
+        verdict: []const u8,
+        can_start: bool,
+        sandbox_driver: []const u8,
+        not_on_rows: usize,
+        blocking_rows: usize,
+        driver_refusal: ?[]const u8,
+        rows: []const Row,
+    };
+
+    var box = try Sandbox.init(gpa, io);
+    defer box.deinit(gpa);
+
+    var run = try runChock(gpa, io, &box.env, &.{ "doctor", "--project", box.root, "--format", "json" });
+    defer run.deinit(gpa);
+
+    const parsed = try std.json.parseFromSlice(Report, gpa, run.out, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("chock.doctor", parsed.value.schema);
+    try testing.expectEqual(@as(u32, 1), parsed.value.version);
+    try testing.expectEqualStrings(box.root, parsed.value.project);
+    try testing.expectEqualStrings("blocked", parsed.value.verdict);
+    try testing.expect(!parsed.value.can_start);
+    try testing.expectEqual(@as(u8, 2), run.code);
+    try expectContains(run.err, doctor_refusal);
+    try testing.expect(parsed.value.rows.len != 0);
+
+    var not_on: usize = 0;
+    var blocking: usize = 0;
+    var saw_sandbox = false;
+    var saw_first_run = false;
+    for (parsed.value.rows) |row| {
+        if (!std.mem.eql(u8, row.status, "ok")) not_on += 1;
+        if (std.mem.eql(u8, row.status, "blocked")) blocking += 1;
+        saw_sandbox = saw_sandbox or std.mem.eql(u8, row.section, "sandbox");
+        saw_first_run = saw_first_run or std.mem.eql(u8, row.section, "first_run");
+    }
+    try testing.expectEqual(parsed.value.not_on_rows, not_on);
+    try testing.expectEqual(parsed.value.blocking_rows, blocking);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, run.out, "\n"));
+    try testing.expect(saw_first_run);
+    if (std.mem.eql(u8, parsed.value.sandbox_driver, "none")) {
+        try testing.expect(parsed.value.driver_refusal != null);
+        try testing.expect(!saw_sandbox);
+    } else {
+        try testing.expect(parsed.value.driver_refusal == null);
+        try testing.expect(saw_sandbox);
+    }
+}
+
 test "chock doctor prints a column of layers or the one sentence about the driver, never both" {
     const gpa = testing.allocator;
     const io = testing.io;
