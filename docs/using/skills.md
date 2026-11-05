@@ -43,7 +43,7 @@ description: How this repository reviews a diff. Use before opening a pull reque
 
 A project says where its own are:
 
-```zig
+```zon
 .{
     .skills = .{ ".chock/skills" },
 }
@@ -101,7 +101,7 @@ path that points at the wrong place cannot read as clean.
 can bind it to the evaluation suites Surgeon uses to teach and measure the
 same behavior:
 
-```zig
+```zon
 .{
     .schema = "chock.skill-training",
     .version = 1,
@@ -176,7 +176,7 @@ skill.read.packaged    ask
 The names are per layer, because a name a package chose must not become part of
 the action namespace. A project that trusts its own skills writes one rule:
 
-```zig
+```zon
 .{
     .policy = .{
         .rules = .{

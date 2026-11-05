@@ -262,7 +262,7 @@ put there yourself. The other two ship as `ask`, because a repository's or a
 package's skill is a stranger's written instruction. A project that trusts its
 own writes one rule:
 
-```zig
+```zon
 .{
     .policy = .{
         .rules = .{

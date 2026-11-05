@@ -38,7 +38,7 @@ An evaluation is a versioned ZON value. Relative fixture paths are resolved
 from the directory containing the spec, while `--project <dir>` overrides the
 fixture for either command.
 
-```zig
+```zon
 .{
     .schema = "chock.eval",
     .version = 1,
@@ -65,14 +65,14 @@ fixture for either command.
         .config_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         .sandbox_sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
         .sandbox_driver = "microvm",
-        .required_events = &.{ "tool.call", "usage" },
-        .forbidden_tools = &.{"browser"},
-        .required_paths = &.{"src/parser.zig"},
-        .forbidden_paths = &.{"secrets.txt"},
-        .files = &.{
+        .required_events = .{ "tool.call", "usage" },
+        .forbidden_tools = .{"browser"},
+        .required_paths = .{"src/parser.zig"},
+        .forbidden_paths = .{"secrets.txt"},
+        .files = .{
             .{ .path = "src/parser.zig", .sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" },
         },
-        .forbidden_network_hosts = &.{"example.invalid"},
+        .forbidden_network_hosts = .{"example.invalid"},
         .require_no_network = true,
         .require_no_refusals = true,
         .min_subagents = 1,
@@ -89,8 +89,8 @@ fixture for either command.
         .budget = 0.5,
         .tests = 3,
     },
-    .tests = &.{
-        .{ .name = "unit", .argv = &.{ "zig", "build", "test" } },
+    .tests = .{
+        .{ .name = "unit", .argv = .{ "zig", "build", "test" } },
     },
 }
 ```
@@ -195,14 +195,14 @@ its capture, report, and trajectory files by SHA-256, so a consumer can detect
 a partial or modified rollout before training. An existing dataset index is
 never overwritten; use a fresh output directory for every collection run.
 
-```zig
+```zon
 .{
     .schema = "chock.rl-suite",
     .version = 1,
     .name = "parser policy train v1",
     .output = "rollouts/run-001",
     .parallelism = 8,
-    .cases = &.{
+    .cases = .{
         .{
             .name = "reject empty input",
             .spec = "parser.zon",
