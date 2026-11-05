@@ -35,6 +35,7 @@ const Exit = @import("exit.zig").Exit;
 const exitFor = @import("main.zig").exitFor;
 const plugin_process = @import("plugin-host.zig");
 const guest_limits = @import("guest_limits.zig");
+const config_cmd = @import("config.zig");
 
 const usage_text =
     \\Usage: chock run [options] [message...]
@@ -1255,14 +1256,8 @@ fn start(
             );
             tty.print(
                 .err,
-                "  .{{\n" ++
-                    "      .providers = .{{\n" ++
-                    "          .{{ .name = \"local\", .kind = \"openai-compat\", " ++
-                    ".base_url = \"http://127.0.0.1:5000/v1\", .context_tokens = 65536 }},\n" ++
-                    "      }},\n" ++
-                    "      .defaults = .{{ .provider = \"local\", .model = \"glm4.7-flash:A3B\" }},\n" ++
-                    "  }}\n",
-                .{},
+                "{s}",
+                .{config_cmd.example_text},
             );
             return error.Reported;
         },

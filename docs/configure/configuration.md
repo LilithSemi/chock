@@ -10,6 +10,15 @@ Ask Chock for it when creating or linking the file:
 chock config path
 ```
 
+Print a valid local-provider starter without writing anything:
+
+```
+chock config example
+```
+
+Edit the endpoint and model for the server you run, then redirect the example
+to the path above if you want to use it as your file.
+
 Check this file without reading a credential or contacting a provider:
 
 ```

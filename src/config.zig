@@ -15,6 +15,7 @@ const usage_text =
     \\
     \\Operations:
     \\  check    Check the configuration and report the selected defaults.
+    \\  example  Print a valid starter configuration without writing it.
     \\  path     Print the configuration path, whether or not the file exists.
     \\
     \\Options:
@@ -24,8 +25,19 @@ const usage_text =
 
 const Operation = enum {
     check,
+    example,
     path,
 };
+
+pub const example_text =
+    \\.{
+    \\    .providers = .{
+    \\        .{ .name = "local", .kind = "openai-compat", .base_url = "http://127.0.0.1:5000/v1", .context_tokens = 65536 },
+    \\    },
+    \\    .defaults = .{ .provider = "local", .model = "glm4.7-flash:A3B" },
+    \\}
+    \\
+;
 
 const Format = enum {
     human,
@@ -63,6 +75,11 @@ pub fn main(
             return Exit.usage.code();
         },
     };
+
+    if (options.operation == .example) {
+        tty.out(.plain, "{s}", .{example_text});
+        return Exit.finished.code();
+    }
 
     const config_dir = chock_auth.paths.configDir(arena, &env) catch |err| {
         tty.print(.err, "chock config {s}: the configuration directory is unknown: {t}\n", .{
@@ -158,9 +175,12 @@ fn report(
 
 fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Options {
     if (args.len == 1 and std.mem.eql(u8, args[0], "check")) return .{ .operation = .check };
+    if (args.len == 1 and std.mem.eql(u8, args[0], "example")) return .{ .operation = .example };
     if (args.len == 1 and std.mem.eql(u8, args[0], "path")) return .{ .operation = .path };
     if (args.len == 2 and
-        (std.mem.eql(u8, args[0], "check") or std.mem.eql(u8, args[0], "path")) and
+        (std.mem.eql(u8, args[0], "check") or
+            std.mem.eql(u8, args[0], "example") or
+            std.mem.eql(u8, args[0], "path")) and
         (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")))
     {
         return error.HelpWanted;
@@ -181,8 +201,9 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
     return error.BadArguments;
 }
 
-test "config takes the check and path operations" {
+test "config takes the check, example, and path operations" {
     try std.testing.expectEqual(Operation.check, (try parseOptions(&.{"check"})).operation);
+    try std.testing.expectEqual(Operation.example, (try parseOptions(&.{"example"})).operation);
     try std.testing.expectEqual(Operation.path, (try parseOptions(&.{"path"})).operation);
     try std.testing.expectEqual(Format.json, (try parseOptions(&.{ "check", "--format", "json" })).format);
     try std.testing.expectEqual(Format.human, (try parseOptions(&.{ "check", "--format", "human" })).format);
@@ -193,7 +214,16 @@ test "config takes the check and path operations" {
     try std.testing.expectError(error.BadArguments, parseOptions(&.{ "check", "--format", "yaml" }));
     try std.testing.expectError(error.HelpWanted, parseOptions(&.{"--help"}));
     try std.testing.expectError(error.HelpWanted, parseOptions(&.{ "check", "--help" }));
+    try std.testing.expectError(error.HelpWanted, parseOptions(&.{ "example", "--help" }));
     try std.testing.expectError(error.HelpWanted, parseOptions(&.{ "path", "-h" }));
+}
+
+test "the starter configuration remains valid" {
+    var config = try chock_auth.config.parse(std.testing.allocator, example_text, null);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.instances.len);
+    try std.testing.expectEqualStrings("local", config.default_provider.?);
 }
 
 test "a valid report says how its default was selected and exposes no credential" {
