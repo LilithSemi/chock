@@ -3953,11 +3953,27 @@ pub fn prepare(
     else
         null;
 
-    const mounted_at: ?[]const u8 = if (resolved) |path|
+    // Where the program really is, which is not where PATH said on a machine
+    // whose profiles are directories of links. Only the directory is resolved,
+    // so the name stays: a program like coreutils or busybox reads which one to
+    // be from argv[0], and the rest of the links resolve inside the sandbox.
+    const host_path: ?[]const u8 = if (resolved) |path|
+        try realDirOf(allocator, io, path)
+    else
+        null;
+
+    const mounted_at: ?[]const u8 = if (host_path) |path|
         try sandboxPathOf(allocator, workspace_config.config.mounts, path)
     else
         null;
-    const bind_source: ?[]const u8 = if (mounted_at == null) resolved else null;
+    // A bind mount source is never followed, so a link outside every mount is
+    // bound by the file it names.
+    const bind_source: ?[]const u8 = if (mounted_at != null)
+        null
+    else if (host_path) |path|
+        if (isLink(io, path)) try realPathOf(allocator, io, path) else path
+    else
+        null;
     const bin_target: []const u8 = if (resolved == null)
         argv[0]
     else if (mounted_at) |inside|
@@ -4071,6 +4087,40 @@ fn resolveOnPath(
         return candidate;
     }
     return null;
+}
+
+fn isLink(io: std.Io, path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return stat.kind == .sym_link;
+}
+
+/// The path with its directory resolved and its last name kept. A link the host
+/// cannot follow stays as it is, because its target can be a path that exists
+/// only inside the sandbox.
+fn realDirOf(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    const dir = std.fs.path.dirname(path) orelse return allocator.dupe(u8, path);
+    const name = std.fs.path.basename(path);
+    var real: [std.fs.max_path_bytes]u8 = undefined;
+    const length = std.Io.Dir.cwd().realPathFile(io, dir, &real) catch
+        return allocator.dupe(u8, path);
+    return std.fs.path.join(allocator, &.{ real[0..length], name });
+}
+
+/// The file a path really names. A link the host cannot follow stays as it is,
+/// because its target can be a path that exists only inside the sandbox.
+fn realPathOf(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    var real: [std.fs.max_path_bytes]u8 = undefined;
+    const length = std.Io.Dir.cwd().realPathFile(io, path, &real) catch
+        return allocator.dupe(u8, path);
+    return allocator.dupe(u8, real[0..length]);
 }
 
 fn candidateRuns(io: std.Io, candidate: []const u8, kind: std.Io.File.Kind) bool {
@@ -5728,6 +5778,32 @@ test "a PATH candidate that is a link the host cannot follow is still a program"
         @as(?[]u8, null),
         try resolveOnPath(allocator, std.testing.io, &env, "link-to-dir"),
     );
+}
+
+test "a program found in a directory of links is named where that directory really is" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+
+    try tmp.dir.createDir(std.testing.io, "store", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "store/coreutils", .data = "#!/bin/sh\n" });
+    try tmp.dir.symLink(std.testing.io, "coreutils", "store/ls", .{});
+    try tmp.dir.symLink(std.testing.io, "store", "profile", .{});
+
+    const through = try std.fs.path.join(allocator, &.{ root, "profile/ls" });
+    defer allocator.free(through);
+
+    const named = try realDirOf(allocator, std.testing.io, through);
+    defer allocator.free(named);
+
+    // The directory is the real one and the name is still ls, which is what a
+    // program like coreutils or busybox reads to know which one to be. The
+    // link from ls to coreutils is left for the sandbox to follow.
+    try std.testing.expect(std.mem.endsWith(u8, named, "/store/ls"));
+    try std.testing.expect(std.mem.indexOf(u8, named, "/profile/") == null);
 }
 
 test "a program out of a container image runs at the path the image gives it" {
