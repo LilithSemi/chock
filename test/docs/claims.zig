@@ -930,7 +930,7 @@ test "every declared JSON schema is named in the documentation" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const docs = try loadDocs(arena, testing.io);
-    const source = try loadSources(arena, testing.io, &command_line_code);
+    const source = try loadSources(arena, testing.io, &all_code);
 
     const marker = "schema: []const u8 = \"";
     var schemas: std.ArrayList([]const u8) = .empty;
@@ -950,7 +950,7 @@ test "every declared JSON schema is named in the documentation" {
             try wrong.print(arena, "no documentation names JSON schema `{s}`\n", .{schema});
         }
     }
-    if (schemas.items.len == 0) try wrong.appendSlice(arena, "no command JSON schema was found in source\n");
+    if (schemas.items.len == 0) try wrong.appendSlice(arena, "no JSON schema was found in source\n");
     try testing.expectEqualStrings("", wrong.items);
 }
 

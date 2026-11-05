@@ -24,6 +24,7 @@ restored in order, so child completion, plans, policy, and other session state
 remain visible to evaluation scoring. Every request is matched by digest, the
 capture itself has an integrity digest, and an exhausted, divergent, truncated,
 reordered, or partly unused capture fails closed.
+The capture file has schema `chock.eval-fixture` version 1.
 
 `check` does not contact a provider. It replays the named audit log, checks its
 hash chain, inspects the resulting repository, and runs the declared commands.

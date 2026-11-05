@@ -122,7 +122,8 @@ suites. `trainable` means it is a training target rather than a runtime prompt.
 the test suite is held out from training and model selection.
 
 Run `chock skills inspect` to validate both files and emit the normalized JSON
-contract consumed by Surgeon:
+contract consumed by Surgeon. The output has schema
+`chock.skill-training-inspection` version 1:
 
 ```console
 chock skills inspect skills/review-a-diff
