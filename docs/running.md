@@ -182,7 +182,9 @@ and the cases that deliberately cold boot.
 offset beside it, so an audit finding can name the exact record. Its default
 human view previews large tool results and diffs; add `--full` to expand them,
 or choose `--format compact` for one line per event. `--format json` writes one
-complete JSON event per line with the real offset in its `id` field.
+complete JSONL record per line. Each record has `id`, `session`, `time_ms`,
+`event`, `version`, and `prev` fields. Event examples on this page show only
+the value of that `event` field, with the event name as its one key.
 
 Use `--only` with a comma-separated set of `lifecycle`, `messages`, `tools`,
 `approvals`, `policy`, `diffs`, `subagents`, `usage`, `context`, `workspace`,
