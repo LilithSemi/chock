@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 check="${here}/check-release-version"
 diagnostic=$(mktemp)
 trap 'rm -f "$diagnostic"' EXIT HUP INT TERM

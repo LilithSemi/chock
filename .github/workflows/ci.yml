@@ -45,6 +45,9 @@ jobs:
 
       - uses: DeterminateSystems/flakehub-cache-action@3ac6f3c19fc52eeb1408fd434bd1b4ed4266bf25 # v3
 
+      - name: Check release scripts
+        run: nix shell nixpkgs#shellcheck -c shellcheck .github/scripts/*
+
       - name: Test reproducible release packaging
         run: nix shell nixpkgs#gnutar nixpkgs#gzip -c .github/scripts/test-package-release
 
