@@ -8,7 +8,7 @@ are already looking.
 chock acp
 ```
 
-The editor launches that itself: you point the editor at the `chok` binary,
+The editor launches that itself: you point the editor at the `chock` binary,
 and it starts one for each project.
 
 ## What it is, and what owns what

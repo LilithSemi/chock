@@ -35,6 +35,13 @@ const foreign_options = [_][]const u8{
     "--lang-name",
 };
 
+/// Misspellings found in published instructions. A command scanner does not
+/// see these when prose names the program without showing a command line.
+const chock_misspellings = [_][]const u8{
+    "`chok`",
+    "`chcok`",
+};
+
 const Doc = struct {
     path: []const u8,
     text: []const u8,
@@ -550,6 +557,30 @@ test "every command Chock answers to is named in the documentation" {
     }
 
     try testing.expectEqualStrings("", missing.items);
+}
+
+test "the documentation does not repeat a known misspelling of Chock" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    var wrong: std.ArrayList(u8) = .empty;
+    for (docs) |doc| {
+        var lines = std.mem.splitScalar(u8, doc.text, '\n');
+        var number: usize = 0;
+        while (lines.next()) |line| {
+            number += 1;
+            for (chock_misspellings) |misspelling| {
+                if (std.mem.indexOf(u8, line, misspelling) == null) continue;
+                try wrong.print(arena, "{s}:{d}: {s} misspells `chock`\n", .{
+                    doc.path, number, misspelling,
+                });
+            }
+        }
+    }
+
+    try testing.expectEqualStrings("", wrong.items);
 }
 
 test "the exit code table has one row for each code, with the number the code has" {
