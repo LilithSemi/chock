@@ -102,6 +102,7 @@ pub fn main(
                     "run `chock config example` to print a starter\n",
                 .{path},
             );
+            try reportInvalid(arena, path, options.format, null);
             return Exit.usage.code();
         },
         else => {
@@ -110,6 +111,7 @@ pub fn main(
             } else {
                 tty.print(.err, "chock config check: {s} could not be read: {t}\n", .{ path, err });
             }
+            try reportInvalid(arena, path, options.format, null);
             return Exit.usage.code();
         },
     };
@@ -121,6 +123,7 @@ pub fn main(
             "chock config check: .defaults.provider names \"{s}\", but no provider has that name\n",
             .{name},
         );
+        try reportInvalid(arena, path, options.format, &loaded);
         return Exit.usage.code();
     }
 
@@ -137,10 +140,37 @@ fn missingDefault(config: *const chock_auth.config.Config) ?[]const u8 {
 const CheckReport = struct {
     path: []const u8,
     valid: bool = true,
-    provider_instances: usize,
-    default_provider: ?[]const u8,
-    default_model: ?[]const u8,
+    provider_instances: usize = 0,
+    default_provider: ?[]const u8 = null,
+    default_model: ?[]const u8 = null,
 };
+
+fn reportInvalid(
+    arena: std.mem.Allocator,
+    path: []const u8,
+    format: Format,
+    config: ?*const chock_auth.config.Config,
+) !void {
+    if (format != .json) return;
+    const known = config orelse {
+        try reportJson(arena, .{ .path = path, .valid = false });
+        return;
+    };
+    const default_provider = if (known.defaultInstance()) |instance| instance.name else null;
+    try reportJson(arena, .{
+        .path = path,
+        .valid = false,
+        .provider_instances = known.instances.len,
+        .default_provider = default_provider,
+        .default_model = known.default_model,
+    });
+}
+
+fn reportJson(arena: std.mem.Allocator, value: CheckReport) !void {
+    const json = try std.json.Stringify.valueAlloc(arena, value, .{});
+    defer arena.free(json);
+    tty.out(.plain, "{s}\n", .{json});
+}
 
 fn report(
     arena: std.mem.Allocator,
@@ -150,14 +180,12 @@ fn report(
 ) !void {
     if (format == .json) {
         const default_provider = if (config.defaultInstance()) |instance| instance.name else null;
-        const json = try std.json.Stringify.valueAlloc(arena, CheckReport{
+        try reportJson(arena, .{
             .path = path,
             .provider_instances = config.instances.len,
             .default_provider = default_provider,
             .default_model = config.default_model,
-        }, .{});
-        defer arena.free(json);
-        tty.out(.plain, "{s}\n", .{json});
+        });
         return;
     }
 
@@ -284,6 +312,48 @@ test "a JSON report is structured and exposes no credential" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.provider_instances);
     try std.testing.expectEqualStrings("local", parsed.value.default_provider.?);
     try std.testing.expectEqualStrings("test-model", parsed.value.default_model.?);
+}
+
+test "an invalid JSON report is structured and has no guessed configuration" {
+    const gpa = std.testing.allocator;
+
+    var capture: tty.Capture = undefined;
+    capture.start(std.testing.io, gpa);
+    defer capture.stop(std.testing.io);
+
+    try reportInvalid(gpa, "/config/chock/config.zon", .json, null);
+
+    const parsed = try std.json.parseFromSlice(CheckReport, gpa, capture.out(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("/config/chock/config.zon", parsed.value.path);
+    try std.testing.expect(!parsed.value.valid);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.provider_instances);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed.value.default_provider);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed.value.default_model);
+}
+
+test "an invalid JSON report keeps configuration facts that were parsed" {
+    const gpa = std.testing.allocator;
+    var config = try chock_auth.config.parse(gpa,
+        \\.{
+        \\    .providers = .{ .{ .name = "work", .kind = "aiand" } },
+        \\    .defaults = .{ .provider = "wrok", .model = "a-model" },
+        \\}
+    , null);
+    defer config.deinit();
+
+    var capture: tty.Capture = undefined;
+    capture.start(std.testing.io, gpa);
+    defer capture.stop(std.testing.io);
+
+    try reportInvalid(gpa, "/config/chock/config.zon", .json, &config);
+
+    const parsed = try std.json.parseFromSlice(CheckReport, gpa, capture.out(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.valid);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.provider_instances);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed.value.default_provider);
+    try std.testing.expectEqualStrings("a-model", parsed.value.default_model.?);
 }
 
 test "a named default must name an instance the file has" {

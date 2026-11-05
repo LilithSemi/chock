@@ -37,8 +37,8 @@ This command checks the user configuration only. The project's `chock.zon` is
 separate and is checked before a session starts.
 
 For a script or configuration deployment, request one JSON object on standard
-output. Diagnostics still go to standard error and a failed check returns a
-nonzero status:
+output. A failed check sets `valid` to `false`, writes the diagnostic to
+standard error, and returns a nonzero status:
 
 ```
 chock config check --format json

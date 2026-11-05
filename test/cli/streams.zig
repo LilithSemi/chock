@@ -170,12 +170,28 @@ test "the documented configuration starter passes the real CLI check" {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
+    const Report = struct {
+        path: []const u8,
+        valid: bool,
+        provider_instances: usize,
+        default_provider: ?[]const u8,
+        default_model: ?[]const u8,
+    };
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
 
     const expected_path = try std.fmt.allocPrint(gpa, "{s}/chock/config.zon", .{box.root});
     defer gpa.free(expected_path);
+
+    var missing = try runChock(gpa, io, &box.env, &.{ "config", "check", "--format", "json" });
+    defer missing.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), missing.code);
+    try testing.expect(std.mem.indexOf(u8, missing.err, "there is no configuration") != null);
+    const invalid = try std.json.parseFromSlice(Report, gpa, missing.out, .{});
+    defer invalid.deinit();
+    try testing.expectEqualStrings(expected_path, invalid.value.path);
+    try testing.expect(!invalid.value.valid);
 
     var path = try runChock(gpa, io, &box.env, &.{ "config", "path" });
     defer path.deinit(gpa);
@@ -197,13 +213,6 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expectEqual(@as(u8, 0), checked.code);
     try testing.expectEqualStrings("", checked.err);
 
-    const Report = struct {
-        path: []const u8,
-        valid: bool,
-        provider_instances: usize,
-        default_provider: ?[]const u8,
-        default_model: ?[]const u8,
-    };
     const parsed = try std.json.parseFromSlice(Report, gpa, checked.out, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings(expected_path, parsed.value.path);
