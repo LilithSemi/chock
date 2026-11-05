@@ -118,8 +118,9 @@ runs, and so does `echo "fix the parser" | chock`.
 
 Name your providers in `~/.config/chock/config.zon`, which Chock reads and
 never writes. `chock config path` prints the exact platform- and XDG-aware
-location; `chock config check` validates it without reading a credential or
-contacting a provider. See
+location. `chock config example` prints a valid local-provider starter without
+writing it. `chock config check` validates the result without reading a
+credential or contacting a provider. See
 [docs/configure/configuration.md](docs/configure/configuration.md).
 
 Chock is a pre-alpha project. Its documentation describes the implemented
