@@ -1220,6 +1220,71 @@ fn zonBlocksIn(arena: std.mem.Allocator, doc: Doc) ![]const Span {
     return out.items;
 }
 
+test "every documented ZON block is valid ZON" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    var wrong: std.ArrayList(u8) = .empty;
+    var checked: usize = 0;
+    for (docs) |doc| {
+        for (try zonBlocksIn(arena, doc)) |block| {
+            checked += 1;
+            const source = try arena.dupeSentinel(u8, block.text, 0);
+            if (!try isComposableZon(gpa, arena, source)) {
+                try wrong.print(arena, "{s}:{d}: the fenced block is not valid ZON\n", .{
+                    block.doc,
+                    block.line,
+                });
+            }
+        }
+    }
+
+    if (checked == 0) try wrong.appendSlice(arena, "no documented ZON blocks were found\n");
+    try testing.expectEqualStrings("", wrong.items);
+}
+
+fn isComposableZon(gpa: std.mem.Allocator, arena: std.mem.Allocator, source: [:0]const u8) !bool {
+    if (try isValidZon(gpa, source)) return true;
+
+    const wrapped = try std.fmt.allocPrintSentinel(arena, ".{{\n{s}\n}}", .{source}, 0);
+    if (try isValidZon(gpa, wrapped)) return true;
+
+    var saw_line = false;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        saw_line = true;
+        if (!try isValidZon(gpa, try arena.dupeSentinel(u8, line, 0))) return false;
+    }
+    return saw_line;
+}
+
+fn isValidZon(gpa: std.mem.Allocator, source: [:0]const u8) !bool {
+    var ast = try std.zig.Ast.parse(gpa, source, .{ .mode = .zon });
+    defer ast.deinit(gpa);
+    var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
+    defer zoir.deinit(gpa);
+    return !zoir.hasCompileErrors();
+}
+
+test "the documentation ZON checker distinguishes values and fragments from malformed input" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expect(try isComposableZon(testing.allocator, arena, ".{ .value = 1 }"));
+    try testing.expect(try isComposableZon(testing.allocator, arena, ".field = .{ .value = 1 },"));
+    try testing.expect(try isComposableZon(testing.allocator, arena,
+        \\.{ .value = 1 }
+        \\.{ .value = 2 }
+    ));
+    try testing.expect(!try isComposableZon(testing.allocator, arena, ".{ .value = }"));
+}
+
 test "the complete user configuration example parses" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
