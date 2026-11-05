@@ -14,6 +14,7 @@
   jdk17,
   gradle_8,
   pkgs,
+  versionCheckHook,
 }:
 let
   # A reference MCP server over streamable HTTP, for test/core/mcp_remote_real.zig.
@@ -142,6 +143,10 @@ stdenv.mkDerivation (finalAttrs: {
 
   # Needed for unit tests
   __darwinAllowLocalNetworking = finalAttrs.doCheck;
+
+  doInstallCheck = true;
+
+  nativeInstallCheckInputs = [ versionCheckHook ];
 
   passthru.shell = mkShell {
     name = "chock-dev-shell";
