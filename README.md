@@ -118,9 +118,7 @@ chock doctor
 
 ```
 chock doctor                               # can this machine contain a session
-config_path=$(chock config path)
-mkdir -p "$(dirname "$config_path")"
-chock config example > "$config_path"     # save a local-provider starter
+chock config init                          # save a local-provider starter
 chock config check                         # check it before a session
 cd ~/some-project
 chock run "add a test for the parser"
@@ -142,11 +140,11 @@ A first word is read as a command name, so a task given on the line goes after
 quietly became a task would spend money on a typo. `chock -- fix the parser`
 runs, and so does `echo "fix the parser" | chock`.
 
-Name your providers in `~/.config/chock/config.zon`, which Chock reads and
-never writes. `chock config path` prints the exact platform- and XDG-aware
-location. `chock config example` prints a valid local-provider starter without
-writing it. `chock config check` validates the result without reading a
-credential or contacting a provider. See
+Name your providers in `~/.config/chock/config.zon`. `chock config init` writes
+a starter only when no configuration exists. `chock config path` prints the
+exact platform- and XDG-aware location. `chock config example` prints the same
+starter without writing it. `chock config check` validates the result without
+reading a credential or contacting a provider. See
 [docs/configure/configuration.md](docs/configure/configuration.md).
 
 Chock is a pre-alpha project. Its documentation describes the implemented

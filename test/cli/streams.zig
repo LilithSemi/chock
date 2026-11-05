@@ -204,9 +204,29 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expectEqual(@as(u8, 0), example.code);
     try testing.expectEqualStrings("", example.err);
 
-    const config_dir = std.fs.path.dirname(expected_path) orelse return error.NoConfigDirectory;
-    try std.Io.Dir.cwd().createDirPath(io, config_dir);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = expected_path, .data = example.out });
+    var initialized = try runChock(gpa, io, &box.env, &.{ "config", "init" });
+    defer initialized.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), initialized.code);
+    try testing.expectEqualStrings("", initialized.err);
+    try testing.expect(std.mem.indexOf(u8, initialized.out, expected_path) != null);
+
+    const saved = try std.Io.Dir.readFileAlloc(.cwd(), io, expected_path, gpa, .limited(1 << 16));
+    defer gpa.free(saved);
+    try testing.expectEqualStrings(example.out, saved);
+    if (comptime std.Io.File.Permissions.has_executable_bit) {
+        const stat = try std.Io.Dir.cwd().statFile(io, expected_path, .{});
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o7777);
+    }
+
+    var refused = try runChock(gpa, io, &box.env, &.{ "config", "init" });
+    defer refused.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), refused.code);
+    try testing.expectEqualStrings("", refused.out);
+    try testing.expect(std.mem.indexOf(u8, refused.err, "already exists") != null);
+
+    const still_saved = try std.Io.Dir.readFileAlloc(.cwd(), io, expected_path, gpa, .limited(1 << 16));
+    defer gpa.free(still_saved);
+    try testing.expectEqualStrings(example.out, still_saved);
 
     var checked = try runChock(gpa, io, &box.env, &.{ "config", "check", "--format", "json" });
     defer checked.deinit(gpa);

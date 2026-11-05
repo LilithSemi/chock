@@ -66,7 +66,7 @@ pub fn main(
     var config = chock_auth.config.load(gpa, io, config_dir, &diag) catch |err| switch (err) {
         error.NoConfigFile => {
             tty.print(.err, "chock models: there is no configuration at {s}/{s}; " ++
-                "run `chock config example` to print a starter\n", .{
+                "run `chock config init` to write a starter\n", .{
                 config_dir, chock_auth.config.file_name,
             });
             return Exit.usage.code();

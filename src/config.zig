@@ -1,4 +1,4 @@
-//! `chock config`: inspect the user configuration without reading credentials.
+//! `chock config`: create or inspect the user configuration without reading credentials.
 
 const std = @import("std");
 const chock_auth = @import("chock-auth");
@@ -9,13 +9,14 @@ const tty = @import("tty.zig");
 const usage_text =
     \\Usage: chock config <operation> [options]
     \\
-    \\Inspect the user configuration without reading a credential or contacting a
-    \\provider. The project's chock.zon is separate and is checked before a session
-    \\starts.
+    \\Create or inspect the user configuration without reading a credential or
+    \\contacting a provider. The project's chock.zon is separate and is checked
+    \\before a session starts.
     \\
     \\Operations:
     \\  check    Check the configuration and report the selected defaults.
     \\  example  Print a valid starter configuration without writing it.
+    \\  init     Write the starter configuration unless a file already exists.
     \\  path     Print the configuration path, whether or not the file exists.
     \\
     \\Options:
@@ -26,6 +27,7 @@ const usage_text =
 const Operation = enum {
     check,
     example,
+    init,
     path,
 };
 
@@ -94,6 +96,23 @@ pub fn main(
         return Exit.finished.code();
     }
 
+    if (options.operation == .init) {
+        std.Io.Dir.cwd().createDirPath(io, config_dir) catch |err| {
+            tty.print(.err, "chock config init: {s} could not be created: {t}\n", .{ config_dir, err });
+            return Exit.usage.code();
+        };
+        const wrote = writeStarter(io, path) catch |err| {
+            tty.print(.err, "chock config init: {s} could not be written: {t}\n", .{ path, err });
+            return Exit.usage.code();
+        };
+        if (!wrote) {
+            tty.print(.err, "chock config init: {s} already exists, so nothing was written\n", .{path});
+            return Exit.usage.code();
+        }
+        tty.out(.plain, "chock config init: wrote {s}\n", .{path});
+        return Exit.finished.code();
+    }
+
     var diag: ?chock_auth.config.Diagnostic = null;
     defer if (diag) |*one| one.deinit(gpa);
     var loaded = chock_auth.config.load(gpa, io, config_dir, &diag) catch |err| switch (err) {
@@ -101,7 +120,7 @@ pub fn main(
             tty.print(
                 .err,
                 "chock config check: there is no configuration at {s}; " ++
-                    "run `chock config example` to print a starter\n",
+                    "run `chock config init` to write a starter\n",
                 .{path},
             );
             try reportInvalid(arena, path, options.format, null);
@@ -131,6 +150,21 @@ pub fn main(
 
     try report(arena, path, &loaded, options.format);
     return Exit.finished.code();
+}
+
+fn writeStarter(io: std.Io, path: []const u8) !bool {
+    var file = std.Io.Dir.createFileAbsolute(io, path, .{
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => return false,
+        else => return err,
+    };
+    errdefer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    defer file.close(io);
+    try file.writeStreamingAll(io, example_text);
+    try file.sync(io);
+    return true;
 }
 
 fn missingDefault(config: *const chock_auth.config.Config) ?[]const u8 {
@@ -208,10 +242,12 @@ fn report(
 fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Options {
     if (args.len == 1 and std.mem.eql(u8, args[0], "check")) return .{ .operation = .check };
     if (args.len == 1 and std.mem.eql(u8, args[0], "example")) return .{ .operation = .example };
+    if (args.len == 1 and std.mem.eql(u8, args[0], "init")) return .{ .operation = .init };
     if (args.len == 1 and std.mem.eql(u8, args[0], "path")) return .{ .operation = .path };
     if (args.len == 2 and
         (std.mem.eql(u8, args[0], "check") or
             std.mem.eql(u8, args[0], "example") or
+            std.mem.eql(u8, args[0], "init") or
             std.mem.eql(u8, args[0], "path")) and
         (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")))
     {
@@ -233,9 +269,10 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
     return error.BadArguments;
 }
 
-test "config takes the check, example, and path operations" {
+test "config takes the check, example, init, and path operations" {
     try std.testing.expectEqual(Operation.check, (try parseOptions(&.{"check"})).operation);
     try std.testing.expectEqual(Operation.example, (try parseOptions(&.{"example"})).operation);
+    try std.testing.expectEqual(Operation.init, (try parseOptions(&.{"init"})).operation);
     try std.testing.expectEqual(Operation.path, (try parseOptions(&.{"path"})).operation);
     try std.testing.expectEqual(Format.json, (try parseOptions(&.{ "check", "--format", "json" })).format);
     try std.testing.expectEqual(Format.human, (try parseOptions(&.{ "check", "--format", "human" })).format);
@@ -247,6 +284,7 @@ test "config takes the check, example, and path operations" {
     try std.testing.expectError(error.HelpWanted, parseOptions(&.{"--help"}));
     try std.testing.expectError(error.HelpWanted, parseOptions(&.{ "check", "--help" }));
     try std.testing.expectError(error.HelpWanted, parseOptions(&.{ "example", "--help" }));
+    try std.testing.expectError(error.HelpWanted, parseOptions(&.{ "init", "--help" }));
     try std.testing.expectError(error.HelpWanted, parseOptions(&.{ "path", "-h" }));
 }
 

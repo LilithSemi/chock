@@ -11,7 +11,7 @@ pub const Entry = struct {
 pub const entries = [_]Entry{
     .{ .name = "run", .summary = "Run one agent session in the current project." },
     .{ .name = "login", .summary = "Store a credential for a provider instance." },
-    .{ .name = "config", .summary = "Inspect the user configuration without reading credentials." },
+    .{ .name = "config", .summary = "Create or inspect the user configuration without reading credentials." },
     .{ .name = "models", .summary = "List configured providers, models, and usable capabilities." },
     .{ .name = "daemon", .summary = "Own sessions, and answer every client that asks about one." },
     .{ .name = "serve", .summary = "Put a browser in front of a daemon. Owns no session itself." },

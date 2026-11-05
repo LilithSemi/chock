@@ -1,7 +1,8 @@
 # Configuration
 
-Chock reads `~/.config/chock/config.zon` and never writes it, so you can give
-the whole directory to home-manager.
+Chock reads `~/.config/chock/config.zon`. The `config init` operation can create
+it, but never replaces it, so you can still give the whole directory to
+home-manager.
 
 The exact path follows the platform configuration directory and `$XDG_CONFIG_HOME`.
 Ask Chock for it when creating or linking the file:
@@ -16,12 +17,10 @@ Print a valid local-provider starter without writing anything:
 chock config example
 ```
 
-Create the parent directory and save that starter with:
+Save that starter without replacing an existing configuration:
 
 ```sh
-config_path=$(chock config path)
-mkdir -p "$(dirname "$config_path")"
-chock config example > "$config_path"
+chock config init
 chock config check
 ```
 
