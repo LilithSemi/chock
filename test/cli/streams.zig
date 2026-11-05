@@ -165,6 +165,54 @@ test "the help a person asked for is on standard output and the help after a mis
     try testing.expectEqual(@as(u8, 1), mistyped.code);
 }
 
+test "the documented configuration starter passes the real CLI check" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var box = try Sandbox.init(gpa, io);
+    defer box.deinit(gpa);
+
+    const expected_path = try std.fmt.allocPrint(gpa, "{s}/chock/config.zon", .{box.root});
+    defer gpa.free(expected_path);
+
+    var path = try runChock(gpa, io, &box.env, &.{ "config", "path" });
+    defer path.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), path.code);
+    try testing.expectEqualStrings("", path.err);
+    try testing.expectEqualStrings(expected_path, std.mem.trimEnd(u8, path.out, "\n"));
+
+    var example = try runChock(gpa, io, &box.env, &.{ "config", "example" });
+    defer example.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), example.code);
+    try testing.expectEqualStrings("", example.err);
+
+    const config_dir = std.fs.path.dirname(expected_path) orelse return error.NoConfigDirectory;
+    try std.Io.Dir.cwd().createDirPath(io, config_dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = expected_path, .data = example.out });
+
+    var checked = try runChock(gpa, io, &box.env, &.{ "config", "check", "--format", "json" });
+    defer checked.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), checked.code);
+    try testing.expectEqualStrings("", checked.err);
+
+    const Report = struct {
+        path: []const u8,
+        valid: bool,
+        provider_instances: usize,
+        default_provider: ?[]const u8,
+        default_model: ?[]const u8,
+    };
+    const parsed = try std.json.parseFromSlice(Report, gpa, checked.out, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(expected_path, parsed.value.path);
+    try testing.expect(parsed.value.valid);
+    try testing.expectEqual(@as(usize, 1), parsed.value.provider_instances);
+    try testing.expectEqualStrings("local", parsed.value.default_provider.?);
+    try testing.expectEqualStrings("glm4.7-flash:A3B", parsed.value.default_model.?);
+}
+
 test "a piped stream gets no escape sequence, and --color=always still paints one" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
