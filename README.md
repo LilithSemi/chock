@@ -68,6 +68,9 @@ approval nobody answers is a refusal.
 
 ## Install
 
+Release archives and the Nix flake support `x86_64-linux`, `aarch64-linux`,
+and `aarch64-darwin`. The Darwin build is for Apple silicon.
+
 Download the build for your platform from
 [chock.ws/download](https://chock.ws/download). The page links to the release
 archives and their checksums, and shows how to put the `chock` binary on your

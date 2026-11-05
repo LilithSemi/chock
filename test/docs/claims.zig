@@ -821,8 +821,24 @@ test "the README keeps both supported install paths" {
     const docs = try loadDocs(arena, testing.io);
     const readme = try docText(docs, "README.md");
 
+    var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{});
+    defer root.close(testing.io);
+    const flake = try root.readFileAlloc(testing.io, "flake.nix", arena, .limited(max_doc_bytes));
+    const systems = try textBetween(flake, "allSystems = [", "];");
+
     try testing.expect(std.mem.indexOf(u8, readme, "[chock.ws/download](https://chock.ws/download)") != null);
     try testing.expect(std.mem.indexOf(u8, readme, "nix profile install github:LilithSemi/chock") != null);
+
+    var named: usize = 0;
+    var lines = std.mem.splitScalar(u8, systems, '\n');
+    while (lines.next()) |line| {
+        const field = std.mem.trim(u8, line, " \t\r\"");
+        if (field.len == 0) continue;
+        const documented = try std.fmt.allocPrint(arena, "`{s}`", .{field});
+        try testing.expect(std.mem.indexOf(u8, readme, documented) != null);
+        named += 1;
+    }
+    try testing.expect(named != 0);
 }
 
 test "the README creates configuration before the first doctor check" {
