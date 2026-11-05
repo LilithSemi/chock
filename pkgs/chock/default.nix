@@ -176,4 +176,16 @@ stdenv.mkDerivation (finalAttrs: {
       export GRADLE_OPTS="-Dorg.gradle.project.android.aapt2FromMavenOverride=$(echo "$ANDROID_HOME/build-tools/"*/aapt2) ''${GRADLE_OPTS:-}"
     '';
   };
+
+  meta = {
+    description = "Auditable AI coding agent with a kernel-enforced sandbox";
+    homepage = "https://chock.ws";
+    license = lib.licenses.asl20;
+    mainProgram = "chock";
+    platforms = [
+      "x86_64-linux"
+      "aarch64-linux"
+      "aarch64-darwin"
+    ];
+  };
 })
