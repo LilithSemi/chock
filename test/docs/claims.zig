@@ -335,6 +335,13 @@ fn containsString(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn docsContain(docs: []const Doc, needle: []const u8) bool {
+    for (docs) |doc| {
+        if (std.mem.indexOf(u8, doc.text, needle) != null) return true;
+    }
+    return false;
+}
+
 /// Reads the names from a plain `enum { ... }` declaration. Report status
 /// enums stay plain so this test can compare their live wire values with the
 /// documentation without maintaining another list.
@@ -915,6 +922,35 @@ test "automation report pages name every stable status value" {
         }
     }
 
+    try testing.expectEqualStrings("", wrong.items);
+}
+
+test "every declared JSON schema is named in the documentation" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+    const source = try loadSources(arena, testing.io, &command_line_code);
+
+    const marker = "schema: []const u8 = \"";
+    var schemas: std.ArrayList([]const u8) = .empty;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, source, cursor, marker)) |found| {
+        const start = found + marker.len;
+        const end = std.mem.indexOfScalarPos(u8, source, start, '"') orelse return error.UnclosedSchema;
+        const schema = source[start..end];
+        cursor = end + 1;
+        if (!std.mem.startsWith(u8, schema, "chock.")) continue;
+        if (!containsString(schemas.items, schema)) try schemas.append(arena, schema);
+    }
+
+    var wrong: std.ArrayList(u8) = .empty;
+    for (schemas.items) |schema| {
+        if (!docsContain(docs, schema)) {
+            try wrong.print(arena, "no documentation names JSON schema `{s}`\n", .{schema});
+        }
+    }
+    if (schemas.items.len == 0) try wrong.appendSlice(arena, "no command JSON schema was found in source\n");
     try testing.expectEqualStrings("", wrong.items);
 }
 
