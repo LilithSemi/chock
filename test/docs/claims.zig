@@ -12,7 +12,9 @@ const Exit = @import("chock-exit").Exit;
 const guest_limits = @import("guest-limits");
 const chock_core = @import("chock-core");
 const chock_auth = @import("chock-auth");
+const chock_cost = @import("chock-cost");
 const chock_policy = @import("chock-policy");
+const chock_workspace = @import("chock-workspace");
 const palisade = @import("palisade");
 const chock_net = @import("chock-net");
 
@@ -1240,6 +1242,66 @@ test "the complete user configuration example parses" {
     }
 
     if (checked == 0) try wrong.appendSlice(arena, "no complete user configuration example was found\n");
+    try testing.expectEqualStrings("", wrong.items);
+}
+
+test "the complete project configuration example parses" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    const page = Doc{
+        .path = "docs/configure/configuration.md",
+        .text = try docText(docs, "docs/configure/configuration.md"),
+    };
+    var wrong: std.ArrayList(u8) = .empty;
+    var checked: usize = 0;
+    for (try zonBlocksIn(arena, page)) |block| {
+        if (std.mem.indexOf(u8, block.text, ".policy") == null or
+            std.mem.indexOf(u8, block.text, ".budget") == null or
+            std.mem.indexOf(u8, block.text, ".deny_read") == null or
+            std.mem.indexOf(u8, block.text, ".subagents") == null or
+            std.mem.indexOf(u8, block.text, ".context") == null or
+            std.mem.indexOf(u8, block.text, ".apply") == null) continue;
+        checked += 1;
+
+        const source = try arena.dupeSentinel(u8, block.text, 0);
+        const policy = chock_policy.table.Table.parse(gpa, source, null) catch |err| {
+            try wrong.print(arena, "{s}:{d}: policy: {t}\n", .{ block.doc, block.line, err });
+            continue;
+        };
+        chock_policy.table.Table.destroy(gpa, policy);
+
+        if (chock_cost.budget.parse(gpa, source, null)) |maybe_budget| {
+            if (maybe_budget) |budget| chock_cost.budget.free(gpa, budget);
+        } else |err| {
+            try wrong.print(arena, "{s}:{d}: budget: {t}\n", .{ block.doc, block.line, err });
+            continue;
+        }
+
+        const denied = chock_workspace.deny.parse(gpa, testing.io, source, repo_root, null) catch |err| {
+            try wrong.print(arena, "{s}:{d}: deny_read: {t}\n", .{ block.doc, block.line, err });
+            continue;
+        };
+        chock_workspace.deny.free(gpa, denied);
+
+        _ = chock_policy.subagents.parse(gpa, source, null) catch |err| {
+            try wrong.print(arena, "{s}:{d}: subagents: {t}\n", .{ block.doc, block.line, err });
+            continue;
+        };
+        _ = chock_policy.context.parse(gpa, source, null) catch |err| {
+            try wrong.print(arena, "{s}:{d}: context: {t}\n", .{ block.doc, block.line, err });
+            continue;
+        };
+        _ = chock_policy.apply.parse(gpa, source, null) catch |err| {
+            try wrong.print(arena, "{s}:{d}: apply: {t}\n", .{ block.doc, block.line, err });
+            continue;
+        };
+    }
+
+    if (checked == 0) try wrong.appendSlice(arena, "no complete project configuration example was found\n");
     try testing.expectEqualStrings("", wrong.items);
 }
 
