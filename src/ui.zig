@@ -1585,7 +1585,6 @@ const HandClock = struct {
 
 const Headless = struct {
     gpa: std.mem.Allocator,
-    threaded: std.Io.Threaded,
     env: std.process.Environ.Map,
     device: std.Io.File,
     sink: Sink,
@@ -1628,8 +1627,7 @@ const Headless = struct {
         errdefer gpa.destroy(self);
 
         self.gpa = gpa;
-        self.threaded = std.Io.Threaded.init(gpa, .{});
-        const io = self.threaded.io();
+        const io = testing.io;
         self.env = std.process.Environ.Map.init(gpa);
         self.sink = .{ .gpa = gpa };
         self.tap = self.sink.tap();
@@ -1684,7 +1682,7 @@ const Headless = struct {
     }
 
     fn close(self: *Headless) void {
-        const io = self.threaded.io();
+        const io = testing.io;
         self.stop();
         self.plain.deinit(self.gpa);
         tty.useStreams(io, null, null);
@@ -1692,7 +1690,6 @@ const Headless = struct {
         self.sink.deinit();
         self.diagnostics.deinit();
         self.env.deinit();
-        self.threaded.deinit();
         self.gpa.destroy(self);
     }
 };
@@ -2833,7 +2830,7 @@ test "a message the person typed is in the transcript, in Chock's voice at colum
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const io = h.threaded.io();
+    const io = testing.io;
     h.terminal().keys.?.device.in = try pressesToRead(&tmp, "fix the parser\r");
     defer h.terminal().keys.?.device.in.close(io);
 
@@ -3014,7 +3011,7 @@ test "a device that is not a terminal is never asked for raw mode" {
     const h = try Headless.open(gpa);
     defer h.close();
 
-    try testing.expect(!(h.device.isTty(h.threaded.io()) catch true));
+    try testing.expect(!(h.device.isTty(testing.io) catch true));
     try testing.expect(!h.terminal().keys.?.raw);
     try testing.expect(h.terminal().keys.?.was == null);
     try testing.expect(h.terminal().keys.?.held == null);
@@ -3825,7 +3822,7 @@ test "a Ctrl-C at a question puts the device back first, and then raises the sig
     defer tmp.cleanup();
 
     try askIn(h, a_question);
-    const io = h.threaded.io();
+    const io = testing.io;
     h.terminal().keys.?.device.in = try pressesToRead(&tmp, "\x03\x03");
     defer h.terminal().keys.?.device.in.close(io);
 
@@ -4606,7 +4603,7 @@ test "a Ctrl-C read by the pump puts the device back first, and then raises the 
     defer tmp.cleanup();
 
     holdsTerminal(h);
-    const io = h.threaded.io();
+    const io = testing.io;
     h.terminal().keys.?.device.in = try pressesToRead(&tmp, "\x03\x03");
     defer h.terminal().keys.?.device.in.close(io);
 
