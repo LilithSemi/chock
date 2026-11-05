@@ -138,7 +138,7 @@ Each exchange appends one `mcp.request`, beside the ordinary `tool.call` and
 `tool.result` for the call itself:
 
 ```json
-{"kind":"mcp.request","server":"notion","host":"mcp.notion.com","about":"search","status":200,"outcome":"answered"}
+{"mcp.request":{"server":"notion","host":"mcp.notion.com","about":"search","status":200,"outcome":"answered"}}
 ```
 
 `about` is the tool the call was about, or `discover` for the one exchange that

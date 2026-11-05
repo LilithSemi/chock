@@ -149,7 +149,7 @@ so in one line, naming the decision and the action.
 Each rule that ran appends a `style.check` event:
 
 ```json
-{"kind":"style.check","rule":"comment-block","path":"src/main.zig","language":"zig","count":1,"line":1,"outcome":"refused"}
+{"style.check":{"rule":"comment-block","path":"src/main.zig","language":"zig","count":1,"line":1,"outcome":"refused"}}
 ```
 
 `outcome` is `permitted`, `refused`, `reported`, `no_parser`, `no_answer` or

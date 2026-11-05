@@ -125,7 +125,7 @@ Each run appends a `hook.run` event, beside the ordinary `tool.call` and
 `tool.result` for the program itself:
 
 ```json
-{"kind":"hook.run","name":"tests-pass","trigger":"tool.before","tool":"request_action","action":"exec.devshell.zig","outcome":"ran","errored":true,"refused":true}
+{"hook.run":{"name":"tests-pass","trigger":"tool.before","tool":"request_action","action":"exec.devshell.zig","outcome":"ran","errored":true,"refused":true}}
 ```
 
 `outcome` is `ran`, `refused_by_policy` or `could_not_run`. `chock sessions

@@ -186,7 +186,7 @@ the action it was given to, how it bound, and the variable it arrived under.
 The value is not in the event, and there is no field it could travel in.
 
 ```json
-{"kind":"secret.used","name":"GITHUB_TOKEN","action":"exec.path.gh","bind":"env","variable":"GITHUB_TOKEN"}
+{"secret.used":{"name":"GITHUB_TOKEN","action":"exec.path.gh","bind":"env","variable":"GITHUB_TOKEN"}}
 ```
 
 For a header the `variable` field holds the header's name, which is the place
