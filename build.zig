@@ -2305,6 +2305,12 @@ pub fn build(b: *std.Build) void {
     // suite reads a few files and takes no time worth saving.
     run_docs_tests.has_side_effects = true;
     test_step.dependOn(&run_docs_tests.step);
+    module_test_steps.add(
+        b,
+        "test-docs",
+        "Run documentation claims only",
+        &run_docs_tests.step,
+    );
 
     // test/broker/askpass.zig drives the askpass helper with the git on this
     // machine: GIT_ASKPASS points at the binary that was just built, and `git

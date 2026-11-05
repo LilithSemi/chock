@@ -28,6 +28,13 @@ Run one command without entering an interactive shell when that is more useful:
 nix develop --command zig build test --summary all
 ```
 
+For a documentation-only change, run the live documentation claims without
+building the main executable tests:
+
+```
+nix develop --command zig build test-docs --summary all
+```
+
 ## Repository layout
 
 - `lib/` - the libraries, one module for each concern. The boundary itself is
