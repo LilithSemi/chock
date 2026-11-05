@@ -48,6 +48,11 @@ const JsonRow = struct {
     output_tokens: u64 = 0,
     cache_creation_input_tokens: u64 = 0,
     cache_read_input_tokens: u64 = 0,
+    turns: u64 = 0,
+    unpriced_turns: u64 = 0,
+    free_turns: u64 = 0,
+    mixed_currency: bool = false,
+    cost_enforceable: bool = false,
     cost: f64 = 0,
     currency: []const u8 = "",
 };
@@ -245,6 +250,11 @@ fn writeNode(
                 .output_tokens = session.spend.output_tokens,
                 .cache_creation_input_tokens = session.spend.cache_creation_input_tokens,
                 .cache_read_input_tokens = session.spend.cache_read_input_tokens,
+                .turns = session.spend.turns,
+                .unpriced_turns = session.spend.unpriced_turns,
+                .free_turns = session.spend.free_turns,
+                .mixed_currency = session.spend.mixed_currency,
+                .cost_enforceable = session.spend.enforceable(),
                 .cost = session.spend.amount,
                 .currency = session.spend.currency,
             };
@@ -390,6 +400,8 @@ test "tree keeps sibling outcomes separate and reconciles delegated usage" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"status\":\"died\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"budget_max_cost\":2.5") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"input_tokens\":100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cost_enforceable\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"unpriced_turns\":0") != null);
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, output.written(), "\n"));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, output.written(), "\"schema\":\"chock.session-tree\""));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, output.written(), "\"version\":1"));

@@ -202,7 +202,9 @@ audit gap. `--format compact` and `--format json` write one row per session for
 scripts that need to inspect or total one branch without mixing in siblings.
 Each JSONL row has schema `chock.session-tree` version 1. A row for a missing or
 unreadable child uses its `problem` field and keeps the same fields as every
-other row.
+other row. Cost fields include the counts of priced, free, and unpriced turns,
+whether currencies were mixed, and `cost_enforceable`. Only an enforceable cost
+is a complete total that a budget check can use.
 
 ### What reached the model
 
