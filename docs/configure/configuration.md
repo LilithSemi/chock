@@ -114,7 +114,7 @@ allowlist. [search.md](search.md) describes that stricter runtime check.
 Use `chock models --format json` for the same offline facts in scripts. Each
 provider record has its name, kind, default status, default model, context
 limit, and effective capability booleans. It omits endpoint URLs and credential
-material. JSON output cannot be combined with `--probe`.
+material.
 
 Add `--probe` to opt into credential lookup and one authenticated `GET
 /models` request per selected provider. The returned model identifiers are
@@ -122,6 +122,12 @@ sorted before they are printed. `chock models --provider <name> --probe` is the
 narrow form. The same typed catalogue result is kept in `chock-auth`, so the
 daemon and graphical clients can use it for a model switcher without parsing
 terminal output or handling credentials themselves.
+
+`chock models --probe --format json` keeps stdout as one JSON document. Its
+top-level `probed` field is true, and each provider has a `catalogue` object
+with a stable status, a sorted `models` array when available, and an HTTP status
+or connection reason when applicable. Probe diagnostics still go to stderr,
+and any failed catalogue makes the command exit nonzero.
 
 ## Naming a credential
 

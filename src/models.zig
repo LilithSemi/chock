@@ -22,8 +22,7 @@ const usage_text =
     \\Options:
     \\  --provider <name>  Show one configured provider instance.
     \\  --probe             Read credentials and query provider model catalogues.
-    \\  --format <kind>     human (default) or json. JSON is offline and cannot be
-    \\                      combined with --probe.
+    \\  --format <kind>     human (default) or json.
     \\
 ++ tty.options_text;
 
@@ -95,8 +94,8 @@ pub fn main(
     else
         null;
 
-    if (options.format == .json) {
-        try reportJson(arena, &config, selected);
+    if (options.format == .json and !options.probe) {
+        try reportJson(arena, &config, selected, null);
         return Exit.finished.code();
     }
 
@@ -114,10 +113,27 @@ pub fn main(
     };
     const store = chock_auth.store.Store{ .data_dir = data_dir, .secrets = driver.secrets() };
 
+    if (options.format == .json) {
+        const count: usize = if (selected == null) config.instances.len else 1;
+        const catalogues = try arena.alloc(CatalogueReport, count);
+        var probe_failed = false;
+        if (selected) |instance| {
+            catalogues[0] = try probe(arena, gpa, io, config_dir, store, instance, .json);
+            probe_failed = !catalogues[0].available();
+        } else {
+            for (config.instances, catalogues) |instance, *catalogue| {
+                catalogue.* = try probe(arena, gpa, io, config_dir, store, instance, .json);
+                if (!catalogue.available()) probe_failed = true;
+            }
+        }
+        try reportJson(arena, &config, selected, catalogues);
+        return if (probe_failed) Exit.faulted.code() else Exit.finished.code();
+    }
+
     if (selected) |instance| {
         describe(instance, &config);
         if (!options.probe) return Exit.finished.code();
-        return if (try probe(gpa, io, config_dir, store, instance))
+        return if ((try probe(arena, gpa, io, config_dir, store, instance, .human)).available())
             Exit.finished.code()
         else
             Exit.faulted.code();
@@ -132,7 +148,9 @@ pub fn main(
     for (config.instances, 0..) |instance, index| {
         if (index != 0) tty.out(.plain, "\n", .{});
         describe(instance, &config);
-        if (options.probe and !try probe(gpa, io, config_dir, store, instance)) probe_failed = true;
+        if (options.probe and !(try probe(arena, gpa, io, config_dir, store, instance, .human)).available()) {
+            probe_failed = true;
+        }
     }
     return if (probe_failed) Exit.faulted.code() else Exit.finished.code();
 }
@@ -153,30 +171,64 @@ const ProviderReport = struct {
     default_model: ?[]const u8,
     context_tokens: ?u64,
     capabilities: CapabilityReport,
+    catalogue: ?CatalogueReport,
 };
 
 const ModelsReport = struct {
     default_provider: ?[]const u8,
     default_model: ?[]const u8,
+    probed: bool,
     providers: []const ProviderReport,
+};
+
+const CatalogueStatus = enum {
+    available,
+    unknown_shape,
+    renewal_lock_failed,
+    renewal_busy,
+    credential_lookup_failed,
+    credential_missing,
+    credential_invalid,
+    scope_missing,
+    renewal_unavailable,
+    renewal_failed,
+    credential_store_failed,
+    rejected,
+    not_reached,
+};
+
+const CatalogueReport = struct {
+    status: CatalogueStatus,
+    models: []const []const u8 = &.{},
+    http_status: ?u16 = null,
+    reason: ?[]const u8 = null,
+
+    fn available(self: CatalogueReport) bool {
+        return self.status == .available;
+    }
 };
 
 fn reportJson(
     arena: std.mem.Allocator,
     config: *const chock_auth.config.Config,
     selected: ?chock_auth.config.Instance,
+    catalogues: ?[]const CatalogueReport,
 ) !void {
     const count: usize = if (selected == null) config.instances.len else 1;
+    if (catalogues) |provided| std.debug.assert(provided.len == count);
     const providers = try arena.alloc(ProviderReport, count);
     defer arena.free(providers);
     if (selected) |instance| {
-        providers[0] = providerReport(instance, config);
+        providers[0] = providerReport(instance, config, if (catalogues) |all| all[0] else null);
     } else {
-        for (config.instances, providers) |instance, *report| report.* = providerReport(instance, config);
+        for (config.instances, providers, 0..) |instance, *report, index| {
+            report.* = providerReport(instance, config, if (catalogues) |all| all[index] else null);
+        }
     }
     const encoded = try std.json.Stringify.valueAlloc(arena, ModelsReport{
         .default_provider = config.default_provider,
         .default_model = config.default_model,
+        .probed = catalogues != null,
         .providers = providers,
     }, .{});
     defer arena.free(encoded);
@@ -186,6 +238,7 @@ fn reportJson(
 fn providerReport(
     instance: chock_auth.config.Instance,
     config: *const chock_auth.config.Config,
+    catalogue: ?CatalogueReport,
 ) ProviderReport {
     const is_default = isDefault(instance, config);
     const features = adapterFor(instance.kind).features();
@@ -202,16 +255,19 @@ fn providerReport(
             .provider_search = features.provider_search,
             .images = features.image_results and instance.capabilities.images,
         },
+        .catalogue = catalogue,
     };
 }
 
 fn probe(
+    arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     io: std.Io,
     config_dir: []const u8,
     store: chock_auth.store.Store,
     instance: chock_auth.config.Instance,
-) !bool {
+    format: Format,
+) !CatalogueReport {
     var openai_lock: ?chock_auth.lock.Held = null;
     defer if (openai_lock) |*held| held.release(io);
     if (instance.kind == .openai) {
@@ -223,7 +279,7 @@ fn probe(
             } else {
                 tty.print(.err, "  catalogue: the OpenAI renewal lock could not be prepared: {t}\n", .{err});
             }
-            return false;
+            return .{ .status = .renewal_lock_failed };
         };
         openai_lock = switch (chock_auth.lock.take(io, store.data_dir, "openai-refresh.lock", .{
             .wait_ns = 30 * std.time.ns_per_s,
@@ -231,11 +287,11 @@ fn probe(
             .held => |held| held,
             .busy => {
                 tty.print(.err, "  catalogue: another process is renewing the OpenAI login; try again\n", .{});
-                return false;
+                return .{ .status = .renewal_busy };
             },
             .unusable => |err| {
                 tty.print(.err, "  catalogue: the OpenAI renewal lock could not be used: {t}\n", .{err});
-                return false;
+                return .{ .status = .renewal_lock_failed };
             },
         };
     }
@@ -255,7 +311,7 @@ fn probe(
         } else {
             tty.print(.err, "  catalogue: credential lookup failed: {t}\n", .{err});
         }
-        return false;
+        return .{ .status = .credential_lookup_failed };
     };
     defer credential.deinit();
 
@@ -263,7 +319,7 @@ fn probe(
         tty.print(.err, "  catalogue: no credential; run `chock login --provider {s} --name {s}`\n", .{
             instance.kind.wireName(), instance.name,
         });
-        return false;
+        return .{ .status = .credential_missing };
     }
 
     var openai_credential: ?std.json.Parsed(chock_auth.openai_oauth.Credential) = null;
@@ -274,18 +330,18 @@ fn probe(
     if (instance.kind == .openai and credential.token.len != 0) {
         openai_credential = chock_auth.openai_oauth.Credential.parse(gpa, credential.token) catch {
             tty.print(.err, "  catalogue: the OpenAI credential is not a web login; run `chock login --provider openai --name {s} --replace`\n", .{instance.name});
-            return false;
+            return .{ .status = .credential_invalid };
         };
         var current = openai_credential.?.value;
         if (!current.hasInferenceScope()) {
             tty.print(.err, "  catalogue: the OpenAI login did not grant ChatGPT plan use; run `chock login --provider openai --name {s} --replace`\n", .{instance.name});
-            return false;
+            return .{ .status = .scope_missing };
         }
         const now = @divTrunc(std.Io.Timestamp.now(io, .real).toMilliseconds(), 1000);
         if (current.expires_at <= now + 300) {
             if (credential.source != .login_store) {
                 tty.print(.err, "  catalogue: the OpenAI login needs renewal but is not in the login store; run `chock login --provider openai --name {s} --replace`\n", .{instance.name});
-                return false;
+                return .{ .status = .renewal_unavailable };
             }
             var zurl_transport: oauth.ZurlTransport = .init(io);
             renewed_set = oauth.refresh(gpa, .{
@@ -295,7 +351,7 @@ fn probe(
                 .extra = oauth_openai.token_extra,
             }, current.refresh_token) catch |err| {
                 tty.print(.err, "  catalogue: the OpenAI login could not be renewed ({t})\n", .{err});
-                return false;
+                return .{ .status = .renewal_failed };
             };
             const renewed = renewed_set.?.value();
             var extension_arena: std.heap.ArenaAllocator = .init(gpa);
@@ -330,7 +386,7 @@ fn probe(
                 } else {
                     tty.print(.err, "  catalogue: the renewed OpenAI login could not be stored: {t}\n", .{err});
                 }
-                return false;
+                return .{ .status = .credential_store_failed };
             };
         }
         token = current.access_token;
@@ -342,19 +398,30 @@ fn probe(
         .ok => |ok| {
             const models = ok.models orelse {
                 tty.print(.warn, "  catalogue: the provider answered, but its model list has an unknown shape\n", .{});
-                return false;
+                return .{ .status = .unknown_shape };
             };
-            tty.out(.plain, "  catalogue: {d} model{s}\n", .{ models.len, if (models.len == 1) "" else "s" });
-            for (models) |model| tty.out(.plain, "    {s}\n", .{model});
-            return true;
+            if (format == .human) {
+                tty.out(.plain, "  catalogue: {d} model{s}\n", .{ models.len, if (models.len == 1) "" else "s" });
+                for (models) |model| tty.out(.plain, "    {s}\n", .{model});
+                return .{ .status = .available };
+            }
+            const copied = try arena.alloc([]const u8, models.len);
+            for (models, copied) |model, *destination| destination.* = try arena.dupe(u8, model);
+            return .{ .status = .available, .models = copied };
         },
         .rejected => |rejected| {
             tty.print(.err, "  catalogue: provider refused the request with status {d}\n", .{@backingInt(rejected.status)});
-            return false;
+            return .{
+                .status = .rejected,
+                .http_status = @intCast(@backingInt(rejected.status)),
+            };
         },
         .not_reached => |reason| {
             tty.print(.err, "  catalogue: provider could not be reached ({s})\n", .{reason});
-            return false;
+            return .{
+                .status = .not_reached,
+                .reason = if (format == .json) try arena.dupe(u8, reason) else null,
+            };
         },
     }
 }
@@ -433,7 +500,6 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
         }
         return error.BadArguments;
     }
-    if (options.probe and options.format == .json) return error.BadArguments;
     return options;
 }
 
@@ -446,7 +512,7 @@ test "model options select at most one provider" {
     try std.testing.expectError(error.BadArguments, parseOptions(&.{"--provider"}));
     try std.testing.expectError(error.BadArguments, parseOptions(&.{ "--provider", "a", "--provider", "b" }));
     try std.testing.expectError(error.BadArguments, parseOptions(&.{ "--probe", "--probe" }));
-    try std.testing.expectError(error.BadArguments, parseOptions(&.{ "--format", "json", "--probe" }));
+    try std.testing.expect((try parseOptions(&.{ "--format", "json", "--probe" })).probe);
     try std.testing.expectError(error.BadArguments, parseOptions(&.{ "--format", "yaml" }));
     try std.testing.expectError(error.BadArguments, parseOptions(&.{ "--format", "human", "--format", "json" }));
     try std.testing.expectError(error.BadArguments, parseOptions(&.{"local"}));
@@ -511,13 +577,14 @@ test "the JSON model report is structured and contains no connection or credenti
     capture.start(std.testing.io, gpa);
     defer capture.stop(std.testing.io);
 
-    try reportJson(gpa, &config, null);
+    try reportJson(gpa, &config, null, null);
     const output = capture.out();
     const parsed = try std.json.parseFromSlice(ModelsReport, gpa, output, .{});
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("local", parsed.value.default_provider.?);
     try std.testing.expectEqualStrings("test-model", parsed.value.default_model.?);
+    try std.testing.expect(!parsed.value.probed);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.providers.len);
     try std.testing.expectEqualStrings("local", parsed.value.providers[0].name);
     try std.testing.expectEqualStrings("openai-compat", parsed.value.providers[0].kind);
@@ -525,6 +592,7 @@ test "the JSON model report is structured and contains no connection or credenti
     try std.testing.expectEqual(@as(?u64, 65536), parsed.value.providers[0].context_tokens);
     try std.testing.expect(parsed.value.providers[0].capabilities.text);
     try std.testing.expect(parsed.value.providers[0].capabilities.images);
+    try std.testing.expect(parsed.value.providers[0].catalogue == null);
     try std.testing.expect(!parsed.value.providers[0].capabilities.provider_search);
     try std.testing.expect(parsed.value.providers[1].capabilities.provider_search);
     try std.testing.expect(std.mem.indexOf(u8, output, "never-print-this") == null);

@@ -26,6 +26,39 @@ const Run = struct {
     }
 };
 
+const ModelReport = struct {
+    const Provider = struct {
+        const Capabilities = struct {
+            text: bool,
+            tools: bool,
+            reasoning: bool,
+            cache_accounting: bool,
+            provider_search: bool,
+            images: bool,
+        };
+
+        const Catalogue = struct {
+            status: []const u8,
+            models: []const []const u8,
+            http_status: ?u16,
+            reason: ?[]const u8,
+        };
+
+        name: []const u8,
+        kind: []const u8,
+        is_default: bool,
+        default_model: ?[]const u8,
+        context_tokens: ?u64,
+        capabilities: Capabilities,
+        catalogue: ?Catalogue,
+    };
+
+    default_provider: ?[]const u8,
+    default_model: ?[]const u8,
+    probed: bool,
+    providers: []const Provider,
+};
+
 /// No command here can crash, and no `Exit` member uses this code.
 const did_not_exit: u8 = 255;
 
@@ -177,30 +210,6 @@ test "the documented configuration starter passes the real CLI check" {
         default_provider: ?[]const u8,
         default_model: ?[]const u8,
     };
-    const ModelReport = struct {
-        const Provider = struct {
-            const Capabilities = struct {
-                text: bool,
-                tools: bool,
-                reasoning: bool,
-                cache_accounting: bool,
-                provider_search: bool,
-                images: bool,
-            };
-
-            name: []const u8,
-            kind: []const u8,
-            is_default: bool,
-            default_model: ?[]const u8,
-            context_tokens: ?u64,
-            capabilities: Capabilities,
-        };
-
-        default_provider: ?[]const u8,
-        default_model: ?[]const u8,
-        providers: []const Provider,
-    };
-
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
 
@@ -272,10 +281,12 @@ test "the documented configuration starter passes the real CLI check" {
     defer model_report.deinit();
     try testing.expectEqualStrings("local", model_report.value.default_provider.?);
     try testing.expectEqualStrings("glm4.7-flash:A3B", model_report.value.default_model.?);
+    try testing.expect(!model_report.value.probed);
     try testing.expectEqual(@as(usize, 1), model_report.value.providers.len);
     try testing.expectEqualStrings("local", model_report.value.providers[0].name);
     try testing.expect(model_report.value.providers[0].is_default);
     try testing.expect(model_report.value.providers[0].capabilities.text);
+    try testing.expect(model_report.value.providers[0].catalogue == null);
     try testing.expect(std.mem.indexOf(u8, models.out, "127.0.0.1") == null);
 
     var conflict = try runChock(gpa, io, &box.env, &.{
@@ -286,6 +297,68 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expect(std.mem.indexOf(u8, conflict.err, "configuration declares \"local\" as kind openai-compat") != null);
     try testing.expect(std.mem.indexOf(u8, conflict.err, "nothing was given") == null);
     try testing.expect(std.mem.indexOf(u8, conflict.out, "asking") == null);
+}
+
+test "a JSON model probe stays one document and reports the sorted remote catalogue" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const body = "{\"object\":\"list\",\"data\":[{\"id\":\"zeta\"},{\"id\":\"alpha\"}]}";
+    const head = std.fmt.comptimePrint(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
+            "Content-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{body.len},
+    );
+    var provider = try fake_provider.FakeProvider.start(gpa, io, .{
+        .head = head,
+        .body = &.{.{ .bytes = body }},
+    });
+
+    var box = try Sandbox.init(gpa, io);
+    defer box.deinit(gpa);
+    var base_buffer: [96]u8 = undefined;
+    const config_dir = try std.fmt.allocPrint(gpa, "{s}/chock", .{box.root});
+    defer gpa.free(config_dir);
+    try std.Io.Dir.cwd().createDirPath(io, config_dir);
+    const config_path = try std.fmt.allocPrint(gpa, "{s}/config.zon", .{config_dir});
+    defer gpa.free(config_path);
+    const config = try std.fmt.allocPrint(gpa,
+        \\.{{
+        \\    .providers = .{{
+        \\        .{{ .name = "local", .kind = "openai-compat",
+        \\           .base_url = "{s}/v1", .context_tokens = 65536 }},
+        \\    }},
+        \\    .defaults = .{{ .provider = "local", .model = "alpha" }},
+        \\}}
+        \\
+    , .{provider.baseUrl(&base_buffer)});
+    defer gpa.free(config);
+    {
+        var config_file = try std.Io.Dir.createFileAbsolute(io, config_path, .{
+            .permissions = .fromMode(0o600),
+        });
+        defer config_file.close(io);
+        try config_file.writeStreamingAll(io, config);
+    }
+
+    var models = try runChock(gpa, io, &box.env, &.{ "models", "--probe", "--format", "json" });
+    defer models.deinit(gpa);
+    provider.join();
+    defer provider.deinit();
+
+    try testing.expectEqual(@as(u8, 0), models.code);
+    try testing.expectEqualStrings("", models.err);
+    try testing.expect(std.mem.indexOf(u8, provider.captured.head, "GET /v1/models") != null);
+    const report = try std.json.parseFromSlice(ModelReport, gpa, models.out, .{});
+    defer report.deinit();
+    try testing.expect(report.value.probed);
+    const catalogue = report.value.providers[0].catalogue.?;
+    try testing.expectEqualStrings("available", catalogue.status);
+    try testing.expectEqual(@as(usize, 2), catalogue.models.len);
+    try testing.expectEqualStrings("alpha", catalogue.models[0]);
+    try testing.expectEqualStrings("zeta", catalogue.models[1]);
+    try testing.expect(catalogue.http_status == null);
+    try testing.expect(catalogue.reason == null);
 }
 
 test "a piped stream gets no escape sequence, and --color=always still paints one" {
