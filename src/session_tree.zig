@@ -41,7 +41,7 @@ const JsonRow = struct {
     agent_kind: []const u8,
     status: []const u8,
     reason: []const u8 = "",
-    problem: ?[]const u8 = null,
+    problem: ?TreeProblem = null,
     budget_max_cost: f64 = 0,
     budget_currency: []const u8 = "",
     input_tokens: u64 = 0,
@@ -55,6 +55,13 @@ const JsonRow = struct {
     cost_enforceable: bool = false,
     cost: f64 = 0,
     currency: []const u8 = "",
+};
+
+const TreeProblem = enum {
+    cycle,
+    missing_log,
+    log_unreadable,
+    log_invalid,
 };
 
 pub fn show(
@@ -121,7 +128,7 @@ fn renderNode(
     totals: *Totals,
 ) !bool {
     if (visited.contains(id)) {
-        try writeMissing(writer, format, depth, id, edge, "cycle");
+        try writeMissing(writer, format, depth, id, edge, .cycle);
         totals.incomplete += 1;
         return true;
     }
@@ -130,7 +137,7 @@ fn renderNode(
     _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             if (depth != 0) {
-                try writeMissing(writer, format, depth, id, edge, "missing log");
+                try writeMissing(writer, format, depth, id, edge, .missing_log);
                 totals.nodes += 1;
                 totals.incomplete += @intFromBool(edge.outcome == null);
                 return true;
@@ -138,7 +145,7 @@ fn renderNode(
             return false;
         },
         else => {
-            try writeMissing(writer, format, depth, id, edge, @errorName(err));
+            try writeMissing(writer, format, depth, id, edge, .log_unreadable);
             totals.nodes += 1;
             totals.incomplete += 1;
             return true;
@@ -149,8 +156,8 @@ fn renderNode(
     try visited.put(gpa, owned_id, {});
 
     var session = state.Session.init(arena);
-    const opened = chock_proto.log.Log.open(io, path, id) catch |err| {
-        try writeMissing(writer, format, depth, id, edge, @errorName(err));
+    const opened = chock_proto.log.Log.open(io, path, id) catch {
+        try writeMissing(writer, format, depth, id, edge, .log_unreadable);
         totals.nodes += 1;
         totals.incomplete += 1;
         return true;
@@ -158,8 +165,8 @@ fn renderNode(
     var backing = chock_proto.storage.JsonLines{ .log = opened };
     const storage = backing.storage();
     defer storage.close(io);
-    var replay = storage.replay(gpa, io, 0) catch |err| {
-        try writeMissing(writer, format, depth, id, edge, @errorName(err));
+    var replay = storage.replay(gpa, io, 0) catch {
+        try writeMissing(writer, format, depth, id, edge, .log_invalid);
         totals.nodes += 1;
         totals.incomplete += 1;
         return true;
@@ -270,16 +277,17 @@ fn writeMissing(
     depth: usize,
     id: []const u8,
     edge: ParentEdge,
-    problem: []const u8,
+    problem: TreeProblem,
 ) !void {
-    const status = if (edge.outcome) |outcome| outcome.wireName() else problem;
+    const problem_name = @tagName(problem);
+    const status = if (edge.outcome) |outcome| outcome.wireName() else problem_name;
     switch (format) {
         .human => {
             try indent(writer, depth);
-            try writer.print("{s}  {s}  {s} ({s})\n", .{ id, edge.agent_kind, status, problem });
+            try writer.print("{s}  {s}  {s} ({s})\n", .{ id, edge.agent_kind, status, problemLabel(problem) });
         },
         .compact => try writer.print("{d} {s} parent={s} agent={s} status={s} problem={s}\n", .{
-            depth, id, edge.parent, edge.agent_kind, status, problem,
+            depth, id, edge.parent, edge.agent_kind, status, problem_name,
         }),
         .json => {
             try std.json.Stringify.value(JsonRow{
@@ -293,6 +301,15 @@ fn writeMissing(
             try writer.writeByte('\n');
         },
     }
+}
+
+fn problemLabel(problem: TreeProblem) []const u8 {
+    return switch (problem) {
+        .cycle => "cycle",
+        .missing_log => "missing log",
+        .log_unreadable => "unreadable log",
+        .log_invalid => "invalid log",
+    };
 }
 
 fn statusName(outcome: ?event.AgentOutcome, session: state.Session, live: bool) []const u8 {
@@ -431,5 +448,13 @@ test "an idle child without agent.complete makes the tree an audit gap" {
     defer output.deinit();
     const result = try render(arena, gpa, std.testing.io, dir, parent, .compact, &output.writer);
     try std.testing.expectEqual(Outcome.invalid, result);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "status=missing log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "status=missing_log problem=missing_log") != null);
+
+    var json: std.Io.Writer.Allocating = .init(gpa);
+    defer json.deinit();
+    try std.testing.expectEqual(
+        Outcome.invalid,
+        try render(arena, gpa, std.testing.io, dir, parent, .json, &json.writer),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, json.written(), "\"problem\":\"missing_log\"") != null);
 }

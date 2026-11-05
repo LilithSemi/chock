@@ -208,6 +208,9 @@ other row. Cost fields include the counts of priced, free, and unpriced turns,
 whether currencies were mixed, and `cost_enforceable`. Only an enforceable cost
 is a complete total that a budget check can use.
 
+The stable `problem` values are `cycle`, `missing_log`, `log_unreadable`, and
+`log_invalid`.
+
 ### What reached the model
 
 `chock sessions show <session> --only context` is the context inspection view.

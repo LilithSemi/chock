@@ -930,12 +930,14 @@ test "automation report pages name every stable status value" {
     const config_source = try root.readFileAlloc(testing.io, "src/config.zig", arena, .limited(max_source_bytes));
     const models_source = try root.readFileAlloc(testing.io, "src/models.zig", arena, .limited(max_source_bytes));
     const doctor_source = try root.readFileAlloc(testing.io, "src/doctor.zig", arena, .limited(max_source_bytes));
+    const tree_source = try root.readFileAlloc(testing.io, "src/session_tree.zig", arena, .limited(max_source_bytes));
 
     const configuration = try docText(docs, "docs/configure/configuration.md");
     const check_section = try textBetween(configuration, "For a script or configuration deployment", "## The name is the identity");
     const catalogue_section = try textBetween(configuration, "Catalogue status values are:", "## Naming a credential");
     const running = try docText(docs, "docs/running.md");
     const doctor_section = try textBetween(running, "The report verdict is", "On an installation an organisation manages");
+    const tree_section = try textBetween(running, "`chock sessions tree <session>`", "### What reached the model");
 
     var wrong: std.ArrayList(u8) = .empty;
     for (try simpleEnumFields(arena, config_source, "const CheckProblem")) |field| {
@@ -956,6 +958,11 @@ test "automation report pages name every stable status value" {
     for (try simpleEnumFields(arena, doctor_source, "const RowStatus")) |field| {
         if (!try namesInTicks(doctor_section, field, arena)) {
             try wrong.print(arena, "docs/running.md names no doctor row status `{s}`\n", .{field});
+        }
+    }
+    for (try simpleEnumFields(arena, tree_source, "const TreeProblem")) |field| {
+        if (!try namesInTicks(tree_section, field, arena)) {
+            try wrong.print(arena, "docs/running.md names no session-tree problem `{s}`\n", .{field});
         }
     }
 
