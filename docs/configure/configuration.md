@@ -3,6 +3,13 @@
 Chock reads `~/.config/chock/config.zon` and never writes it, so you can give
 the whole directory to home-manager.
 
+The exact path follows the platform configuration directory and `$XDG_CONFIG_HOME`.
+Ask Chock for it when creating or linking the file:
+
+```
+chock config path
+```
+
 Check this file without reading a credential or contacting a provider:
 
 ```

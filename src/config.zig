@@ -7,16 +7,21 @@ const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
 const usage_text =
-    \\Usage: chock config check [options]
+    \\Usage: chock config <operation> [options]
     \\
-    \\Checks ~/.config/chock/config.zon without reading a credential or contacting
-    \\a provider. The project's chock.zon is separate and is checked before a
-    \\session starts.
+    \\Inspect the user configuration without reading a credential or contacting a
+    \\provider. The project's chock.zon is separate and is checked before a session
+    \\starts.
+    \\
+    \\Operations:
+    \\  check    Check the configuration and report the selected defaults.
+    \\  path     Print the configuration path, whether or not the file exists.
     \\
 ++ tty.options_text;
 
 const Operation = enum {
     check,
+    path,
 };
 
 pub fn main(
@@ -35,7 +40,7 @@ pub fn main(
     var env = try environ.createMap(arena);
     defer env.deinit();
 
-    _ = parseOperation(args) catch |err| switch (err) {
+    const operation = parseOperation(args) catch |err| switch (err) {
         error.HelpWanted => {
             tty.out(.plain, "{s}", .{usage_text});
             return Exit.finished.code();
@@ -47,10 +52,18 @@ pub fn main(
     };
 
     const config_dir = chock_auth.paths.configDir(arena, &env) catch |err| {
-        tty.print(.err, "chock config check: the configuration directory is unknown: {t}\n", .{err});
+        tty.print(.err, "chock config {s}: the configuration directory is unknown: {t}\n", .{
+            @tagName(operation),
+            err,
+        });
         return Exit.usage.code();
     };
     const path = try std.fs.path.join(arena, &.{ config_dir, chock_auth.config.file_name });
+
+    if (operation == .path) {
+        tty.out(.plain, "{s}\n", .{path});
+        return Exit.finished.code();
+    }
 
     var diag: ?chock_auth.config.Diagnostic = null;
     defer if (diag) |*one| one.deinit(gpa);
@@ -106,6 +119,7 @@ fn report(path: []const u8, config: *const chock_auth.config.Config) void {
 
 fn parseOperation(args: []const []const u8) error{ HelpWanted, BadArguments }!Operation {
     if (args.len == 1 and std.mem.eql(u8, args[0], "check")) return .check;
+    if (args.len == 1 and std.mem.eql(u8, args[0], "path")) return .path;
     if (args.len == 1 and
         (std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h")))
     {
@@ -114,8 +128,9 @@ fn parseOperation(args: []const []const u8) error{ HelpWanted, BadArguments }!Op
     return error.BadArguments;
 }
 
-test "config takes only the check operation" {
+test "config takes the check and path operations" {
     try std.testing.expectEqual(Operation.check, try parseOperation(&.{"check"}));
+    try std.testing.expectEqual(Operation.path, try parseOperation(&.{"path"}));
     try std.testing.expectError(error.BadArguments, parseOperation(&.{}));
     try std.testing.expectError(error.BadArguments, parseOperation(&.{"show"}));
     try std.testing.expectError(error.BadArguments, parseOperation(&.{ "check", "again" }));
