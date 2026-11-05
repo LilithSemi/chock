@@ -1,7 +1,6 @@
 //! The `chock` program: CLI dispatcher over pre-built libraries.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const chock_broker = @import("chock-broker");
 const chock_core = @import("chock-core");
 const chock_proto = @import("chock-proto");
@@ -315,13 +314,7 @@ fn namesNoCommand(first: []const u8) bool {
 
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
-
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = debug_allocator.deinit();
-    const gpa = switch (builtin.mode) {
-        .Debug, .ReleaseSafe => debug_allocator.allocator(),
-        .ReleaseFast, .ReleaseSmall => std.heap.smp_allocator,
-    };
+    const gpa = init.gpa;
 
     const args = try init.minimal.args.toSlice(arena);
 
