@@ -106,19 +106,25 @@ chock doctor
 ## Getting started
 
 ```
-chock doctor                        # can this machine contain a session
-chock login --provider aiand        # store a credential
-chock login --provider openai       # sign in through the browser
+chock doctor                               # can this machine contain a session
+config_path=$(chock config path)
+mkdir -p "$(dirname "$config_path")"
+chock config example > "$config_path"     # save a local-provider starter
+chock config check                         # check it before a session
 cd ~/some-project
 chock run "add a test for the parser"
-chock -- add a test for the parser  # the same task, with no subcommand
-chock                               # the interface, which asks for the task
+chock -- add a test for the parser         # the same task, with no subcommand
+chock                                      # the interface, which asks for the task
 ```
 
 `chock doctor` tries each sandbox layer for real and says which are on.
 `chock run` names the session before it starts, and `chock run --verbose` adds
 the session log's path. Bare `chock` brings up a full screen interface and asks
 for the task in it.
+
+The starter uses a local OpenAI-compatible endpoint and needs no credential.
+Edit it when you use a remote provider. Then run `chock config check` again and
+use `chock login --provider NAME` when that provider needs a stored login.
 
 A first word is read as a command name, so a task given on the line goes after
 `--`. `chock fix the parser` is refused, because a typed `chock rnu` that
