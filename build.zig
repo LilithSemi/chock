@@ -2260,6 +2260,22 @@ pub fn build(b: *std.Build) void {
     const repo_root_options = b.addOptions();
     repo_root_options.addOption([]const u8, "repo_root", repo_root);
 
+    const command_meta_module = b.createModule(.{
+        .root_source_file = b.path("src/command_meta.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const exit_module = b.createModule(.{
+        .root_source_file = b.path("src/exit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const guest_limits_module = b.createModule(.{
+        .root_source_file = b.path("src/guest_limits.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const docs_tests = b.addTest(.{
         .use_llvm = evaluator_llvm,
         .root_module = b.createModule(.{
@@ -2267,7 +2283,9 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "chock_main", .module = chock_exe_module },
+                .{ .name = "command_meta", .module = command_meta_module },
+                .{ .name = "chock-exit", .module = exit_module },
+                .{ .name = "guest-limits", .module = guest_limits_module },
                 .{ .name = "chock-core", .module = chock_core },
                 .{ .name = "chock-policy", .module = chock_policy },
                 .{ .name = "chock-net", .module = chock_net },

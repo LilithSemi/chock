@@ -31,6 +31,7 @@ const guest_cmd = @import("guest.zig");
 const interrupt = @import("interrupt.zig");
 const tty = @import("tty.zig");
 const ui = @import("ui.zig");
+const command_meta = @import("command_meta.zig");
 
 pub const session = @import("session.zig");
 
@@ -269,6 +270,17 @@ pub const commands = [_]Command{
 };
 
 comptime {
+    if (commands.len != command_meta.entries.len) {
+        @compileError("the dispatch table and command metadata have different lengths");
+    }
+    for (commands, command_meta.entries) |entry, meta| {
+        if (!std.mem.eql(u8, entry.name, meta.name)) {
+            @compileError("the dispatch table and command metadata disagree at chock " ++ meta.name);
+        }
+        if (!std.mem.eql(u8, entry.summary, meta.summary)) {
+            @compileError("the dispatch summary for chock " ++ meta.name ++ " disagrees with command metadata");
+        }
+    }
     for (commands) |entry| {
         if (entry.run != null) continue;
         const landed = entry.landed orelse @compileError("chock " ++ entry.name ++

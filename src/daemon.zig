@@ -19,6 +19,7 @@ const workspace_cmd = @import("workspace.zig");
 const interrupt = @import("interrupt.zig");
 const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
+const guest_limits = @import("guest_limits.zig");
 
 const control = chock_proto.control;
 
@@ -1384,7 +1385,7 @@ fn releaseShares(daemon: *Daemon, room: *std.heap.ArenaAllocator) void {
     daemon.gpa.destroy(room);
 }
 
-pub const max_granted_roots: usize = run_cmd.host_toolchain_candidates.len - 1 + 6;
+pub const max_granted_roots = guest_limits.max_granted_roots;
 
 fn guestShares(
     arena: std.mem.Allocator,

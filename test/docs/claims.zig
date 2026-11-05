@@ -7,7 +7,9 @@
 //! page it was given once.
 
 const std = @import("std");
-const chock_main = @import("chock_main");
+const command_meta = @import("command_meta");
+const Exit = @import("chock-exit").Exit;
+const guest_limits = @import("guest-limits");
 const chock_core = @import("chock-core");
 const chock_policy = @import("chock-policy");
 const palisade = @import("palisade");
@@ -196,7 +198,7 @@ fn sourceHasOption(source: []const u8, option: []const u8, arena: std.mem.Alloca
 }
 
 fn isCommand(name: []const u8) bool {
-    for (chock_main.commands) |entry| {
+    for (command_meta.entries) |entry| {
         if (std.mem.eql(u8, entry.name, name)) return true;
     }
     return false;
@@ -589,7 +591,7 @@ test "every command Chock answers to is named in the documentation" {
     const docs = try loadDocs(arena, testing.io);
 
     var missing: std.ArrayList(u8) = .empty;
-    for (chock_main.commands) |entry| {
+    for (command_meta.entries) |entry| {
         const shown = try std.fmt.allocPrint(arena, "chock {s}", .{entry.name});
         var found = false;
         for (docs) |doc| {
@@ -649,7 +651,7 @@ test "the exit code table has one row for each code, with the number the code ha
         found += 1;
     }
 
-    const codes = @typeInfo(chock_main.Exit).@"enum".field_names.len;
+    const codes = @typeInfo(Exit).@"enum".field_names.len;
     if (found != codes) {
         try rows.print(arena, "docs/running.md: the table has {d} rows, and Exit has {d} members\n", .{ found, codes });
     }
@@ -955,7 +957,7 @@ test "the microVM page counts the roots a guest is granted and the offers it tak
         docs,
         "docs/security/microvm.md",
         "roots",
-        chock_main.daemon.max_granted_roots,
+        guest_limits.max_granted_roots,
         &wrong,
     );
     try checkCount(

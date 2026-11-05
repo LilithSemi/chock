@@ -34,6 +34,7 @@ const ui = @import("ui.zig");
 const Exit = @import("exit.zig").Exit;
 const exitFor = @import("main.zig").exitFor;
 const plugin_process = @import("plugin-host.zig");
+const guest_limits = @import("guest_limits.zig");
 
 const usage_text =
     \\Usage: chock run [options] [message...]
@@ -3199,18 +3200,7 @@ const Toolchain = struct {
     const Which = enum { dev_shell, image, host };
 };
 
-pub const host_toolchain_candidates: []const []const u8 = &.{
-    "/nix/store",
-    "/usr",
-    "/bin",
-    "/sbin",
-    "/lib",
-    "/lib32",
-    "/lib64",
-    "/libx32",
-    "/etc",
-    "/opt",
-};
+pub const host_toolchain_candidates = guest_limits.host_toolchain_candidates;
 
 pub fn hostToolchainPaths(
     arena: std.mem.Allocator,
