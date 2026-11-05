@@ -27,6 +27,7 @@ const approve_cmd = @import("approve.zig");
 const doctor_cmd = @import("doctor.zig");
 const askpass_cmd = @import("askpass.zig");
 const guest_cmd = @import("guest.zig");
+const interrupt = @import("interrupt.zig");
 const tty = @import("tty.zig");
 const ui = @import("ui.zig");
 
@@ -35,6 +36,27 @@ pub const session = @import("session.zig");
 pub const daemon = @import("daemon.zig");
 
 pub const std_options: std.Options = .{ .logFn = ui.logMessage };
+
+/// What `std.debug` prints a panic or a segfault through. Only the crash
+/// handler differs from the default: the terminal goes back to the shell
+/// before the report, or the display eats it.
+pub const std_options_debug_io: std.Io = .{
+    .userdata = std.Io.Threaded.global_single_threaded,
+    .vtable = &crash_vtable,
+};
+
+const crash_vtable: std.Io.VTable = vtable: {
+    var copy = debug_vtable.*;
+    copy.crashHandler = handOverTerminalThenCrash;
+    break :vtable copy;
+};
+
+const debug_vtable = std.Io.Threaded.global_single_threaded.io().vtable;
+
+fn handOverTerminalThenCrash(userdata: ?*anyopaque) void {
+    interrupt.handOverTerminal();
+    debug_vtable.crashHandler(userdata);
+}
 
 pub const version = @import("chock-version").text;
 

@@ -60,6 +60,17 @@ pub fn restoreBytesIfArmed() ?[]const u8 {
     return restore_bytes;
 }
 
+var restore_fd: std.atomic.Value(i32) = .init(std.posix.STDOUT_FILENO);
+
+pub fn restoreToForTest(fd: std.posix.fd_t) std.posix.fd_t {
+    return restore_fd.swap(fd, .monotonic);
+}
+
+fn writeRestoreIfArmed() void {
+    const bytes = restoreBytesIfArmed() orelse return;
+    _ = std.posix.system.write(restore_fd.load(.monotonic), bytes.ptr, bytes.len);
+}
+
 var stop_asked: std.atomic.Value(bool) = .init(false);
 threadlocal var scoped_stop: ?*const std.atomic.Value(bool) = null;
 
@@ -101,9 +112,7 @@ pub fn install() void {
 fn onSignal(sig: std.posix.SIG) callconv(.c) void {
     if (stop_asked.swap(true, .monotonic)) {
         chock_core.tools.cancelRunningTool();
-        if (restoreBytesIfArmed()) |bytes| {
-            _ = std.posix.system.write(std.posix.STDOUT_FILENO, bytes.ptr, bytes.len);
-        }
+        writeRestoreIfArmed();
         restoreTerminalSettings();
         // Restores the default handler and re-raises, so the process ends exactly as it would have with no handler installed.
         const default = std.posix.Sigaction{
@@ -117,6 +126,14 @@ fn onSignal(sig: std.posix.SIG) callconv(.c) void {
     }
     tty.noteScroll();
     _ = std.posix.system.write(message_fd.load(.monotonic), first_message.ptr, first_message.len);
+}
+
+/// Hand the terminal back. The display leaves the screen on the alternate
+/// buffer in raw mode, which turns a panic report into unreadable rubble.
+pub fn handOverTerminal() void {
+    if (builtin.os.tag == .windows) return;
+    writeRestoreIfArmed();
+    restoreTerminalSettings();
 }
 
 const testing = std.testing;
@@ -207,6 +224,34 @@ test "a terminated session is asked to stop the same way an interrupted one is" 
     defer gpa.free(line);
     try testing.expectEqualStrings(first_message, line);
     forgetForTest();
+}
+
+test "a crash hands the terminal back, and says nothing when no display holds it" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    disarmTerminalRestore();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: [std.fs.max_path_bytes]u8 = undefined;
+    const at = try tmp.dir.realPath(io, &dir);
+    var named: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&named, "{s}/gave-back", .{dir[0..at]});
+
+    const file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    const was = restoreToForTest(file.handle);
+    defer _ = restoreToForTest(was);
+
+    handOverTerminal();
+
+    armTerminalRestore();
+    defer disarmTerminalRestore();
+    handOverTerminal();
+    file.close(io);
+
+    const written = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4096));
+    defer gpa.free(written);
+    try testing.expectEqualStrings(restore_bytes, written);
 }
 
 test "a worker stop is scoped to its thread" {
