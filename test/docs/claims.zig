@@ -11,6 +11,7 @@ const command_meta = @import("command_meta");
 const Exit = @import("chock-exit").Exit;
 const guest_limits = @import("guest-limits");
 const chock_core = @import("chock-core");
+const chock_auth = @import("chock-auth");
 const chock_policy = @import("chock-policy");
 const palisade = @import("palisade");
 const chock_net = @import("chock-net");
@@ -1204,6 +1205,42 @@ fn zonBlocksIn(arena: std.mem.Allocator, doc: Doc) ![]const Span {
         try body.append(arena, '\n');
     }
     return out.items;
+}
+
+test "the complete user configuration example parses" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    const page = Doc{
+        .path = "docs/configure/configuration.md",
+        .text = try docText(docs, "docs/configure/configuration.md"),
+    };
+    var wrong: std.ArrayList(u8) = .empty;
+    var checked: usize = 0;
+    for (try zonBlocksIn(arena, page)) |block| {
+        if (std.mem.indexOf(u8, block.text, ".providers") == null or
+            std.mem.indexOf(u8, block.text, ".defaults") == null) continue;
+        checked += 1;
+
+        const source = try arena.dupeSentinel(u8, block.text, 0);
+        var diag: ?chock_auth.config.Diagnostic = null;
+        var config = chock_auth.config.parse(gpa, source, &diag) catch |err| {
+            defer if (diag) |*one| one.deinit(gpa);
+            if (diag) |*one| {
+                try wrong.print(arena, "{s}:{d}: {f}\n", .{ block.doc, block.line, one });
+            } else {
+                try wrong.print(arena, "{s}:{d}: {t}\n", .{ block.doc, block.line, err });
+            }
+            continue;
+        };
+        config.deinit();
+    }
+
+    if (checked == 0) try wrong.appendSlice(arena, "no complete user configuration example was found\n");
+    try testing.expectEqualStrings("", wrong.items);
 }
 
 test "the microVM page counts the roots a guest is granted and the offers it takes" {

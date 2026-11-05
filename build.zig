@@ -2293,6 +2293,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "chock-exit", .module = exit_module },
                 .{ .name = "guest-limits", .module = guest_limits_module },
                 .{ .name = "chock-core", .module = chock_core },
+                .{ .name = "chock-auth", .module = chock_auth },
                 .{ .name = "chock-policy", .module = chock_policy },
                 .{ .name = "chock-net", .module = chock_net },
                 .{ .name = "palisade", .module = palisade },
