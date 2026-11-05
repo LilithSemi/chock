@@ -148,6 +148,19 @@ const Sandbox = struct {
         self.env.deinit();
         self.tmp.cleanup();
     }
+
+    fn writeConfig(self: *const Sandbox, gpa: std.mem.Allocator, io: std.Io, contents: []const u8) !void {
+        const config_dir = try std.fmt.allocPrint(gpa, "{s}/chock", .{self.root});
+        defer gpa.free(config_dir);
+        try std.Io.Dir.cwd().createDirPath(io, config_dir);
+        const config_path = try std.fmt.allocPrint(gpa, "{s}/config.zon", .{config_dir});
+        defer gpa.free(config_path);
+        var file = try std.Io.Dir.createFileAbsolute(io, config_path, .{
+            .permissions = .fromMode(0o600),
+        });
+        defer file.close(io);
+        try file.writeStreamingAll(io, contents);
+    }
 };
 
 /// Read back out of the program's own message, rather than a second copy of `session.projectKey`.
@@ -319,11 +332,6 @@ test "a JSON model probe stays one document and reports the sorted remote catalo
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
     var base_buffer: [96]u8 = undefined;
-    const config_dir = try std.fmt.allocPrint(gpa, "{s}/chock", .{box.root});
-    defer gpa.free(config_dir);
-    try std.Io.Dir.cwd().createDirPath(io, config_dir);
-    const config_path = try std.fmt.allocPrint(gpa, "{s}/config.zon", .{config_dir});
-    defer gpa.free(config_path);
     const config = try std.fmt.allocPrint(gpa,
         \\.{{
         \\    .providers = .{{
@@ -335,13 +343,7 @@ test "a JSON model probe stays one document and reports the sorted remote catalo
         \\
     , .{provider.baseUrl(&base_buffer)});
     defer gpa.free(config);
-    {
-        var config_file = try std.Io.Dir.createFileAbsolute(io, config_path, .{
-            .permissions = .fromMode(0o600),
-        });
-        defer config_file.close(io);
-        try config_file.writeStreamingAll(io, config);
-    }
+    try box.writeConfig(gpa, io, config);
 
     var models = try runChock(gpa, io, &box.env, &.{ "models", "--probe", "--format", "json" });
     defer models.deinit(gpa);
@@ -374,11 +376,6 @@ test "a failed JSON model probe returns a document and a fault exit" {
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
-    const config_dir = try std.fmt.allocPrint(gpa, "{s}/chock", .{box.root});
-    defer gpa.free(config_dir);
-    try std.Io.Dir.cwd().createDirPath(io, config_dir);
-    const config_path = try std.fmt.allocPrint(gpa, "{s}/config.zon", .{config_dir});
-    defer gpa.free(config_path);
     const config = try std.fmt.allocPrint(gpa,
         \\.{{
         \\    .providers = .{{
@@ -390,13 +387,7 @@ test "a failed JSON model probe returns a document and a fault exit" {
         \\
     , .{port});
     defer gpa.free(config);
-    {
-        var config_file = try std.Io.Dir.createFileAbsolute(io, config_path, .{
-            .permissions = .fromMode(0o600),
-        });
-        defer config_file.close(io);
-        try config_file.writeStreamingAll(io, config);
-    }
+    try box.writeConfig(gpa, io, config);
 
     var models = try runChock(gpa, io, &box.env, &.{ "models", "--probe", "--format", "json" });
     defer models.deinit(gpa);
@@ -558,18 +549,8 @@ const Project = struct {
         // `Sandbox` builds its environment from nothing, so the workspace builder would find no `git`.
         try box.env.put("PATH", std.fs.path.dirname(git_path) orelse "/usr/bin");
 
-        const config_dir = try std.fmt.allocPrint(gpa, "{s}/chock", .{box.root});
-        defer gpa.free(config_dir);
-        try std.Io.Dir.cwd().createDirPath(io, config_dir);
-
-        const config_path = try std.fmt.allocPrint(gpa, "{s}/config.zon", .{config_dir});
-        defer gpa.free(config_path);
         // Readable by nobody else, which `chock-auth` insists on for a token.
-        var file = try std.Io.Dir.createFileAbsolute(io, config_path, .{ .permissions = @fromBackingInt(@intCast(0o600)) });
-        defer file.close(io);
-        var buffer: [512]u8 = undefined;
-        var writer = file.writerStreaming(io, &buffer);
-        try writer.interface.print(
+        const config = try std.fmt.allocPrint(gpa,
             \\.{{
             \\    .providers = .{{
             \\        .{{ .name = "dead", .kind = "openai-compat", .base_url = "{s}",
@@ -579,7 +560,8 @@ const Project = struct {
             \\}}
             \\
         , .{provider_url});
-        try writer.interface.flush();
+        defer gpa.free(config);
+        try box.writeConfig(gpa, io, config);
 
         const path = try std.fmt.allocPrint(gpa, "{s}/project", .{box.root});
         errdefer gpa.free(path);
