@@ -628,6 +628,27 @@ test "the documentation does not repeat a known misspelling of Chock" {
     try testing.expectEqualStrings("", wrong.items);
 }
 
+test "the README names the declared Zig toolchain" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{});
+    defer root.close(testing.io);
+    const manifest = try root.readFileAlloc(testing.io, "build.zig.zon", arena, .limited(max_doc_bytes));
+
+    const prefix = ".minimum_zig_version = \"";
+    const start = (std.mem.indexOf(u8, manifest, prefix) orelse return error.MissingZigVersion) + prefix.len;
+    const end = std.mem.indexOfScalarPos(u8, manifest, start, '"') orelse return error.MissingZigVersion;
+    const full = manifest[start..end];
+    const second_dot = std.mem.indexOfScalarPos(u8, full, (std.mem.indexOfScalar(u8, full, '.') orelse return error.MissingZigVersion) + 1, '.') orelse return error.MissingZigVersion;
+    const documented = try std.fmt.allocPrint(arena, "Zig {s}", .{full[0..second_dot]});
+
+    const readme = try docText(docs, "README.md");
+    try testing.expect(std.mem.indexOf(u8, readme, documented) != null);
+}
+
 test "the exit code table has one row for each code, with the number the code has" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

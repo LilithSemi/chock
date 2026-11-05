@@ -3,7 +3,7 @@
 Chock is a sandbox first AI coding harness. It runs a coding agent inside the
 operating system's own sandbox, in a throwaway copy of your project, and it
 writes every turn to a session log you can read afterwards. Chock is written in
-Zig 0.16 and builds with `zig build`.
+Zig 0.17 and builds with `zig build`.
 
 ## Why
 

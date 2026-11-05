@@ -2,7 +2,7 @@
     .name = .chock,
     .version = "0.1.0-unstable",
     .fingerprint = 0x311929c57e1c1728,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .vulcan = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan#7a60777bb2d90634da2ae665766371376d9d49ec",
