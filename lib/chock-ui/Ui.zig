@@ -1626,7 +1626,7 @@ pub const Ui = struct {
         self.pending.appendSlice(self.gpa, rest) catch {};
     }
 
-    fn sayFmt(self: *Ui, voice: model.Voice, comptime fmt: []const u8, args: anytype) void {
+    pub fn sayFmt(self: *Ui, voice: model.Voice, comptime fmt: []const u8, args: anytype) void {
         var buffer: [shown_line_bytes + 128]u8 = undefined;
         const said = std.fmt.bufPrint(&buffer, fmt, args) catch said: {
             @memset(buffer[buffer.len - 3 ..], '.');

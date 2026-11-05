@@ -12235,7 +12235,19 @@ fn runSession(
                 });
                 return .audit_gap;
             },
-            else => return err,
+            else => |one| {
+                // A fault is the end of the turn. It is the end of the program
+                // only when nobody is there to read it, which is `chock run`.
+                const watching = screen orelse return one;
+                turns += 1;
+                noteTurnFault(gpa, io, started.storage, one) catch |kept| {
+                    tty.print(.warn, "chock: the fault could not be written to the log: {t}\n", .{kept});
+                };
+                watching.sayFmt(.chock, "this turn ended early: {s}", .{@errorName(one)});
+                watching.endLine();
+                if (interrupt.requested()) break;
+                continue;
+            },
         };
         const ending = try finalEnding(gpa, io, started.storage);
         _ = chock_workspace.checkpoint.save(
@@ -12317,9 +12329,13 @@ fn reconcileTaskReceipts(
     }
 }
 
+/// Whether the interface asks for another message. The human reading the screen
+/// is the one who decides a session is over, so every way a session can end is
+/// a thing to read and answer. A handover is the exception, because the daemon
+/// owns the session from then on.
 fn keepAsking(ending: Exit, interrupted: bool) bool {
     if (interrupted) return false;
-    return ending == .finished;
+    return ending != .handed_over;
 }
 
 fn finalExit(gpa: std.mem.Allocator, io: std.Io, storage: chock_proto.storage.Storage) !Exit {
@@ -12932,6 +12948,27 @@ fn appendUserMessage(
         gpa,
         io,
         .{ .message = .{ .role = .user, .content = &content } },
+        std.Io.Timestamp.now(io, .real).toMilliseconds(),
+    );
+}
+
+/// Write the fault into the session log. A turn that threw appended no ending
+/// of its own, and a log that stops in the middle of a turn says nothing about
+/// why the next message starts a new one.
+fn noteTurnFault(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    err: anyerror,
+) !void {
+    var locked = try storage.lock(io);
+    defer locked.unlock(io) catch {};
+    const detail = try std.fmt.allocPrint(gpa, "the turn ended with {s}", .{@errorName(err)});
+    defer gpa.free(detail);
+    _ = try locked.append(
+        gpa,
+        io,
+        .{ .session_end = .{ .reason = .errored, .detail = detail } },
         std.Io.Timestamp.now(io, .real).toMilliseconds(),
     );
 }
@@ -19134,12 +19171,37 @@ const AllowEverything = struct {
     }
 };
 
-test "the interface asks again after a turn that finished, and after nothing else" {
-    try testing.expect(keepAsking(.finished, false));
+test "a turn that faulted leaves an ending the interface can read, so the next message is a new turn" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
 
-    try testing.expect(!keepAsking(.finished, true));
+    var backing = try chock_proto.storage.Memory.init(gpa, "01TURNFAULT000000000000000");
+    const storage = backing.storage();
+    defer storage.close(io);
 
+    try noteTurnFault(gpa, io, storage, error.MountTreeFailed);
+
+    const ending = try finalEnding(gpa, io, storage);
+    try testing.expectEqual(Exit.faulted, ending.exit);
+    try testing.expect(keepAsking(ending.exit, false));
+
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    var said: ?[]const u8 = null;
+    var buffer: [128]u8 = undefined;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .session_end) continue;
+        const detail = parsed.value.event.session_end.detail;
+        @memcpy(buffer[0..detail.len], detail);
+        said = buffer[0..detail.len];
+    }
+    try testing.expectEqualStrings("the turn ended with MountTreeFailed", said.?);
+}
+
+test "the interface asks again after every ending but a handover, and never after an interrupt" {
     for ([_]Exit{
+        .finished,
         .usage,
         .faulted,
         .refused,
@@ -19147,11 +19209,17 @@ test "the interface asks again after a turn that finished, and after nothing els
         .not_implemented,
         .no_progress,
         .budget,
-        .handed_over,
+        .audit_gap,
+        .empty_response,
+        .model_refused,
+        .rate_limited,
     }) |ending| {
-        try testing.expect(!keepAsking(ending, false));
+        try testing.expect(keepAsking(ending, false));
         try testing.expect(!keepAsking(ending, true));
     }
+
+    try testing.expect(!keepAsking(.handed_over, false));
+    try testing.expect(!keepAsking(.handed_over, true));
 }
 
 fn writeBundle(gpa: std.mem.Allocator, dir: std.Io.Dir, name: []const u8, source: []const u8) ![]u8 {
