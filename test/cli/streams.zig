@@ -177,6 +177,29 @@ test "the documented configuration starter passes the real CLI check" {
         default_provider: ?[]const u8,
         default_model: ?[]const u8,
     };
+    const ModelReport = struct {
+        const Provider = struct {
+            const Capabilities = struct {
+                text: bool,
+                tools: bool,
+                reasoning: bool,
+                cache_accounting: bool,
+                provider_search: bool,
+                images: bool,
+            };
+
+            name: []const u8,
+            kind: []const u8,
+            is_default: bool,
+            default_model: ?[]const u8,
+            context_tokens: ?u64,
+            capabilities: Capabilities,
+        };
+
+        default_provider: ?[]const u8,
+        default_model: ?[]const u8,
+        providers: []const Provider,
+    };
 
     var box = try Sandbox.init(gpa, io);
     defer box.deinit(gpa);
@@ -240,6 +263,20 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expectEqual(@as(usize, 1), parsed.value.provider_instances);
     try testing.expectEqualStrings("local", parsed.value.default_provider.?);
     try testing.expectEqualStrings("glm4.7-flash:A3B", parsed.value.default_model.?);
+
+    var models = try runChock(gpa, io, &box.env, &.{ "models", "--format", "json" });
+    defer models.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), models.code);
+    try testing.expectEqualStrings("", models.err);
+    const model_report = try std.json.parseFromSlice(ModelReport, gpa, models.out, .{});
+    defer model_report.deinit();
+    try testing.expectEqualStrings("local", model_report.value.default_provider.?);
+    try testing.expectEqualStrings("glm4.7-flash:A3B", model_report.value.default_model.?);
+    try testing.expectEqual(@as(usize, 1), model_report.value.providers.len);
+    try testing.expectEqualStrings("local", model_report.value.providers[0].name);
+    try testing.expect(model_report.value.providers[0].is_default);
+    try testing.expect(model_report.value.providers[0].capabilities.text);
+    try testing.expect(std.mem.indexOf(u8, models.out, "127.0.0.1") == null);
 
     var conflict = try runChock(gpa, io, &box.env, &.{
         "login", "--provider", "aiand", "--name", "local", "--password-method", "stdin",

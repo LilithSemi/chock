@@ -22,12 +22,20 @@ const usage_text =
     \\Options:
     \\  --provider <name>  Show one configured provider instance.
     \\  --probe             Read credentials and query provider model catalogues.
+    \\  --format <kind>     human (default) or json. JSON is offline and cannot be
+    \\                      combined with --probe.
     \\
 ++ tty.options_text;
+
+const Format = enum {
+    human,
+    json,
+};
 
 const Options = struct {
     provider: ?[]const u8 = null,
     probe: bool = false,
+    format: Format = .human,
 };
 
 pub fn main(
@@ -79,6 +87,19 @@ pub fn main(
     };
     defer config.deinit();
 
+    const selected = if (options.provider) |name|
+        config.find(name) orelse {
+            tty.print(.err, "chock models: the configuration names no provider called \"{s}\"\n", .{name});
+            return Exit.usage.code();
+        }
+    else
+        null;
+
+    if (options.format == .json) {
+        try reportJson(arena, &config, selected);
+        return Exit.finished.code();
+    }
+
     const data_dir = if (options.probe)
         chock_auth.paths.dataDir(arena, &env) catch |err| {
             tty.print(.err, "chock models: the credential directory is unknown: {t}\n", .{err});
@@ -93,11 +114,7 @@ pub fn main(
     };
     const store = chock_auth.store.Store{ .data_dir = data_dir, .secrets = driver.secrets() };
 
-    if (options.provider) |name| {
-        const instance = config.find(name) orelse {
-            tty.print(.err, "chock models: the configuration names no provider called \"{s}\"\n", .{name});
-            return Exit.usage.code();
-        };
+    if (selected) |instance| {
         describe(instance, &config);
         if (!options.probe) return Exit.finished.code();
         return if (try probe(gpa, io, config_dir, store, instance))
@@ -118,6 +135,74 @@ pub fn main(
         if (options.probe and !try probe(gpa, io, config_dir, store, instance)) probe_failed = true;
     }
     return if (probe_failed) Exit.faulted.code() else Exit.finished.code();
+}
+
+const CapabilityReport = struct {
+    text: bool = true,
+    tools: bool,
+    reasoning: bool,
+    cache_accounting: bool,
+    provider_search: bool,
+    images: bool,
+};
+
+const ProviderReport = struct {
+    name: []const u8,
+    kind: []const u8,
+    is_default: bool,
+    default_model: ?[]const u8,
+    context_tokens: ?u64,
+    capabilities: CapabilityReport,
+};
+
+const ModelsReport = struct {
+    default_provider: ?[]const u8,
+    default_model: ?[]const u8,
+    providers: []const ProviderReport,
+};
+
+fn reportJson(
+    arena: std.mem.Allocator,
+    config: *const chock_auth.config.Config,
+    selected: ?chock_auth.config.Instance,
+) !void {
+    const count: usize = if (selected == null) config.instances.len else 1;
+    const providers = try arena.alloc(ProviderReport, count);
+    defer arena.free(providers);
+    if (selected) |instance| {
+        providers[0] = providerReport(instance, config);
+    } else {
+        for (config.instances, providers) |instance, *report| report.* = providerReport(instance, config);
+    }
+    const encoded = try std.json.Stringify.valueAlloc(arena, ModelsReport{
+        .default_provider = config.default_provider,
+        .default_model = config.default_model,
+        .providers = providers,
+    }, .{});
+    defer arena.free(encoded);
+    tty.out(.plain, "{s}\n", .{encoded});
+}
+
+fn providerReport(
+    instance: chock_auth.config.Instance,
+    config: *const chock_auth.config.Config,
+) ProviderReport {
+    const is_default = isDefault(instance, config);
+    const features = adapterFor(instance.kind).features();
+    return .{
+        .name = instance.name,
+        .kind = instance.kind.wireName(),
+        .is_default = is_default,
+        .default_model = if (is_default) config.default_model else null,
+        .context_tokens = instance.context_tokens,
+        .capabilities = .{
+            .tools = features.tool_calls,
+            .reasoning = features.reasoning,
+            .cache_accounting = features.cache_accounting,
+            .provider_search = features.provider_search,
+            .images = features.image_results and instance.capabilities.images,
+        },
+    };
 }
 
 fn probe(
@@ -275,10 +360,7 @@ fn probe(
 }
 
 fn describe(instance: chock_auth.config.Instance, config: *const chock_auth.config.Config) void {
-    const is_default = if (config.defaultInstance()) |chosen|
-        std.mem.eql(u8, chosen.name, instance.name)
-    else
-        false;
+    const is_default = isDefault(instance, config);
     const adapter = adapterFor(instance.kind);
     const features = adapter.features();
 
@@ -307,6 +389,11 @@ fn describe(instance: chock_auth.config.Instance, config: *const chock_auth.conf
     }
 }
 
+fn isDefault(instance: chock_auth.config.Instance, config: *const chock_auth.config.Config) bool {
+    const chosen = config.defaultInstance() orelse return false;
+    return std.mem.eql(u8, chosen.name, instance.name);
+}
+
 fn adapterFor(kind: chock_auth.config.Kind) chock_provider.Client.Adapter {
     return switch (kind) {
         .anthropic => .anthropic,
@@ -317,6 +404,7 @@ fn adapterFor(kind: chock_auth.config.Kind) chock_provider.Client.Adapter {
 
 fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Options {
     var options = Options{};
+    var format_set = false;
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const argument = args[index];
@@ -332,8 +420,20 @@ fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Opti
             options.probe = true;
             continue;
         }
+        if (std.mem.eql(u8, argument, "--format")) {
+            index += 1;
+            if (index >= args.len or format_set) return error.BadArguments;
+            format_set = true;
+            if (std.mem.eql(u8, args[index], "human")) continue;
+            if (std.mem.eql(u8, args[index], "json")) {
+                options.format = .json;
+                continue;
+            }
+            return error.BadArguments;
+        }
         return error.BadArguments;
     }
+    if (options.probe and options.format == .json) return error.BadArguments;
     return options;
 }
 
@@ -341,9 +441,14 @@ test "model options select at most one provider" {
     try std.testing.expect((try parseOptions(&.{})).provider == null);
     try std.testing.expectEqualStrings("local", (try parseOptions(&.{ "--provider", "local" })).provider.?);
     try std.testing.expect((try parseOptions(&.{"--probe"})).probe);
+    try std.testing.expectEqual(Format.json, (try parseOptions(&.{ "--format", "json" })).format);
+    try std.testing.expectEqual(Format.json, (try parseOptions(&.{ "--provider", "local", "--format", "json" })).format);
     try std.testing.expectError(error.BadArguments, parseOptions(&.{"--provider"}));
     try std.testing.expectError(error.BadArguments, parseOptions(&.{ "--provider", "a", "--provider", "b" }));
     try std.testing.expectError(error.BadArguments, parseOptions(&.{ "--probe", "--probe" }));
+    try std.testing.expectError(error.BadArguments, parseOptions(&.{ "--format", "json", "--probe" }));
+    try std.testing.expectError(error.BadArguments, parseOptions(&.{ "--format", "yaml" }));
+    try std.testing.expectError(error.BadArguments, parseOptions(&.{ "--format", "human", "--format", "json" }));
     try std.testing.expectError(error.BadArguments, parseOptions(&.{"local"}));
     try std.testing.expectError(error.HelpWanted, parseOptions(&.{"--help"}));
 }
@@ -381,6 +486,47 @@ test "a model description reports effective features without credential material
     try std.testing.expect(std.mem.indexOf(u8, output, "65536 tokens") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "tools") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "images") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "never-print-this") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "127.0.0.1") == null);
+}
+
+test "the JSON model report is structured and contains no connection or credential material" {
+    const gpa = std.testing.allocator;
+    var config = try chock_auth.config.parse(gpa,
+        \\.{
+        \\    .providers = .{
+        \\        .{ .name = "local", .kind = "openai-compat",
+        \\           .base_url = "http://127.0.0.1:5000/v1",
+        \\           .token = "never-print-this",
+        \\           .context_tokens = 65536,
+        \\           .capabilities = .{ .images = true } },
+        \\        .{ .name = "work", .kind = "openai" },
+        \\    },
+        \\    .defaults = .{ .provider = "local", .model = "test-model" },
+        \\}
+    , null);
+    defer config.deinit();
+
+    var capture: tty.Capture = undefined;
+    capture.start(std.testing.io, gpa);
+    defer capture.stop(std.testing.io);
+
+    try reportJson(gpa, &config, null);
+    const output = capture.out();
+    const parsed = try std.json.parseFromSlice(ModelsReport, gpa, output, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("local", parsed.value.default_provider.?);
+    try std.testing.expectEqualStrings("test-model", parsed.value.default_model.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.providers.len);
+    try std.testing.expectEqualStrings("local", parsed.value.providers[0].name);
+    try std.testing.expectEqualStrings("openai-compat", parsed.value.providers[0].kind);
+    try std.testing.expect(parsed.value.providers[0].is_default);
+    try std.testing.expectEqual(@as(?u64, 65536), parsed.value.providers[0].context_tokens);
+    try std.testing.expect(parsed.value.providers[0].capabilities.text);
+    try std.testing.expect(parsed.value.providers[0].capabilities.images);
+    try std.testing.expect(!parsed.value.providers[0].capabilities.provider_search);
+    try std.testing.expect(parsed.value.providers[1].capabilities.provider_search);
     try std.testing.expect(std.mem.indexOf(u8, output, "never-print-this") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "127.0.0.1") == null);
 }
