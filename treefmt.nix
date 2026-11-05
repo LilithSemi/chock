@@ -7,8 +7,12 @@
     nixfmt.enable = true;
     shellcheck = {
       enable = true;
-      # Release scripts intentionally have command names without extensions.
-      includes = [ ".github/scripts/*" ];
+      # Release scripts and the root direnv file intentionally have names
+      # without shell extensions.
+      includes = [
+        ".envrc"
+        ".github/scripts/*"
+      ];
     };
     zig.enable = true;
   };
