@@ -46,6 +46,9 @@ pub const Nix = struct {
     max_session_bytes: ?u64 = null,
     /// The attribute under `devShells.<system>`. Null is `default`.
     dev_shell: ?[]const u8 = null,
+    /// Installables every session of this project gets, as `nixpkgs#zig_0_17`.
+    /// A bare name is an attribute of the default registry.
+    packages: ?[]const []const u8 = null,
     provenance: ?Provenance = null,
 };
 
@@ -55,6 +58,7 @@ pub const Resolved = struct {
     max_object_bytes_from_org: bool = false,
     max_session_bytes_from_org: bool = false,
     dev_shell: ?[]const u8 = null,
+    packages: ?[]const []const u8 = null,
     provenance: ?Provenance = null,
 };
 
@@ -63,6 +67,7 @@ pub fn foldLayers(project: Nix, operator: Nix, ceiling: ?Ceiling) Resolved {
         .max_object_bytes = project.max_object_bytes orelse operator.max_object_bytes orelse default_max_object_bytes,
         .max_session_bytes = project.max_session_bytes orelse operator.max_session_bytes orelse default_max_session_bytes,
         .dev_shell = project.dev_shell orelse operator.dev_shell,
+        .packages = project.packages orelse operator.packages,
         .provenance = project.provenance orelse operator.provenance,
     };
     return underCeiling(resolved, ceiling);
@@ -110,6 +115,10 @@ pub const Diagnostic = struct {
         dev_shell_not_a_string,
         dev_shell_empty,
         dev_shell_has_hash: []const u8,
+        packages_not_a_list,
+        packages_too_many,
+        packages_entry_not_a_string: usize,
+        packages_entry_empty: usize,
         provenance_not_a_struct,
         provenance_unknown_field: []const u8,
         provenance_required_not_a_bool,
@@ -195,6 +204,22 @@ pub const Diagnostic = struct {
                 "{s}: the nix block's dev_shell field holds \"{s}\". A # separates the flake from " ++
                     "the attribute, so the name cannot hold one",
                 .{ self.source, name },
+            ),
+            .packages_not_a_list => try writer.print(
+                "{s}: the nix block's packages field must hold a list of installables",
+                .{self.source},
+            ),
+            .packages_too_many => try writer.print(
+                "{s}: the nix block's packages field holds more than {d} installables",
+                .{ self.source, max_packages },
+            ),
+            .packages_entry_not_a_string => |at| try writer.print(
+                "{s}: entry {d} of the nix block's packages field is not a string",
+                .{ self.source, at },
+            ),
+            .packages_entry_empty => |at| try writer.print(
+                "{s}: entry {d} of the nix block's packages field is empty, and an installable cannot be",
+                .{ self.source, at },
             ),
             .provenance_not_a_struct => try writer.print(
                 "{s}: the nix block's provenance field must hold a struct literal",
@@ -320,6 +345,8 @@ fn parseFields(
                     nix.max_session_bytes = try readBytes(gpa, zoir, "max_session_bytes", value_node, source_name, diag);
                 } else if (std.mem.eql(u8, name, "dev_shell")) {
                     nix.dev_shell = try readDevShell(gpa, zoir, value_node, source_name, diag);
+                } else if (std.mem.eql(u8, name, "packages")) {
+                    nix.packages = try readPackages(gpa, zoir, value_node, source_name, diag);
                 } else if (std.mem.eql(u8, name, "provenance")) {
                     nix.provenance = try readProvenance(gpa, zoir, value_node, source_name, diag);
                 } else {
@@ -425,6 +452,56 @@ fn readNames(
         };
         if (text.len == 0) {
             _ = note(diag, source_name, .{ .provenance_entry_empty = .{ .field = field, .at = at } });
+            return error.InvalidNix;
+        }
+        try out.append(gpa, try gpa.dupe(u8, text));
+    }
+
+    return out.toOwnedSlice(gpa);
+}
+
+pub const max_packages: usize = 32;
+
+/// The installables `.nix.packages` names. Each one is a flake reference with
+/// an attribute, as `nixpkgs#zig_0_17`, or a bare attribute of the default
+/// registry. Unlike `dev_shell`, a foreign flake is the point of the field.
+fn readPackages(
+    gpa: std.mem.Allocator,
+    zoir: std.zig.Zoir,
+    node: std.zig.Zoir.Node.Index,
+    source_name: []const u8,
+    diag: ?*?Diagnostic,
+) ParseError![]const []const u8 {
+    const items = switch (node.get(&zoir)) {
+        .empty_literal => return &.{},
+        .array_literal => |list| list,
+        else => {
+            _ = note(diag, source_name, .packages_not_a_list);
+            return error.InvalidNix;
+        },
+    };
+
+    if (items.len > max_packages) {
+        _ = note(diag, source_name, .packages_too_many);
+        return error.InvalidNix;
+    }
+
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |one| gpa.free(one);
+        out.deinit(gpa);
+    }
+
+    for (0..items.len) |at| {
+        const text = switch (items.at(@intCast(at)).get(&zoir)) {
+            .string_literal => |text| text,
+            else => {
+                _ = note(diag, source_name, .{ .packages_entry_not_a_string = at });
+                return error.InvalidNix;
+            },
+        };
+        if (text.len == 0) {
+            _ = note(diag, source_name, .{ .packages_entry_empty = at });
             return error.InvalidNix;
         }
         try out.append(gpa, try gpa.dupe(u8, text));
@@ -924,4 +1001,35 @@ test "the project's provenance block wins over the operator's, as every other fi
 
     const neither = foldLayers(.{}, .{}, null);
     try testing.expectEqual(@as(?Provenance, null), neither.provenance);
+}
+
+test "packages names installables, and a foreign flake is what they are for" {
+    const gpa = testing.allocator;
+
+    const named = try parse(gpa, ".{ .nix = .{ .packages = .{ \"nixpkgs#zig_0_17\", \"ripgrep\" } } }", null);
+    defer {
+        for (named.packages.?) |one| gpa.free(one);
+        gpa.free(named.packages.?);
+    }
+    try testing.expectEqual(@as(usize, 2), named.packages.?.len);
+    try testing.expectEqualStrings("nixpkgs#zig_0_17", named.packages.?[0]);
+    try testing.expectEqualStrings("ripgrep", named.packages.?[1]);
+
+    const quiet = try parse(gpa, ".{ .nix = .{ .dev_shell = \"ci\" } }", null);
+    defer gpa.free(quiet.dev_shell.?);
+    try testing.expectEqual(@as(?[]const []const u8, null), quiet.packages);
+
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidNix,
+        parse(gpa, ".{ .nix = .{ .packages = .{ \"\" } } }", &diag),
+    );
+    try testing.expectEqual(
+        Diagnostic.Fault.packages_entry_empty,
+        std.meta.activeTag(diag.?.fault),
+    );
+
+    const operator_only = foldLayers(.{}, .{ .packages = &.{"ripgrep"} }, null);
+    try testing.expectEqual(@as(usize, 1), operator_only.packages.?.len);
 }

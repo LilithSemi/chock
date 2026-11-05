@@ -55,6 +55,10 @@ const usage_text =
     \\                      needs no flake.nix in the project. Defaults to
     \\                      .nix.dev_shell, and to what `nix develop` takes when
     \\                      neither names one.
+    \\  --with <package>    Put this package in the session's toolchain, as
+    \\                      nixpkgs#zig_0_17 or a bare name in the default
+    \\                      registry. It is built with nix before the session
+    \\                      starts. Repeatable, and added to .nix.packages.
     \\  --policy-rule <r>   One policy rule, written <action>=<decision>. It
     \\                      answers instead of the project's chock.zon, and the
     \\                      org bundle still holds it. Repeatable.
@@ -124,6 +128,7 @@ const Options = struct {
     instructions: []const []const u8 = &.{},
     max_turns: ?usize = null,
     dev_shell: ?[]const u8 = null,
+    packages: []const []const u8 = &.{},
     policy_rules: []const chock_policy.table.Rule = &.{},
     continue_newest: bool = false,
     adopt: bool = false,
@@ -773,6 +778,9 @@ const Started = struct {
     guidance: chock_core.guidance.Found,
     hooks: []const chock_core.hooks.Hook,
     tool_env: *std.process.Environ.Map,
+    /// The packages a person named, already built. Every session mounts them
+    /// and puts their bin directories on the tool PATH.
+    packages: []const chock_nix.provision.Provided = &.{},
     provisioning: ?Provisioning,
     nix_build: ?NixBuild,
     nix_caps: chock_policy.nix.Resolved,
@@ -1921,6 +1929,15 @@ fn start(
         flake_inputs,
     );
 
+    const named_packages = try buildNamedPackages(
+        arena,
+        io,
+        env,
+        options.packages,
+        nix_caps,
+        dev_shell_dir,
+    );
+
     const project_hooks = try projectHooks(arena, io, project_root);
     reportHooks(project_hooks);
 
@@ -2039,6 +2056,7 @@ fn start(
         .guidance = found_guidance,
         .hooks = project_hooks,
         .tool_env = tool_env,
+        .packages = named_packages,
         .provisioning = provisioning,
         .nix_build = nix_build,
         .nix_caps = nix_caps,
@@ -4674,6 +4692,130 @@ fn readProjectLock(arena: std.mem.Allocator, io: std.Io, project_root: []const u
         arena,
         .limited(chock_nix.inputs.max_lock_bytes),
     ) catch null;
+}
+
+/// The installables a person named, with `--with` or in `.nix.packages`, built
+/// before the session starts. The policy for `provide_tool` does not answer
+/// here: that rule is for what the agent may add on its own.
+fn buildNamedPackages(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    given: []const []const u8,
+    caps: chock_policy.nix.Resolved,
+    root_dir: ?[]const u8,
+) StartError![]const chock_nix.provision.Provided {
+    const named = try std.mem.concat(arena, []const u8, &.{ given, caps.packages orelse &.{} });
+    if (named.len == 0) return &.{};
+
+    const nix_program = chock_nix.proc.resolve(arena, io, env, "nix") catch {
+        tty.print(
+            .err,
+            "chock run: {d} packages were named and nix is not on this machine's PATH, so " ++
+                "none of them can be built. Install nix, or run chock from a shell that has it.\n",
+            .{named.len},
+        );
+        return error.Reported;
+    };
+    const nix_store_program = chock_nix.proc.resolve(arena, io, env, "nix-store") catch null;
+
+    var built: std.ArrayList(chock_nix.provision.Provided) = .empty;
+    for (named) |installable| {
+        const request = packageRequest(installable, provenanceWanted(caps)) orelse {
+            tty.print(
+                .err,
+                "chock run: --with {s} names no package. Write it as nixpkgs#zig_0_17, or as " ++
+                    "a bare name in the default registry.\n",
+                .{installable},
+            );
+            return error.Reported;
+        };
+
+        tty.print(.plain, "chock: building {s} with nix, which can take some time\n", .{installable});
+
+        var diag: ?chock_nix.Diagnostic = null;
+        var host = chock_nix.provision.Host{ .nix_program = nix_program, .env = env, .diag = &diag };
+        const answer = chock_nix.provision.resolve(arena, io, host.runner(), request) catch |err| {
+            if (diag) |*fault| tty.print(.err, "chock run: {f}\n", .{fault});
+            tty.print(
+                .err,
+                "chock run: {s} could not be built ({t}), so this session stops.\n",
+                .{ installable, err },
+            );
+            return error.Reported;
+        };
+
+        const provided = switch (answer) {
+            .refused => |text| {
+                tty.print(.err, "chock run: {s} was not built: {s}\n", .{ installable, text });
+                return error.Reported;
+            },
+            .provided => |one| one,
+        };
+
+        rootNamedPackage(arena, io, env, nix_store_program, root_dir, provided);
+        try built.append(arena, provided);
+
+        tty.print(
+            .plain,
+            "chock: {s} is in this session's toolchain, {d} store paths\n",
+            .{ provided.installable, provided.store_paths.len },
+        );
+    }
+
+    return built.toOwnedSlice(arena);
+}
+
+/// The registry and the attribute in `nixpkgs#zig_0_17`. A name with no flake
+/// of its own is an attribute of the default registry.
+fn packageRequest(
+    installable: []const u8,
+    wanted: chock_nix.provenance.Expectation,
+) ?chock_nix.provision.Request {
+    const at = std.mem.indexOfScalar(u8, installable, '#') orelse return .{
+        .program = installable,
+        .provenance = wanted,
+    };
+    if (at == 0 or at + 1 == installable.len) return null;
+    return .{
+        .program = installable[at + 1 ..],
+        .registry = installable[0..at],
+        .provenance = wanted,
+    };
+}
+
+/// Hold the built paths against the garbage collector, the way a provisioned
+/// program is held. A session whose toolchain is collected under it fails every
+/// call after that.
+fn rootNamedPackage(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    nix_store_program: ?[]const u8,
+    root_dir: ?[]const u8,
+    provided: chock_nix.provision.Provided,
+) void {
+    const program = nix_store_program orelse return;
+    const dir = root_dir orelse return;
+
+    var diag: ?chock_nix.Diagnostic = null;
+    const prefix = providedRootPrefix(arena, dir, provided.program) catch return;
+    chock_nix.store.addRoots(
+        arena,
+        io,
+        program,
+        env,
+        prefix,
+        provided.store_paths,
+        &diag,
+    ) catch {
+        tty.print(
+            .warn,
+            "chock: {s} could not be held against the garbage collector. A nix-collect-garbage " ++
+                "during this session can break it.\n",
+            .{provided.program},
+        );
+    };
 }
 
 fn provisioningFor(
@@ -11735,6 +11877,7 @@ fn runSession(
         .tool_env = started.tool_env,
     };
     try session_mounts.start(context.store_paths);
+    for (started.packages) |one| try session_mounts.adopt(one);
 
     var nix_build = NixBuildToolRunner{
         .inner = nix_eval.runner(),
@@ -13636,6 +13779,7 @@ const value_options = [_][]const u8{
     "--org-bundle",
     "--instructions",
     "--dev-shell",
+    "--with",
     "--policy-rule",
     "--max-turns",
     "--export-dir",
@@ -13662,6 +13806,7 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
     var options = Options{};
     var words: std.ArrayList([]const u8) = .empty;
     var given: std.ArrayList([]const u8) = .empty;
+    var packages: std.ArrayList([]const u8) = .empty;
     var rules: std.ArrayList(chock_policy.table.Rule) = .empty;
     var chain: std.ArrayList(chock_proto.event.SpawnLink) = .empty;
 
@@ -13715,6 +13860,8 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
             try given.append(arena, value);
         } else if (std.mem.eql(u8, argument, "--dev-shell")) {
             options.dev_shell = value;
+        } else if (std.mem.eql(u8, argument, "--with")) {
+            try packages.append(arena, value);
         } else if (std.mem.eql(u8, argument, "--policy-rule")) {
             const rule = chock_policy.table.parseGivenRule(value) catch |err| {
                 tty.print(
@@ -13835,6 +13982,7 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
 
     options.message_words = words.items;
     options.instructions = given.items;
+    options.packages = packages.items;
     options.policy_rules = rules.items;
     options.parent_chain = chain.items;
     return options;
@@ -19216,6 +19364,43 @@ test "a turn that faulted leaves an ending the interface can read, so the next m
         said = buffer[0..detail.len];
     }
     try testing.expectEqualStrings("the turn ended with MountTreeFailed", said.?);
+}
+
+test "a package is named by its flake and its attribute, or by an attribute alone" {
+    const nixpkgs = packageRequest("nixpkgs#zig_0_17", .{}).?;
+    try testing.expectEqualStrings("nixpkgs", nixpkgs.registry);
+    try testing.expectEqualStrings("zig_0_17", nixpkgs.program);
+
+    const bare = packageRequest("ripgrep", .{}).?;
+    try testing.expectEqualStrings(chock_nix.provision.default_registry, bare.registry);
+    try testing.expectEqualStrings("ripgrep", bare.program);
+
+    const remote = packageRequest("github:NixOS/nixpkgs#zig", .{}).?;
+    try testing.expectEqualStrings("github:NixOS/nixpkgs", remote.registry);
+    try testing.expectEqualStrings("zig", remote.program);
+
+    try testing.expectEqual(@as(?chock_nix.provision.Request, null), packageRequest("#zig", .{}));
+    try testing.expectEqual(@as(?chock_nix.provision.Request, null), packageRequest("nixpkgs#", .{}));
+}
+
+test "--with is repeatable and adds to what the project names" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const asked = (try readOptions(arena, &.{
+        "--with",      "nixpkgs#zig_0_17",
+        "--with",      "ripgrep",
+        "--dev-shell", "ci",
+        "--",          "do the thing",
+    })).?;
+    try testing.expectEqual(@as(usize, 2), asked.packages.len);
+    try testing.expectEqualStrings("nixpkgs#zig_0_17", asked.packages[0]);
+    try testing.expectEqualStrings("ripgrep", asked.packages[1]);
+    try testing.expectEqualStrings("ci", asked.dev_shell.?);
+
+    const quiet = (try readOptions(arena, &.{ "--", "nothing named" })).?;
+    try testing.expectEqual(@as(usize, 0), quiet.packages.len);
 }
 
 test "the interface asks again after every ending but a handover, and never after an interrupt" {
