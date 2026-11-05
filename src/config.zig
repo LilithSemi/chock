@@ -17,11 +17,24 @@ const usage_text =
     \\  check    Check the configuration and report the selected defaults.
     \\  path     Print the configuration path, whether or not the file exists.
     \\
+    \\Options:
+    \\  --format <kind>  For check: human (default) or json.
+    \\
 ++ tty.options_text;
 
 const Operation = enum {
     check,
     path,
+};
+
+const Format = enum {
+    human,
+    json,
+};
+
+const Options = struct {
+    operation: Operation,
+    format: Format = .human,
 };
 
 pub fn main(
@@ -40,7 +53,7 @@ pub fn main(
     var env = try environ.createMap(arena);
     defer env.deinit();
 
-    const operation = parseOperation(args) catch |err| switch (err) {
+    const options = parseOptions(args) catch |err| switch (err) {
         error.HelpWanted => {
             tty.out(.plain, "{s}", .{usage_text});
             return Exit.finished.code();
@@ -53,14 +66,14 @@ pub fn main(
 
     const config_dir = chock_auth.paths.configDir(arena, &env) catch |err| {
         tty.print(.err, "chock config {s}: the configuration directory is unknown: {t}\n", .{
-            @tagName(operation),
+            @tagName(options.operation),
             err,
         });
         return Exit.usage.code();
     };
     const path = try std.fs.path.join(arena, &.{ config_dir, chock_auth.config.file_name });
 
-    if (operation == .path) {
+    if (options.operation == .path) {
         tty.out(.plain, "{s}\n", .{path});
         return Exit.finished.code();
     }
@@ -92,7 +105,7 @@ pub fn main(
         return Exit.usage.code();
     }
 
-    report(path, &loaded);
+    try report(arena, path, &loaded, options.format);
     return Exit.finished.code();
 }
 
@@ -102,7 +115,33 @@ fn missingDefault(config: *const chock_auth.config.Config) ?[]const u8 {
     return name;
 }
 
-fn report(path: []const u8, config: *const chock_auth.config.Config) void {
+const CheckReport = struct {
+    path: []const u8,
+    valid: bool = true,
+    provider_instances: usize,
+    default_provider: ?[]const u8,
+    default_model: ?[]const u8,
+};
+
+fn report(
+    arena: std.mem.Allocator,
+    path: []const u8,
+    config: *const chock_auth.config.Config,
+    format: Format,
+) !void {
+    if (format == .json) {
+        const default_provider = if (config.defaultInstance()) |instance| instance.name else null;
+        const json = try std.json.Stringify.valueAlloc(arena, CheckReport{
+            .path = path,
+            .provider_instances = config.instances.len,
+            .default_provider = default_provider,
+            .default_model = config.default_model,
+        }, .{});
+        defer arena.free(json);
+        tty.out(.plain, "{s}\n", .{json});
+        return;
+    }
+
     tty.out(.plain, "{s}: valid; {d} provider instance{s}", .{
         path,
         config.instances.len,
@@ -117,9 +156,17 @@ fn report(path: []const u8, config: *const chock_auth.config.Config) void {
     tty.out(.plain, "\n", .{});
 }
 
-fn parseOperation(args: []const []const u8) error{ HelpWanted, BadArguments }!Operation {
-    if (args.len == 1 and std.mem.eql(u8, args[0], "check")) return .check;
-    if (args.len == 1 and std.mem.eql(u8, args[0], "path")) return .path;
+fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Options {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "check")) return .{ .operation = .check };
+    if (args.len == 1 and std.mem.eql(u8, args[0], "path")) return .{ .operation = .path };
+    if (args.len == 3 and
+        std.mem.eql(u8, args[0], "check") and
+        std.mem.eql(u8, args[1], "--format"))
+    {
+        if (std.mem.eql(u8, args[2], "human")) return .{ .operation = .check };
+        if (std.mem.eql(u8, args[2], "json")) return .{ .operation = .check, .format = .json };
+        return error.BadArguments;
+    }
     if (args.len == 1 and
         (std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h")))
     {
@@ -129,12 +176,16 @@ fn parseOperation(args: []const []const u8) error{ HelpWanted, BadArguments }!Op
 }
 
 test "config takes the check and path operations" {
-    try std.testing.expectEqual(Operation.check, try parseOperation(&.{"check"}));
-    try std.testing.expectEqual(Operation.path, try parseOperation(&.{"path"}));
-    try std.testing.expectError(error.BadArguments, parseOperation(&.{}));
-    try std.testing.expectError(error.BadArguments, parseOperation(&.{"show"}));
-    try std.testing.expectError(error.BadArguments, parseOperation(&.{ "check", "again" }));
-    try std.testing.expectError(error.HelpWanted, parseOperation(&.{"--help"}));
+    try std.testing.expectEqual(Operation.check, (try parseOptions(&.{"check"})).operation);
+    try std.testing.expectEqual(Operation.path, (try parseOptions(&.{"path"})).operation);
+    try std.testing.expectEqual(Format.json, (try parseOptions(&.{ "check", "--format", "json" })).format);
+    try std.testing.expectEqual(Format.human, (try parseOptions(&.{ "check", "--format", "human" })).format);
+    try std.testing.expectError(error.BadArguments, parseOptions(&.{}));
+    try std.testing.expectError(error.BadArguments, parseOptions(&.{"show"}));
+    try std.testing.expectError(error.BadArguments, parseOptions(&.{ "check", "again" }));
+    try std.testing.expectError(error.BadArguments, parseOptions(&.{ "path", "--format", "json" }));
+    try std.testing.expectError(error.BadArguments, parseOptions(&.{ "check", "--format", "yaml" }));
+    try std.testing.expectError(error.HelpWanted, parseOptions(&.{"--help"}));
 }
 
 test "a valid report says how its default was selected and exposes no credential" {
@@ -155,13 +206,44 @@ test "a valid report says how its default was selected and exposes no credential
     capture.start(std.testing.io, gpa);
     defer capture.stop(std.testing.io);
 
-    report("/config/chock/config.zon", &config);
+    try report(gpa, "/config/chock/config.zon", &config, .human);
     const output = capture.out();
     try std.testing.expect(std.mem.indexOf(u8, output, "valid; 1 provider instance") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "default provider local") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "default model test-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "never-print-this") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "127.0.0.1") == null);
+}
+
+test "a JSON report is structured and exposes no credential" {
+    const gpa = std.testing.allocator;
+    var config = try chock_auth.config.parse(gpa,
+        \\.{
+        \\    .providers = .{
+        \\        .{ .name = "local", .kind = "openai-compat",
+        \\           .base_url = "http://127.0.0.1:5000/v1",
+        \\           .token = "never-print-this" },
+        \\    },
+        \\    .defaults = .{ .provider = "local", .model = "test-model" },
+        \\}
+    , null);
+    defer config.deinit();
+
+    var capture: tty.Capture = undefined;
+    capture.start(std.testing.io, gpa);
+    defer capture.stop(std.testing.io);
+
+    try report(gpa, "/config/chock/config.zon", &config, .json);
+    const output = capture.out();
+    try std.testing.expect(std.mem.indexOf(u8, output, "never-print-this") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "127.0.0.1") == null);
+
+    const parsed = try std.json.parseFromSlice(CheckReport, gpa, output, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.valid);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.provider_instances);
+    try std.testing.expectEqualStrings("local", parsed.value.default_provider.?);
+    try std.testing.expectEqualStrings("test-model", parsed.value.default_model.?);
 }
 
 test "a named default must name an instance the file has" {
