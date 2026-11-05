@@ -66,6 +66,26 @@ approval nobody answers is a refusal.
 - OpenAI through a ChatGPT account
 - Any OpenAI compatible endpoint
 
+## Install
+
+Download the build for your platform from
+[chock.ws/download](https://chock.ws/download). The page links to the release
+archives and their checksums, and shows how to put the `chock` binary on your
+path.
+
+With [Nix](https://nixos.org), install the current build from the project's
+flake into your user profile:
+
+```
+nix profile install github:LilithSemi/chock
+```
+
+Then check which sandbox layers this machine provides:
+
+```
+chock doctor
+```
+
 ## Getting started
 
 ```
