@@ -116,9 +116,9 @@ fn note(diag: ?*?Diagnostic, step: Step, errno: i32) void {
 }
 
 fn classify(step: Step, errno: i32) Error {
-    if (errno == @intFromEnum(linux.E.PERM) or errno == @intFromEnum(linux.E.ACCES)) return error.NotPermitted;
-    if (errno == @intFromEnum(linux.E.OPNOTSUPP) or errno == @intFromEnum(linux.E.PROTONOSUPPORT)) return error.KernelModuleMissing;
-    if (errno == @intFromEnum(linux.E.NOENT)) {
+    if (errno == @backingInt(linux.E.PERM) or errno == @backingInt(linux.E.ACCES)) return error.NotPermitted;
+    if (errno == @backingInt(linux.E.OPNOTSUPP) or errno == @backingInt(linux.E.PROTONOSUPPORT)) return error.KernelModuleMissing;
+    if (errno == @backingInt(linux.E.NOENT)) {
         return switch (step) {
             .guard_chain, .relay_chain, .conntrack_rule, .loopback_rule, .allowed4_rule, .allowed6_rule, .reject_rule, .relay_rule => error.KernelModuleMissing,
             else => error.Refused,
@@ -135,8 +135,8 @@ pub const Session = struct {
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             else => |e| {
-                note(diag, .open_socket, @intFromEnum(e));
-                return classify(.open_socket, @intFromEnum(e));
+                note(diag, .open_socket, @backingInt(e));
+                return classify(.open_socket, @backingInt(e));
             },
         }
         const fd: i32 = @intCast(rc);
@@ -145,8 +145,8 @@ pub const Session = struct {
             .SUCCESS => {},
             else => |e| {
                 _ = linux.close(fd);
-                note(diag, .bind_socket, @intFromEnum(e));
-                return classify(.bind_socket, @intFromEnum(e));
+                note(diag, .bind_socket, @backingInt(e));
+                return classify(.bind_socket, @backingInt(e));
             },
         }
         return .{ .fd = fd };
@@ -181,7 +181,7 @@ pub const Session = struct {
         while (messages.next()) |message| {
             if (message.kind == nlmsg_error) {
                 const code = errorCode(message.body);
-                if (code == @intFromEnum(linux.E.NOENT)) return null;
+                if (code == @backingInt(linux.E.NOENT)) return null;
                 if (code == 0) continue;
                 note(diag, .element_read, code);
                 return classify(.element_read, code);
@@ -202,7 +202,7 @@ pub const Session = struct {
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             else => |e| {
-                note(diag, step, @intFromEnum(e));
+                note(diag, step, @backingInt(e));
                 return error.ExchangeFailed;
             },
         }
@@ -217,7 +217,7 @@ pub const Session = struct {
         switch (linux.errno(rc)) {
             .SUCCESS => return rc,
             else => |e| {
-                note(diag, step, @intFromEnum(e));
+                note(diag, step, @backingInt(e));
                 return error.ExchangeFailed;
             },
         }
@@ -231,7 +231,7 @@ pub const Session = struct {
                 .SUCCESS => {},
                 .AGAIN => return,
                 else => |e| {
-                    note(diag, .receive, @intFromEnum(e));
+                    note(diag, .receive, @backingInt(e));
                     return error.ExchangeFailed;
                 },
             }
@@ -970,10 +970,10 @@ fn measureInChild(record: *Measurement) void {
 
 fn recordFailure(record: *Measurement, diag: ?Diagnostic) void {
     if (diag) |d| {
-        record.failed_step = @intFromEnum(d.step);
+        record.failed_step = @backingInt(d.step);
         record.failed_errno = d.errno;
     } else {
-        record.failed_step = @intFromEnum(Step.send);
+        record.failed_step = @backingInt(Step.send);
     }
 }
 
@@ -1163,16 +1163,16 @@ test "an address that was never allowed is absent rather than an error" {
 }
 
 test "an absent kernel module is told apart from a refusal and from a bug" {
-    try testing.expectEqual(error.KernelModuleMissing, classify(.batch_begin, @intFromEnum(linux.E.OPNOTSUPP)));
-    try testing.expectEqual(error.KernelModuleMissing, classify(.open_socket, @intFromEnum(linux.E.PROTONOSUPPORT)));
-    try testing.expectEqual(error.KernelModuleMissing, classify(.relay_rule, @intFromEnum(linux.E.NOENT)));
-    try testing.expectEqual(error.KernelModuleMissing, classify(.relay_chain, @intFromEnum(linux.E.NOENT)));
+    try testing.expectEqual(error.KernelModuleMissing, classify(.batch_begin, @backingInt(linux.E.OPNOTSUPP)));
+    try testing.expectEqual(error.KernelModuleMissing, classify(.open_socket, @backingInt(linux.E.PROTONOSUPPORT)));
+    try testing.expectEqual(error.KernelModuleMissing, classify(.relay_rule, @backingInt(linux.E.NOENT)));
+    try testing.expectEqual(error.KernelModuleMissing, classify(.relay_chain, @backingInt(linux.E.NOENT)));
 
-    try testing.expectEqual(error.NotPermitted, classify(.batch_begin, @intFromEnum(linux.E.PERM)));
+    try testing.expectEqual(error.NotPermitted, classify(.batch_begin, @backingInt(linux.E.PERM)));
 
-    try testing.expectEqual(error.Refused, classify(.table, @intFromEnum(linux.E.NOENT)));
-    try testing.expectEqual(error.Refused, classify(.element_add, @intFromEnum(linux.E.NOENT)));
-    try testing.expectEqual(error.Refused, classify(.set4, @intFromEnum(linux.E.INVAL)));
+    try testing.expectEqual(error.Refused, classify(.table, @backingInt(linux.E.NOENT)));
+    try testing.expectEqual(error.Refused, classify(.element_add, @backingInt(linux.E.NOENT)));
+    try testing.expectEqual(error.Refused, classify(.set4, @backingInt(linux.E.INVAL)));
 }
 
 test "a refusal names the message the kernel would not take" {

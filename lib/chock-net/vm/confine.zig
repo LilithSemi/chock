@@ -71,7 +71,7 @@ fn takeLandlockAndSeccomp(
 fn noDumps() bool {
     const none = linux.rlimit{ .cur = 0, .max = 0 };
     if (linux.errno(linux.setrlimit(.CORE, &none)) != .SUCCESS) return false;
-    const pr = linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
+    const pr = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
     return linux.errno(pr) == .SUCCESS;
 }
 

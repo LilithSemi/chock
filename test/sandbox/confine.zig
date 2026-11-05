@@ -101,7 +101,7 @@ fn readOnce(fd: i32, buffer: []u8) Chunk {
         const rc = std.c.read(fd, buffer.ptr, buffer.len);
         if (rc > 0) return .{ .got = @intCast(rc) };
         if (rc == 0) return .done;
-        return if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) .interrupted else .done;
+        return if (std.c._errno().* == @backingInt(std.c.E.INTR)) .interrupted else .done;
     }
     const rc = linux.read(fd, buffer.ptr, buffer.len);
     const errno = linux.errno(rc);
@@ -158,7 +158,7 @@ fn triedToExec(path: [:0]const u8) E {
     if (darwin) {
         std.c._errno().* = 0;
         _ = std.c.execve(path.ptr, nothing, nothing);
-        return @enumFromInt(std.c._errno().*);
+        return @fromBackingInt(@intCast(std.c._errno().*));
     }
     return linux.errno(linux.execve(path, nothing, nothing));
 }
@@ -173,7 +173,7 @@ fn waitFor(pid: i32) ?u32 {
     if (darwin) {
         var status: c_int = 0;
         while (std.c.waitpid(pid, &status, 0) < 0) {
-            if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return null;
+            if (std.c._errno().* != @backingInt(std.c.E.INTR)) return null;
         }
         return @bitCast(status);
     }
@@ -188,10 +188,10 @@ fn waitFor(pid: i32) ?u32 {
 fn killedBy(status: u32) ?u32 {
     if (darwin) {
         if (!std.c.W.IFSIGNALED(status)) return null;
-        return @intFromEnum(std.c.W.TERMSIG(status));
+        return @backingInt(std.c.W.TERMSIG(status));
     }
     if (!linux.W.IFSIGNALED(@bitCast(status))) return null;
-    return @intFromEnum(linux.W.TERMSIG(@bitCast(status)));
+    return @backingInt(linux.W.TERMSIG(@bitCast(status)));
 }
 
 fn exitedWith(status: u32) ?u8 {
@@ -280,7 +280,7 @@ test "a confined VMM cannot run a program, reach a path outside its shares, or w
     } else {
         // A second message on the pipe would mean the filter let the exec through.
         try std.testing.expectEqual(@as(usize, 0), trailing_held);
-        try std.testing.expectEqual(@as(?u32, @intFromEnum(linux.SIG.SYS)), killedBy(status));
+        try std.testing.expectEqual(@as(?u32, @backingInt(linux.SIG.SYS)), killedBy(status));
     }
 }
 

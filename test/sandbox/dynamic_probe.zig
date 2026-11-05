@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         hints.family = c.AF.INET;
         hints.socktype = c.SOCK.STREAM;
         var found: ?*c.addrinfo = null;
-        if (c.getaddrinfo(name.ptr, null, &hints, &found) != @as(c.EAI, @enumFromInt(0)))
+        if (c.getaddrinfo(name.ptr, null, &hints, &found) != @as(c.EAI, @fromBackingInt(@intCast(0))))
             return not_resolved;
         const first = found orelse return not_resolved;
         defer c.freeaddrinfo(first);

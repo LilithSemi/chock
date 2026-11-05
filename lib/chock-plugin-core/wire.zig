@@ -265,7 +265,7 @@ pub fn serializeInto(record: Metadata, out: []u8) SerializeError!usize {
 
     var at: usize = 0;
     putU32(out, &at, Magic.word);
-    putU32(out, &at, @intFromEnum(AbiVersion.current));
+    putU32(out, &at, @backingInt(AbiVersion.current));
     putU32(out, &at, @intCast(total));
 
     putString(out, &at, record.name);
@@ -429,7 +429,7 @@ fn putProperties(out: []u8, at: *usize, properties: []const Property) void {
 
 /// A presence byte distinguishes no items from an item of strings.
 fn putShape(out: []u8, at: *usize, shape: Shape) void {
-    out[at.*] = @intFromEnum(shape.kind);
+    out[at.*] = @backingInt(shape.kind);
     at.* += 1;
     switch (shape.kind) {
         .array => {
@@ -473,7 +473,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, refusal: ?*?Refusal) Par
     const prefix = try Prefix.read(bytes, refusal);
     const known = prefix.known() orelse return note(refusal, .{ .unknown_abi_version = .{
         .found = prefix.abi_version,
-        .speaks = @intFromEnum(AbiVersion.current),
+        .speaks = @backingInt(AbiVersion.current),
     } }, error.UnknownAbiVersion);
 
     if (bytes.len < prefix.total_len) {
@@ -813,7 +813,7 @@ test "an unknown ABI version is refused with both numbers in the message" {
     const want = try std.fmt.allocPrint(
         testing.allocator,
         "built for plugin ABI 7, this Chock speaks plugin ABI {d}: rebuild the plugin",
-        .{@intFromEnum(AbiVersion.current)},
+        .{@backingInt(AbiVersion.current)},
     );
     defer testing.allocator.free(want);
     try testing.expectEqualStrings(want, text.written());
@@ -960,7 +960,7 @@ test "the prefix is at the offsets the format promises" {
 
     try testing.expectEqual(@as(u32, 0x9E4B_4843), std.mem.readInt(u32, bytes[0..4], .little));
     try testing.expectEqual(
-        @as(u32, @intFromEnum(AbiVersion.current)),
+        @as(u32, @backingInt(AbiVersion.current)),
         std.mem.readInt(u32, bytes[4..8], .little),
     );
     try testing.expectEqual(@as(u32, @intCast(bytes.len)), std.mem.readInt(u32, bytes[8..12], .little));
@@ -1131,9 +1131,9 @@ test "a blob that nests deeper than the bound is refused before it is followed" 
 
     // The shape is the last three bytes: an array, a present item, a string.
     const shape_at = bytes.len - 3;
-    try testing.expectEqual(@intFromEnum(schema.Kind.array), bytes[shape_at]);
+    try testing.expectEqual(@backingInt(schema.Kind.array), bytes[shape_at]);
     try testing.expectEqual(@as(u8, 1), bytes[shape_at + 1]);
-    try testing.expectEqual(@intFromEnum(schema.Kind.string), bytes[shape_at + 2]);
+    try testing.expectEqual(@backingInt(schema.Kind.string), bytes[shape_at + 2]);
 
     // One more array level is two bytes: the kind, then the item's present byte.
     const levels = max_schema_depth + 4;
@@ -1141,7 +1141,7 @@ test "a blob that nests deeper than the bound is refused before it is followed" 
     defer testing.allocator.free(deeper);
     @memcpy(deeper[0..shape_at], bytes[0..shape_at]);
     for (0..levels) |level| {
-        deeper[shape_at + level * 2] = @intFromEnum(schema.Kind.array);
+        deeper[shape_at + level * 2] = @backingInt(schema.Kind.array);
         deeper[shape_at + level * 2 + 1] = 1;
     }
     @memcpy(deeper[shape_at + levels * 2 ..], bytes[shape_at..]);
@@ -1167,7 +1167,7 @@ test "a field type byte this Chock does not have is refused rather than read" {
     defer testing.allocator.free(bytes);
 
     // The kind byte is the last one: name, description, requirement, then shape.
-    try testing.expectEqual(@intFromEnum(schema.Kind.string), bytes[bytes.len - 1]);
+    try testing.expectEqual(@backingInt(schema.Kind.string), bytes[bytes.len - 1]);
     bytes[bytes.len - 1] = 200;
 
     var refusal: ?Refusal = null;

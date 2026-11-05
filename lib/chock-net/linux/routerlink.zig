@@ -595,12 +595,12 @@ test "the far side refuses a message whose shape is not one request" {
         } },
         .{ .name = "a kind this file does not have", .request = blk: {
             var one = resolveRequest("api.anthropic.com", .ipv4);
-            one.kind = @enumFromInt(9);
+            one.kind = @fromBackingInt(@intCast(9));
             break :blk one;
         } },
         .{ .name = "a width this file does not have", .request = blk: {
             var one = resolveRequest("api.anthropic.com", .ipv4);
-            one.family = @enumFromInt(9);
+            one.family = @fromBackingInt(@intCast(9));
             break :blk one;
         } },
         .{ .name = "a reserved byte that is not zero", .request = blk: {

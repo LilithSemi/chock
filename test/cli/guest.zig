@@ -104,7 +104,7 @@ const Home = struct {
         defer gpa.free(path);
 
         var file = try std.Io.Dir.createFileAbsolute(io, path, .{
-            .permissions = @enumFromInt(0o600),
+            .permissions = @fromBackingInt(@intCast(0o600)),
         });
         defer file.close(io);
         var buffer: [1024]u8 = undefined;

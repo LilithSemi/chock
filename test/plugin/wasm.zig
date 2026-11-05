@@ -95,7 +95,7 @@ test "the host side reader reads the real module as the author wrote it" {
     try testing.expectEqualStrings("greet", read.record().tools[1].name);
     try testing.expectEqual(@as(usize, 2), read.record().tools[1].parameters.len);
     try testing.expectEqualStrings("who", read.record().tools[1].parameters[0].name);
-    try testing.expectEqual(@as(u32, @intFromEnum(core.AbiVersion.current)), read.abi_word);
+    try testing.expectEqual(@as(u32, @backingInt(core.AbiVersion.current)), read.abi_word);
     try testing.expectEqual(core.AbiVersion.current, read.parsed.abi_version);
 }
 
@@ -121,10 +121,10 @@ test "the real linker exports the metadata as a global holding an address" {
     const kind_at = named + core.Metadata.symbol.len;
     try testing.expectEqual(
         plugin_module.ExportKind.global,
-        @as(plugin_module.ExportKind, @enumFromInt(module[kind_at])),
+        @as(plugin_module.ExportKind, @fromBackingInt(@intCast(module[kind_at]))),
     );
 
-    module[kind_at] = @intFromEnum(plugin_module.ExportKind.function);
+    module[kind_at] = @backingInt(plugin_module.ExportKind.function);
     var refusal: ?plugin_module.Refusal = null;
     try testing.expectError(
         error.IncompletePlugin,
@@ -153,7 +153,7 @@ test "a real module built for another plugin ABI is refused with both numbers" {
 
     // The `chock_plugin_magic` global holds the four bytes in front of the blob.
     try testing.expectEqual(
-        @as(u32, @intFromEnum(core.AbiVersion.current)),
+        @as(u32, @backingInt(core.AbiVersion.current)),
         std.mem.readInt(u32, module[blob_at - 4 ..][0..4], .little),
     );
 
@@ -170,7 +170,7 @@ test "a real module built for another plugin ABI is refused with both numbers" {
     const want = try std.fmt.allocPrint(
         testing.allocator,
         "built for plugin ABI 7, this Chock speaks plugin ABI {d}: rebuild the plugin",
-        .{@intFromEnum(core.AbiVersion.current)},
+        .{@backingInt(core.AbiVersion.current)},
     );
     defer testing.allocator.free(want);
     try testing.expectEqualStrings(want, text);
@@ -192,7 +192,7 @@ test "a real module whose two ABI numbers disagree is refused" {
     const want = try std.fmt.allocPrint(
         testing.allocator,
         "the module says it is plugin ABI {d} and its metadata says ABI 7",
-        .{@intFromEnum(core.AbiVersion.current)},
+        .{@backingInt(core.AbiVersion.current)},
     );
     defer testing.allocator.free(want);
     try testing.expectEqualStrings(want, text);

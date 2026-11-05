@@ -152,8 +152,8 @@ pub const Guest = struct {
         _ = ptr;
         const fd = handle.fd() orelse return error.NoHandle;
         const line = switch (sig) {
-            @intFromEnum(std.posix.SIG.KILL) => wire.cancel_kill,
-            @intFromEnum(std.posix.SIG.TERM) => wire.cancel_terminate,
+            @backingInt(std.posix.SIG.KILL) => wire.cancel_kill,
+            @backingInt(std.posix.SIG.TERM) => wire.cancel_terminate,
             else => return error.NoHandle,
         };
         // May run inside a signal handler, so this is the raw syscall with no allocation.
@@ -387,8 +387,8 @@ pub const Guest = struct {
 
         return switch (ended) {
             .exited => |code| .{ .exited = code },
-            .signalled => |sig| .{ .signal = @enumFromInt(sig) },
-            .stopped => |sig| .{ .stopped = @enumFromInt(sig) },
+            .signalled => |sig| .{ .signal = @fromBackingInt(@intCast(sig)) },
+            .stopped => |sig| .{ .stopped = @fromBackingInt(@intCast(sig)) },
             .unknown => |code| .{ .unknown = code },
         };
     }
@@ -510,7 +510,7 @@ test "a cancel is one line on the stream, and nothing joins a keyring on a guest
     var unspawned: iface.Handle = .{};
     try testing.expectError(
         error.NoHandle,
-        as_driver.signal(&unspawned, @intFromEnum(std.posix.SIG.TERM)),
+        as_driver.signal(&unspawned, @backingInt(std.posix.SIG.TERM)),
     );
 
     var pair: [2]std.posix.fd_t = undefined;
@@ -521,9 +521,9 @@ test "a cancel is one line on the stream, and nothing joins a keyring on a guest
 
     var live: iface.Handle = .{ .driver = as_driver };
     live.publish(iface.Handle.elsewhere, pair[0]);
-    try live.signal(@intFromEnum(std.posix.SIG.TERM));
-    try live.signal(@intFromEnum(std.posix.SIG.KILL));
-    try testing.expectError(error.NoHandle, live.signal(@intFromEnum(std.posix.SIG.HUP)));
+    try live.signal(@backingInt(std.posix.SIG.TERM));
+    try live.signal(@backingInt(std.posix.SIG.KILL));
+    try testing.expectError(error.NoHandle, live.signal(@backingInt(std.posix.SIG.HUP)));
 
     var read_into: [64]u8 = undefined;
     const got = try std.posix.read(pair[1], &read_into);

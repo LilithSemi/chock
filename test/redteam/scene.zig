@@ -197,7 +197,7 @@ fn writeFile(io: std.Io, path: []const u8, contents: []const u8) Error!void {
 
 fn writePrivateFile(io: std.Io, path: []const u8, contents: []const u8) Error!void {
     // `chock_auth.lookup` refuses a credential file another user can read.
-    var file = std.Io.Dir.createFileAbsolute(io, path, .{ .permissions = @enumFromInt(0o600) }) catch
+    var file = std.Io.Dir.createFileAbsolute(io, path, .{ .permissions = @fromBackingInt(@intCast(0o600)) }) catch
         return error.SceneNotBuilt;
     defer file.close(io);
     file.writeStreamingAll(io, contents) catch return error.SceneNotBuilt;

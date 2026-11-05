@@ -33,7 +33,7 @@ pub fn resetSignalState() void {
     };
     var number: u32 = 1;
     while (number <= last_reset_signal) : (number += 1) {
-        const sig: std.posix.SIG = @enumFromInt(number);
+        const sig: std.posix.SIG = @fromBackingInt(@intCast(number));
         if (sig == .KILL or sig == .STOP) continue;
         _ = linux.sigaction(sig, &to_default, null);
     }

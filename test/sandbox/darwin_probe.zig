@@ -193,13 +193,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         const rc = std.c.connect(socket, @ptrCast(&address), @sizeOf(std.posix.sockaddr.un));
         if (rc == 0) return succeeded;
         // A refusal and a socket nobody listens on are different facts.
-        return if (std.c._errno().* == @intFromEnum(std.c.E.PERM)) refused else no_answer;
+        return if (std.c._errno().* == @backingInt(std.c.E.PERM)) refused else no_answer;
     }
 
     if (std.mem.eql(u8, op, "in-signal")) {
         const pid = std.fmt.parseInt(std.c.pid_t, args[3], 10) catch return no_answer;
         // Signal 0 sends nothing. The kernel only checks that the process exists.
-        return if (std.c.kill(pid, @enumFromInt(0)) == 0) succeeded else refused;
+        return if (std.c.kill(pid, @fromBackingInt(@intCast(0))) == 0) succeeded else refused;
     }
 
     if (std.mem.eql(u8, op, "in-signal-own")) {
@@ -426,7 +426,7 @@ fn runCancel(arena: std.mem.Allocator, work: []const u8, self_path: []const u8, 
         return if (call.failed) call.failure else spawn_refused;
     }
 
-    call.middle.signal(@intFromEnum(std.c.SIG.KILL)) catch {
+    call.middle.signal(@backingInt(std.c.SIG.KILL)) catch {
         thread.join();
         call.middle.close();
         return not_cancelled;

@@ -28,8 +28,8 @@ const Failure = enum(i32) {
 
 fn failureFor(answer: i32) ast.Error {
     return switch (answer) {
-        @intFromEnum(Failure.rows) => error.TooManyMatches,
-        @intFromEnum(Failure.memory) => error.OutOfMemory,
+        @backingInt(Failure.rows) => error.TooManyMatches,
+        @backingInt(Failure.memory) => error.OutOfMemory,
         else => error.ParserFailed,
     };
 }

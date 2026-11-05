@@ -45,7 +45,7 @@ pub const Trigger = enum {
 
     pub fn fromWireName(text: []const u8) ?Trigger {
         inline for (@typeInfo(Trigger).@"enum".field_values) |value| {
-            const one: Trigger = @enumFromInt(value);
+            const one: Trigger = @fromBackingInt(@intCast(value));
             if (std.mem.eql(u8, text, one.wireName())) return one;
         }
         return null;
@@ -72,7 +72,7 @@ pub const Input = enum {
 
     pub fn fromWireName(text: []const u8) ?Input {
         inline for (@typeInfo(Input).@"enum".field_values) |value| {
-            const one: Input = @enumFromInt(value);
+            const one: Input = @fromBackingInt(@intCast(value));
             if (std.mem.eql(u8, text, one.wireName())) return one;
         }
         return null;
@@ -93,7 +93,7 @@ pub const Output = enum {
 
     pub fn fromWireName(text: []const u8) ?Output {
         inline for (@typeInfo(Output).@"enum".field_values) |value| {
-            const one: Output = @enumFromInt(value);
+            const one: Output = @fromBackingInt(@intCast(value));
             if (std.mem.eql(u8, text, one.wireName())) return one;
         }
         return null;
@@ -910,7 +910,7 @@ const testing = std.testing;
 
 test "a trigger and its wire name agree in both directions" {
     inline for (@typeInfo(Trigger).@"enum".field_values) |value| {
-        const one: Trigger = @enumFromInt(value);
+        const one: Trigger = @fromBackingInt(@intCast(value));
         try testing.expectEqual(one, Trigger.fromWireName(one.wireName()).?);
     }
     try testing.expect(Trigger.fromWireName("tool.during") == null);
@@ -935,7 +935,7 @@ test "an output is allowed only where it could mean something" {
     try testing.expect(!Output.note.allowedFor(.session_end));
 
     inline for (@typeInfo(Trigger).@"enum".field_values) |value| {
-        try testing.expect(Output.ignore.allowedFor(@enumFromInt(value)));
+        try testing.expect(Output.ignore.allowedFor(@fromBackingInt(@intCast(value))));
     }
 }
 

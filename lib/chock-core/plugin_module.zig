@@ -840,7 +840,7 @@ fn sentence(refusal: Refusal) ![]u8 {
 }
 
 test "a module built to the shape a plugin has reads back the record it carries" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try sampleModule(data);
     defer testing.allocator.free(module);
@@ -849,12 +849,12 @@ test "a module built to the shape a plugin has reads back the record it carries"
     defer read_module.deinit();
 
     try testing.expect(sample_record.eql(read_module.record()));
-    try testing.expectEqual(@as(u32, @intFromEnum(core.AbiVersion.current)), read_module.abi_word);
+    try testing.expectEqual(@as(u32, @backingInt(core.AbiVersion.current)), read_module.abi_word);
     try testing.expectEqual(@as(u32, 0), read_module.init_function);
 }
 
 test "a symbol that is an imported global is refused rather than guessed at" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .imported_globals = 1,
@@ -874,7 +874,7 @@ test "a symbol that is an imported global is refused rather than guessed at" {
 }
 
 test "the import section shifts the global index space this reader reads" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .imported_globals = 2,
@@ -894,7 +894,7 @@ test "the import section shifts the global index space this reader reads" {
 }
 
 test "a global whose initialiser is not a constant is refused" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, null },
@@ -915,7 +915,7 @@ test "a global whose initialiser is not a constant is refused" {
 }
 
 test "a symbol pointing at an address no data segment covers is refused" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4096 },
@@ -934,7 +934,7 @@ test "a symbol pointing at an address no data segment covers is refused" {
 }
 
 test "a passive data segment is in no memory, so a symbol into one is refused" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },
@@ -951,7 +951,7 @@ test "a passive data segment is in no memory, so a symbol into one is refused" {
 }
 
 test "two data segments over one address are refused rather than resolved" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },
@@ -976,7 +976,7 @@ test "two data segments over one address are refused rather than resolved" {
 }
 
 test "a blob split across two touching segments still reads" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const cut = data.len / 2;
     const module = try buildModule(.{
@@ -999,7 +999,7 @@ test "a blob split across two touching segments still reads" {
 }
 
 test "a hole between two segments is not read as zeros" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const cut = data.len / 2;
     const module = try buildModule(.{
@@ -1020,7 +1020,7 @@ test "a hole between two segments is not read as zeros" {
 }
 
 test "a module with no chock_plugin_magic is not a Chock plugin" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },
@@ -1043,7 +1043,7 @@ test "a module with no chock_plugin_magic is not a Chock plugin" {
 }
 
 test "a plugin with no chock_plugin_init is refused at load and not at call" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },
@@ -1061,7 +1061,7 @@ test "a plugin with no chock_plugin_init is refused at load and not at call" {
 }
 
 test "a symbol exported as the wrong kind of thing is refused by name" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },
@@ -1085,7 +1085,7 @@ test "a symbol exported as the wrong kind of thing is refused by name" {
 }
 
 test "a module that exports one name twice is refused" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4, 0 },
@@ -1120,7 +1120,7 @@ test "the ABI in the magic symbol and the ABI in the blob must agree" {
     const want = try std.fmt.allocPrint(
         testing.allocator,
         "the module says it is plugin ABI 9 and its metadata says ABI {d}",
-        .{@intFromEnum(core.AbiVersion.current)},
+        .{@backingInt(core.AbiVersion.current)},
     );
     defer testing.allocator.free(want);
     try testing.expectEqualStrings(want, text);
@@ -1164,7 +1164,7 @@ test "a wasm binary format this reader does not know is refused by number" {
 }
 
 test "a section that runs past the end of the file is refused" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try sampleModule(data);
     defer testing.allocator.free(module);
@@ -1204,7 +1204,7 @@ test "a count above the bytes left in its own section is refused before anything
 }
 
 test "the memory a module declares costs this reader nothing" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .memory_pages = 65536,
@@ -1224,7 +1224,7 @@ test "the memory a module declares costs this reader nothing" {
 }
 
 test "a blob that states a length above the bound is refused before it is allocated" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     std.mem.writeInt(u32, data[4 + core.Prefix.total_len_offset ..][0..4], std.math.maxInt(u32), .little);
 
@@ -1237,7 +1237,7 @@ test "a blob that states a length above the bound is refused before it is alloca
 }
 
 test "a blob that states more bytes than the module carries is refused" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const stated = @as(u32, @intCast(data.len - 4)) + 64;
     std.mem.writeInt(u32, data[4 + core.Prefix.total_len_offset ..][0..4], stated, .little);
@@ -1251,7 +1251,7 @@ test "a blob that states more bytes than the module carries is refused" {
 }
 
 test "a symbol holding a negative address is refused rather than cast" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ -4, sample_address + 4 },
@@ -1270,7 +1270,7 @@ test "a symbol holding a negative address is refused rather than cast" {
 }
 
 test "a passive segment is not read as though it sat at address zero" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ 0, 4 },
@@ -1300,7 +1300,7 @@ test "a LEB128 padded out past the width it claims is refused" {
 }
 
 test "chock_plugin_init exported as anything but a function is refused" {
-    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
+    const data = try sampleData(@backingInt(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },

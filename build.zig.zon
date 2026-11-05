@@ -9,16 +9,16 @@
             .hash = "vulcan-0.0.0-d6EfZFBzxACTD8hewzXG1xRLTYG9G1oa7-4DPIMJdYBV",
         },
         .phantom = .{
-            .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#f714d4ef226ce1ad16a9b0dc7b482cfb9875af86",
-            .hash = "phantom-0.1.0-HsUDTGo_KgDoJTQejHVQkb8cUExjzEK1VudPAqSLMqqW",
+            .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#1461c16a50c184bfc01ba5ffe811a0b2e30663c2",
+            .hash = "phantom-0.1.0-HsUDTIKPLwBtAd2ebTaLj1UfgHFJndLAj9Pa9gNKUiYr",
         },
         .udev = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/udev.zig#5b76bbccde9ef7bcb9b6447c0f2454f2ade51733",
             .hash = "udev-0.1.0-ZWb7H_NaBwBz8odIGbKN2hpRa-3HdrIsuNaml7VzsRTs",
         },
         .fix = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/fix?ref=integration#5f668f30e1cba722c5554cdd1c2344e3cd46f09b",
-            .hash = "fix-0.3.0-2pqVLBL6VwCSG9zdNHKoB7JAqKKM08x46Ml8D-BWRTKB",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/fix?ref=integration#2689cadf32d10699ba93b22f2fdb0d2098447b84",
+            .hash = "fix-0.3.0-2pqVLBb6VwAhdqOLW-5k2ikVrtYAW0Z-yl8HnsNwZOg0",
         },
         .dbus = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/dbus.zig#ac21c343ceee75c0a5ea1793096751ca851abfa1",
@@ -33,8 +33,8 @@
             .hash = "palisade-0.1.0-kI7k7wBYCACmg_K3izmw3Kf-cMYYu82uo2Z7y_DGhe5n",
         },
         .ziggit = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/ziggit#52a7deaf438c677b670e8f2af0d208bd29bfb92b",
-            .hash = "ziggit-0.1.0-KYLpgYHNFADuTovcF0_Zr68pzPsJi57KekNX3OHtW0GR",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/ziggit#884b9f44194b59e0a19c7e32ffbecb11310342dc",
+            .hash = "ziggit-0.1.0-KYLpgYXNFABoWgLmMApxFgdX5PmoPW9oyM1PDNmqtvhM",
         },
         .pcsc = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/pcsc.zig#9fa2f723e7747db81b4b238da23d85be37bcb88b",
@@ -53,8 +53,8 @@
             .hash = "llm_provider-0.1.0-P6m-95CdBgDvDArAXHpkn-JNNj4QDY5mzU3i1fEtrfFq",
         },
         .oauth = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/oauth.zig#8e658a56316f77e9594e9fde391fbf35bcd5cf5a",
-            .hash = "oauth-0.1.0-jO2OUe0VAgBLjK50VY1mICVLSgO44WXKRiEEd2F7KvF6",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/oauth.zig#8a435cf8d2724fbe7931f0909d5e71d393df7f3c",
+            .hash = "oauth-0.1.0-jO2OUe0VAgA3cg8fMDZQXFkn--7ciG6OwYLeZubY07Ys",
         },
     },
     .paths = .{

@@ -29,7 +29,7 @@ pub const Kind = enum(u8) {
     /// Null for a JSON type word this project does not write.
     pub fn fromJsonName(word: []const u8) ?Kind {
         inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |_, field_value| {
-            const kind: Kind = @enumFromInt(field_value);
+            const kind: Kind = @fromBackingInt(@intCast(field_value));
             if (std.mem.eql(u8, kind.jsonName(), word)) return kind;
         }
         return null;
@@ -294,7 +294,7 @@ test "eql separates an array with an item shape from one without" {
 
 test "every JSON type word reads back as the kind that wrote it" {
     inline for (@typeInfo(Kind).@"enum".field_names, @typeInfo(Kind).@"enum".field_values) |_, field_value| {
-        const kind: Kind = @enumFromInt(field_value);
+        const kind: Kind = @fromBackingInt(@intCast(field_value));
         try testing.expectEqual(kind, Kind.fromJsonName(kind.jsonName()).?);
     }
     try testing.expectEqual(@as(?Kind, null), Kind.fromJsonName("null"));

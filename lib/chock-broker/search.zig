@@ -728,7 +728,7 @@ fn request(
         error.ReadFailed => return error.RequestFailed,
     };
 
-    return .{ .status = @intFromEnum(response.head.status), .body = response_body };
+    return .{ .status = @backingInt(response.head.status), .body = response_body };
 }
 
 const SearxResult = struct {

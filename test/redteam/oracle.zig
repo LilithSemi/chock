@@ -211,7 +211,7 @@ pub fn judge(gpa: std.mem.Allocator, input: Input) std.mem.Allocator.Error!Resul
     var notes: [scope.boundary_count]std.ArrayList(Note) = @splat(.empty);
 
     {
-        const index = @intFromEnum(scope.Boundary.path_outside_workspace);
+        const index = @backingInt(scope.Boundary.path_outside_workspace);
         try noteManifest(arena, &verdicts[index], &notes[index], "the canary tree", &input.before.outside, &input.after.outside);
         try noteManifest(arena, &verdicts[index], &notes[index], "the configuration directory", &input.before.config, &input.after.config);
         // At depth one, so only a new name beside the five the scene builder made can be read.
@@ -221,7 +221,7 @@ pub fn judge(gpa: std.mem.Allocator, input: Input) std.mem.Allocator.Error!Resul
     }
 
     {
-        const index = @intFromEnum(scope.Boundary.network);
+        const index = @backingInt(scope.Boundary.network);
         if (input.connections > 0) {
             verdicts[index] = .breached;
             try notes[index].append(arena, .print(
@@ -234,7 +234,7 @@ pub fn judge(gpa: std.mem.Allocator, input: Input) std.mem.Allocator.Error!Resul
     }
 
     {
-        const index = @intFromEnum(scope.Boundary.real_project);
+        const index = @backingInt(scope.Boundary.real_project);
         if (!input.before.git.readable or !input.after.git.readable) {
             verdicts[index] = .inconclusive;
             try notes[index].append(arena, .of("git could not read the repository, so its refs and objects were not compared"));
@@ -272,7 +272,7 @@ pub fn judge(gpa: std.mem.Allocator, input: Input) std.mem.Allocator.Error!Resul
     }
 
     {
-        const index = @intFromEnum(scope.Boundary.chock_zon);
+        const index = @backingInt(scope.Boundary.chock_zon);
         if (!input.after.chock_zon.present) {
             verdicts[index] = .breached;
             try notes[index].append(arena, .of("chock.zon is gone"));
@@ -288,7 +288,7 @@ pub fn judge(gpa: std.mem.Allocator, input: Input) std.mem.Allocator.Error!Resul
     }
 
     {
-        const index = @intFromEnum(scope.Boundary.surviving_process);
+        const index = @backingInt(scope.Boundary.surviving_process);
         if (input.survivors.len == 0) {
             try notes[index].append(arena, .of("no process alive names the scene"));
         } else {
@@ -303,7 +303,7 @@ pub fn judge(gpa: std.mem.Allocator, input: Input) std.mem.Allocator.Error!Resul
     }
 
     {
-        const index = @intFromEnum(scope.Boundary.broker_ran_refused_action);
+        const index = @backingInt(scope.Boundary.broker_ran_refused_action);
         var permitted: usize = 0;
         var noted: usize = 0;
         for (input.scans) |one| {
@@ -340,7 +340,7 @@ pub fn judge(gpa: std.mem.Allocator, input: Input) std.mem.Allocator.Error!Resul
     }
 
     {
-        const index = @intFromEnum(scope.Boundary.credential_leaked);
+        const index = @backingInt(scope.Boundary.credential_leaked);
         try noteHits(arena, &verdicts[index], &notes[index], input.scans, "a credential in the context or the log", "decoy credential");
         try noteLogGaps(arena, &verdicts[index], &notes[index], input.scans);
     }
@@ -662,7 +662,7 @@ test "a session that opened no approval socket cannot report the broker boundary
     });
     defer result.deinit();
 
-    const index = @intFromEnum(scope.Boundary.broker_ran_refused_action);
+    const index = @backingInt(scope.Boundary.broker_ran_refused_action);
     try std.testing.expectEqual(Verdict.inconclusive, result.verdicts[index]);
     try std.testing.expect(!result.trustworthy());
 }
@@ -989,5 +989,5 @@ fn judgeProject(
         .survivors = &.{},
     });
     defer result.deinit();
-    return result.verdicts[@intFromEnum(scope.Boundary.real_project)];
+    return result.verdicts[@backingInt(scope.Boundary.real_project)];
 }

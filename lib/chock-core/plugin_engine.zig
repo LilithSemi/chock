@@ -370,7 +370,7 @@ fn stageAnswer(guest: []u8, at: u32, outcome: core.call.Outcome, text: []const u
     std.mem.writeInt(
         u32,
         guest[at + core.call.Answer.outcome_offset ..][0..4],
-        @intFromEnum(outcome),
+        @backingInt(outcome),
         .little,
     );
     std.mem.writeInt(u32, guest[at + core.call.Answer.text_ptr_offset ..][0..4], text_at, .little);

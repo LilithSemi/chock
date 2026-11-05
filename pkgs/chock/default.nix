@@ -29,9 +29,9 @@ let
       ''
         import sys
 
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
 
-        mcp = FastMCP("probe", host="127.0.0.1", port=int(sys.argv[1]))
+        mcp = MCPServer("probe")
 
 
         @mcp.tool()
@@ -40,7 +40,11 @@ let
             return text
 
 
-        mcp.run(transport="streamable-http")
+        mcp.run(
+            transport="streamable-http",
+            host="127.0.0.1",
+            port=int(sys.argv[1]),
+        )
       '';
 
   # One grammar a language, named after the language, for
@@ -115,7 +119,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   zigDeps = zig.fetchDeps {
     inherit (finalAttrs) src pname version;
-    hash = "sha256-FNVuNn1veFrY++y7gRbEWQhDgb8d3J8euZ9oqtrYn+8=";
+    hash = "sha256-DyTznIycyOV42TepVCqffKrmGixIJUaRONqzB+1BGz0=";
   };
 
   nativeBuildInputs = [

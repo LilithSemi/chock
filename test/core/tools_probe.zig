@@ -32,7 +32,7 @@ fn armCancelTimer(period_ms: u64) void {
         .usec = @intCast((period_ms % std.time.ms_per_s) * std.time.us_per_ms),
     };
     const timer: IntervalTimer = .{ .interval = period, .value = period };
-    const rc = linux.syscall3(.setitimer, @intFromEnum(linux.ITIMER.REAL), @intFromPtr(&timer), 0);
+    const rc = linux.syscall3(.setitimer, @backingInt(linux.ITIMER.REAL), @intFromPtr(&timer), 0);
     if (linux.errno(rc) != .SUCCESS) std.debug.print("could not arm the cancel timer\n", .{});
 }
 

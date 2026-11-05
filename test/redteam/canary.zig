@@ -117,7 +117,7 @@ pub const Manifest = struct {
             .file => {
                 const stat = dir.statFile(io, path, .{}) catch
                     return std.fmt.allocPrint(gpa, "f ? ? {s}", .{path});
-                const mode = @intFromEnum(stat.permissions);
+                const mode = @backingInt(stat.permissions);
                 const contents = dir.readFileAlloc(io, path, gpa, .limited(max_file_bytes)) catch
                     return std.fmt.allocPrint(gpa, "f {o} <unreadable> {s}", .{ mode, path });
                 defer gpa.free(contents);

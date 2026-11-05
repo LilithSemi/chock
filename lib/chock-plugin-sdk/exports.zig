@@ -20,7 +20,7 @@ pub fn Exports(comptime declared: meta.Metadata) type {
     return struct {
         pub const record: core.Metadata = declared.lower();
         pub const blob = core.serializeComptime(record);
-        pub const abi_word: u32 = @intFromEnum(core.AbiVersion.current);
+        pub const abi_word: u32 = @backingInt(core.AbiVersion.current);
 
         var bound: [declared.tools.len]Bound = undefined;
         var bound_count: u32 = 0;

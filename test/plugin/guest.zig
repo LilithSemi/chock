@@ -72,7 +72,7 @@ test "the bound entry reaches the author's own tool body" {
 
 test "chock_plugin_magic carries the ABI version this SDK writes" {
     const word = @extern(*const u32, .{ .name = core.Magic.symbol });
-    try testing.expectEqual(@intFromEnum(core.AbiVersion.current), word.*);
+    try testing.expectEqual(@backingInt(core.AbiVersion.current), word.*);
     try testing.expectEqual(core.AbiVersion.current, core.abiVersion(word.*).?);
 }
 
@@ -134,7 +134,7 @@ test "the exported blob begins with the fixed prefix" {
     try testing.expect(blob.len > core.Prefix.len);
     try testing.expectEqualSlices(u8, &.{ 'C', 'H', 'K', 0x9E }, blob[0..4]);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(core.AbiVersion.current)),
+        @as(u32, @backingInt(core.AbiVersion.current)),
         std.mem.readInt(u32, blob[4..8], .little),
     );
     try testing.expectEqual(@as(u32, @intCast(blob.len)), std.mem.readInt(u32, blob[8..12], .little));

@@ -63,7 +63,7 @@ pub fn writeAnswer(record: *[Answer.len]u8, outcome: Outcome, text: []const u8) 
     std.mem.writeInt(
         u32,
         record[Answer.outcome_offset..][0..4],
-        @intFromEnum(outcome),
+        @backingInt(outcome),
         .little,
     );
     std.mem.writeInt(
@@ -91,7 +91,7 @@ fn withAnswer(memory: []u8, at: usize, outcome: u32, text_ptr: u32, text_len: u3
 test "an answer a guest wrote reads back with its text" {
     var memory: [128]u8 = @splat(0);
     @memcpy(memory[64..][0..5], "hello");
-    withAnswer(&memory, 16, @intFromEnum(Outcome.success), 64, 5);
+    withAnswer(&memory, 16, @backingInt(Outcome.success), 64, 5);
 
     const answer = try readAnswer(&memory, 16);
     try testing.expectEqual(Outcome.success, answer.outcome);
@@ -100,10 +100,10 @@ test "an answer a guest wrote reads back with its text" {
 
 test "a text address past the end of the guest's memory is refused, not read" {
     var memory: [128]u8 = @splat(0);
-    withAnswer(&memory, 16, @intFromEnum(Outcome.success), 120, 64);
+    withAnswer(&memory, 16, @backingInt(Outcome.success), 120, 64);
     try testing.expectError(error.TextOutOfBounds, readAnswer(&memory, 16));
 
-    withAnswer(&memory, 16, @intFromEnum(Outcome.success), 4096, 0);
+    withAnswer(&memory, 16, @backingInt(Outcome.success), 4096, 0);
     try testing.expectError(error.TextOutOfBounds, readAnswer(&memory, 16));
 }
 
@@ -113,7 +113,7 @@ test "an address that wraps when the record is added to it is refused" {
         error.AnswerOutOfBounds,
         readAnswer(&memory, std.math.maxInt(usize) - 4),
     );
-    withAnswer(&memory, 16, @intFromEnum(Outcome.success), std.math.maxInt(u32), 8);
+    withAnswer(&memory, 16, @backingInt(Outcome.success), std.math.maxInt(u32), 8);
     try testing.expectError(error.TextOutOfBounds, readAnswer(&memory, 16));
 }
 
@@ -121,7 +121,7 @@ test "a record that does not fit inside the guest's memory is refused" {
     var memory: [128]u8 = @splat(0);
     try testing.expectError(error.AnswerOutOfBounds, readAnswer(&memory, 120));
     try testing.expectError(error.AnswerOutOfBounds, readAnswer(&memory, 117));
-    withAnswer(&memory, 116, @intFromEnum(Outcome.success), 0, 0);
+    withAnswer(&memory, 116, @backingInt(Outcome.success), 0, 0);
     _ = try readAnswer(&memory, 116);
 }
 
@@ -135,7 +135,7 @@ test "a text longer than this ABI carries is refused before it is measured again
     const memory = try testing.allocator.alloc(u8, (max_result_bytes * 2) + 64);
     defer testing.allocator.free(memory);
     @memset(memory, 0);
-    withAnswer(memory, 16, @intFromEnum(Outcome.success), 64, max_result_bytes + 1);
+    withAnswer(memory, 16, @backingInt(Outcome.success), 64, max_result_bytes + 1);
     try testing.expectError(error.TextOutOfBounds, readAnswer(memory, 16));
 }
 

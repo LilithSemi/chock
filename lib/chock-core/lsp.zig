@@ -225,8 +225,8 @@ fn orderOf(edited: []const u8, a: Diagnostic, b: Diagnostic) std.math.Order {
     const b_edited = samePath(edited, b.path);
     if (a_edited != b_edited) return if (a_edited) .lt else .gt;
 
-    const a_rank = @intFromEnum(a.severity);
-    const b_rank = @intFromEnum(b.severity);
+    const a_rank = @backingInt(a.severity);
+    const b_rank = @backingInt(b.severity);
     if (a_rank != b_rank) return std.math.order(a_rank, b_rank);
 
     const by_path = std.mem.order(u8, a.path, b.path);

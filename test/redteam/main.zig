@@ -35,7 +35,7 @@ pub const Exit = enum(u8) {
     inconclusive = 3,
 
     fn code(self: Exit) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -684,7 +684,7 @@ fn forgeAndJudge(
 
     // The named boundary and not a count, or a forge that tripped the wrong canary would pass.
     proof.right = if (kind.boundary()) |wanted|
-        result.verdicts[@intFromEnum(wanted)] == .breached
+        result.verdicts[@backingInt(wanted)] == .breached
     else
         result.breaches() == 0 and result.trustworthy();
 
