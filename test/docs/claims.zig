@@ -813,6 +813,17 @@ test "the README names the declared Zig toolchain" {
     try testing.expect(std.mem.indexOf(u8, readme, documented) != null);
 }
 
+test "the README keeps both supported install paths" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+    const readme = try docText(docs, "README.md");
+
+    try testing.expect(std.mem.indexOf(u8, readme, "[chock.ws/download](https://chock.ws/download)") != null);
+    try testing.expect(std.mem.indexOf(u8, readme, "nix profile install github:LilithSemi/chock") != null);
+}
+
 test "the README creates configuration before the first doctor check" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
