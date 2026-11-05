@@ -278,6 +278,75 @@ fn repoHas(io: std.Io, arena: std.mem.Allocator, path: []const u8) !bool {
     return true;
 }
 
+fn markdownAnchor(arena: std.mem.Allocator, line: []const u8) !?[]const u8 {
+    var indent: usize = 0;
+    while (indent < line.len and line[indent] == ' ') : (indent += 1) {}
+    if (indent > 3 or (indent < line.len and line[indent] == '\t')) return null;
+    const trimmed = line[indent..];
+    if (trimmed.len < 2 or trimmed[0] != '#') return null;
+
+    var heading_start: usize = 0;
+    while (heading_start < trimmed.len and trimmed[heading_start] == '#') : (heading_start += 1) {}
+    if (heading_start == 0 or heading_start > 6) return null;
+    if (heading_start == trimmed.len or (trimmed[heading_start] != ' ' and trimmed[heading_start] != '\t')) return null;
+
+    var heading = std.mem.trim(u8, trimmed[heading_start..], " \t");
+    heading = std.mem.trimEnd(u8, heading, "#");
+    heading = std.mem.trimEnd(u8, heading, " \t");
+
+    var anchor: std.ArrayList(u8) = .empty;
+    for (heading) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') {
+            try anchor.append(arena, std.ascii.toLower(c));
+        } else if (c == ' ' or c == '\t') {
+            try anchor.append(arena, '-');
+        }
+    }
+    return anchor.items;
+}
+
+fn pageHasAnchor(arena: std.mem.Allocator, page: []const u8, wanted: []const u8) !bool {
+    var occupied: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, page, '\n');
+    var fenced = false;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "```") or std.mem.startsWith(u8, trimmed, "~~~")) {
+            fenced = !fenced;
+            continue;
+        }
+        if (fenced) continue;
+        const anchor = try markdownAnchor(arena, line) orelse continue;
+        var candidate = anchor;
+        var suffix: usize = 1;
+        while (containsString(occupied.items, candidate)) : (suffix += 1) {
+            candidate = try std.fmt.allocPrint(arena, "{s}-{d}", .{ anchor, suffix });
+        }
+        try occupied.append(arena, candidate);
+        if (std.mem.eql(u8, candidate, wanted)) return true;
+    }
+    return false;
+}
+
+fn containsString(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |one| {
+        if (std.mem.eql(u8, one, needle)) return true;
+    }
+    return false;
+}
+
+test "Markdown headings become the anchors local links use" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectEqualStrings("workspacebind", (try markdownAnchor(arena, "## `workspace.bind`")).?);
+    try testing.expect((try markdownAnchor(arena, "    # code, not a heading")) == null);
+    try testing.expect(try pageHasAnchor(arena, "# Same heading\n# Same heading\n", "same-heading-1"));
+    try testing.expect(!try pageHasAnchor(arena, "# Same heading\n", "same-heading-1"));
+    try testing.expect(!try pageHasAnchor(arena, "```text\n# code, not a heading\n```\n", "code-not-a-heading"));
+}
+
 test "every external action in CI is pinned to an immutable revision" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -342,7 +411,7 @@ test "the documentation index names every page under docs/" {
     try testing.expectEqualStrings("", missing.items);
 }
 
-test "every path the documentation names is in the repository" {
+test "every local documentation link reaches a file and heading" {
     // A link is read relative to the page it is on, the way a browser reads it.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -375,13 +444,28 @@ test "every path the documentation names is in the repository" {
             rest = rest[close + 1 ..];
             if (std.mem.startsWith(u8, target, "http")) continue;
             if (std.mem.startsWith(u8, target, "mailto:")) continue;
-            if (std.mem.startsWith(u8, target, "#")) continue;
-            const file = if (std.mem.indexOfScalar(u8, target, '#')) |hash| target[0..hash] else target;
-            if (file.len == 0) continue;
-            checked += 1;
-            const path = try std.fs.path.join(arena, &.{ directory, file });
-            if (try repoHas(testing.io, arena, path)) continue;
-            try missing.print(arena, "{s}: the link to {s} reaches nothing\n", .{ doc.path, target });
+            const hash = std.mem.indexOfScalar(u8, target, '#');
+            const file = if (hash) |at| target[0..at] else target;
+            const path = if (file.len == 0)
+                doc.path
+            else
+                try std.fs.path.join(arena, &.{ directory, file });
+            if (file.len != 0) {
+                checked += 1;
+                if (!try repoHas(testing.io, arena, path)) {
+                    try missing.print(arena, "{s}: the link to {s} reaches no file\n", .{ doc.path, target });
+                    continue;
+                }
+            }
+            if (hash) |at| {
+                const anchor = target[at + 1 ..];
+                if (anchor.len == 0) continue;
+                checked += 1;
+                const full = try std.fs.path.join(arena, &.{ repo_root, path });
+                const page = try std.Io.Dir.cwd().readFileAlloc(testing.io, full, arena, .limited(max_doc_bytes));
+                if (try pageHasAnchor(arena, page, anchor)) continue;
+                try missing.print(arena, "{s}: the link to {s} reaches no heading\n", .{ doc.path, target });
+            }
         }
     }
 
