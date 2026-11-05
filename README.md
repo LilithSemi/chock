@@ -109,7 +109,8 @@ quietly became a task would spend money on a typo. `chock -- fix the parser`
 runs, and so does `echo "fix the parser" | chock`.
 
 Name your providers in `~/.config/chock/config.zon`, which Chock reads and
-never writes. See
+never writes. Run `chock config check` to validate it without reading a
+credential or contacting a provider. See
 [docs/configure/configuration.md](docs/configure/configuration.md).
 
 Chock is a pre-alpha project. Its documentation describes the implemented

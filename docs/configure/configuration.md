@@ -3,6 +3,15 @@
 Chock reads `~/.config/chock/config.zon` and never writes it, so you can give
 the whole directory to home-manager.
 
+Check this file without reading a credential or contacting a provider:
+
+```
+chock config check
+```
+
+This command checks the user configuration only. The project's `chock.zon` is
+separate and is checked before a session starts.
+
 ```zon
 .{
     .providers = .{

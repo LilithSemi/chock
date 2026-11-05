@@ -8,6 +8,7 @@ const chock_proto = @import("chock-proto");
 
 const run_cmd = @import("run.zig");
 const login_cmd = @import("login.zig");
+const config_cmd = @import("config.zig");
 const models_cmd = @import("models.zig");
 const daemon_cmd = @import("daemon.zig");
 const acp_cmd = @import("acp.zig");
@@ -164,6 +165,11 @@ pub const commands = [_]Command{
         .name = "login",
         .summary = "Store a credential for a provider instance.",
         .run = login_cmd.main,
+    },
+    .{
+        .name = "config",
+        .summary = "Check the user configuration without reading credentials.",
+        .run = config_cmd.main,
     },
     .{
         .name = "models",
