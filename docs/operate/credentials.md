@@ -13,6 +13,10 @@ on Linux, which is what gnome-keyring and kwallet answer, and the Keychain on
 macOS. It is checked against the provider before it is stored, so a mistyped key
 fails at login rather than on your first turn.
 
+If `config.zon` already declares the instance name, Chock checks its provider
+kind before it asks for a credential or opens a browser. A conflicting login
+therefore stores nothing and does not ask you to enter a secret it cannot use.
+
 ## OpenAI web login
 
 `chock login --provider openai` opens the system browser and starts an OAuth

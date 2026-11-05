@@ -220,6 +220,15 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expectEqual(@as(usize, 1), parsed.value.provider_instances);
     try testing.expectEqualStrings("local", parsed.value.default_provider.?);
     try testing.expectEqualStrings("glm4.7-flash:A3B", parsed.value.default_model.?);
+
+    var conflict = try runChock(gpa, io, &box.env, &.{
+        "login", "--provider", "aiand", "--name", "local", "--password-method", "stdin",
+    });
+    defer conflict.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), conflict.code);
+    try testing.expect(std.mem.indexOf(u8, conflict.err, "configuration declares \"local\" as kind openai-compat") != null);
+    try testing.expect(std.mem.indexOf(u8, conflict.err, "nothing was given") == null);
+    try testing.expect(std.mem.indexOf(u8, conflict.out, "asking") == null);
 }
 
 test "a piped stream gets no escape sequence, and --color=always still paints one" {

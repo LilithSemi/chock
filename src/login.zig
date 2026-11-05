@@ -116,6 +116,18 @@ pub fn main(
     const name = options.name orelse kind_and_url.kind.wireName();
     const name_was_given = options.name != null;
 
+    const loaded = loadConfig(arena, io, config_dir);
+    const target = checkTarget(kind_and_url, loaded.find(name)) catch {
+        const declared = loaded.find(name).?;
+        tty.print(
+            .warn,
+            "chock login: the configuration declares \"{s}\" as kind {s}, and this command says {s}. " ++
+                "Nothing was stored.\n",
+            .{ name, declared.kind.wireName(), kind_and_url.kind.wireName() },
+        );
+        return Exit.usage.code();
+    };
+
     // Holds no lock here: a lock held across a person answering a prompt would hold it for minutes, and every other login would time out.
     const method = options.method orelse defaultMethod(io);
 
@@ -164,18 +176,6 @@ pub fn main(
         tty.print(.warn, "chock login: nothing was given, so nothing was stored.\n", .{});
         return Exit.usage.code();
     }
-
-    const loaded = loadConfig(arena, io, config_dir);
-    const target = checkTarget(kind_and_url, loaded.find(name)) catch {
-        const declared = loaded.find(name).?;
-        tty.print(
-            .warn,
-            "chock login: the configuration declares \"{s}\" as kind {s}, and this command says {s}. " ++
-                "Nothing was stored.\n",
-            .{ name, declared.kind.wireName(), kind_and_url.kind.wireName() },
-        );
-        return Exit.usage.code();
-    };
 
     if (target.kind != .openai) check: {
         tty.print(.plain, "chock login: asking {s} whether this credential works...\n", .{target.base_url});
