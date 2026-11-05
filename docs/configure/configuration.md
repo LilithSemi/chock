@@ -38,7 +38,9 @@ separate and is checked before a session starts.
 For a script or configuration deployment, request one JSON object on standard
 output. The document has schema `chock.config-check` version 1. A failed check
 sets `valid` to `false`, writes the diagnostic to standard error, and returns a
-nonzero status:
+nonzero status. When the file parsed but a default names no provider, the JSON
+keeps that configured provider and model so a deployment can report the exact
+bad reference:
 
 ```
 chock config check --format json

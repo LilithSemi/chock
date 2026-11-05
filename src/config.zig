@@ -192,12 +192,11 @@ fn reportInvalid(
         try reportJson(arena, .{ .path = path, .valid = false });
         return;
     };
-    const default_provider = if (known.defaultInstance()) |instance| instance.name else null;
     try reportJson(arena, .{
         .path = path,
         .valid = false,
         .provider_instances = known.instances.len,
-        .default_provider = default_provider,
+        .default_provider = known.default_provider,
         .default_model = known.default_model,
     });
 }
@@ -394,7 +393,7 @@ test "an invalid JSON report keeps configuration facts that were parsed" {
     defer parsed.deinit();
     try std.testing.expect(!parsed.value.valid);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.provider_instances);
-    try std.testing.expectEqual(@as(?[]const u8, null), parsed.value.default_provider);
+    try std.testing.expectEqualStrings("wrok", parsed.value.default_provider.?);
     try std.testing.expectEqualStrings("a-model", parsed.value.default_model.?);
 }
 

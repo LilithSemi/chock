@@ -313,6 +313,22 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expect(std.mem.indexOf(u8, conflict.err, "configuration declares \"local\" as kind openai-compat") != null);
     try testing.expect(std.mem.indexOf(u8, conflict.err, "nothing was given") == null);
     try testing.expect(std.mem.indexOf(u8, conflict.out, "asking") == null);
+
+    try box.writeConfig(gpa, io,
+        \\.{
+        \\    .providers = .{ .{ .name = "work", .kind = "aiand" } },
+        \\    .defaults = .{ .provider = "wrok", .model = "a-model" },
+        \\}
+    );
+    var invalid_default = try runChock(gpa, io, &box.env, &.{ "config", "check", "--format", "json" });
+    defer invalid_default.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), invalid_default.code);
+    try testing.expect(std.mem.indexOf(u8, invalid_default.err, "wrok") != null);
+    const invalid_report = try std.json.parseFromSlice(Report, gpa, invalid_default.out, .{});
+    defer invalid_report.deinit();
+    try testing.expect(!invalid_report.value.valid);
+    try testing.expectEqualStrings("wrok", invalid_report.value.default_provider.?);
+    try testing.expectEqualStrings("a-model", invalid_report.value.default_model.?);
 }
 
 test "a JSON model probe stays one document and reports the sorted remote catalogue" {
