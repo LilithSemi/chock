@@ -927,15 +927,22 @@ test "automation report pages name every stable status value" {
 
     var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{});
     defer root.close(testing.io);
+    const config_source = try root.readFileAlloc(testing.io, "src/config.zig", arena, .limited(max_source_bytes));
     const models_source = try root.readFileAlloc(testing.io, "src/models.zig", arena, .limited(max_source_bytes));
     const doctor_source = try root.readFileAlloc(testing.io, "src/doctor.zig", arena, .limited(max_source_bytes));
 
     const configuration = try docText(docs, "docs/configure/configuration.md");
+    const check_section = try textBetween(configuration, "For a script or configuration deployment", "## The name is the identity");
     const catalogue_section = try textBetween(configuration, "Catalogue status values are:", "## Naming a credential");
     const running = try docText(docs, "docs/running.md");
     const doctor_section = try textBetween(running, "The report verdict is", "On an installation an organisation manages");
 
     var wrong: std.ArrayList(u8) = .empty;
+    for (try simpleEnumFields(arena, config_source, "const CheckProblem")) |field| {
+        if (!try namesInTicks(check_section, field, arena)) {
+            try wrong.print(arena, "docs/configure/configuration.md names no configuration problem `{s}`\n", .{field});
+        }
+    }
     for (try simpleEnumFields(arena, models_source, "const CatalogueStatus")) |field| {
         if (!try namesInTicks(catalogue_section, field, arena)) {
             try wrong.print(arena, "docs/configure/configuration.md names no catalogue status `{s}`\n", .{field});
