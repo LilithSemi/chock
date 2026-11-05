@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+version=${1:?usage: check-release-version <version> <ref> <ref-name>}
+ref=${2:?usage: check-release-version <version> <ref> <ref-name>}
+ref_name=${3:?usage: check-release-version <version> <ref> <ref-name>}
+
+case "$ref" in
+  refs/tags/v*)
+    expected="v${version}"
+    if [ "$ref_name" != "$expected" ]; then
+      echo "::error::release tag ${ref_name} does not match the package version ${version}; expected ${expected}" >&2
+      exit 1
+    fi
+    ;;
+esac

@@ -38,6 +38,9 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
+      - name: Test the release version guard
+        run: .github/scripts/test-release-version
+
       - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3 # v3
 
       - uses: DeterminateSystems/flakehub-cache-action@3ac6f3c19fc52eeb1408fd434bd1b4ed4266bf25 # v3
@@ -167,6 +170,12 @@ jobs:
         run: |
           set -euo pipefail
           version=$(nix eval .#default.version --raw)
+
+          # A tag is the public version identity, while this value names the
+          # archive and is compiled into the binary. Refuse the release before
+          # building three platforms if those identities disagree.
+          ./.github/scripts/check-release-version \
+            "${version}" "${GITHUB_REF}" "${GITHUB_REF_NAME}"
 
           nix build .#default --print-build-logs
 

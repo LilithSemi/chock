@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+check="${here}/check-release-version"
+diagnostic=$(mktemp)
+trap 'rm -f "$diagnostic"' EXIT HUP INT TERM
+
+"$check" 1.2.3 refs/tags/v1.2.3 v1.2.3
+"$check" 1.2.3 refs/heads/master master
+
+if "$check" 1.2.3 refs/tags/v1.2.4 v1.2.4 2>"$diagnostic"; then
+  echo "a mismatched release tag passed" >&2
+  exit 1
+fi
+
+grep -q 'expected v1.2.3' "$diagnostic"
