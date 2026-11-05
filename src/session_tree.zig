@@ -316,7 +316,16 @@ fn statusName(outcome: ?event.AgentOutcome, session: state.Session, live: bool) 
     if (live) return "running";
     if (outcome) |one| return one.wireName();
     if (session.ended) return session.end_reason.wireName();
-    return "missing terminal record";
+    return "missing_terminal_record";
+}
+
+test "session tree machine statuses contain no spaces" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const session = state.Session.init(arena_state.allocator());
+
+    try std.testing.expectEqualStrings("running", statusName(null, session, true));
+    try std.testing.expectEqualStrings("missing_terminal_record", statusName(null, session, false));
 }
 
 fn indent(writer: *std.Io.Writer, depth: usize) !void {

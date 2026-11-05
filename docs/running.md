@@ -209,7 +209,8 @@ whether currencies were mixed, and `cost_enforceable`. Only an enforceable cost
 is a complete total that a budget check can use.
 
 The stable `problem` values are `cycle`, `missing_log`, `log_unreadable`, and
-`log_invalid`.
+`log_invalid`. A nonterminal row uses `running` or `missing_terminal_record` as
+its `status`. A terminal row uses the outcome recorded in the session events.
 
 ### What reached the model
 
