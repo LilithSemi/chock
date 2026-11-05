@@ -159,6 +159,12 @@ fn report(
 fn parseOptions(args: []const []const u8) error{ HelpWanted, BadArguments }!Options {
     if (args.len == 1 and std.mem.eql(u8, args[0], "check")) return .{ .operation = .check };
     if (args.len == 1 and std.mem.eql(u8, args[0], "path")) return .{ .operation = .path };
+    if (args.len == 2 and
+        (std.mem.eql(u8, args[0], "check") or std.mem.eql(u8, args[0], "path")) and
+        (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")))
+    {
+        return error.HelpWanted;
+    }
     if (args.len == 3 and
         std.mem.eql(u8, args[0], "check") and
         std.mem.eql(u8, args[1], "--format"))
@@ -186,6 +192,8 @@ test "config takes the check and path operations" {
     try std.testing.expectError(error.BadArguments, parseOptions(&.{ "path", "--format", "json" }));
     try std.testing.expectError(error.BadArguments, parseOptions(&.{ "check", "--format", "yaml" }));
     try std.testing.expectError(error.HelpWanted, parseOptions(&.{"--help"}));
+    try std.testing.expectError(error.HelpWanted, parseOptions(&.{ "check", "--help" }));
+    try std.testing.expectError(error.HelpWanted, parseOptions(&.{ "path", "-h" }));
 }
 
 test "a valid report says how its default was selected and exposes no credential" {
