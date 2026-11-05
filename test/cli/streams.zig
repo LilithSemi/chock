@@ -217,6 +217,7 @@ test "the documented configuration starter passes the real CLI check" {
         version: u32,
         path: []const u8,
         valid: bool,
+        problem: ?[]const u8,
         provider_instances: usize,
         default_provider: ?[]const u8,
         default_model: ?[]const u8,
@@ -237,6 +238,7 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expectEqual(@as(u32, 1), invalid.value.version);
     try testing.expectEqualStrings(expected_path, invalid.value.path);
     try testing.expect(!invalid.value.valid);
+    try testing.expectEqualStrings("config_missing", invalid.value.problem.?);
 
     var path = try runChock(gpa, io, &box.env, &.{ "config", "path" });
     defer path.deinit(gpa);
@@ -327,8 +329,18 @@ test "the documented configuration starter passes the real CLI check" {
     const invalid_report = try std.json.parseFromSlice(Report, gpa, invalid_default.out, .{});
     defer invalid_report.deinit();
     try testing.expect(!invalid_report.value.valid);
+    try testing.expectEqualStrings("default_provider_missing", invalid_report.value.problem.?);
     try testing.expectEqualStrings("wrok", invalid_report.value.default_provider.?);
     try testing.expectEqualStrings("a-model", invalid_report.value.default_model.?);
+
+    try box.writeConfig(gpa, io, ".{ .providers = ");
+    var malformed = try runChock(gpa, io, &box.env, &.{ "config", "check", "--format", "json" });
+    defer malformed.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), malformed.code);
+    const malformed_report = try std.json.parseFromSlice(Report, gpa, malformed.out, .{});
+    defer malformed_report.deinit();
+    try testing.expect(!malformed_report.value.valid);
+    try testing.expectEqualStrings("config_invalid", malformed_report.value.problem.?);
 }
 
 test "a JSON model probe stays one document and reports the sorted remote catalogue" {

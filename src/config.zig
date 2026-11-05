@@ -121,7 +121,7 @@ pub fn main(
                     "run `chock config init` to write a starter\n",
                 .{path},
             );
-            try reportInvalid(arena, path, options.format, null);
+            try reportInvalid(arena, path, options.format, .config_missing, null);
             return Exit.usage.code();
         },
         else => {
@@ -130,7 +130,13 @@ pub fn main(
             } else {
                 tty.print(.err, "chock config check: {s} could not be read: {t}\n", .{ path, err });
             }
-            try reportInvalid(arena, path, options.format, null);
+            try reportInvalid(
+                arena,
+                path,
+                options.format,
+                problemForLoadError(err),
+                null,
+            );
             return Exit.usage.code();
         },
     };
@@ -142,7 +148,7 @@ pub fn main(
             "chock config check: .defaults.provider names \"{s}\", but no provider has that name\n",
             .{name},
         );
-        try reportInvalid(arena, path, options.format, &loaded);
+        try reportInvalid(arena, path, options.format, .default_provider_missing, &loaded);
         return Exit.usage.code();
     }
 
@@ -176,25 +182,39 @@ const CheckReport = struct {
     version: u32 = 1,
     path: []const u8,
     valid: bool = true,
+    problem: ?CheckProblem = null,
     provider_instances: usize = 0,
     default_provider: ?[]const u8 = null,
     default_model: ?[]const u8 = null,
 };
 
+const CheckProblem = enum {
+    config_missing,
+    config_invalid,
+    config_unreadable,
+    default_provider_missing,
+};
+
+fn problemForLoadError(err: anyerror) CheckProblem {
+    return if (err == error.ReadFailed) .config_unreadable else .config_invalid;
+}
+
 fn reportInvalid(
     arena: std.mem.Allocator,
     path: []const u8,
     format: Format,
+    problem: CheckProblem,
     config: ?*const chock_auth.config.Config,
 ) !void {
     if (format != .json) return;
     const known = config orelse {
-        try reportJson(arena, .{ .path = path, .valid = false });
+        try reportJson(arena, .{ .path = path, .valid = false, .problem = problem });
         return;
     };
     try reportJson(arena, .{
         .path = path,
         .valid = false,
+        .problem = problem,
         .provider_instances = known.instances.len,
         .default_provider = known.default_provider,
         .default_model = known.default_model,
@@ -362,12 +382,13 @@ test "an invalid JSON report is structured and has no guessed configuration" {
     capture.start(std.testing.io, gpa);
     defer capture.stop(std.testing.io);
 
-    try reportInvalid(gpa, "/config/chock/config.zon", .json, null);
+    try reportInvalid(gpa, "/config/chock/config.zon", .json, .config_missing, null);
 
     const parsed = try std.json.parseFromSlice(CheckReport, gpa, capture.out(), .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("/config/chock/config.zon", parsed.value.path);
     try std.testing.expect(!parsed.value.valid);
+    try std.testing.expectEqual(CheckProblem.config_missing, parsed.value.problem.?);
     try std.testing.expectEqual(@as(usize, 0), parsed.value.provider_instances);
     try std.testing.expectEqual(@as(?[]const u8, null), parsed.value.default_provider);
     try std.testing.expectEqual(@as(?[]const u8, null), parsed.value.default_model);
@@ -387,11 +408,12 @@ test "an invalid JSON report keeps configuration facts that were parsed" {
     capture.start(std.testing.io, gpa);
     defer capture.stop(std.testing.io);
 
-    try reportInvalid(gpa, "/config/chock/config.zon", .json, &config);
+    try reportInvalid(gpa, "/config/chock/config.zon", .json, .default_provider_missing, &config);
 
     const parsed = try std.json.parseFromSlice(CheckReport, gpa, capture.out(), .{});
     defer parsed.deinit();
     try std.testing.expect(!parsed.value.valid);
+    try std.testing.expectEqual(CheckProblem.default_provider_missing, parsed.value.problem.?);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.provider_instances);
     try std.testing.expectEqualStrings("wrok", parsed.value.default_provider.?);
     try std.testing.expectEqualStrings("a-model", parsed.value.default_model.?);
@@ -408,4 +430,10 @@ test "a named default must name an instance the file has" {
     defer config.deinit();
 
     try std.testing.expectEqualStrings("wrok", missingDefault(&config).?);
+}
+
+test "configuration load failures have stable problem classes" {
+    try std.testing.expectEqual(CheckProblem.config_unreadable, problemForLoadError(error.ReadFailed));
+    try std.testing.expectEqual(CheckProblem.config_invalid, problemForLoadError(error.InvalidConfig));
+    try std.testing.expectEqual(CheckProblem.config_invalid, problemForLoadError(error.ConfigTooLarge));
 }
