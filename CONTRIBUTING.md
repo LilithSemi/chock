@@ -9,6 +9,25 @@ test.
 This project follows a [Code of Conduct](CODE_OF_CONDUCT.md). By taking part, you
 agree to uphold it.
 
+## Development environment
+
+Enter the repository's Nix development shell before building:
+
+```
+nix develop
+```
+
+The shell supplies the supported Zig toolchain and the native packages used by
+the full test suite. It also supplies the reference MCP servers and language
+grammar modules used by the real integration tests. The flake supports
+`x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`.
+
+Run one command without entering an interactive shell when that is more useful:
+
+```
+nix develop --command zig build test --summary all
+```
+
 ## Repository layout
 
 - `lib/` - the libraries, one module for each concern. The boundary itself is
