@@ -150,9 +150,10 @@ behaviour, read the comments around it and the documentation that describes it.
 
 - `zig build` succeeds.
 - `zig build test --summary all` passes, and a skip says why it skipped.
-- `zig fmt --check build.zig lib src test` names no file. Give it the source
-  directories, because a bare `.` also walks the fetched packages under
-  `zig-pkg/`, which are not ours to format.
+- `nix fmt -- --ci` passes. It checks the Nix and Zig formatting, the GitHub
+  Actions workflow with Actionlint, and the release scripts with ShellCheck.
+  Treefmt walks the repository's source files, so fetched packages under
+  `zig-pkg/` are not checked as Chock source.
 - The build log is silent. `zig build` prints `failed command:` for any step that
   writes to standard error, whatever its exit status, so a stray print makes
   every other result in the run look doubtful. `zig build test` therefore fails
