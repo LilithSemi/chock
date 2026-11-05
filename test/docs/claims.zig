@@ -406,6 +406,26 @@ test "release provenance covers archives and their checksum manifest" {
     try testing.expect(std.mem.indexOf(u8, workflow, subjects) != null);
 }
 
+test "Linux releases package both microVM guest images" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{});
+    defer root.close(testing.io);
+    const workflow = try root.readFileAlloc(testing.io, ".github/workflows/ci.yml", arena, .limited(max_doc_bytes));
+
+    for ([_][]const u8{
+        "nix build .#guest-kernel --out-link result-guest-kernel",
+        "nix build .#guest-initrd --out-link result-guest-initrd",
+        "chock-${version}-guest-${{ matrix.target }}",
+        "cp \"result-guest-kernel/${guest_kernel_name}\"",
+        "cp result-guest-initrd/initrd",
+    }) |required| {
+        try testing.expect(std.mem.indexOf(u8, workflow, required) != null);
+    }
+}
+
 test "the documentation index names every page under docs/" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

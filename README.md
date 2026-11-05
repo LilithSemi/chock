@@ -73,6 +73,12 @@ Download the build for your platform from
 archives and their checksums, and shows how to put the `chock` binary on your
 path.
 
+Release assets also include optional `chock-<version>-guest-<linux-target>`
+archives for the microVM driver. They contain the architecture-matched kernel
+and initrd and are separate so an ordinary installation does not download
+guest images it does not use. See
+[docs/security/microvm.md](docs/security/microvm.md#where-the-images-are-built).
+
 Download `SHA256SUMS` beside the archive. With the GitHub CLI, first verify that
 the checksum manifest came from this repository's workflow:
 

@@ -81,16 +81,21 @@ the Darwin gap, but a Mac cannot build `x86_64-linux`'s module closure
 itself: that needs an `x86_64-linux` remote builder in `nix.buildMachines`,
 or the CI `ubuntu-latest` runner, which builds its own images natively.
 
-A Mac instead takes the images from a release or a configured Linux builder,
-naming the two files by their architecture's own names, `Image` and
-`initrd`:
+A release publishes the images in a separate
+`chock-<version>-guest-<linux-target>.tar.gz` archive. An Apple Silicon Mac
+uses the `aarch64-linux` guest archive. It contains `Image`, `initrd`, the
+license, and the release README. This keeps the images out of ordinary binary
+downloads.
+
+A Mac takes that archive or uses a configured Linux builder. Name the two
+extracted files in the configuration:
 
 ```zon
 .{
     .sandbox = .{
         .driver = "microvm",
-        .kernel = "/nix/store/<hash>-linux-6.1.182/Image",
-        .initrd = "/nix/store/<hash>-initrd/initrd",
+        .kernel = "/path/to/chock-<version>-guest-aarch64-linux/Image",
+        .initrd = "/path/to/chock-<version>-guest-aarch64-linux/initrd",
     },
 }
 ```

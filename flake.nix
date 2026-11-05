@@ -96,8 +96,8 @@
           # x86_64: an aarch64 machine needs an x86_64 remote builder, or the x86 CI
           # runner, to produce it. See `docs/security/microvm.md`.
           #
-          # A Mac takes the images from a release, or from a Linux builder it is
-          # configured with. See `docs/security/microvm.md`.
+          # A Mac takes the optional aarch64 guest archive from a release, or
+          # uses a configured Linux builder. See `docs/security/microvm.md`.
           onLinux = lib.hasSuffix "-linux" system;
           guest = import ./pkgs/chock/guest.nix {
             inherit lib;
@@ -109,8 +109,8 @@
           default = pkgs.chock;
         }
         // lib.optionalAttrs onLinux {
-          # The two things a microVM guest boots, each its own derivation, so a
-          # release tarball carries them beside the binary.
+          # The two things a microVM guest boots, each its own derivation. The
+          # release workflow puts them in an optional architecture archive.
           guest-kernel = guest.kernel;
           guest-initrd = guest.initrd;
         }

@@ -179,6 +179,20 @@ jobs:
 
           nix build .#default --print-build-logs
 
+          # A guest is Linux even when its host is macOS. Build its kernel and
+          # initrd on each Linux runner and publish them as an optional archive
+          # of their own, so a Mac can use the aarch64 images without making
+          # every binary download carry them.
+          guest_kernel_name=
+          case "${{ matrix.target }}" in
+            x86_64-linux) guest_kernel_name=bzImage ;;
+            aarch64-linux) guest_kernel_name=Image ;;
+          esac
+          if [ -n "${guest_kernel_name}" ]; then
+            nix build .#guest-kernel --out-link result-guest-kernel --print-build-logs
+            nix build .#guest-initrd --out-link result-guest-initrd --print-build-logs
+          fi
+
           # **A version-less copy is made for a tagged release alone.**
           # GitHub serves `releases/latest/download/<name>` out of the latest
           # FULL release and never out of a prerelease, and every unstable
@@ -231,6 +245,27 @@ jobs:
                 | gzip -n > 'artifacts/${shape}.tar.gz'
             "
           done
+
+          if [ -n "${guest_kernel_name}" ]; then
+            guest_shapes=("chock-${version}-guest-${{ matrix.target }}")
+            if [ "${permanent_name}" = 1 ]; then
+              guest_shapes+=("chock-guest-${{ matrix.target }}")
+            fi
+            for shape in "${guest_shapes[@]}"; do
+              rm -rf "stage/${shape}"
+              mkdir -p "stage/${shape}"
+              cp "result-guest-kernel/${guest_kernel_name}" "stage/${shape}/"
+              cp result-guest-initrd/initrd "stage/${shape}/"
+              cp LICENSE README.md "stage/${shape}/"
+              nix shell nixpkgs#gnutar nixpkgs#gzip -c sh -c "
+                tar --sort=name \
+                    --owner=0 --group=0 --numeric-owner \
+                    --mtime='@${SOURCE_DATE_EPOCH:-0}' \
+                    -C stage -cf - '${shape}' \
+                  | gzip -n > 'artifacts/${shape}.tar.gz'
+              "
+            done
+          fi
 
           # **Every platform reports its own version, and not one of them on
           # behalf of the rest.** The old job ran the Linux binary alone, so a
