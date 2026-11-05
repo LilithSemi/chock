@@ -162,6 +162,17 @@ behaviour, read the comments around it and the documentation that describes it.
 - A security relevant change says what it changes in [SECURITY.md](SECURITY.md),
   or says why that file still reads true.
 
+## Releases
+
+The version in `build.zig.zon` is the release identity. A release tag adds one
+leading `v`, so version `1.2.3` uses tag `v1.2.3`. CI refuses a tag that does
+not match before it builds the release archives. Update and test the manifest
+version before you create the tag.
+
+A version with a pre-release suffix, such as `1.2.3-rc1`, becomes a GitHub
+pre-release. The `-unstable` manifest version is reserved for the rolling build
+from `master`; CI gives each such build its date and revision automatically.
+
 ## Commits
 
 Chock uses short, imperative commit subjects with a type prefix, such as
