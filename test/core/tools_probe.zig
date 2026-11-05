@@ -186,7 +186,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         // Nothing is printed here: the build fails on a byte written to standard error.
         error.NamespaceFailed => return palisade.linux.namespace.nothing_measured_exit_status,
         else => {
-            std.debug.print("dispatch failed: {s}\n", .{@errorName(err)});
+            // On standard output, because a test reads nothing else.
+            writeAll("dispatch failed: ");
+            writeAll(@errorName(err));
+            if (chock_core.tools.sandboxSaid()) |said| {
+                writeAll(": ");
+                writeAll(said);
+            }
+            writeAll("\n");
             return 3;
         },
     };

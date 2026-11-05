@@ -1783,7 +1783,7 @@ fn runTool(
         failing.clear(allocator);
         break :good ran;
     } else |err| blk: {
-        const said = tools.driverNow().whyLast();
+        const said = tools.driverNow().whyLast() orelse tools.sandboxSaid();
         _ = try failing.observe(allocator, said orelse @errorName(err));
         break :blk event.ToolResult{
             .call_id = try allocator.dupe(u8, call.call_id),

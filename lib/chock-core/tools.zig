@@ -4108,6 +4108,29 @@ const SpawnThread = struct {
     }
 };
 
+/// The line the sandbox wrote as it died before the program ran. A spawn
+/// failure carries an error name and no detail, and the one line that names the
+/// call, the errno and the path is on the capture pipe, so it is kept for the
+/// loop to put in the tool result.
+threadlocal var sandbox_words: [256]u8 = undefined;
+threadlocal var sandbox_words_len: usize = 0;
+
+pub fn sandboxSaid() ?[]const u8 {
+    if (sandbox_words_len == 0) return null;
+    return sandbox_words[0..sandbox_words_len];
+}
+
+fn keepSandboxSaid(said: []const u8) void {
+    sandbox_words_len = 0;
+    const line = std.mem.trim(u8, said, &std.ascii.whitespace);
+    const first = line[0 .. std.mem.indexOfScalar(u8, line, '\n') orelse line.len];
+    const trimmed = std.mem.trim(u8, first, &std.ascii.whitespace);
+    if (trimmed.len == 0) return;
+    const take = @min(trimmed.len, sandbox_words.len);
+    @memcpy(sandbox_words[0..take], trimmed[0..take]);
+    sandbox_words_len = take;
+}
+
 threadlocal var chosen_driver: chock_net.Driver = chock_net.Driver.native_driver;
 
 pub fn useDriver(one: chock_net.Driver) void {
@@ -4176,6 +4199,7 @@ fn spawnCapturingIo(
     approval_wait_ns: ?*const std.atomic.Value(u64),
     chock_io_driver: chock_io.Io,
 ) palisade.Sandbox.SpawnError!Captured {
+    sandbox_words_len = 0;
     const raw_pipe = try chock_io_driver.pipeCloseOnExec();
     const read_fd = raw_pipe.read_fd;
     const write_fd = raw_pipe.write_fd;
@@ -4248,6 +4272,7 @@ fn spawnCapturingIo(
     thread.join();
 
     if (spawn_thread.spawn_err) |err| {
+        keepSandboxSaid(drained.data);
         allocator.free(drained.data);
         return err;
     }

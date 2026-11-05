@@ -392,7 +392,9 @@ fn parseProbeOutcome(allocator: std.mem.Allocator, term: std.process.Child.Term,
             .fault = code,
             .is_error = false,
             .truncated = false,
-            .output = try allocator.dupe(u8, &.{}),
+            // Whatever the probe said before it gave up, which is where a
+            // sandbox that died in setup names the call and the errno.
+            .output = try allocator.dupe(u8, stdout),
             .note = try allocator.dupe(u8, &.{}),
             .media_type = try allocator.dupe(u8, &.{}),
             .image_bytes = 0,
@@ -1200,9 +1202,11 @@ test "regression: a tool call that fails in setup leaves the session root fit fo
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_path = try absoluteDirPath(&root_buffer, root_tmp.dir.handle);
 
-    // A dev shell store path the Nix garbage collector took away fails at the `mount_tree` step.
-    const gone = try std.fs.path.join(allocator, &.{ ov.project, "a-toolchain-path-that-is-not-here" });
-    defer allocator.free(gone);
+    // A toolchain path that names a link fails at the `mount_tree` step, because
+    // a bind source is never followed.
+    const linked = try std.fs.path.join(allocator, &.{ ov.project, "a-toolchain-path-that-is-a-link" });
+    defer allocator.free(linked);
+    try std.Io.Dir.cwd().symLink(std.testing.io, ov.project, linked, .{});
 
     {
         var first = try runToolCallWith(
@@ -1211,10 +1215,16 @@ test "regression: a tool call that fails in setup leaves the session root fit fo
             root_tmp,
             "run_command",
             "{\"argv\":[\"cat\",\"hello.txt\"]}",
-            .{ .store_paths = &.{ "/nix/store", gone } },
+            .{ .store_paths = &.{ "/nix/store", linked } },
         );
         defer first.deinit(allocator);
         try std.testing.expectEqual(@as(?u8, 3), first.fault);
+
+        // The step that failed is not the answer. What the sandbox said as it
+        // died is the answer, and a caller that drops it leaves a session with
+        // nothing to act on.
+        try std.testing.expect(std.mem.indexOf(u8, first.output, "MountTreeFailed") != null);
+        try std.testing.expect(std.mem.indexOf(u8, first.output, "symbolic link") != null);
     }
 
     try std.testing.expectEqual(@as(?usize, 0), rootEntryCount(root_path));
