@@ -94,3 +94,32 @@ test "a refusal comes back with the provider's own words and stores nothing" {
     try std.testing.expectEqual(std.http.Status.unauthorized, outcome.rejected.status);
     try std.testing.expectEqualStrings(refusal, outcome.rejected.body);
 }
+
+test "a catalogue that stops answering is bounded by the request timeout" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const body = "{\"object\":\"list\",\"data\":[]}";
+    var gate: fake_provider.Gate = .{};
+    var fp = try fake_provider.FakeProvider.start(gpa, io, .{
+        .head = catalogueHead(body),
+        .body = &.{.{ .bytes = body }},
+        .gate = &gate,
+    });
+
+    var base_buf: [64]u8 = undefined;
+    var outcome = try chock_auth.check.credentialWithTimeout(
+        gpa,
+        io,
+        .openai_compat,
+        fp.baseUrl(&base_buf),
+        "",
+        .fromMilliseconds(20),
+    );
+    gate.openAll();
+    fp.join();
+    defer fp.deinit();
+    defer outcome.deinit(gpa);
+
+    try std.testing.expectEqual(std.meta.activeTag(outcome), chock_auth.check.Outcome.not_reached);
+    try std.testing.expectEqualStrings("TimedOut", outcome.not_reached);
+}

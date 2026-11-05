@@ -119,10 +119,11 @@ booleans. It omits endpoint URLs and credential material.
 
 Add `--probe` to opt into credential lookup and one authenticated `GET
 /models` request per selected provider. The returned model identifiers are
-sorted before they are printed. `chock models --provider <name> --probe` is the
-narrow form. The same typed catalogue result is kept in `chock-auth`, so the
-daemon and graphical clients can use it for a model switcher without parsing
-terminal output or handling credentials themselves.
+sorted before they are printed. Each provider request stops after 15 seconds
+if the connection, headers, or body do not finish. `chock models --provider
+<name> --probe` is the narrow form. The same typed catalogue result is kept in
+`chock-auth`, so the daemon and graphical clients can use it for a model
+switcher without parsing terminal output or handling credentials themselves.
 
 `chock models --probe --format json` keeps stdout as one JSON document. Its
 top-level `probed` field is true, and each provider has a `catalogue` object

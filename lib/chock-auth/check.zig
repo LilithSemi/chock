@@ -41,7 +41,78 @@ pub const Rejected = struct {
 
 pub const Error = std.mem.Allocator.Error;
 
+/// The complete catalogue exchange is bounded, including connect, headers,
+/// and body reads.
+pub const request_timeout: std.Io.Duration = .fromSeconds(15);
+
 pub fn credential(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    kind: config.Kind,
+    base_url: []const u8,
+    token: []const u8,
+) Error!Outcome {
+    return credentialWithTimeout(gpa, io, kind, base_url, token, request_timeout);
+}
+
+/// Performs the same check with a caller-selected bound. This is useful for
+/// short probes and deterministic tests.
+pub fn credentialWithTimeout(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    kind: config.Kind,
+    base_url: []const u8,
+    token: []const u8,
+    timeout: std.Io.Duration,
+) Error!Outcome {
+    const Race = union(enum) {
+        request: Error!Outcome,
+        deadline: std.Io.Cancelable!void,
+    };
+    var completed: [2]Race = undefined;
+    var race: std.Io.Select(Race) = .init(io, &completed);
+    race.async(.request, credentialRequest, .{ gpa, io, kind, base_url, token });
+    const deadline = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{
+        .raw = timeout,
+        .clock = .awake,
+    });
+    race.async(.deadline, waitUntil, .{ deadline, io });
+
+    const first = race.await() catch {
+        discardRace(Race, &race, gpa);
+        return .{ .not_reached = "Canceled" };
+    };
+    return switch (first) {
+        .request => |result| {
+            race.cancelDiscard();
+            return result;
+        },
+        .deadline => |result| {
+            result catch |err| {
+                discardRace(Race, &race, gpa);
+                return .{ .not_reached = @errorName(err) };
+            };
+            discardRace(Race, &race, gpa);
+            return .{ .not_reached = "TimedOut" };
+        },
+    };
+}
+
+fn discardRace(comptime Race: type, race: *std.Io.Select(Race), gpa: std.mem.Allocator) void {
+    while (race.cancel()) |remaining| switch (remaining) {
+        .request => |result| {
+            var outcome = result catch continue;
+            outcome.deinit(gpa);
+        },
+        .deadline => {},
+    };
+}
+
+fn waitUntil(deadline: std.Io.Clock.Timestamp, io: std.Io) std.Io.Cancelable!void {
+    return deadline.wait(io);
+}
+
+fn credentialRequest(
     gpa: std.mem.Allocator,
     io: std.Io,
     kind: config.Kind,
