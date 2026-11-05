@@ -520,6 +520,10 @@ blocking and not-on counts, and every row. Each row has a `sandbox` or
 `first_run` section and a stable status. A blocked report still exits `2` and
 writes its diagnostic to standard error.
 
+The report verdict is `ready`, `degraded`, or `blocked`. Row status is `ok`,
+`off`, `unsupported`, `degraded`, or `blocked`. A `blocked` verdict is the only
+one for which `can_start` is false.
+
 On an installation an organisation manages, it also reports what that
 organisation's policy bundle imposes: the audit sinks it requires, and every
 ceiling it sets on spending, on how far a spawn tree may grow, and on the paths

@@ -131,6 +131,24 @@ with a stable status, a sorted `models` array when available, and an HTTP status
 or connection reason when applicable. Probe diagnostics still go to stderr,
 and any failed catalogue makes the command exit nonzero.
 
+Catalogue status values are:
+
+| Status | Meaning |
+| --- | --- |
+| `available` | The provider returned a recognized model list. |
+| `unknown_shape` | The provider answered successfully, but its JSON was not a recognized catalogue. |
+| `credential_missing` | No credential was available for a provider that requires one. |
+| `credential_invalid` | A stored OpenAI credential was not a valid web login. |
+| `credential_lookup_failed` | The configured credential source could not be read. |
+| `scope_missing` | An OpenAI web login did not grant ChatGPT plan use. |
+| `renewal_busy` | Another process was renewing the OpenAI login. |
+| `renewal_lock_failed` | The OpenAI renewal lock could not be prepared or used. |
+| `renewal_unavailable` | An expired OpenAI login was not in a store that can be updated. |
+| `renewal_failed` | OpenAI login renewal failed. |
+| `credential_store_failed` | A renewed OpenAI login could not be saved. |
+| `rejected` | The provider returned a non-success HTTP status. |
+| `not_reached` | The request could not connect, complete, or finish before its deadline. |
+
 ## Naming a credential
 
 A provider names its credential one of three ways:
