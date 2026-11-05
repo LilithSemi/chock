@@ -24,6 +24,25 @@ const max_env_bytes: usize = 1024 * 1024;
 
 const interpreter_names = [_][]const u8{ "BASH", "CONFIG_SHELL", "SHELL", "builder" };
 
+/// Whether a dev shell name carries the flake it comes from, as
+/// `nixpkgs#zig_0_17` does. A bare name is an attribute of the project's own
+/// flake.
+pub fn namesItsOwnFlake(shell_name: []const u8) bool {
+    return std.mem.indexOfScalar(u8, shell_name, '#') != null;
+}
+
+/// What `nix print-dev-env` is given. A name of its own flake is used as it is,
+/// so a project with no flake.nix can still name a toolchain.
+pub fn installableFor(
+    allocator: std.mem.Allocator,
+    flake_dir: []const u8,
+    shell_name: ?[]const u8,
+) std.mem.Allocator.Error![]u8 {
+    const name = shell_name orelse return allocator.dupe(u8, flake_dir);
+    if (namesItsOwnFlake(name)) return allocator.dupe(u8, name);
+    return std.fmt.allocPrint(allocator, "{s}#{s}", .{ flake_dir, name });
+}
+
 pub fn printDevEnv(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -33,11 +52,8 @@ pub fn printDevEnv(
     host_env: *const std.process.Environ.Map,
     diag: ?diagnostic.Sink,
 ) Error![]u8 {
-    const installable = if (shell_name) |name|
-        try std.fmt.allocPrint(allocator, "{s}#{s}", .{ flake_dir, name })
-    else
-        flake_dir;
-    defer if (shell_name != null) allocator.free(installable);
+    const installable = try installableFor(allocator, flake_dir, shell_name);
+    defer allocator.free(installable);
 
     var output = try proc.run(allocator, io, .{
         .argv = &.{ nix_program, "print-dev-env", installable },
@@ -468,4 +484,23 @@ test "a record with no name and a record with no value are read the way env mean
     const empty = splitRecord("EMPTY=").?;
     try std.testing.expectEqualStrings("EMPTY", empty.key);
     try std.testing.expectEqualStrings("", empty.value);
+}
+
+test "a dev shell name that holds its own flake is taken as it is" {
+    const allocator = std.testing.allocator;
+
+    const own = try installableFor(allocator, "/home/me/project", "nixpkgs#zig_0_17");
+    defer allocator.free(own);
+    try std.testing.expectEqualStrings("nixpkgs#zig_0_17", own);
+
+    const attribute = try installableFor(allocator, "/home/me/project", "ci");
+    defer allocator.free(attribute);
+    try std.testing.expectEqualStrings("/home/me/project#ci", attribute);
+
+    const unnamed = try installableFor(allocator, "/home/me/project", null);
+    defer allocator.free(unnamed);
+    try std.testing.expectEqualStrings("/home/me/project", unnamed);
+
+    try std.testing.expect(namesItsOwnFlake("github:NixOS/nixpkgs#zig"));
+    try std.testing.expect(!namesItsOwnFlake("default"));
 }

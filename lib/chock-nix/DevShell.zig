@@ -37,7 +37,10 @@ pub const Options = struct {
 };
 
 pub fn load(gpa: std.mem.Allocator, io: std.Io, options: Options) Error!?DevShell {
-    if (!try hasFlake(io, options.project_root)) return null;
+    // A shell that names its own flake needs nothing from the project, which is
+    // how a project with no flake.nix still gets a toolchain of its own.
+    const own_flake = if (options.shell_name) |name| dev_env.namesItsOwnFlake(name) else false;
+    if (!own_flake and !try hasFlake(io, options.project_root)) return null;
 
     // The message is held by gpa and the answer by the arena below: load destroys the arena on the way out when it fails, so a message living in the arena would be a read of freed memory after that.
     const sink = diagnostic.sinkOf(gpa, options.diag);

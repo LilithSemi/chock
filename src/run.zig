@@ -50,8 +50,11 @@ const usage_text =
     \\  --allow-dirty       Copy the project's uncommitted work into the workspace.
     \\                      Without this the agent sees the committed state.
     \\  --dev-shell <name>  The devShells attribute the tool environment comes
-    \\                      from, for this run. Defaults to .nix.dev_shell, and
-    \\                      to what `nix develop` takes when neither names one.
+    \\                      from, for this run. A name that holds a flake of its
+    \\                      own, such as nixpkgs#zig_0_17, is taken as it is and
+    \\                      needs no flake.nix in the project. Defaults to
+    \\                      .nix.dev_shell, and to what `nix develop` takes when
+    \\                      neither names one.
     \\  --policy-rule <r>   One policy rule, written <action>=<decision>. It
     \\                      answers instead of the project's chock.zon, and the
     \\                      org bundle still holds it. Repeatable.
@@ -3089,16 +3092,32 @@ fn loadDevShell(
             tty.print(.err, "chock: this project's dev shell could not be read ({t})\n", .{err});
         }
         if (shell_name) |name| {
+            const installable = chock_nix.dev_env.installableFor(gpa, project_root, name) catch name;
             tty.print(
                 .err,
                 "chock: nothing named {s} could be read, so this session stops. " ++
-                    "`nix develop {s}#{s}` says the same thing.\n",
-                .{ name, project_root, name },
+                    "`nix develop {s}` says the same thing.\n",
+                .{ name, installable },
             );
             return error.Reported;
         }
         break :loaded null;
     };
+
+    // A session that was told which toolchain to use never falls back to this
+    // machine's own programs. That is how a different compiler gets in.
+    if (loaded == null) {
+        if (shell_name) |name| {
+            tty.print(
+                .err,
+                "chock: the dev shell {s} was asked for and {s} has no flake.nix to read it " ++
+                    "from, so this session stops. Name the flake it comes from, as in " ++
+                    "nixpkgs#zig_0_17, or write a flake.nix that holds a {s} dev shell.\n",
+                .{ name, project_root, name },
+            );
+            return error.Reported;
+        }
+    }
 
     if (loaded != null) {
         if (diag) |*notice| tty.print(.warn, "chock: {f}\n", .{notice});
