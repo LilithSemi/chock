@@ -35,6 +35,9 @@ building the main executable tests:
 nix develop --command zig build test-docs --summary all
 ```
 
+Use `zig build test-exe` for command unit tests. Use `zig build test-cli` when a
+change needs the built command-line process and its real standard streams.
+
 ## Repository layout
 
 - `lib/` - the libraries, one module for each concern. The boundary itself is

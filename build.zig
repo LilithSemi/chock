@@ -2175,6 +2175,12 @@ pub fn build(b: *std.Build) void {
     // machine has nothing it can run.
     run_cli_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_cli_tests.step);
+    module_test_steps.add(
+        b,
+        "test-cli",
+        "Run the built command-line process tests only",
+        &run_cli_tests.step,
+    );
 
     // **The one test that boots a guest.** Everything else on the microVM path
     // drives a piece of it: the allow list against Mirage's own exports, the
