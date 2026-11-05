@@ -276,6 +276,49 @@ fn repoHas(io: std.Io, arena: std.mem.Allocator, path: []const u8) !bool {
     return true;
 }
 
+test "every external action in CI is pinned to an immutable revision" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{});
+    defer root.close(testing.io);
+    const path = ".github/workflows/ci.yml";
+    const workflow = try root.readFileAlloc(testing.io, path, arena, .limited(max_doc_bytes));
+
+    var wrong: std.ArrayList(u8) = .empty;
+    var checked: usize = 0;
+    var lines = std.mem.splitScalar(u8, workflow, '\n');
+    var number: usize = 0;
+    while (lines.next()) |line| {
+        number += 1;
+        const marker = "uses:";
+        const marker_at = std.mem.indexOf(u8, line, marker) orelse continue;
+        const value = std.mem.trim(u8, line[marker_at + marker.len ..], " \t");
+        if (std.mem.startsWith(u8, value, "./")) continue;
+        checked += 1;
+
+        const comment_at = std.mem.indexOf(u8, value, " #") orelse value.len;
+        const reference = value[0..comment_at];
+        const at = std.mem.lastIndexOfScalar(u8, reference, '@') orelse {
+            try wrong.print(arena, "{s}:{d}: external action has no revision\n", .{ path, number });
+            continue;
+        };
+        const revision = reference[at + 1 ..];
+        var immutable = revision.len == 40;
+        for (revision) |c| {
+            if (!std.ascii.isHex(c) or std.ascii.isUpper(c)) immutable = false;
+        }
+        if (immutable) continue;
+        try wrong.print(arena, "{s}:{d}: {s} is not an immutable action revision\n", .{
+            path, number, reference,
+        });
+    }
+
+    try testing.expect(checked >= 10);
+    try testing.expectEqualStrings("", wrong.items);
+}
+
 test "the documentation index names every page under docs/" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
