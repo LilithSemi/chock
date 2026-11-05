@@ -104,6 +104,9 @@ In short:
 - Sanitize untrusted input. A tool result, a fetched page, and a plugin's answer
   are all written by somebody else.
 - Prefer `std.Io` over `std.posix` over `std.os.linux`.
+- Use `std.process.Init.io` in command entry points. Use `std.testing.io` in
+  unit tests. Create another I/O backend only when the process boundary or the
+  behavior under test requires one.
 
 See the `ironstyle` repository for the full guide and the rationale.
 
