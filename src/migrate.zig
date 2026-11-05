@@ -231,7 +231,7 @@ pub fn main(
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
-    const environ = init.minimal.environ;
+    const env = init.environ_map.*;
 
     _ = gpa;
     _ = exe_path;
@@ -267,9 +267,6 @@ pub fn main(
 
     const project_root = try resolveProject(arena, io, options.project);
     const found = try vet(arena, try reader.read(arena, io, project_root));
-
-    var env = try environ.createMap(arena);
-    defer env.deinit();
 
     const sessions_result: ?transcript.Result = if (options.sessions)
         try transcript.import(arena, io, &env, options.from, project_root)

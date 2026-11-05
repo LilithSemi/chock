@@ -256,10 +256,7 @@ pub fn main(
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
-    const environ = init.minimal.environ;
-
-    var env = try environ.createMap(arena);
-    defer env.deinit();
+    const env = init.environ_map.*;
 
     if (args.len != 0 and std.mem.eql(u8, args[0], "suite"))
         return eval_suite.main(arena, gpa, io, &env, exe_path, args[1..]);

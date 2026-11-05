@@ -153,12 +153,9 @@ pub fn main(
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
-    const environ = init.minimal.environ;
+    const env = init.environ_map.*;
 
     _ = exe_path;
-
-    var env = try environ.createMap(arena);
-    defer env.deinit();
 
     const options = parseOptions(args) catch |err| switch (err) {
         error.HelpWanted => {

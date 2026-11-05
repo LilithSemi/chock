@@ -118,7 +118,7 @@ pub fn main(
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
-    const environ = init.minimal.environ;
+    const env = init.environ_map.*;
 
     _ = exe_path;
 
@@ -129,8 +129,6 @@ pub fn main(
         },
         error.BadArguments => return Exit.usage.code(),
     };
-
-    var env = try environ.createMap(arena);
 
     const daemon_text = options.daemon orelse env.get(control.address_env) orelse text: {
         const state = chock_auth.paths.stateDir(arena, &env) catch |err| {

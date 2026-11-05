@@ -59,7 +59,7 @@ pub fn main(
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
-    const environ = init.minimal.environ;
+    const env = init.environ_map.*;
 
     _ = exe_path;
 
@@ -78,9 +78,6 @@ pub fn main(
         tty.out(.plain, "{s}", .{example_text});
         return Exit.finished.code();
     }
-
-    var env = try environ.createMap(arena);
-    defer env.deinit();
 
     const config_dir = chock_auth.paths.configDir(arena, &env) catch |err| {
         tty.print(.err, "chock config {s}: the configuration directory is unknown: {t}\n", .{
