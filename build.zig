@@ -2296,6 +2296,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "chock-auth", .module = chock_auth },
                 .{ .name = "chock-cost", .module = chock_cost },
                 .{ .name = "chock-policy", .module = chock_policy },
+                .{ .name = "chock-proto", .module = chock_proto },
                 .{ .name = "chock-workspace", .module = chock_workspace },
                 .{ .name = "chock-net", .module = chock_net },
                 .{ .name = "palisade", .module = palisade },

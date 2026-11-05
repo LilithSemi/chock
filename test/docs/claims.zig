@@ -14,6 +14,7 @@ const chock_core = @import("chock-core");
 const chock_auth = @import("chock-auth");
 const chock_cost = @import("chock-cost");
 const chock_policy = @import("chock-policy");
+const chock_proto = @import("chock-proto");
 const chock_workspace = @import("chock-workspace");
 const palisade = @import("palisade");
 const chock_net = @import("chock-net");
@@ -1249,6 +1250,41 @@ test "every documented JSON block is valid JSON" {
     }
 
     if (checked == 0) try wrong.appendSlice(arena, "no documented JSON blocks were found\n");
+    try testing.expectEqualStrings("", wrong.items);
+}
+
+test "every documented event example matches the event wire type" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    var wrong: std.ArrayList(u8) = .empty;
+    var checked: usize = 0;
+    for (docs) |doc| {
+        for (try fencedBlocksIn(arena, doc, "json")) |block| {
+            const value = try std.json.parseFromSlice(std.json.Value, gpa, block.text, .{});
+            defer value.deinit();
+            const object = switch (value.value) {
+                .object => |object| object,
+                else => continue,
+            };
+            if (object.count() != 1) continue;
+            var fields = object.iterator();
+            const field = fields.next().?;
+            if (chock_proto.event.Kind.fromWireName(field.key_ptr.*) == null) continue;
+            checked += 1;
+
+            const event = std.json.parseFromSlice(chock_proto.event.Event, gpa, block.text, .{}) catch |err| {
+                try wrong.print(arena, "{s}:{d}: {t}\n", .{ block.doc, block.line, err });
+                continue;
+            };
+            event.deinit();
+        }
+    }
+
+    if (checked == 0) try wrong.appendSlice(arena, "no documented event examples were found\n");
     try testing.expectEqualStrings("", wrong.items);
 }
 
