@@ -120,6 +120,7 @@ chock doctor
 chock doctor                               # can this machine contain a session
 chock config init                          # save a local-provider starter
 chock config check                         # check it before a session
+chock models                               # show the effective provider and model
 cd ~/some-project
 chock run "add a test for the parser"
 chock -- add a test for the parser         # the same task, with no subcommand
@@ -144,7 +145,10 @@ Name your providers in `~/.config/chock/config.zon`. `chock config init` writes
 a starter only when no configuration exists. `chock config path` prints the
 exact platform- and XDG-aware location. `chock config example` prints the same
 starter without writing it. `chock config check` validates the result without
-reading a credential or contacting a provider. See
+reading a credential or contacting a provider. `chock models` shows the
+effective default, context limit, and adapter capabilities without contacting
+the provider. Add `--probe` only when you want an authenticated catalogue
+request. See
 [docs/configure/configuration.md](docs/configure/configuration.md).
 
 Chock is a pre-alpha project. Its documentation describes the implemented
