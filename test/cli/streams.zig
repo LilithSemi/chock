@@ -351,6 +351,7 @@ test "the documented configuration starter passes the real CLI check" {
     var oversized = try runChock(gpa, io, &box.env, &.{ "config", "check", "--format", "json" });
     defer oversized.deinit(gpa);
     try testing.expectEqual(@as(u8, 1), oversized.code);
+    try testing.expect(std.mem.indexOf(u8, oversized.err, "exceeds the 256 KiB configuration limit") != null);
     const oversized_report = try std.json.parseFromSlice(Report, gpa, oversized.out, .{});
     defer oversized_report.deinit();
     try testing.expect(!oversized_report.value.valid);

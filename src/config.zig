@@ -126,7 +126,13 @@ pub fn main(
             return Exit.usage.code();
         },
         else => {
-            if (diag) |*one| {
+            if (err == error.ConfigTooLarge) {
+                tty.print(
+                    .err,
+                    "chock config check: {s} exceeds the {d} KiB configuration limit\n",
+                    .{ path, chock_auth.config.max_file_bytes / 1024 },
+                );
+            } else if (diag) |*one| {
                 tty.print(.err, "chock config check: {f}\n", .{one});
             } else {
                 tty.print(.err, "chock config check: {s} could not be read: {t}\n", .{ path, err });
