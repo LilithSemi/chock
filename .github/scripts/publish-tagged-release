@@ -26,6 +26,20 @@ if [ ! -e "$1" ]; then
   exit 1
 fi
 
+local_tag=$(git rev-parse "$ref")
+remote_tag=$(
+  git ls-remote --tags origin "$ref" |
+    awk -v wanted="$ref" '$2 == wanted { print $1 }'
+)
+if [ -z "$remote_tag" ]; then
+  echo "::error::the remote tag $tag does not exist" >&2
+  exit 1
+fi
+if [ "$remote_tag" != "$local_tag" ]; then
+  echo "::error::the remote tag $tag is $remote_tag, not the checked-out tag $local_tag" >&2
+  exit 1
+fi
+
 tag_commit=$(git rev-parse "$ref^{commit}")
 if [ "$tag_commit" != "$commit" ]; then
   echo "::error::the tag $tag points at $tag_commit, not $commit" >&2

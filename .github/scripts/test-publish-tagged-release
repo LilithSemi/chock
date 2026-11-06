@@ -12,9 +12,17 @@ cat > "$scratch/bin/git" <<'EOF'
 #!/bin/sh
 set -eu
 printf 'git %s\n' "$*" >> "$CALLS"
-if [ "$1" = rev-parse ]; then
-  printf '%s\n' "$TAG_COMMIT"
-fi
+case "$1" in
+  rev-parse)
+    case "$2" in
+      *'^{commit}') printf '%s\n' "$TAG_COMMIT" ;;
+      *) printf '%s\n' "${LOCAL_TAG_OBJECT:-$TAG_COMMIT}" ;;
+    esac
+    ;;
+  ls-remote)
+    printf '%s\t%s\n' "${REMOTE_TAG_OBJECT:-$TAG_COMMIT}" "$4"
+    ;;
+esac
 EOF
 
 cat > "$scratch/bin/gh" <<'EOF'
@@ -39,6 +47,7 @@ commit=abcdef0123456789
 TAG_COMMIT=$commit DRAFT_STATE='' \
   "$here/publish-tagged-release" "$tag" "$commit" "$scratch/artifacts" 0
 grep -Fx "git rev-parse refs/tags/$tag^{commit}" "$CALLS"
+grep -Fx "git ls-remote --tags origin refs/tags/$tag" "$CALLS"
 grep -F "gh release create $tag --draft --verify-tag --title $tag --generate-notes" "$CALLS"
 grep -F "gh release upload $tag $scratch/artifacts/chock-test.tar.gz --clobber" "$CALLS"
 grep -Fx "gh release edit $tag --draft=false" "$CALLS"
@@ -76,6 +85,17 @@ if TAG_COMMIT=deadbeef DRAFT_STATE='' \
 fi
 if grep -Fq "gh " "$CALLS"; then
   echo "a conflicting tag changed release state" >&2
+  exit 1
+fi
+
+: > "$CALLS"
+if TAG_COMMIT=$commit LOCAL_TAG_OBJECT=tag-object REMOTE_TAG_OBJECT=moved-tag DRAFT_STATE='' \
+  "$here/publish-tagged-release" "$tag" "$commit" "$scratch/artifacts" 0 2>/dev/null; then
+  echo "a remotely moved tag was accepted" >&2
+  exit 1
+fi
+if grep -Fq "gh " "$CALLS"; then
+  echo "a remotely moved tag changed release state" >&2
   exit 1
 fi
 
