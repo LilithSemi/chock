@@ -430,21 +430,21 @@ chock workspace adopt 01K2...       # take the work out of one kept overlay
 
 ## Exit codes
 
-| Code | Meaning |
-|---|---|
-| 0 | finished |
-| 1 | the command line was not understood, or the session could not start |
-| 2 | a fault |
-| 3 | refused or canceled |
-| 4 | the turn limit from `--max-turns` |
-| 5 | a subcommand that is not built |
-| 6 | the agent gave up, because it stopped making progress |
-| 7 | the budget in `chock.zon` |
-| 8 | handed over to another process, so the work is not over |
-| 9 | a required audit sink still held none of the tail of the log |
-| 10 | the model backend answered a turn with nothing, so there is no answer |
-| 11 | the model backend refused the request, and said why |
-| 12 | the model backend rate limited this credential, and every retry was spent |
+| Code | Status | Meaning |
+|---|---|---|
+| 0 | `finished` | finished |
+| 1 | `usage` | the command line was not understood, or the session could not start |
+| 2 | `faulted` | a fault |
+| 3 | `refused` | refused or canceled |
+| 4 | `turn_limit` | the turn limit from `--max-turns` |
+| 5 | `not_implemented` | a subcommand that is not built |
+| 6 | `no_progress` | the agent gave up, because it stopped making progress |
+| 7 | `budget` | the budget in `chock.zon` |
+| 8 | `handed_over` | handed over to another process, so the work is not over |
+| 9 | `audit_gap` | a required audit sink still held none of the tail of the log |
+| 10 | `empty_response` | the model backend answered a turn with nothing, so there is no answer |
+| 11 | `model_refused` | the model backend refused the request, and said why |
+| 12 | `rate_limited` | the model backend rate limited this credential, and every retry was spent |
 
 A session that changed files and never committed them exits `2`, and says so:
 only a commit is carried back. A refusal is not a crash and must not look like

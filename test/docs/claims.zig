@@ -374,19 +374,24 @@ fn simpleEnumFields(
 /// Reads the names from an integer-backed enum whose fields have explicit
 /// numeric values. Exit codes keep those values explicit because they are a
 /// process and JSON contract.
+const NumberedEnumField = struct {
+    name: []const u8,
+    number: []const u8,
+};
+
 fn numberedEnumFields(
     arena: std.mem.Allocator,
     source: []const u8,
     declaration: []const u8,
     backing: []const u8,
-) ![]const []const u8 {
+) ![]const NumberedEnumField {
     const prefix = try std.fmt.allocPrint(arena, "{s} = enum({s}) {{", .{ declaration, backing });
     const start = (std.mem.indexOf(u8, source, prefix) orelse return error.MissingEnum) + prefix.len;
     const relative_end = std.mem.indexOf(u8, source[start..], "\n\n    pub fn") orelse
         return error.UnclosedEnum;
     const body = source[start .. start + relative_end];
 
-    var fields: std.ArrayList([]const u8) = .empty;
+    var fields: std.ArrayList(NumberedEnumField) = .empty;
     var split = std.mem.splitScalar(u8, body, ',');
     while (split.next()) |part| {
         const field = std.mem.trim(u8, part, " \t\r\n");
@@ -396,7 +401,7 @@ fn numberedEnumFields(
         const number = std.mem.trim(u8, field[equals + 1 ..], " \t");
         if (!isMadeOf(name, "_") or number.len == 0) return error.InvalidNumberedEnumField;
         for (number) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidNumberedEnumField;
-        try fields.append(arena, name);
+        try fields.append(arena, .{ .name = name, .number = number });
     }
     if (fields.items.len == 0) return error.EmptyEnum;
     return fields.items;
@@ -1029,8 +1034,12 @@ test "automation report pages name every stable status value" {
         }
     }
     for (try numberedEnumFields(arena, exit_source, "pub const Exit", "u8")) |field| {
-        if (!try namesInTicks(run_result_section, field, arena)) {
-            try wrong.print(arena, "docs/running.md names no run-result status `{s}`\n", .{field});
+        if (!try namesInTicks(run_result_section, field.name, arena)) {
+            try wrong.print(arena, "docs/running.md names no run-result status `{s}`\n", .{field.name});
+        }
+        const row = try std.fmt.allocPrint(arena, "| {s} | `{s}` |", .{ field.number, field.name });
+        if (std.mem.indexOf(u8, running, row) == null) {
+            try wrong.print(arena, "docs/running.md does not map exit code {s} to `{s}`\n", .{ field.number, field.name });
         }
     }
 
