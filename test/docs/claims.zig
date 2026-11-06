@@ -507,6 +507,24 @@ test "Linux releases package both microVM guest images" {
     }
 }
 
+test "the macOS release verifies the entitlement its documentation names" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{});
+    defer root.close(testing.io);
+    const workflow = try root.readFileAlloc(testing.io, ".github/workflows/ci.yml", arena, .limited(max_doc_bytes));
+    const plist = try root.readFileAlloc(testing.io, "build/hypervisor.plist", arena, .limited(max_doc_bytes));
+    const entitlement = try textBetween(plist, "<key>", "</key>");
+    const microvm = try docText(docs, "docs/security/microvm.md");
+
+    try testing.expect(std.mem.indexOf(u8, workflow, "codesign --verify --strict result/bin/chock") != null);
+    try testing.expect(std.mem.indexOf(u8, workflow, entitlement) != null);
+    try testing.expect(std.mem.indexOf(u8, microvm, entitlement) != null);
+}
+
 test "the documentation index names every page under docs/" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

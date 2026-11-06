@@ -263,6 +263,24 @@ jobs:
             *) echo "::error::${reported} does not agree with ${version}" >&2; exit 1 ;;
           esac
 
+          # The microVM driver on Apple Silicon needs the Hypervisor
+          # entitlement. Zig writes an ad hoc signature, but a later package
+          # fixup can invalidate it. Check the final store output that enters
+          # the archive, not an intermediate linker output.
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            /usr/bin/codesign --verify --strict result/bin/chock
+            entitlements=$(
+              /usr/bin/codesign -d --entitlements :- result/bin/chock 2>/dev/null
+            )
+            case "${entitlements}" in
+              *'<key>com.apple.security.hypervisor</key>'*'<true/>'*) ;;
+              *)
+                echo "::error::the macOS binary lacks its Hypervisor entitlement" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: chock-${{ matrix.target }}
