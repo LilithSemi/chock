@@ -6,6 +6,7 @@ const chock_proto = @import("chock-proto");
 
 const approval = @import("approval.zig");
 const session_paths = @import("session.zig");
+const directory_help = @import("directory_help.zig");
 const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
@@ -59,9 +60,12 @@ pub fn main(
         tty.print(.err, "chock approve: the project directory could not be read.\n", .{});
         return Exit.usage.code();
     };
-    const dir = session_paths.projectDir(arena, &env, project_root) catch |err| {
-        tty.print(.err, "chock approve: the session directory is unknown: {t}\n", .{err});
-        return Exit.usage.code();
+    const dir = session_paths.projectDir(arena, &env, project_root) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("approve", .state);
+            return Exit.usage.code();
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
 
     const id = if (options.session.len != 0) options.session else newestSession(arena, io, dir) orelse {

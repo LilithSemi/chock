@@ -170,9 +170,12 @@ pub fn main(
     };
 
     const project_root = try resolveProject(arena, io, options.project);
-    const dir = session_paths.projectDir(arena, &env, project_root) catch |err| {
-        tty.print(.err, "chock sessions: the session directory is unknown: {s}\n", .{@errorName(err)});
-        return Exit.usage.code();
+    const dir = session_paths.projectDir(arena, &env, project_root) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("sessions", .state);
+            return Exit.usage.code();
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
 
     if (options.action == .list) return listSessions(arena, io, dir, project_root);

@@ -270,7 +270,17 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expectEqualStrings("", unknown_models.out);
     try testing.expect(std.mem.indexOf(u8, unknown_models.err, "set HOME or an absolute XDG_CONFIG_HOME") != null);
 
-    for ([_][]const u8{ "daemon", "serve", "acp", "detach" }) |command| {
+    for ([_][]const u8{
+        "daemon",
+        "serve",
+        "acp",
+        "detach",
+        "sessions",
+        "plan",
+        "approve",
+        "workspace",
+        "usage",
+    }) |command| {
         var unknown_state = try runChock(gpa, io, &no_home, &.{command});
         defer unknown_state.deinit(gpa);
         try testing.expectEqual(@as(u8, 1), unknown_state.code);

@@ -4,6 +4,7 @@ const std = @import("std");
 const chock_proto = @import("chock-proto");
 
 const session_paths = @import("session.zig");
+const directory_help = @import("directory_help.zig");
 const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
@@ -53,9 +54,12 @@ pub fn main(
     };
 
     const project_root = try resolveProject(arena, io, options.project);
-    const dir = session_paths.projectDir(arena, &env, project_root) catch |err| {
-        tty.print(.err, "chock usage: the session directory is unknown: {s}\n", .{@errorName(err)});
-        return Exit.usage.code();
+    const dir = session_paths.projectDir(arena, &env, project_root) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("usage", .state);
+            return Exit.usage.code();
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
 
     return switch (options.action) {

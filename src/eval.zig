@@ -7,6 +7,7 @@ const ziggit = @import("ziggit");
 
 const session_paths = @import("session.zig");
 const eval_suite = @import("eval_suite.zig");
+const directory_help = @import("directory_help.zig");
 const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
@@ -333,9 +334,12 @@ pub fn main(
         .compare => unreachable,
     };
 
-    const session_dir = session_paths.projectDir(arena, &env, project) catch |err| {
-        tty.print(.err, "chock eval: the session directory is unknown: {t}\n", .{err});
-        return Exit.usage.code();
+    const session_dir = session_paths.projectDir(arena, &env, project) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("eval", .state);
+            return Exit.usage.code();
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
     const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ session_dir, session }, 0);
     var observed = observe(arena, gpa, io, log_path, session) catch |err| {
