@@ -79,12 +79,16 @@ pub fn main(
         return Exit.finished.code();
     }
 
-    const config_dir = chock_auth.paths.configDir(arena, &env) catch |err| {
-        tty.print(.err, "chock config {s}: the configuration directory is unknown: {t}\n", .{
-            @tagName(options.operation),
-            err,
-        });
-        return Exit.usage.code();
+    const config_dir = chock_auth.paths.configDir(arena, &env) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            tty.print(
+                .err,
+                "chock config {s}: set HOME or an absolute XDG_CONFIG_HOME to select the configuration directory\n",
+                .{@tagName(options.operation)},
+            );
+            return Exit.usage.code();
+        },
+        error.OutOfMemory => return err,
     };
     const path = try std.fs.path.join(arena, &.{ config_dir, chock_auth.config.file_name });
 
