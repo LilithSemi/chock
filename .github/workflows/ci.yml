@@ -38,8 +38,10 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - name: Test the release version guard
-        run: .github/scripts/test-release-version
+      - name: Test the release helpers
+        run: |
+          .github/scripts/test-release-version
+          .github/scripts/test-publish-rolling-release
 
       - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3 # v3
 
@@ -419,20 +421,13 @@ jobs:
           # `422 Cannot upload assets to an immutable release` on
           # 2026-09-17. A release that is written once and never touched
           # again is the only shape immutability leaves.
-          git tag "${tag}" "${GITHUB_SHA}"
-          git push origin "refs/tags/${tag}"
-
-          # **Draft first, assets second, published last.** Immutability
-          # closes a release to new assets at the moment it is published, so
-          # the order here is the whole fix: a release published empty can
-          # never be filled.
-          gh release create "${tag}" \
-            --draft \
-            --prerelease \
-            --title "unstable (${GITHUB_SHA:0:7})" \
-            --generate-notes
-          gh release upload "${tag}" artifacts/*
-          gh release edit "${tag}" --draft=false
+          # **Safe to resume after cancellation.** The helper accepts an
+          # existing tag only at this commit, resumes a draft with clobbered
+          # assets, and leaves an already published immutable release alone.
+          # It always keeps the important order: draft first, assets second,
+          # published last.
+          .github/scripts/publish-rolling-release \
+            "${tag}" "${GITHUB_SHA}" artifacts
 
           # **Matched on `-unstable` inside the tag, and never on the
           # prerelease flag.** The tag is the version now, so an unstable

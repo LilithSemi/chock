@@ -1,0 +1,61 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 3 ]; then
+  echo "usage: publish-rolling-release <tag> <commit> <artifacts-directory>" >&2
+  exit 2
+fi
+
+tag=$1
+commit=$2
+artifacts=$3
+ref="refs/tags/$tag"
+
+set -- "$artifacts"/*
+if [ ! -e "$1" ]; then
+  echo "::error::the artifact directory $artifacts is empty" >&2
+  exit 1
+fi
+
+remote_commit=$(
+  git ls-remote --tags origin "$ref" |
+    awk -v wanted="$ref" '$2 == wanted { print $1 }'
+)
+if [ -n "$remote_commit" ] && [ "$remote_commit" != "$commit" ]; then
+  echo "::error::the existing tag $tag points at $remote_commit, not $commit" >&2
+  exit 1
+fi
+
+if [ -z "$remote_commit" ]; then
+  git tag "$tag" "$commit"
+  git push origin "$ref"
+else
+  echo "the tag $tag already points at this commit"
+fi
+
+draft=$(
+  gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || true
+)
+case "$draft" in
+  "")
+    gh release create "$tag" \
+      --draft \
+      --prerelease \
+      --title "unstable ($(printf '%s' "$commit" | cut -c1-7))" \
+      --generate-notes
+    ;;
+  true)
+    echo "resuming the existing draft release for $tag"
+    ;;
+  false)
+    echo "the immutable release for $tag is already published"
+    exit 0
+    ;;
+  *)
+    echo "::error::GitHub returned an unknown draft state for $tag: $draft" >&2
+    exit 1
+    ;;
+esac
+
+gh release upload "$tag" "$@" --clobber
+gh release edit "$tag" --draft=false
