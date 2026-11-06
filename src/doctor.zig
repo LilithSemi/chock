@@ -201,6 +201,7 @@ pub const Measured = struct {
     required_sinks: []const SinkProbe = &.{},
     org_ceilings: []const []const u8 = &.{},
     org_policy_failure: ?[]const u8 = null,
+    project_policy_failure: ?[]const u8 = null,
 };
 
 pub const driver_gives_nothing =
@@ -468,6 +469,13 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
         .state = .unavailable,
         .means = reason,
         .fix = "Repair or remove the installed org-policy.zon. Chock refuses to start while its installation policy cannot be read.",
+        .blocks = true,
+    });
+    if (m.project_policy_failure) |reason| try rows.append(arena, .{
+        .name = "project policy",
+        .state = .unavailable,
+        .means = reason,
+        .fix = "Repair or remove this project's chock.zon policy. Chock refuses to start while it cannot be read.",
         .blocks = true,
     });
     for (m.org_ceilings) |means| try rows.append(arena, .{
@@ -1442,6 +1450,7 @@ fn isFirstRunRow(row: Row) bool {
         "workspace space",
         "card seal",
         "org policy",
+        "project policy",
         required_sink_name,
     }) |name| {
         if (std.mem.eql(u8, row.name, name)) return true;
@@ -1545,6 +1554,7 @@ fn measureHost(
         project_root,
         defaultModel(arena, io, env),
         if (org_bundle) |bundle| bundle.rules else &.{},
+        &m.project_policy_failure,
     );
 
     if (m.driver.contains(.network_isolated)) {
@@ -1629,14 +1639,25 @@ fn measureHardening(
     project_root: []const u8,
     model: []const u8,
     org_rules: []const chock_policy.table.Rule,
+    failure: *?[]const u8,
 ) chock_policy.hardening.WriteExecute {
+    var diag: ?chock_policy.table.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
     const policy = chock_policy.table.Table.loadUnder(
         arena,
         io,
         project_root,
         org_rules,
-        null,
-    ) catch return .strict;
+        &diag,
+    ) catch |err| {
+        if (err != error.NoPolicyFile) {
+            failure.* = if (diag) |*fault|
+                std.fmt.allocPrint(arena, "{f}", .{fault}) catch @errorName(err)
+            else
+                @errorName(err);
+        }
+        return .strict;
+    };
 
     return chock_policy.hardening.writeExecuteFor(policy.evaluateChain(&.{doctor_agent_kind}, .{
         .agent_kind = doctor_agent_kind,
@@ -3003,6 +3024,34 @@ test "an invalid installed org policy is a blocking doctor row" {
     try testing.expectEqual(ui.Layer.State.unavailable, row.state);
     try testing.expect(row.blocks);
     try testing.expect(std.mem.indexOf(u8, row.fix, "org-policy.zon") != null);
+}
+
+test "an invalid project policy blocks doctor instead of assuming strict hardening" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "chock.zon",
+        .data = ".{ .policy = .{ .rules = 4 } }",
+    });
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+
+    var failure: ?[]const u8 = null;
+    _ = measureHardening(arena, io, root, no_default_model, &.{}, &failure);
+    try testing.expect(failure != null);
+
+    const rows = try rowsFor(arena, .{ .project_policy_failure = failure });
+    const row = rowNamed(rows, "project policy").?;
+    try testing.expectEqual(ui.Layer.State.unavailable, row.state);
+    try testing.expect(row.blocks);
+    try testing.expect(isFirstRunRow(row));
+    try testing.expect(std.mem.indexOf(u8, row.fix, "chock.zon") != null);
 }
 
 test "a missing state home is not reported as a project without a flake" {
