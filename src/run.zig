@@ -1675,9 +1675,9 @@ fn start(
 
     const handovers = handoverEndpoint(arena, io, paths.dir, id);
 
-    const dev_shell_dir = devShellDirFor(arena, io, env, project_root);
+    const dev_shell_dir = try devShellDirFor(arena, io, env, project_root);
 
-    const staging_dir = devShellStagingDirFor(arena, io, env, project_root);
+    const staging_dir = try devShellStagingDirFor(arena, io, env, project_root);
 
     const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
     const dev_shell_name = options.dev_shell orelse nix_caps.dev_shell;
@@ -1885,9 +1885,12 @@ fn start(
         .aiand, .openai_compat => .openai_compatible,
     };
 
-    const memory_dir = session_paths.memoryDir(arena, env, project_root) catch |err| {
-        tty.print(.err, "chock run: the knowledgebase directory is unknown: {s}\n", .{@errorName(err)});
-        return error.Reported;
+    const memory_dir = session_paths.memoryDir(arena, env, project_root) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("run", .data);
+            return error.Reported;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
     const memory_ready = if (session_paths.createMemoryDir(io, memory_dir)) true else |_| ready: {
         tty.print(
@@ -1899,9 +1902,17 @@ fn start(
         break :ready false;
     };
 
-    const cache_dir = resolvedForSandbox(arena, io, prepareCache(arena, gpa, io, env, project_root));
+    const cache_dir = try resolvedForSandbox(
+        arena,
+        io,
+        try prepareCache(arena, gpa, io, env, project_root),
+    );
 
-    const scratch_dir = resolvedForSandbox(arena, io, prepareScratchpad(arena, gpa, io, env, id, options));
+    const scratch_dir = try resolvedForSandbox(
+        arena,
+        io,
+        try prepareScratchpad(arena, gpa, io, env, id, options),
+    );
     const tasks_dir: ?[]const u8 = if (scratch_dir) |dir|
         std.fs.path.join(arena, &.{ dir, chock_core.tasks.host_leaf }) catch return error.OutOfMemory
     else
@@ -2931,7 +2942,7 @@ fn prepareScratchpad(
     env: *const std.process.Environ.Map,
     id: []const u8,
     options: Options,
-) ?[]const u8 {
+) std.mem.Allocator.Error!?[]const u8 {
     if (options.scratchpad.len != 0) {
         var diag: ?chock_core.Diagnostic = null;
         defer if (diag) |*fault| fault.deinit(gpa);
@@ -2961,15 +2972,7 @@ fn prepareScratchpad(
         return options.scratchpad;
     }
 
-    const dir = session_paths.scratchpadDir(arena, env, id) catch {
-        tty.print(
-            .warn,
-            "chock run: the scratchpad directory is unknown, so tool calls have nowhere but " ++
-                "the workspace to write and no command can run in the background.\n",
-            .{},
-        );
-        return null;
-    };
+    const dir = try session_paths.scratchpadDir(arena, env, id);
 
     var made_diag: ?chock_core.Diagnostic = null;
     defer if (made_diag) |*fault| fault.deinit(gpa);
@@ -2986,12 +2989,16 @@ fn prepareScratchpad(
     return dir;
 }
 
-fn resolvedForSandbox(arena: std.mem.Allocator, io: std.Io, dir: ?[]const u8) ?[]const u8 {
+fn resolvedForSandbox(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    dir: ?[]const u8,
+) std.mem.Allocator.Error!?[]const u8 {
     const path = dir orelse return null;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const resolved = palisade.Sandbox.resolvedPath(io, path, &buffer);
     if (std.mem.eql(u8, resolved, path)) return path;
-    return arena.dupe(u8, resolved) catch path;
+    return try arena.dupe(u8, resolved);
 }
 
 fn prepareCache(
@@ -3000,15 +3007,18 @@ fn prepareCache(
     io: std.Io,
     env: *const std.process.Environ.Map,
     project_root: []const u8,
-) ?[]const u8 {
-    const dir = session_paths.cacheDir(arena, env, project_root) catch |err| {
-        tty.print(
-            .warn,
-            "chock run: the toolchain cache directory is unknown ({t}), so tool calls have " ++
-                "nowhere but the workspace to write.\n",
-            .{err},
-        );
-        return null;
+) std.mem.Allocator.Error!?[]const u8 {
+    const dir = session_paths.cacheDir(arena, env, project_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoHomeDirectory => {
+            tty.print(
+                .warn,
+                "chock run: the toolchain cache directory is unknown, so tool calls have " ++
+                    "nowhere but the workspace to write.\n",
+                .{},
+            );
+            return null;
+        },
     };
 
     var diag: ?chock_core.Diagnostic = null;
@@ -3161,14 +3171,17 @@ fn devShellDirFor(
     io: std.Io,
     env: *const std.process.Environ.Map,
     project_root: []const u8,
-) ?[]const u8 {
-    const dir = session_paths.devShellDir(arena, env, project_root) catch |err| {
-        tty.print(
-            .warn,
-            "chock: the dev shell directory is unknown ({t}), so this session has no dev shell\n",
-            .{err},
-        );
-        return null;
+) std.mem.Allocator.Error!?[]const u8 {
+    const dir = session_paths.devShellDir(arena, env, project_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoHomeDirectory => {
+            tty.print(
+                .warn,
+                "chock: the dev shell directory is unknown, so this session has no dev shell\n",
+                .{},
+            );
+            return null;
+        },
     };
     session_paths.createDevShellDir(io, dir) catch return null;
     return dir;
@@ -3179,14 +3192,17 @@ fn devShellStagingDirFor(
     io: std.Io,
     env: *const std.process.Environ.Map,
     project_root: []const u8,
-) ?[]const u8 {
-    const dir = session_paths.devShellStagingDir(arena, env, project_root) catch |err| {
-        tty.print(
-            .warn,
-            "chock: the dev shell staging directory is unknown ({t}), so nix picks its own\n",
-            .{err},
-        );
-        return null;
+) std.mem.Allocator.Error!?[]const u8 {
+    const dir = session_paths.devShellStagingDir(arena, env, project_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoHomeDirectory => {
+            tty.print(
+                .warn,
+                "chock: the dev shell staging directory is unknown, so nix picks its own\n",
+                .{},
+            );
+            return null;
+        },
     };
     session_paths.createDevShellStagingDir(io, dir) catch return null;
     return dir;
@@ -13983,6 +13999,46 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
 }
 
 const testing = std.testing;
+
+test "optional setup paths preserve allocation failure" {
+    const gpa = testing.allocator;
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", "/data");
+    try env.put("XDG_STATE_HOME", "/state");
+
+    const id = "01JQ" ++ @as([22]u8, @splat('A'));
+    var scratch_allocator = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        prepareScratchpad(
+            scratch_allocator.allocator(),
+            gpa,
+            testing.io,
+            &env,
+            id,
+            .{},
+        ),
+    );
+
+    var cache_allocator = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        prepareCache(cache_allocator.allocator(), gpa, testing.io, &env, "/project"),
+    );
+
+    var shell_allocator = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        devShellDirFor(shell_allocator.allocator(), testing.io, &env, "/project"),
+    );
+
+    var staging_allocator = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        devShellStagingDirFor(staging_allocator.allocator(), testing.io, &env, "/project"),
+    );
+}
 
 test "--adopt takes over a session that exists, and refuses every shape that is not that" {
     const gpa = testing.allocator;
