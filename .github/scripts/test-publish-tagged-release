@@ -1,0 +1,92 @@
+#!/bin/sh
+set -eu
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+scratch=$(mktemp -d)
+trap 'rm -rf -- "$scratch"' EXIT HUP INT TERM
+
+mkdir -p "$scratch/bin" "$scratch/artifacts"
+printf 'archive\n' > "$scratch/artifacts/chock-test.tar.gz"
+
+cat > "$scratch/bin/git" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'git %s\n' "$*" >> "$CALLS"
+if [ "$1" = rev-parse ]; then
+  printf '%s\n' "$TAG_COMMIT"
+fi
+EOF
+
+cat > "$scratch/bin/gh" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'gh %s\n' "$*" >> "$CALLS"
+if [ "$1 $2" = "release view" ]; then
+  if [ -z "${DRAFT_STATE:-}" ]; then
+    exit 1
+  fi
+  printf '%s\n' "$DRAFT_STATE"
+fi
+EOF
+
+chmod +x "$scratch/bin/git" "$scratch/bin/gh"
+export PATH="$scratch/bin:$PATH"
+export CALLS="$scratch/calls"
+
+tag=v1.2.3
+commit=abcdef0123456789
+
+TAG_COMMIT=$commit DRAFT_STATE='' \
+  "$here/publish-tagged-release" "$tag" "$commit" "$scratch/artifacts" 0
+grep -Fx "git rev-parse refs/tags/$tag^{commit}" "$CALLS"
+grep -F "gh release create $tag --draft --verify-tag --title $tag --generate-notes" "$CALLS"
+grep -F "gh release upload $tag $scratch/artifacts/chock-test.tar.gz --clobber" "$CALLS"
+grep -Fx "gh release edit $tag --draft=false" "$CALLS"
+
+: > "$CALLS"
+TAG_COMMIT=$commit DRAFT_STATE='' \
+  "$here/publish-tagged-release" v1.2.3-rc1 "$commit" "$scratch/artifacts" 1
+grep -F "gh release create v1.2.3-rc1 --draft --verify-tag --prerelease" "$CALLS"
+
+: > "$CALLS"
+TAG_COMMIT=$commit DRAFT_STATE=true \
+  "$here/publish-tagged-release" "$tag" "$commit" "$scratch/artifacts" 0
+if grep -Fq "release create" "$CALLS"; then
+  echo "a resumed draft recreated its release" >&2
+  exit 1
+fi
+grep -F "gh release upload $tag $scratch/artifacts/chock-test.tar.gz --clobber" "$CALLS"
+
+: > "$CALLS"
+if TAG_COMMIT=$commit DRAFT_STATE=false \
+  "$here/publish-tagged-release" "$tag" "$commit" "$scratch/artifacts" 0 2>/dev/null; then
+  echo "an already published release was accepted" >&2
+  exit 1
+fi
+if grep -Fq "release upload" "$CALLS" || grep -Fq "release edit" "$CALLS"; then
+  echo "a published immutable release was changed" >&2
+  exit 1
+fi
+
+: > "$CALLS"
+if TAG_COMMIT=deadbeef DRAFT_STATE='' \
+  "$here/publish-tagged-release" "$tag" "$commit" "$scratch/artifacts" 0 2>/dev/null; then
+  echo "a tag at another commit was accepted" >&2
+  exit 1
+fi
+if grep -Fq "gh " "$CALLS"; then
+  echo "a conflicting tag changed release state" >&2
+  exit 1
+fi
+
+mkdir "$scratch/empty"
+: > "$CALLS"
+if TAG_COMMIT=$commit DRAFT_STATE='' \
+  "$here/publish-tagged-release" "$tag" "$commit" "$scratch/empty" 0 2>/dev/null; then
+  echo "an empty artifact directory was accepted" >&2
+  exit 1
+fi
+if [ -s "$CALLS" ]; then
+  echo "an empty artifact directory changed release state" >&2
+  exit 1
+fi

@@ -1,0 +1,69 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 4 ]; then
+  echo "usage: publish-tagged-release <tag> <commit> <artifacts-directory> <prerelease:0|1>" >&2
+  exit 2
+fi
+
+tag=$1
+commit=$2
+artifacts=$3
+prerelease=$4
+ref="refs/tags/$tag"
+
+case "$prerelease" in
+  0 | 1) ;;
+  *)
+    echo "::error::prerelease must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+
+set -- "$artifacts"/*
+if [ ! -e "$1" ]; then
+  echo "::error::the artifact directory $artifacts is empty" >&2
+  exit 1
+fi
+
+tag_commit=$(git rev-parse "$ref^{commit}")
+if [ "$tag_commit" != "$commit" ]; then
+  echo "::error::the tag $tag points at $tag_commit, not $commit" >&2
+  exit 1
+fi
+
+draft=$(
+  gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || true
+)
+case "$draft" in
+  "")
+    if [ "$prerelease" = 1 ]; then
+      gh release create "$tag" \
+        --draft \
+        --verify-tag \
+        --prerelease \
+        --title "$tag" \
+        --generate-notes
+    else
+      gh release create "$tag" \
+        --draft \
+        --verify-tag \
+        --title "$tag" \
+        --generate-notes
+    fi
+    ;;
+  true)
+    echo "resuming the existing draft release for $tag"
+    ;;
+  false)
+    echo "::error::the immutable release for $tag is already published; cut a new version" >&2
+    exit 1
+    ;;
+  *)
+    echo "::error::GitHub returned an unknown draft state for $tag: $draft" >&2
+    exit 1
+    ;;
+esac
+
+gh release upload "$tag" "$@" --clobber
+gh release edit "$tag" --draft=false

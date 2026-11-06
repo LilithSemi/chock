@@ -41,6 +41,7 @@ jobs:
       - name: Test the release helpers
         run: |
           .github/scripts/test-release-version
+          .github/scripts/test-publish-tagged-release
           .github/scripts/test-publish-rolling-release
 
       - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3 # v3
@@ -384,21 +385,12 @@ jobs:
           # itself in front of every reader who asked for the release. A tag
           # carrying a pre-release part is exactly what a candidate is:
           # `v0.1.0-rc1` has one and `v0.1.0` does not.
-          mark=()
+          prerelease=0
           case "${GITHUB_REF_NAME}" in
-            *-*) mark=(--prerelease) ;;
+            *-*) prerelease=1 ;;
           esac
-
-          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release create "${GITHUB_REF_NAME}" \
-              --draft \
-              --verify-tag \
-              ${mark[@]+"${mark[@]}"} \
-              --title "${GITHUB_REF_NAME}" \
-              --generate-notes
-          fi
-          gh release upload "${GITHUB_REF_NAME}" artifacts/* --clobber
-          gh release edit "${GITHUB_REF_NAME}" --draft=false
+          .github/scripts/publish-tagged-release \
+            "${GITHUB_REF_NAME}" "$(git rev-parse HEAD)" artifacts "${prerelease}"
 
       # **A rolling build of master that a stranger can actually download.**
       # Measured 2026-09-16: a workflow artefact answers `401` to an anonymous
