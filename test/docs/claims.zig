@@ -1091,6 +1091,9 @@ test "automation report pages name every stable status value" {
             try wrong.print(arena, "docs/running.md names no doctor row status `{s}`\n", .{field});
         }
     }
+    if (std.mem.indexOf(u8, doctor_section, "`session storage`") == null) {
+        try wrong.print(arena, "docs/running.md does not name the doctor session-storage gate\n", .{});
+    }
     for (try simpleEnumFields(arena, show_source, "const ShowProblem")) |field| {
         if (!try namesInTicks(show_section, field, arena)) {
             try wrong.print(arena, "docs/running.md names no session-show problem `{s}`\n", .{field});

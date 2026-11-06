@@ -547,6 +547,13 @@ The report verdict is `ready`, `degraded`, or `blocked`. Row status is `ok`,
 `off`, `unsupported`, `degraded`, or `blocked`. A `blocked` verdict is the only
 one for which `can_start` is false.
 
+The first-run section checks the host programs and toolchain, the selected
+credential, free workspace space, and Chock's own `session storage`. That last
+row makes and removes a probe directory beneath the project's state directory.
+It blocks when neither `HOME` nor an absolute `XDG_STATE_HOME` selects a
+location, or when the location is not writable, because a session cannot start
+without somewhere outside the project for its log and workspace.
+
 On an installation an organisation manages, it also reports what that
 organisation's policy bundle imposes: the audit sinks it requires, and every
 ceiling it sets on spending, on how far a spawn tree may grow, and on the paths
@@ -555,3 +562,7 @@ machine that is well still reads ready. A machine with no bundle gains no rows
 at all. They are there because a cap is otherwise invisible until it bites: a
 session that stops at a number nobody wrote in `chock.zon` reads as a fault
 until you know where the number came from.
+
+An installed bundle that cannot be read is different from an installation
+with no bundle. It adds a blocking `org policy` row with the parser or read
+diagnostic, matching the refusal `chock run` gives before a session starts.
