@@ -1118,6 +1118,7 @@ fn loadPolicyUnder(
         layers,
         &policy_diag,
     ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
         error.NoPolicyFile => chock_policy.table.Table.parseLayered(arena, ".{}", layers, null) catch
             return error.OutOfMemory,
         else => {
@@ -1264,6 +1265,7 @@ fn start(
     var config_diag: ?chock_auth.config.Diagnostic = null;
     defer if (config_diag) |*d| d.deinit(arena);
     var config = chock_auth.config.load(arena, io, config_dir, &config_diag) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
         error.NoConfigFile => {
             tty.print(
                 .err,
@@ -1364,6 +1366,7 @@ fn start(
         store,
         &credential_diag,
     ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (credential_diag) |*d| {
             tty.print(
                 .err,
@@ -1774,6 +1777,7 @@ fn start(
     var devices_diag: ?chock_core.devices.Diagnostic = null;
     defer if (devices_diag) |*d| d.deinit(arena);
     const declared_devices = chock_core.devices.load(arena, io, project_root, &devices_diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (devices_diag) |*d| {
             tty.print(.err, "chock run: the devices block in chock.zon could not be read: {f}\n", .{d});
         } else {
@@ -1809,6 +1813,7 @@ fn start(
     var budget_diag: ?chock_cost.budget.Diagnostic = null;
     defer if (budget_diag) |*d| d.deinit(arena);
     const from_file = chock_cost.budget.load(arena, io, project_root, &budget_diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (budget_diag) |*d| {
             tty.print(.err, "chock run: the budget in chock.zon could not be read: {f}\n", .{d});
         } else {
@@ -1823,6 +1828,7 @@ fn start(
     var subagents_diag: ?chock_policy.subagents.Diagnostic = null;
     defer if (subagents_diag) |*d| d.deinit(arena);
     const limits_from_file = chock_policy.subagents.load(arena, io, project_root, &subagents_diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (subagents_diag) |*d| {
             tty.print(.err, "chock run: the subagents block in chock.zon could not be read: {f}\n", .{d});
         } else {
@@ -1835,6 +1841,7 @@ fn start(
     var context_diag: ?chock_policy.context.Diagnostic = null;
     defer if (context_diag) |*d| d.deinit(arena);
     const context_settings = chock_policy.context.load(arena, io, project_root, &context_diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (context_diag) |*d| {
             tty.print(.err, "chock run: the context block in chock.zon could not be read: {f}\n", .{d});
         } else {
@@ -1852,6 +1859,7 @@ fn start(
         project_root,
         &language_server_diag,
     ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (language_server_diag) |*d| {
             tty.print(.err, "chock run: the language_servers block in chock.zon could not be read: {f}\n", .{d});
         } else {
@@ -1863,6 +1871,7 @@ fn start(
     var mcp_diag: ?chock_core.mcp.Diagnostic = null;
     defer if (mcp_diag) |*d| d.deinit(arena);
     const mcp_servers = chock_core.mcp.load(arena, io, project_root, &mcp_diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (mcp_diag) |*d| {
             tty.print(.err, "chock run: the mcp_servers block in chock.zon could not be read: {f}\n", .{d});
         } else {
@@ -1874,6 +1883,7 @@ fn start(
     var plugins_diag: ?chock_core.plugin.Diagnostic = null;
     defer if (plugins_diag) |*d| d.deinit(arena);
     const plugins = chock_core.plugin.load(arena, io, project_root, &plugins_diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (plugins_diag) |*d| {
             tty.print(.err, "chock run: the plugins block in chock.zon could not be read: {f}\n", .{d});
         } else {
@@ -2666,6 +2676,7 @@ fn loadSearchCredential(
     defer if (diag) |*d| d.deinit(arena);
 
     const held = chock_auth.search.load(arena, io, store.secrets, name, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (diag) |*d| {
             tty.print(.err, "chock run: the search key could not be read: {f}\n", .{d});
         } else {
@@ -3122,6 +3133,7 @@ fn loadDevShell(
         .staging_dir = staging_dir,
         .diag = &diag,
     }) catch |err| loaded: {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (diag) |*fault| {
             tty.print(.err, "chock: this project's dev shell could not be read: {f}\n", .{fault});
         } else {
@@ -3915,6 +3927,7 @@ fn workspaceBinds(
     var diag: ?block_mod.Diagnostic = null;
     defer if (diag) |*d| d.deinit(arena);
     const block = block_mod.load(arena, io, project_root, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (diag) |*d| {
             tty.print(.err, "chock run: the workspace block in chock.zon could not be read: {f}\n", .{d});
         } else {
@@ -3974,6 +3987,7 @@ fn workspaceBinds(
         const permitted = narrower(table_says, decisionOf(bind.write));
         for (matches) |relative| {
             var resolved = block_mod.resolve(arena, io, root, bind, relative, &diag) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 if (diag) |*d| {
                     tty.print(.err, "chock run: {f}\n", .{d});
                 } else {
@@ -5083,6 +5097,7 @@ fn projectNamedInstructions(
     defer if (diag) |*d| d.deinit(arena);
 
     const block = chock_policy.instructions.load(arena, io, project_root, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (diag) |*d| {
             tty.print(.err, "chock run: the instructions block in chock.zon could not be read: {f}\n", .{d});
         } else {
@@ -5094,6 +5109,7 @@ fn projectNamedInstructions(
     const resolved = try arena.alloc([]const u8, block.files.len);
     for (block.files, 0..) |name, index_of| {
         resolved[index_of] = chock_policy.instructions.resolve(arena, io, project_root, name, &diag) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
             if (diag) |*d| {
                 tty.print(.err, "chock run: the instructions block in chock.zon could not be read: {f}\n", .{d});
             } else {
@@ -5167,6 +5183,7 @@ fn projectHooks(
     defer if (diag) |*one| one.deinit(arena);
 
     const block = chock_core.hooks.load(arena, io, project_root, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (diag) |*one| {
             tty.print(.err, "chock run: the hooks block in chock.zon could not be read: {f}\n", .{one});
         } else {
@@ -5315,6 +5332,7 @@ fn projectDirs(
     defer if (diag) |*d| d.deinit(arena);
 
     const block = chock_policy.dirs.load(arena, io, project_root, which, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         reportBlockFault(which, if (diag) |*one| one else null, err);
         return error.Reported;
     };
@@ -5329,6 +5347,7 @@ fn projectDirs(
             name,
             &diag,
         ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
             reportBlockFault(which, if (diag) |*one| one else null, err);
             return error.Reported;
         };
@@ -14054,6 +14073,28 @@ test "session setup paths preserve allocation failure" {
     try testing.expectError(
         error.OutOfMemory,
         loadImage(gpa, image_allocator.allocator(), testing.io, &env, "/project"),
+    );
+}
+
+test "project configuration readers preserve allocation failure" {
+    const gpa = testing.allocator;
+
+    var instructions_allocator = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        projectNamedInstructions(instructions_allocator.allocator(), testing.io, "/project"),
+    );
+
+    var hooks_allocator = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        projectHooks(hooks_allocator.allocator(), testing.io, "/project"),
+    );
+
+    var dirs_allocator = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        projectDirs(dirs_allocator.allocator(), testing.io, "/project", .skills),
     );
 }
 
