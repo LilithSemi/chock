@@ -136,6 +136,12 @@ pub const CacheState = union(enum) {
     refused: []const u8,
 };
 
+pub const SessionStorageState = union(enum) {
+    ready: []const u8,
+    directory_missing: directory_help.Kind,
+    refused: []const u8,
+};
+
 pub const LayerFamily = enum {
     none,
     namespaces,
@@ -183,6 +189,7 @@ pub const Measured = struct {
     container: ContainerState = .not_installed,
     toolchain: ToolchainState = .none,
     credential: CredentialState = .{ .unconfigured = "the configuration was not read" },
+    session_storage: ?SessionStorageState = null,
     cache: CacheState = .{ .refused = "the toolchain cache was not read" },
     free_bytes: ?u64 = null,
 
@@ -449,6 +456,7 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
     if (try containerRow(arena, m.container, m.toolchain)) |row| try rows.append(arena, row);
     try rows.append(arena, try toolchainRow(arena, m.toolchain));
     try rows.append(arena, try credentialRow(arena, m.credential));
+    if (m.session_storage) |state| try rows.append(arena, try sessionStorageRow(arena, state));
     try rows.append(arena, try cacheRow(arena, m.cache));
     try rows.append(arena, try freeSpaceRow(arena, m.free_bytes));
     try rows.append(arena, try cardSealRow(arena, m.card_seal, m.card_readers));
@@ -1104,6 +1112,42 @@ test "failed program probes are not reported as missing installations" {
     try testing.expect(!nix.blocks);
 }
 
+fn sessionStorageRow(
+    arena: std.mem.Allocator,
+    state: SessionStorageState,
+) std.mem.Allocator.Error!Row {
+    return switch (state) {
+        .ready => |path| .{
+            .name = "session storage",
+            .state = .on,
+            .means = path,
+            .why = "the session log and workspace can be written outside the project",
+        },
+        .directory_missing => |kind| .{
+            .name = "session storage",
+            .state = .unavailable,
+            .means = try std.fmt.allocPrint(
+                arena,
+                "its state directory is unknown because neither HOME nor an absolute {s} is set",
+                .{directory_help.variable(kind)},
+            ),
+            .fix = try std.fmt.allocPrint(
+                arena,
+                "Set HOME or an absolute {s}. No session can start until its log and workspace have a location.",
+                .{directory_help.variable(kind)},
+            ),
+            .blocks = true,
+        },
+        .refused => |reason| .{
+            .name = "session storage",
+            .state = .unavailable,
+            .means = try std.fmt.allocPrint(arena, "its directory could not be made: {s}", .{reason}),
+            .fix = "Make the Chock state directory writable. No session can start until its log and workspace can be stored.",
+            .blocks = true,
+        },
+    };
+}
+
 fn cacheRow(arena: std.mem.Allocator, state: CacheState) std.mem.Allocator.Error!Row {
     return switch (state) {
         .ok => .{
@@ -1320,6 +1364,7 @@ fn isFirstRunRow(row: Row) bool {
         "container runtime",
         "toolchain",
         "credential",
+        "session storage",
         "toolchain cache",
         "workspace space",
         "card seal",
@@ -1400,6 +1445,12 @@ fn measureHost(
     m.toolchain = measureToolchain(arena, io, env, project_root, m.dev_shell, m.container);
     m.credential = measureCredential(arena, io, env);
 
+    m.session_storage = measureSessionStorage(arena, io, env, project_root);
+    switch (m.session_storage.?) {
+        .ready => |dir| m.free_bytes = freeBytesNear(dir),
+        .directory_missing, .refused => {},
+    }
+
     m.cache = cache: {
         const dir = session_paths.cacheDir(arena, env, project_root) catch |err| break :cache switch (err) {
             error.NoHomeDirectory => .{ .directory_missing = .data },
@@ -1408,10 +1459,6 @@ fn measureHost(
         _ = session_paths.createCacheDir(io, dir, null) catch |err| break :cache .{ .refused = @errorName(err) };
         break :cache .ok;
     };
-
-    if (session_paths.projectDir(arena, env, project_root) catch null) |dir| {
-        m.free_bytes = freeBytesNear(dir);
-    }
 
     measureCardSeal(arena, io, m);
 
@@ -1446,6 +1493,26 @@ fn measureProgram(
             return null;
         },
     };
+}
+
+fn measureSessionStorage(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+) SessionStorageState {
+    const dir = session_paths.projectDir(arena, env, project_root) catch |err| return switch (err) {
+        error.NoHomeDirectory => .{ .directory_missing = .state },
+        error.OutOfMemory => .{ .refused = @errorName(err) },
+    };
+    session_paths.createDirAll(io, dir) catch |err| return .{ .refused = @errorName(err) };
+
+    var name_buffer: [64]u8 = undefined;
+    const name = probeDirName(&name_buffer) catch |err| return .{ .refused = @errorName(err) };
+    const probe = std.fs.path.join(arena, &.{ dir, name }) catch |err| return .{ .refused = @errorName(err) };
+    session_paths.createDirAll(io, probe) catch |err| return .{ .refused = @errorName(err) };
+    std.Io.Dir.cwd().deleteTree(io, probe) catch {};
+    return .{ .ready = dir };
 }
 
 fn measureResolverFiles(io: std.Io, toolchain: ToolchainState, host_root: []const u8) ResolverFiles {
@@ -2882,6 +2949,29 @@ test "a missing state home is not reported as a project without a flake" {
     const row = try devShellRow(arena, measured);
     try testing.expect(std.mem.indexOf(u8, row.means, "XDG_STATE_HOME") != null);
     try testing.expect(std.mem.indexOf(u8, row.fix, "XDG_STATE_HOME") != null);
+}
+
+test "a missing state home blocks first run through the session storage row" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+
+    const measured = measureSessionStorage(arena, testing.io, &env, "/project");
+    const kind = switch (measured) {
+        .directory_missing => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(directory_help.Kind.state, kind);
+
+    const row = try sessionStorageRow(arena, measured);
+    try testing.expect(std.mem.indexOf(u8, row.means, "XDG_STATE_HOME") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "No session can start") != null);
+    try testing.expect(row.blocks);
+    try testing.expectEqual(Verdict.blocked, verdictFor(&.{row}));
 }
 
 test "an unusable dev shell state directory is not reported as a project without a flake" {
