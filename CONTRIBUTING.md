@@ -35,8 +35,10 @@ building the main executable tests:
 nix develop --command zig build test-docs --summary all
 ```
 
-Use `zig build test-exe` for command unit tests. Use `zig build test-cli` when a
-change needs the built command-line process and its real standard streams.
+Use `zig build test-exe` for command unit tests. Use `zig build test-ui` for the
+shared terminal, desktop, and browser interface model. Use `zig build test-cli`
+when a change needs the built command-line process and its real standard
+streams.
 
 ## Repository layout
 
