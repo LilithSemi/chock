@@ -1114,6 +1114,28 @@ test "an invalid existing configuration tells the user to edit it instead of ini
     try testing.expect(row.blocks);
 }
 
+test "credential probe allocation failures do not look like missing configuration" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("HOME", "/home/tester");
+
+    var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    const state = measureCredential(failing.allocator(), testing.io, &env);
+    const reason = switch (state) {
+        .probe_failed => |text| text,
+        else => return error.TestUnexpectedResult,
+    };
+    const row = try credentialRow(arena, state);
+    try testing.expectEqualStrings("OutOfMemory", reason);
+    try testing.expect(std.mem.indexOf(u8, row.means, "could not check the configuration") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "config init") == null);
+    try testing.expect(row.blocks);
+}
+
 test "a missing credential directory names the environment value that fixes it" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -2008,11 +2030,11 @@ fn measureCredential(
 ) CredentialState {
     const config_dir = chock_auth.paths.configDir(arena, env) catch |err| return switch (err) {
         error.NoHomeDirectory => .{ .directory_missing = .config },
-        error.OutOfMemory => .{ .unconfigured = @errorName(err) },
+        error.OutOfMemory => .{ .probe_failed = @errorName(err) },
     };
     const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| return switch (err) {
         error.NoHomeDirectory => .{ .directory_missing = .data },
-        error.OutOfMemory => .{ .unconfigured = @errorName(err) },
+        error.OutOfMemory => .{ .probe_failed = @errorName(err) },
     };
 
     var config_diag: ?chock_auth.config.Diagnostic = null;
@@ -2058,6 +2080,7 @@ fn measureCredential(
         store,
         &lookup_diag,
     ) catch |err| {
+        if (err == error.OutOfMemory) return .{ .probe_failed = @errorName(err) };
         if (lookup_diag) |*d| return .{
             .unreadable = std.fmt.allocPrint(arena, "{f}", .{d}) catch @errorName(err),
         };
