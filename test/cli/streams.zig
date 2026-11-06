@@ -437,6 +437,26 @@ test "a failed JSON model probe returns a document and a fault exit" {
     try testing.expect(catalogue.reason.?.len != 0);
 }
 
+test "an empty configuration cannot pass a provider probe" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var box = try Sandbox.init(gpa, io);
+    defer box.deinit(gpa);
+    try box.writeConfig(gpa, io, ".{}\n");
+
+    var models = try runChock(gpa, io, &box.env, &.{ "models", "--probe", "--format", "json" });
+    defer models.deinit(gpa);
+
+    try testing.expectEqual(@as(u8, 2), models.code);
+    try testing.expect(std.mem.indexOf(u8, models.err, "no provider instance to probe") != null);
+    const report = try std.json.parseFromSlice(ModelReport, gpa, models.out, .{});
+    defer report.deinit();
+    try testing.expect(report.value.probed);
+    try testing.expectEqual(@as(usize, 0), report.value.providers.len);
+    try testing.expect(report.value.default_provider == null);
+}
+
 test "a compatible provider rejection names the credential command" {
     const gpa = testing.allocator;
     const io = testing.io;

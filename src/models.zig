@@ -116,7 +116,10 @@ pub fn main(
     if (options.format == .json) {
         const count: usize = if (selected == null) config.instances.len else 1;
         const catalogues = try arena.alloc(CatalogueReport, count);
-        var probe_failed = false;
+        var probe_failed = count == 0;
+        if (count == 0) {
+            tty.print(.err, "chock models: config.zon names no provider instance to probe\n", .{});
+        }
         if (selected) |instance| {
             catalogues[0] = try probe(arena, gpa, io, config_dir, store, instance, .json);
             probe_failed = !catalogues[0].available();
@@ -141,6 +144,10 @@ pub fn main(
 
     if (config.instances.len == 0) {
         tty.out(.plain, "chock models: config.zon names no provider instances.\n", .{});
+        if (options.probe) {
+            tty.print(.err, "chock models: no provider was available to probe\n", .{});
+            return Exit.faulted.code();
+        }
         return Exit.finished.code();
     }
 

@@ -150,7 +150,9 @@ switcher without parsing terminal output or handling credentials themselves.
 top-level `probed` field is true, and each provider has a `catalogue` object
 with a stable status, a sorted `models` array when available, and an HTTP status
 or connection reason when applicable. Probe diagnostics still go to stderr,
-and any failed catalogue makes the command exit nonzero.
+and any failed catalogue makes the command exit nonzero. A probe with no
+configured provider also exits nonzero and keeps the empty structured report
+on standard output.
 
 Catalogue status values are:
 
