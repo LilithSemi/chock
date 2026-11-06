@@ -185,7 +185,13 @@ version before you create the tag.
 
 A version with a pre-release suffix, such as `1.2.3-rc1`, becomes a GitHub
 pre-release. The `-unstable` manifest version is reserved for the rolling build
-from `master`; CI gives each such build its date and revision automatically.
+from `master`. CI gives each such build its date and revision automatically.
+
+Test archive creation with the same locked tools that CI uses:
+
+```sh
+nix develop .#release --command .github/scripts/test-package-release
+```
 
 ## Commits
 
