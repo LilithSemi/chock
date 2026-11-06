@@ -246,6 +246,16 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expectEqualStrings("", path.err);
     try testing.expectEqualStrings(expected_path, std.mem.trimEnd(u8, path.out, "\n"));
 
+    try box.env.put("XDG_CONFIG_HOME", "relative/config");
+    const fallback_path = try std.fmt.allocPrint(gpa, "{s}/.config/chock/config.zon", .{box.root});
+    defer gpa.free(fallback_path);
+    var fallback = try runChock(gpa, io, &box.env, &.{ "config", "path" });
+    defer fallback.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), fallback.code);
+    try testing.expectEqualStrings("", fallback.err);
+    try testing.expectEqualStrings(fallback_path, std.mem.trimEnd(u8, fallback.out, "\n"));
+    try box.env.put("XDG_CONFIG_HOME", box.root);
+
     var example = try runChock(gpa, io, &box.env, &.{ "config", "example" });
     defer example.deinit(gpa);
     try testing.expectEqual(@as(u8, 0), example.code);
