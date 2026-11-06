@@ -898,6 +898,28 @@ test "the README checks configuration, provider, and machine in order" {
     try testing.expect(std.mem.indexOf(u8, getting_started, "chock login --provider NAME") == null);
 }
 
+test "first-run documentation names the generated starter endpoint and model" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+    const readme = try docText(docs, "README.md");
+    const configuration = try docText(docs, "docs/configure/configuration.md");
+
+    var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{});
+    defer root.close(testing.io);
+    const source = try root.readFileAlloc(testing.io, "src/config.zig", arena, .limited(max_source_bytes));
+    const starter = try textBetween(source, "pub const example_text =", "\n;\n\nconst Format");
+    const endpoint = try textBetween(starter, ".base_url = \"", "\"");
+    const model = try textBetween(starter, ".model = \"", "\"");
+
+    for ([_][]const u8{ endpoint, model }) |value| {
+        const documented = try std.fmt.allocPrint(arena, "`{s}`", .{value});
+        try testing.expect(std.mem.indexOf(u8, readme, documented) != null);
+        try testing.expect(std.mem.indexOf(u8, configuration, documented) != null);
+    }
+}
+
 test "the exit code table has one row for each code, with the number the code has" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

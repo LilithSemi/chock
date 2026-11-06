@@ -137,8 +137,9 @@ the session log's path. Bare `chock` brings up a full screen interface and asks
 for the task in it.
 
 The starter expects a local OpenAI-compatible server at
-`http://127.0.0.1:5000/v1` and needs no credential. Start that server, or edit
-the provider and model when you use a different one. Then run
+`http://127.0.0.1:5000/v1` with model `glm4.7-flash:A3B`, and needs no
+credential. Start that server, or edit the provider and model when you use a
+different one. Then run
 `chock config check` again. When the provider needs a stored login, use
 `chock login --provider KIND --name NAME`. Omit `--name` when the instance name
 is the same as its kind. `chock models --probe` tests the endpoint and credential
