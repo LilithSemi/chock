@@ -122,7 +122,7 @@ Then continue with the configuration and first-run checks below.
 ```
 chock config init                          # save a local-provider starter
 chock config check                         # check it before a session
-chock models                               # show the effective provider and model
+chock models --probe                       # test the provider and list its models
 chock doctor                               # can this configuration run here
 cd ~/some-project
 chock run "add a test for the parser"
@@ -136,9 +136,12 @@ needed for a first session, so run it after creating or linking that file.
 the session log's path. Bare `chock` brings up a full screen interface and asks
 for the task in it.
 
-The starter uses a local OpenAI-compatible endpoint and needs no credential.
-Edit it when you use a remote provider. Then run `chock config check` again and
-use `chock login --provider NAME` when that provider needs a stored login.
+The starter expects a local OpenAI-compatible server at
+`http://127.0.0.1:5000/v1` and needs no credential. Start that server, or edit
+the provider and model when you use a different one. Then run
+`chock config check` again and use `chock login --provider NAME` when that
+provider needs a stored login. `chock models --probe` tests the endpoint and
+credential before the first session.
 
 A first word is read as a command name, so a task given on the line goes after
 `--`. `chock fix the parser` is refused, because a typed `chock rnu` that

@@ -107,7 +107,8 @@ pub fn main(
             return Exit.usage.code();
         }
         tty.out(.plain, "chock config init: wrote {s}\n", .{path});
-        tty.out(.plain, "Edit its endpoint and model, then run `chock config check`.\n", .{});
+        tty.out(.plain, "The starter expects a local OpenAI-compatible server. Start it or edit the endpoint and model.\n", .{});
+        tty.out(.plain, "Then run `chock config check`, `chock models --probe`, and `chock doctor`.\n", .{});
         return Exit.finished.code();
     }
 

@@ -878,7 +878,7 @@ test "the README keeps both supported install paths" {
     try testing.expect(named != 0);
 }
 
-test "the README creates configuration before the first doctor check" {
+test "the README checks configuration, provider, and machine in order" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -888,9 +888,12 @@ test "the README creates configuration before the first doctor check" {
 
     const init_at = std.mem.indexOf(u8, getting_started, "chock config init") orelse
         return error.MissingConfigInit;
+    const probe_at = std.mem.indexOf(u8, getting_started, "chock models --probe") orelse
+        return error.MissingModelProbe;
     const doctor_at = std.mem.indexOf(u8, getting_started, "chock doctor") orelse
         return error.MissingDoctor;
-    try testing.expect(init_at < doctor_at);
+    try testing.expect(init_at < probe_at);
+    try testing.expect(probe_at < doctor_at);
 }
 
 test "the exit code table has one row for each code, with the number the code has" {

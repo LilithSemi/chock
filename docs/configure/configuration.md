@@ -24,7 +24,11 @@ chock config init
 chock config check
 ```
 
-Edit the endpoint and model for the server you run before starting a session.
+The starter expects an OpenAI-compatible server at
+`http://127.0.0.1:5000/v1` that serves `glm4.7-flash:A3B`. Start that server,
+or edit the endpoint and model before you start a session. After the file
+passes `chock config check`, run `chock models --probe` to test the endpoint,
+credential, and model catalogue.
 
 Check this file without reading a credential or contacting a provider:
 
