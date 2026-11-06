@@ -986,6 +986,7 @@ test "automation report pages name every stable status value" {
     var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{});
     defer root.close(testing.io);
     const config_source = try root.readFileAlloc(testing.io, "src/config.zig", arena, .limited(max_source_bytes));
+    const auth_config_source = try root.readFileAlloc(testing.io, "lib/chock-auth/config.zig", arena, .limited(max_source_bytes));
     const models_source = try root.readFileAlloc(testing.io, "src/models.zig", arena, .limited(max_source_bytes));
     const doctor_source = try root.readFileAlloc(testing.io, "src/doctor.zig", arena, .limited(max_source_bytes));
     const show_source = try root.readFileAlloc(testing.io, "src/session_show.zig", arena, .limited(max_source_bytes));
@@ -1006,6 +1007,17 @@ test "automation report pages name every stable status value" {
     for (try simpleEnumFields(arena, config_source, "const CheckProblem")) |field| {
         if (!try namesInTicks(check_section, field, arena)) {
             try wrong.print(arena, "docs/configure/configuration.md names no configuration problem `{s}`\n", .{field});
+        }
+    }
+    const provider_kinds = try textBetween(
+        auth_config_source,
+        "pub const all_wire_names = \"",
+        "\";",
+    );
+    var kinds = std.mem.splitSequence(u8, provider_kinds, ", ");
+    while (kinds.next()) |kind| {
+        if (!try namesInTicks(configuration, kind, arena)) {
+            try wrong.print(arena, "docs/configure/configuration.md names no provider kind `{s}`\n", .{kind});
         }
     }
     for (try simpleEnumFields(arena, models_source, "const CatalogueStatus")) |field| {
