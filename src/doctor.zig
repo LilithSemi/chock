@@ -191,6 +191,7 @@ pub const Measured = struct {
 
     required_sinks: []const SinkProbe = &.{},
     org_ceilings: []const []const u8 = &.{},
+    org_policy_failure: ?[]const u8 = null,
 };
 
 pub const driver_gives_nothing =
@@ -452,6 +453,13 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
     try rows.append(arena, try freeSpaceRow(arena, m.free_bytes));
     try rows.append(arena, try cardSealRow(arena, m.card_seal, m.card_readers));
     for (m.required_sinks) |one| try rows.append(arena, try requiredSinkRow(arena, one));
+    if (m.org_policy_failure) |reason| try rows.append(arena, .{
+        .name = "org policy",
+        .state = .unavailable,
+        .means = reason,
+        .fix = "Repair or remove the installed org-policy.zon. Chock refuses to start while its installation policy cannot be read.",
+        .blocks = true,
+    });
     for (m.org_ceilings) |means| try rows.append(arena, .{
         .name = org_ceiling_name,
         .state = .on,
@@ -1315,6 +1323,7 @@ fn isFirstRunRow(row: Row) bool {
         "toolchain cache",
         "workspace space",
         "card seal",
+        "org policy",
         required_sink_name,
     }) |name| {
         if (std.mem.eql(u8, row.name, name)) return true;
@@ -1406,10 +1415,17 @@ fn measureHost(
 
     measureCardSeal(arena, io, m);
 
-    m.required_sinks = measureRequiredSinks(arena, io, env);
-    m.org_ceilings = measureOrgCeilings(arena, io, env);
+    const org_bundle = measureOrgBundle(arena, io, env, &m.org_policy_failure);
+    m.required_sinks = measureRequiredSinks(arena, io, org_bundle);
+    m.org_ceilings = measureOrgCeilings(arena, org_bundle);
 
-    m.write_execute = measureHardening(arena, io, env, project_root, defaultModel(arena, io, env));
+    m.write_execute = measureHardening(
+        arena,
+        io,
+        project_root,
+        defaultModel(arena, io, env),
+        if (org_bundle) |bundle| bundle.rules else &.{},
+    );
 
     if (m.driver.contains(.network_isolated)) {
         m.resolver_files = measureResolverFiles(io, m.toolchain, "");
@@ -1470,18 +1486,10 @@ fn under(buffer: []u8, root: []const u8, path: []const u8) ?[]const u8 {
 fn measureHardening(
     arena: std.mem.Allocator,
     io: std.Io,
-    env: *const std.process.Environ.Map,
     project_root: []const u8,
     model: []const u8,
+    org_rules: []const chock_policy.table.Rule,
 ) chock_policy.hardening.WriteExecute {
-    const org_rules: []const chock_policy.table.Rule = rules: {
-        const data_dir = chock_auth.paths.dataDir(arena, env) catch break :rules &.{};
-        const path = std.fs.path.join(arena, &.{ data_dir, chock_policy.org.file_name }) catch
-            break :rules &.{};
-        const bundle = chock_policy.org.load(arena, io, path, null) catch break :rules &.{};
-        break :rules bundle.rules;
-    };
-
     const policy = chock_policy.table.Table.loadUnder(
         arena,
         io,
@@ -1556,12 +1564,9 @@ const probe_drop_name = ".chock-doctor.probe";
 
 fn measureOrgCeilings(
     arena: std.mem.Allocator,
-    io: std.Io,
-    env: *const std.process.Environ.Map,
+    maybe_bundle: ?*const chock_policy.org.Bundle,
 ) []const []const u8 {
-    const data_dir = chock_auth.paths.dataDir(arena, env) catch return &.{};
-    const path = std.fs.path.join(arena, &.{ data_dir, chock_policy.org.file_name }) catch return &.{};
-    const bundle = chock_policy.org.load(arena, io, path, null) catch return &.{};
+    const bundle = maybe_bundle orelse return &.{};
 
     var found: std.ArrayList([]const u8) = .empty;
 
@@ -1652,11 +1657,9 @@ fn resolveCeilingField(text: ?[]const u8, basis: u64) ?u64 {
 fn measureRequiredSinks(
     arena: std.mem.Allocator,
     io: std.Io,
-    env: *const std.process.Environ.Map,
+    maybe_bundle: ?*const chock_policy.org.Bundle,
 ) []const SinkProbe {
-    const data_dir = chock_auth.paths.dataDir(arena, env) catch return &.{};
-    const path = std.fs.path.join(arena, &.{ data_dir, chock_policy.org.file_name }) catch return &.{};
-    const bundle = chock_policy.org.load(arena, io, path, null) catch return &.{};
+    const bundle = maybe_bundle orelse return &.{};
     if (bundle.sinks.len == 0) return &.{};
 
     const probes = arena.alloc(SinkProbe, bundle.sinks.len) catch return &.{};
@@ -1668,6 +1671,38 @@ fn measureRequiredSinks(
         };
     }
     return probes;
+}
+
+fn measureOrgBundle(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    failure: *?[]const u8,
+) ?*const chock_policy.org.Bundle {
+    const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| {
+        failure.* = switch (err) {
+            error.NoHomeDirectory => "the data directory is unknown because neither HOME nor an absolute XDG_DATA_HOME is set",
+            error.OutOfMemory => @errorName(err),
+        };
+        return null;
+    };
+    const path = std.fs.path.join(arena, &.{ data_dir, chock_policy.org.file_name }) catch |err| {
+        failure.* = @errorName(err);
+        return null;
+    };
+
+    var diag: ?chock_policy.org.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+    return chock_policy.org.load(arena, io, path, &diag) catch |err| switch (err) {
+        error.NoBundleFile => null,
+        else => {
+            failure.* = if (diag) |*fault|
+                std.fmt.allocPrint(arena, "{f}", .{fault}) catch @errorName(err)
+            else
+                @errorName(err);
+            return null;
+        },
+    };
 }
 
 fn reachSink(
@@ -2794,6 +2829,38 @@ test "an invalid operator nix block is a failed dev shell probe" {
     };
     try testing.expect(std.mem.indexOf(u8, reason, "dev_shell field must be a string") != null);
     try testing.expect(std.mem.indexOf(u8, reason, "config.zon") != null);
+}
+
+test "an invalid installed org policy is a blocking doctor row" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "chock", .default_dir);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "chock/org-policy.zon",
+        .data = ".{ .version = \"not a number\" }",
+    });
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", root);
+
+    var failure: ?[]const u8 = null;
+    try testing.expect(measureOrgBundle(arena, io, &env, &failure) == null);
+    try testing.expect(std.mem.indexOf(u8, failure.?, "org policy bundle") != null);
+
+    const rows = try rowsFor(arena, .{ .org_policy_failure = failure });
+    const row = rowNamed(rows, "org policy").?;
+    try testing.expectEqual(ui.Layer.State.unavailable, row.state);
+    try testing.expect(row.blocks);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "org-policy.zon") != null);
 }
 
 test "a missing state home is not reported as a project without a flake" {
