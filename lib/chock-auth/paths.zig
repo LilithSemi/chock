@@ -30,10 +30,12 @@ fn xdgDir(
     home_relative: []const []const u8,
 ) DirError![]u8 {
     if (env.get(variable)) |base| {
-        if (base.len != 0) return std.fs.path.join(gpa, &.{ base, dir_name });
+        if (base.len != 0 and std.fs.path.isAbsolute(base)) {
+            return std.fs.path.join(gpa, &.{ base, dir_name });
+        }
     }
     const home = env.get("HOME") orelse return error.NoHomeDirectory;
-    if (home.len == 0) return error.NoHomeDirectory;
+    if (home.len == 0 or !std.fs.path.isAbsolute(home)) return error.NoHomeDirectory;
 
     var parts: std.ArrayList([]const u8) = .empty;
     defer parts.deinit(gpa);
@@ -260,6 +262,21 @@ test "a machine with no home directory is told so, never given a guessed path" {
     defer env.deinit();
     try testing.expectError(error.NoHomeDirectory, configDir(gpa, &env));
     try testing.expectError(error.NoHomeDirectory, dataDir(gpa, &env));
+}
+
+test "relative base directories never reach absolute path operations" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("HOME", "/home/somebody");
+    try env.put("XDG_CONFIG_HOME", "relative/config");
+
+    const config = try configDir(gpa, &env);
+    defer gpa.free(config);
+    try testing.expectEqualStrings("/home/somebody/.config/chock", config);
+
+    try env.put("HOME", "relative/home");
+    try testing.expectError(error.NoHomeDirectory, configDir(gpa, &env));
 }
 
 test "the mode a credential file holds reaches the caller, and no longer only a terminal" {

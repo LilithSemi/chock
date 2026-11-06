@@ -4,8 +4,10 @@ Chock reads `~/.config/chock/config.zon`. The `config init` operation can create
 it, but never replaces it, so you can still give the whole directory to
 home-manager.
 
-The exact path follows the platform configuration directory and `$XDG_CONFIG_HOME`.
-Ask Chock for it when creating or linking the file:
+The exact path follows the platform configuration directory and an absolute
+`$XDG_CONFIG_HOME`. Chock ignores a relative value and uses `$HOME/.config`, as
+the XDG base directory rules require. Ask Chock for the path when you create or
+link the file:
 
 ```
 chock config path
