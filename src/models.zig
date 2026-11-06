@@ -417,11 +417,7 @@ fn probe(
             if (instance.kind == .openai_compat and
                 (rejected.status == .unauthorized or rejected.status == .forbidden))
             {
-                tty.print(
-                    .err,
-                    "  catalogue: store its credential with `chock login --provider openai-compat={s} --name {s}`\n",
-                    .{ instance.base_url, instance.name },
-                );
+                reportCompatibleCredentialRejection(instance, credential.source);
             }
             return .{
                 .status = .rejected,
@@ -435,6 +431,29 @@ fn probe(
                 .reason = if (format == .json) try arena.dupe(u8, reason) else null,
             };
         },
+    }
+}
+
+fn reportCompatibleCredentialRejection(
+    instance: chock_auth.config.Instance,
+    source: chock_auth.lookup.Source,
+) void {
+    switch (source) {
+        .none => tty.print(
+            .err,
+            "  catalogue: store its credential with `chock login --provider openai-compat={s} --name {s}`\n",
+            .{ instance.base_url, instance.name },
+        ),
+        .login_store => tty.print(
+            .err,
+            "  catalogue: replace its stored credential with `chock login --provider openai-compat={s} --name {s} --replace`\n",
+            .{ instance.base_url, instance.name },
+        ),
+        .instance_token, .instance_token_file, .token_file => tty.print(
+            .err,
+            "  catalogue: the rejected credential came from {s}; replace it there\n",
+            .{source.describe()},
+        ),
     }
 }
 
@@ -611,4 +630,24 @@ test "the JSON model report is structured and contains no connection or credenti
     try std.testing.expect(parsed.value.providers[1].capabilities.provider_search);
     try std.testing.expect(std.mem.indexOf(u8, output, "never-print-this") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "127.0.0.1") == null);
+}
+
+test "a rejected explicit credential is fixed at its source" {
+    const gpa = std.testing.allocator;
+    var capture: tty.Capture = undefined;
+    capture.start(std.testing.io, gpa);
+    defer capture.stop(std.testing.io);
+
+    reportCompatibleCredentialRejection(.{
+        .name = "private",
+        .kind = .openai_compat,
+        .base_url = "https://example.test/v1",
+        .credential = .{ .token = "not printed" },
+        .context_tokens = null,
+        .capabilities = .{},
+    }, .instance_token);
+
+    try std.testing.expect(std.mem.indexOf(u8, capture.err(), "token written in the configuration file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.err(), "chock login") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.err(), "not printed") == null);
 }

@@ -31,8 +31,9 @@ passes `chock config check`, run `chock models --probe` to test the endpoint,
 credential, and model catalogue.
 
 If an OpenAI-compatible endpoint answers that probe with status 401 or 403,
-Chock prints the matching `chock login` command. This keeps the configured URL
-and instance name in the credential identity.
+Chock says where the rejected credential came from. When none was configured,
+it prints the matching `chock login` command. This keeps the configured URL and
+instance name in the credential identity.
 
 Check this file without reading a credential or contacting a provider:
 
