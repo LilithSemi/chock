@@ -104,9 +104,12 @@ pub fn main(
     }
 
     const data_dir = if (options.probe)
-        chock_auth.paths.dataDir(arena, &env) catch |err| {
-            tty.print(.err, "chock models: the credential directory is unknown: {t}\n", .{err});
-            return Exit.usage.code();
+        chock_auth.paths.dataDir(arena, &env) catch |err| switch (err) {
+            error.NoHomeDirectory => {
+                directory_help.report("models", .data);
+                return Exit.usage.code();
+            },
+            error.OutOfMemory => return error.OutOfMemory,
         }
     else
         "";

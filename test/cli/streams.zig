@@ -284,6 +284,16 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expect(std.mem.indexOf(u8, initialized.out, "`chock models --probe`") != null);
     try testing.expect(std.mem.indexOf(u8, initialized.out, "`chock doctor`") != null);
 
+    var probe_env = try box.env.clone(gpa);
+    defer probe_env.deinit();
+    _ = probe_env.swapRemove("HOME");
+    _ = probe_env.swapRemove("XDG_DATA_HOME");
+    var unknown_data = try runChock(gpa, io, &probe_env, &.{ "models", "--probe" });
+    defer unknown_data.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), unknown_data.code);
+    try testing.expectEqualStrings("", unknown_data.out);
+    try testing.expect(std.mem.indexOf(u8, unknown_data.err, "set HOME or an absolute XDG_DATA_HOME") != null);
+
     const saved = try std.Io.Dir.readFileAlloc(.cwd(), io, expected_path, gpa, .limited(1 << 16));
     defer gpa.free(saved);
     try testing.expectEqualStrings(example.out, saved);
