@@ -56,6 +56,8 @@ if "$here/package-release" \
   echo "package-release accepted two files with the same name" >&2
   exit 1
 fi
+test ! -e "$scratch/artifacts/chock-collision.tar.gz"
+test ! -e "$scratch/stage/chock-collision"
 
 if "$here/package-release" \
   "$scratch/artifacts" "$scratch/stage" ../outside \
@@ -63,3 +65,5 @@ if "$here/package-release" \
   echo "package-release accepted a path as an archive shape" >&2
   exit 1
 fi
+test ! -e "$scratch/outside.tar.gz"
+test ! -e "$scratch/outside"
