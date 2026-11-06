@@ -343,6 +343,18 @@ test "the documented configuration starter passes the real CLI check" {
     defer malformed_report.deinit();
     try testing.expect(!malformed_report.value.valid);
     try testing.expectEqualStrings("config_invalid", malformed_report.value.problem.?);
+
+    const oversized_bytes = try gpa.alloc(u8, 256 * 1024 + 1);
+    defer gpa.free(oversized_bytes);
+    @memset(oversized_bytes, ' ');
+    try box.writeConfig(gpa, io, oversized_bytes);
+    var oversized = try runChock(gpa, io, &box.env, &.{ "config", "check", "--format", "json" });
+    defer oversized.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), oversized.code);
+    const oversized_report = try std.json.parseFromSlice(Report, gpa, oversized.out, .{});
+    defer oversized_report.deinit();
+    try testing.expect(!oversized_report.value.valid);
+    try testing.expectEqualStrings("config_too_large", oversized_report.value.problem.?);
 }
 
 test "a JSON model probe stays one document and reports the sorted remote catalogue" {
