@@ -7,6 +7,12 @@ ref_name=${3:?usage: check-release-version <version> <ref> <ref-name>}
 
 case "$ref" in
   refs/tags/v*)
+    case "$version" in
+      *-unstable | *-unstable-*)
+        echo "::error::${version} is reserved for rolling builds from master and cannot be a release tag" >&2
+        exit 1
+        ;;
+    esac
     expected="v${version}"
     if [ "$ref_name" != "$expected" ]; then
       echo "::error::release tag ${ref_name} does not match the package version ${version}; expected ${expected}" >&2

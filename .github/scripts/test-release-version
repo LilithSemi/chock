@@ -7,7 +7,18 @@ diagnostic=$(mktemp)
 trap 'rm -f "$diagnostic"' EXIT HUP INT TERM
 
 "$check" 1.2.3 refs/tags/v1.2.3 v1.2.3
+"$check" 1.2.3-rc1 refs/tags/v1.2.3-rc1 v1.2.3-rc1
 "$check" 1.2.3 refs/heads/master master
+"$check" 0.1.0-unstable-20261105-deadbee refs/heads/master master
+
+if "$check" 0.1.0-unstable-20261105-deadbee \
+  refs/tags/v0.1.0-unstable-20261105-deadbee \
+  v0.1.0-unstable-20261105-deadbee 2>"$diagnostic"; then
+  echo "a rolling unstable version passed as a release tag" >&2
+  exit 1
+fi
+
+grep -q 'reserved for rolling builds' "$diagnostic"
 
 if "$check" 1.2.3 refs/tags/v1.2.4 v1.2.4 2>"$diagnostic"; then
   echo "a mismatched release tag passed" >&2
