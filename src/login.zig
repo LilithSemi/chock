@@ -9,6 +9,7 @@ const oauth_mcp = @import("oauth-mcp");
 const oauth_openai = @import("oauth-openai");
 
 const Exit = @import("exit.zig").Exit;
+const directory_help = @import("directory_help.zig");
 const tty = @import("tty.zig");
 
 const usage_text =
@@ -83,13 +84,19 @@ pub fn main(
         error.BadArguments => return Exit.usage.code(),
     };
 
-    const config_dir = chock_auth.paths.configDir(arena, &env) catch |err| {
-        tty.print(.err, "chock login: the configuration directory is unknown: {s}\n", .{@errorName(err)});
-        return Exit.usage.code();
+    const config_dir = chock_auth.paths.configDir(arena, &env) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("login", .config);
+            return Exit.usage.code();
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
-    const data_dir = chock_auth.paths.dataDir(arena, &env) catch |err| {
-        tty.print(.err, "chock login: the data directory is unknown: {s}\n", .{@errorName(err)});
-        return Exit.usage.code();
+    const data_dir = chock_auth.paths.dataDir(arena, &env) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("login", .data);
+            return Exit.usage.code();
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
 
     const credential_store = chock_auth.config.credentialStore(arena, io, config_dir);

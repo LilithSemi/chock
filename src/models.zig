@@ -9,6 +9,7 @@ const oauth_openai = @import("oauth-openai");
 const chock_provider = @import("chock-provider");
 
 const Exit = @import("exit.zig").Exit;
+const directory_help = @import("directory_help.zig");
 const tty = @import("tty.zig");
 
 const usage_text =
@@ -60,9 +61,12 @@ pub fn main(
         },
     };
 
-    const config_dir = chock_auth.paths.configDir(arena, &env) catch |err| {
-        tty.print(.err, "chock models: the configuration directory is unknown: {t}\n", .{err});
-        return Exit.usage.code();
+    const config_dir = chock_auth.paths.configDir(arena, &env) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("models", .config);
+            return Exit.usage.code();
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
 
     var diag: ?chock_auth.config.Diagnostic = null;

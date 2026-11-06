@@ -25,6 +25,7 @@ const subagent = chock_core.subagent;
 const approval = @import("approval.zig");
 const ast_engine = @import("ast_engine.zig");
 const clock = @import("clock.zig");
+const directory_help = @import("directory_help.zig");
 const sessions_cmd = @import("sessions.zig");
 const tty = @import("tty.zig");
 const interrupt = @import("interrupt.zig");
@@ -1190,9 +1191,12 @@ fn start(
 ) StartError!Started {
     const project_root = try resolveProject(arena, io, options);
 
-    const config_dir = chock_auth.paths.configDir(arena, env) catch |err| {
-        tty.print(.err, "chock run: the configuration directory is unknown: {s}\n", .{@errorName(err)});
-        return error.Reported;
+    const config_dir = chock_auth.paths.configDir(arena, env) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("run", .config);
+            return error.Reported;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
 
     // The message is read and a command in it expanded before any session
@@ -1212,15 +1216,21 @@ fn start(
         }
         break :blk try expandCommand(arena, io, config_dir, project_root, typed);
     };
-    const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| {
-        tty.print(.err, "chock run: the data directory is unknown: {s}\n", .{@errorName(err)});
-        return error.Reported;
+    const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("run", .data);
+            return error.Reported;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
 
     const sandbox_choice = try sandboxChoice(arena, io, config_dir);
-    const state_dir = chock_auth.paths.stateDir(arena, env) catch |err| {
-        tty.print(.err, "chock run: the state directory is unknown: {s}\n", .{@errorName(err)});
-        return error.Reported;
+    const state_dir = chock_auth.paths.stateDir(arena, env) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("run", .state);
+            return error.Reported;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
 
     const org_bundle = try loadOrgBundle(arena, io, data_dir, options);

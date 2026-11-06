@@ -88,7 +88,7 @@ pub fn main(
             );
             return Exit.usage.code();
         },
-        error.OutOfMemory => return err,
+        error.OutOfMemory => return error.OutOfMemory,
     };
     const path = try std.fs.path.join(arena, &.{ config_dir, chock_auth.config.file_name });
 

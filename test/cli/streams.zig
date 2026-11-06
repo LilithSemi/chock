@@ -264,6 +264,12 @@ test "the documented configuration starter passes the real CLI check" {
     try testing.expectEqualStrings("", unknown.out);
     try testing.expect(std.mem.indexOf(u8, unknown.err, "set HOME or an absolute XDG_CONFIG_HOME") != null);
 
+    var unknown_models = try runChock(gpa, io, &no_home, &.{"models"});
+    defer unknown_models.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), unknown_models.code);
+    try testing.expectEqualStrings("", unknown_models.out);
+    try testing.expect(std.mem.indexOf(u8, unknown_models.err, "set HOME or an absolute XDG_CONFIG_HOME") != null);
+
     var example = try runChock(gpa, io, &box.env, &.{ "config", "example" });
     defer example.deinit(gpa);
     try testing.expectEqual(@as(u8, 0), example.code);

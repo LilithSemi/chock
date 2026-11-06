@@ -16,6 +16,7 @@ const show_cmd = @import("session_show.zig");
 const tree_cmd = @import("session_tree.zig");
 const usage_cmd = @import("usage.zig");
 const workspace_cmd = @import("workspace.zig");
+const directory_help = @import("directory_help.zig");
 const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
@@ -1294,13 +1295,19 @@ fn sealMain(
     id: []const u8,
     require_card: bool,
 ) !u8 {
-    const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| {
-        tty.print(.err, "chock sessions seal: the data directory is unknown: {s}\n", .{@errorName(err)});
-        return Exit.usage.code();
+    const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("sessions seal", .data);
+            return Exit.usage.code();
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
-    const config_dir = chock_auth.paths.configDir(arena, env) catch |err| {
-        tty.print(.err, "chock sessions seal: the configuration directory is unknown: {s}\n", .{@errorName(err)});
-        return Exit.usage.code();
+    const config_dir = chock_auth.paths.configDir(arena, env) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("sessions seal", .config);
+            return Exit.usage.code();
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
     var driver = chock_auth.store.Driver{
         .data_dir = data_dir,
