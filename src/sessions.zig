@@ -464,9 +464,7 @@ const Probe = struct {
 };
 
 fn probe(io: std.Io, log_path: [:0]const u8) ?Probe {
-    const flags: std.posix.O = .{ .ACCMODE = .RDONLY };
-    const fd = std.posix.openatZ(std.posix.AT.FDCWD, log_path, flags, 0) catch return null;
-    var file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    var file = std.Io.Dir.openFileAbsolute(io, log_path, .{}) catch return null;
     const acquired = file.tryLock(io, probe_lock) catch {
         file.close(io);
         return null;

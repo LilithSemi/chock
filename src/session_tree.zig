@@ -334,8 +334,7 @@ fn indent(writer: *std.Io.Writer, depth: usize) !void {
 }
 
 fn isLive(io: std.Io, path: [:0]const u8) bool {
-    const fd = std.posix.openatZ(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
-    var file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
     defer file.close(io);
     const acquired = file.tryLock(io, .shared) catch return false;
     if (acquired) file.unlock(io);
