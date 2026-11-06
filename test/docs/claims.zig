@@ -371,6 +371,37 @@ fn simpleEnumFields(
     return fields.items;
 }
 
+/// Reads the names from an integer-backed enum whose fields have explicit
+/// numeric values. Exit codes keep those values explicit because they are a
+/// process and JSON contract.
+fn numberedEnumFields(
+    arena: std.mem.Allocator,
+    source: []const u8,
+    declaration: []const u8,
+    backing: []const u8,
+) ![]const []const u8 {
+    const prefix = try std.fmt.allocPrint(arena, "{s} = enum({s}) {{", .{ declaration, backing });
+    const start = (std.mem.indexOf(u8, source, prefix) orelse return error.MissingEnum) + prefix.len;
+    const relative_end = std.mem.indexOf(u8, source[start..], "\n\n    pub fn") orelse
+        return error.UnclosedEnum;
+    const body = source[start .. start + relative_end];
+
+    var fields: std.ArrayList([]const u8) = .empty;
+    var split = std.mem.splitScalar(u8, body, ',');
+    while (split.next()) |part| {
+        const field = std.mem.trim(u8, part, " \t\r\n");
+        if (field.len == 0) continue;
+        const equals = std.mem.indexOfScalar(u8, field, '=') orelse return error.UnnumberedEnumField;
+        const name = std.mem.trim(u8, field[0..equals], " \t");
+        const number = std.mem.trim(u8, field[equals + 1 ..], " \t");
+        if (!isMadeOf(name, "_") or number.len == 0) return error.InvalidNumberedEnumField;
+        for (number) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidNumberedEnumField;
+        try fields.append(arena, name);
+    }
+    if (fields.items.len == 0) return error.EmptyEnum;
+    return fields.items;
+}
+
 fn textBetween(text: []const u8, start_marker: []const u8, end_marker: []const u8) ![]const u8 {
     const start = std.mem.indexOf(u8, text, start_marker) orelse return error.MissingStartMarker;
     const after_start = start + start_marker.len;
@@ -950,6 +981,7 @@ test "automation report pages name every stable status value" {
     const show_source = try root.readFileAlloc(testing.io, "src/session_show.zig", arena, .limited(max_source_bytes));
     const tree_source = try root.readFileAlloc(testing.io, "src/session_tree.zig", arena, .limited(max_source_bytes));
     const run_source = try root.readFileAlloc(testing.io, "src/run.zig", arena, .limited(max_source_bytes));
+    const exit_source = try root.readFileAlloc(testing.io, "src/exit.zig", arena, .limited(max_source_bytes));
 
     const configuration = try docText(docs, "docs/configure/configuration.md");
     const check_section = try textBetween(configuration, "For a script or configuration deployment", "## The name is the identity");
@@ -994,6 +1026,11 @@ test "automation report pages name every stable status value" {
     for (try simpleEnumFields(arena, run_source, "const Applied")) |field| {
         if (!try namesInTicks(run_result_section, field, arena)) {
             try wrong.print(arena, "docs/running.md names no run-result workspace outcome `{s}`\n", .{field});
+        }
+    }
+    for (try numberedEnumFields(arena, exit_source, "pub const Exit", "u8")) |field| {
+        if (!try namesInTicks(run_result_section, field, arena)) {
+            try wrong.print(arena, "docs/running.md names no run-result status `{s}`\n", .{field});
         }
     }
 

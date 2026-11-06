@@ -93,6 +93,10 @@ null session, answer, and audit-log fields.
 The exact `workspace.outcome` values are `landed`, `refused`, `uncommitted`,
 `failed`, and `nothing_to_apply`.
 
+The exact `status` values are `finished`, `usage`, `faulted`, `refused`,
+`turn_limit`, `not_implemented`, `no_progress`, `budget`, `handed_over`,
+`audit_gap`, `empty_response`, `model_refused`, and `rate_limited`.
+
 `--output jsonl` writes live `chock.run-event` version `1` objects as the
 session records them, then writes the `chock.run-result` object as the final
 line. Each event line carries `session_id`, the byte-offset `event_id` used by
