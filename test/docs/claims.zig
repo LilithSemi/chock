@@ -832,8 +832,9 @@ test "the README keeps both supported install paths" {
     var named: usize = 0;
     var lines = std.mem.splitScalar(u8, systems, '\n');
     while (lines.next()) |line| {
-        const field = std.mem.trim(u8, line, " \t\r\"");
-        if (field.len == 0) continue;
+        const quoted = std.mem.trim(u8, line, " \t\r");
+        if (quoted.len < 2 or quoted[0] != '"' or quoted[quoted.len - 1] != '"') continue;
+        const field = quoted[1 .. quoted.len - 1];
         const documented = try std.fmt.allocPrint(arena, "`{s}`", .{field});
         try testing.expect(std.mem.indexOf(u8, readme, documented) != null);
         named += 1;
