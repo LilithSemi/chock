@@ -526,6 +526,21 @@ test "the macOS release verifies the entitlement its documentation names" {
     try testing.expect(std.mem.indexOf(u8, microvm, entitlement) != null);
 }
 
+test "migration documentation keeps the source home refusal" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{});
+    defer root.close(testing.io);
+    const source = try root.readFileAlloc(testing.io, "src/migrate/transcript.zig", arena, .limited(max_source_bytes));
+    const home_fix = try textBetween(source, "pub const home_fix = \"", "\";");
+    const migrate = try docText(docs, "docs/using/migrate.md");
+
+    try testing.expect(std.mem.indexOf(u8, migrate, home_fix) != null);
+}
+
 test "the documentation index names every page under docs/" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

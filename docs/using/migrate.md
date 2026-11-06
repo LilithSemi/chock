@@ -57,7 +57,9 @@ instructions. An agent wrote those notes, so promoting them to mandatory
 guidance would let earlier model output order a later session around.
 
 Transcript and memory imports are the only readers that reach under the user's
-home. Project configuration readers deliberately do not.
+home. Project configuration readers deliberately do not. `HOME` must name an
+absolute directory. If it is absent or relative, the refusal says
+`set HOME to an absolute directory before importing Claude Code data`.
 
 ## Audit header
 
