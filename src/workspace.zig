@@ -628,6 +628,7 @@ pub const ReviewWire = struct {
         path: []const u8,
         old_path: []const u8 = "",
         status: []const u8,
+        reason: []const u8 = "",
         selectable: bool = true,
         binary: bool = false,
         atomic: bool = false,
@@ -703,7 +704,8 @@ pub fn reviewJson(
             for (report.skipped) |one| {
                 files[at] = .{
                     .path = try arena.dupe(u8, one.path),
-                    .status = try std.fmt.allocPrint(arena, "skipped: {s}", .{one.reason}),
+                    .status = "skipped",
+                    .reason = try arena.dupe(u8, one.reason),
                     .selectable = false,
                     .atomic = true,
                 };

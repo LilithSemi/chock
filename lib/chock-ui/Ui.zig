@@ -948,6 +948,7 @@ pub const Ui = struct {
                 .path = arena.dupe(u8, file.path) catch return,
                 .old_path = arena.dupe(u8, file.old_path) catch return,
                 .status = arena.dupe(u8, file.status) catch return,
+                .reason = arena.dupe(u8, file.reason) catch return,
                 .selectable = file.selectable,
                 .binary = file.binary,
                 .atomic = file.atomic,
@@ -2461,10 +2462,11 @@ pub const Ui = struct {
         var group_at: usize = 0;
         for (review.files) |file| {
             if (!file.selectable) {
-                addReviewRow(&lines, &seen, scroll_at, ctx.arena, self.bandRow(ctx, std.fmt.allocPrint(ctx.arena, " [ ] {s} {s}", .{
-                    file.status,
-                    file.path,
-                }) catch file.path, colors.fg_muted));
+                const text = if (file.reason.len == 0)
+                    std.fmt.allocPrint(ctx.arena, " [ ] {s} {s}", .{ file.status, file.path }) catch file.path
+                else
+                    std.fmt.allocPrint(ctx.arena, " [ ] {s} {s}: {s}", .{ file.status, file.path, file.reason }) catch file.path;
+                addReviewRow(&lines, &seen, scroll_at, ctx.arena, self.bandRow(ctx, text, colors.fg_muted));
                 continue;
             }
             if (file.atomic or file.hunks.len == 0) {
@@ -3809,6 +3811,22 @@ test "workspace review keeps whole-file and hunk choices separate" {
     Ui.onReviewGroupTap(&group);
     try std.testing.expect(!ui.review_choices[1].accepted);
     try std.testing.expect(!ui.review_choices[2].accepted);
+}
+
+test "workspace review keeps skipped-file reasons separate from status" {
+    const ui = try Ui.init(std.testing.allocator, std.testing.io, host_mod.quiet);
+    defer ui.deinit();
+    ui.showReview(.{ .kind = .overlay, .files = &.{.{
+        .path = "pipe",
+        .status = "skipped",
+        .reason = "unsupported file kind",
+        .selectable = false,
+        .atomic = true,
+    }} });
+
+    try std.testing.expectEqual(@as(usize, 0), ui.review_choices.len);
+    try std.testing.expectEqualStrings("skipped", ui.review.?.files[0].status);
+    try std.testing.expectEqualStrings("unsupported file kind", ui.review.?.files[0].reason);
 }
 
 test "a message tap requests its exact completed turn" {

@@ -113,6 +113,7 @@ pub const Review = struct {
         path: []const u8,
         old_path: []const u8 = "",
         status: []const u8,
+        reason: []const u8 = "",
         selectable: bool = true,
         binary: bool = false,
         /// Binary, rename, deletion, symlink and mode changes are deliberately
