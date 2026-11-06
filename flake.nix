@@ -79,6 +79,12 @@
         { pkgs, ... }:
         {
           default = pkgs.chock.shell;
+          release = pkgs.mkShellNoCC {
+            packages = [
+              pkgs.gnutar
+              pkgs.gzip
+            ];
+          };
         }
       );
 

@@ -46,7 +46,7 @@ jobs:
       - uses: DeterminateSystems/flakehub-cache-action@3ac6f3c19fc52eeb1408fd434bd1b4ed4266bf25 # v3
 
       - name: Test reproducible release packaging
-        run: nix shell nixpkgs#gnutar nixpkgs#gzip -c .github/scripts/test-package-release
+        run: nix develop .#release --command .github/scripts/test-package-release
 
       - name: Permit the nested user namespace
         if: runner.os == 'Linux'
@@ -228,14 +228,14 @@ jobs:
           #
           # **GNU tar by name, and never the runner's own.** macOS ships bsdtar,
           # which has none of those four options, so the flags are not portable
-          # and neither is the archive one writes. Taking both tools from nix
-          # makes every platform build the same shape of tarball.
+          # and neither is the archive one writes. Taking both tools from the
+          # locked flake makes every platform build the same shape of tarball.
           shapes=("chock-${version}-${{ matrix.target }}")
           if [ "${permanent_name}" = 1 ]; then
             shapes+=("chock-${{ matrix.target }}")
           fi
           for shape in "${shapes[@]}"; do
-            nix shell nixpkgs#gnutar nixpkgs#gzip -c \
+            nix develop .#release --command \
               ./.github/scripts/package-release artifacts stage "${shape}" \
               result/bin/chock LICENSE README.md
           done
@@ -246,7 +246,7 @@ jobs:
               guest_shapes+=("chock-guest-${{ matrix.target }}")
             fi
             for shape in "${guest_shapes[@]}"; do
-              nix shell nixpkgs#gnutar nixpkgs#gzip -c \
+              nix develop .#release --command \
                 ./.github/scripts/package-release artifacts stage "${shape}" \
                 "result-guest-kernel/${guest_kernel_name}" \
                 result-guest-initrd/initrd LICENSE README.md
