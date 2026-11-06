@@ -1456,8 +1456,10 @@ fn start(
             const renewed = renewed_set.?.value();
             // The server's own refresh hint, stored and never read back, so a
             // value Chock cannot parse must not end the session.
-            const extension = renewed_set.?.extension(arena, oauth_openai.Extension) catch
-                oauth_openai.Extension{};
+            const extension = renewed_set.?.extension(arena, oauth_openai.Extension) catch |err| switch (err) {
+                error.MalformedResponse => oauth_openai.Extension{},
+                error.OutOfMemory => return error.OutOfMemory,
+            };
             current = current.renewed(.{
                 .access_token = renewed.access_token,
                 .token_type = renewed.token_type,

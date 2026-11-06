@@ -336,7 +336,10 @@ fn openAiCredential(
     var token_set = try oauth.exchangeCode(gpa, call, callback.code(), &attempt.verifier, callback_url);
     defer token_set.deinit();
     const token = token_set.value();
-    const extension = token_set.extension(arena, oauth_openai.Extension) catch oauth_openai.Extension{};
+    const extension = token_set.extension(arena, oauth_openai.Extension) catch |err| switch (err) {
+        error.MalformedResponse => oauth_openai.Extension{},
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     const id_token = token.id_token orelse return error.IdTokenMissing;
     const jwks = try oauth.oidc.fetchJwks(arena, zurl_transport.transport(), oauth_openai.jwks_uri);
     const now = @divTrunc(std.Io.Timestamp.now(io, .real).toMilliseconds(), 1000);

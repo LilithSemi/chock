@@ -372,8 +372,10 @@ fn probe(
             const renewed = renewed_set.?.value();
             var extension_arena: std.heap.ArenaAllocator = .init(gpa);
             defer extension_arena.deinit();
-            const extension = renewed_set.?.extension(extension_arena.allocator(), oauth_openai.Extension) catch
-                oauth_openai.Extension{};
+            const extension = renewed_set.?.extension(extension_arena.allocator(), oauth_openai.Extension) catch |err| switch (err) {
+                error.MalformedResponse => oauth_openai.Extension{},
+                error.OutOfMemory => return error.OutOfMemory,
+            };
             current = current.renewed(.{
                 .access_token = renewed.access_token,
                 .token_type = renewed.token_type,
