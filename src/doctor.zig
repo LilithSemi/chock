@@ -1635,7 +1635,9 @@ fn measureContainer(
     io: std.Io,
     env: *const std.process.Environ.Map,
 ) ContainerState {
-    const answer = chock_container.Runtime.detect(arena, io, env, null) catch return .not_installed;
+    const answer = chock_container.Runtime.detect(arena, io, env, null) catch |err| return .{
+        .unreachable_runtime = @errorName(err),
+    };
     return switch (answer) {
         .not_installed => .not_installed,
         .refused => |refusal| .{ .unreachable_runtime = refusal.text },
@@ -2627,6 +2629,21 @@ test "an invalid nix block is a failed dev shell probe" {
         else => return error.TestUnexpectedResult,
     };
     try testing.expect(std.mem.indexOf(u8, reason, "dev_shell field must be a string") != null);
+}
+
+test "a failed container runtime probe is not reported as not installed" {
+    const gpa = testing.allocator;
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("PATH", "/bin");
+
+    var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    const measured = measureContainer(failing.allocator(), testing.io, &env);
+    const reason = switch (measured) {
+        .unreachable_runtime => |text| text,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqualStrings("OutOfMemory", reason);
 }
 
 test "a layer this machine has is still reported absent when the measurement says absent" {
