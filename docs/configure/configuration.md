@@ -44,6 +44,12 @@ chock config check
 This command checks the user configuration only. The project's `chock.zon` is
 separate and is checked before a session starts.
 
+A valid human report names the selected provider and model. It says
+`no default provider` or `no default model` when either choice is absent. The
+file is still valid because a run can supply those choices explicitly, but
+`chock doctor` reports that an unqualified first run is blocked until both
+defaults exist.
+
 For a script or configuration deployment, request one JSON object on standard
 output. The document has schema `chock.config-check` version 1. A failed check
 sets `valid` to `false`, writes the diagnostic to standard error, and returns a

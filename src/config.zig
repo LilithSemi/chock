@@ -252,10 +252,14 @@ fn report(
     });
     if (config.defaultInstance()) |instance| {
         tty.out(.plain, "; default provider {s}", .{instance.name});
-    } else if (config.instances.len > 1) {
+    } else {
         tty.out(.plain, "; no default provider", .{});
     }
-    if (config.default_model) |model| tty.out(.plain, "; default model {s}", .{model});
+    if (config.default_model) |model| {
+        tty.out(.plain, "; default model {s}", .{model});
+    } else {
+        tty.out(.plain, "; no default model", .{});
+    }
     tty.out(.plain, "\n", .{});
 }
 
@@ -341,6 +345,21 @@ test "a valid report says how its default was selected and exposes no credential
     try std.testing.expect(std.mem.indexOf(u8, output, "default model test-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "never-print-this") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "127.0.0.1") == null);
+}
+
+test "a valid report names missing defaults" {
+    const gpa = std.testing.allocator;
+    var config = try chock_auth.config.parse(gpa, ".{}", null);
+    defer config.deinit();
+
+    var capture: tty.Capture = undefined;
+    capture.start(std.testing.io, gpa);
+    defer capture.stop(std.testing.io);
+
+    try report(gpa, "/config/chock/config.zon", &config, .human);
+    try std.testing.expect(std.mem.indexOf(u8, capture.out(), "valid; 0 provider instances") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.out(), "no default provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.out(), "no default model") != null);
 }
 
 test "a JSON report is structured and exposes no credential" {
