@@ -113,8 +113,7 @@ pub fn show(
     options: Options,
 ) !Outcome {
     const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ dir, id }, 0);
-    const flags: std.posix.O = .{ .ACCMODE = .RDONLY };
-    const fd = std.posix.openatZ(std.posix.AT.FDCWD, path, flags, 0) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return .not_found,
         else => {
             try writeDiagnostic(arena, options.format, 0, .log_unreadable, @errorName(err));
@@ -122,7 +121,7 @@ pub fn show(
         },
     };
     var log = chock_proto.log.Log{
-        .file = .{ .handle = fd, .flags = .{ .nonblocking = false } },
+        .file = file,
         .session = id,
     };
     defer log.close(io);
