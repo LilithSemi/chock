@@ -30,6 +30,10 @@ or edit the endpoint and model before you start a session. After the file
 passes `chock config check`, run `chock models --probe` to test the endpoint,
 credential, and model catalogue.
 
+If an OpenAI-compatible endpoint answers that probe with status 401 or 403,
+Chock prints the matching `chock login` command. This keeps the configured URL
+and instance name in the credential identity.
+
 Check this file without reading a credential or contacting a provider:
 
 ```

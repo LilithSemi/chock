@@ -437,6 +437,43 @@ test "a failed JSON model probe returns a document and a fault exit" {
     try testing.expect(catalogue.reason.?.len != 0);
 }
 
+test "a compatible provider rejection names the credential command" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const head = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    var provider = try fake_provider.FakeProvider.start(gpa, io, .{ .head = head });
+
+    var box = try Sandbox.init(gpa, io);
+    defer box.deinit(gpa);
+    var base_buffer: [96]u8 = undefined;
+    const base_url = try std.fmt.allocPrint(gpa, "{s}/v1", .{provider.baseUrl(&base_buffer)});
+    defer gpa.free(base_url);
+    const config = try std.fmt.allocPrint(gpa,
+        \\.{{
+        \\    .providers = .{{
+        \\        .{{ .name = "private", .kind = "openai-compat", .base_url = "{s}" }},
+        \\    }},
+        \\    .defaults = .{{ .provider = "private", .model = "example" }},
+        \\}}
+        \\
+    , .{base_url});
+    defer gpa.free(config);
+    try box.writeConfig(gpa, io, config);
+
+    var models = try runChock(gpa, io, &box.env, &.{ "models", "--probe" });
+    defer models.deinit(gpa);
+    provider.join();
+    defer provider.deinit();
+
+    try testing.expectEqual(@as(u8, 2), models.code);
+    try testing.expect(std.mem.indexOf(u8, models.out, "private  (default provider)") != null);
+    try testing.expect(std.mem.indexOf(u8, models.err, "status 401") != null);
+    const wanted = try std.fmt.allocPrint(gpa, "chock login --provider openai-compat={s} --name private", .{base_url});
+    defer gpa.free(wanted);
+    try testing.expect(std.mem.indexOf(u8, models.err, wanted) != null);
+}
+
 test "a piped stream gets no escape sequence, and --color=always still paints one" {
     const gpa = testing.allocator;
     const io = testing.io;

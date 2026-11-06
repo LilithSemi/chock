@@ -412,10 +412,20 @@ fn probe(
             return .{ .status = .available, .models = copied };
         },
         .rejected => |rejected| {
-            tty.print(.err, "  catalogue: provider refused the request with status {d}\n", .{@backingInt(rejected.status)});
+            const status = @backingInt(rejected.status);
+            tty.print(.err, "  catalogue: provider refused the request with status {d}\n", .{status});
+            if (instance.kind == .openai_compat and
+                (rejected.status == .unauthorized or rejected.status == .forbidden))
+            {
+                tty.print(
+                    .err,
+                    "  catalogue: store its credential with `chock login --provider openai-compat={s} --name {s}`\n",
+                    .{ instance.base_url, instance.name },
+                );
+            }
             return .{
                 .status = .rejected,
-                .http_status = @intCast(@backingInt(rejected.status)),
+                .http_status = @intCast(status),
             };
         },
         .not_reached => |reason| {
