@@ -932,6 +932,16 @@ test "the README checks configuration, provider, and machine in order" {
     try testing.expect(std.mem.indexOf(u8, getting_started, "chock login --provider NAME") == null);
 }
 
+test "the README qualifies the default config path with XDG_CONFIG_HOME" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const docs = try loadDocs(arena_state.allocator(), testing.io);
+    const readme = try docText(docs, "README.md");
+
+    try testing.expect(std.mem.indexOf(u8, readme, "By default, Chock reads `~/.config/chock/config.zon`") != null);
+    try testing.expect(std.mem.indexOf(u8, readme, "absolute\n`XDG_CONFIG_HOME` selects a different config directory") != null);
+}
+
 test "first-run documentation names the generated starter endpoint and model" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

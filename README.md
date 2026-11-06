@@ -150,9 +150,10 @@ A first word is read as a command name, so a task given on the line goes after
 quietly became a task would spend money on a typo. `chock -- fix the parser`
 runs, and so does `echo "fix the parser" | chock`.
 
-Name your providers in `~/.config/chock/config.zon`. `chock config init` writes
-a starter only when no configuration exists. `chock config path` prints the
-exact XDG-aware location. `chock config example` prints the same
+By default, Chock reads `~/.config/chock/config.zon`; an absolute
+`XDG_CONFIG_HOME` selects a different config directory. `chock config init`
+writes a starter only when no configuration exists. `chock config path` prints
+the exact XDG-aware location. `chock config example` prints the same
 starter without writing it. `chock config check` validates the result without
 reading a credential or contacting a provider. `chock models` shows the
 effective default, context limit, and adapter capabilities without contacting
