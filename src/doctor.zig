@@ -176,7 +176,9 @@ pub const Measured = struct {
     device_passthrough: bool = palisade.Sandbox.expresses.device_passthrough,
 
     git_program: ?[]const u8 = null,
+    git_probe_failure: ?[]const u8 = null,
     nix_program: ?[]const u8 = null,
+    nix_probe_failure: ?[]const u8 = null,
     dev_shell: DevShellState = .no_flake,
     container: ContainerState = .not_installed,
     toolchain: ToolchainState = .none,
@@ -809,6 +811,13 @@ fn gitRow(m: Measured) Row {
         .means = path,
         .why = "the session works in a worktree of your project, so your own tree is never edited",
     };
+    if (m.git_probe_failure) |reason| return .{
+        .name = "git",
+        .state = .unavailable,
+        .means = reason,
+        .fix = "Chock could not check PATH for git. Fix the reported failure and run doctor again.",
+        .blocks = true,
+    };
     return .{
         .name = "git",
         .state = .unavailable,
@@ -823,6 +832,13 @@ fn nixRow(m: Measured) Row {
         .name = "nix",
         .state = .on,
         .means = path,
+    };
+    if (m.nix_probe_failure) |reason| return .{
+        .name = "nix",
+        .state = .unavailable,
+        .means = reason,
+        .fix = "Chock could not check PATH for nix. Fix the reported failure and run doctor again.",
+        .blocks = false,
     };
     return .{
         .name = "nix",
@@ -1050,6 +1066,34 @@ test "a missing cache directory names the environment value that fixes it" {
     try testing.expect(std.mem.indexOf(u8, row.means, "XDG_DATA_HOME") != null);
     try testing.expect(std.mem.indexOf(u8, row.fix, "XDG_DATA_HOME") != null);
     try testing.expect(!row.blocks);
+}
+
+test "failed program probes are not reported as missing installations" {
+    const gpa = testing.allocator;
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("PATH", "/bin");
+
+    var failure: ?[]const u8 = null;
+    var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try testing.expect(measureProgram(
+        failing.allocator(),
+        testing.io,
+        &env,
+        "git",
+        &failure,
+    ) == null);
+    try testing.expectEqualStrings("OutOfMemory", failure.?);
+
+    const git = gitRow(.{ .git_probe_failure = failure });
+    try testing.expect(std.mem.indexOf(u8, git.means, "OutOfMemory") != null);
+    try testing.expect(std.mem.indexOf(u8, git.fix, "Install git") == null);
+    try testing.expect(git.blocks);
+
+    const nix = nixRow(.{ .nix_probe_failure = failure });
+    try testing.expect(std.mem.indexOf(u8, nix.means, "OutOfMemory") != null);
+    try testing.expect(std.mem.indexOf(u8, nix.fix, "Install nix") == null);
+    try testing.expect(!nix.blocks);
 }
 
 fn cacheRow(arena: std.mem.Allocator, state: CacheState) std.mem.Allocator.Error!Row {
@@ -1340,8 +1384,8 @@ fn measureHost(
     project_root: []const u8,
     m: *Measured,
 ) void {
-    m.git_program = chock_nix.proc.resolve(arena, io, env, "git") catch null;
-    m.nix_program = chock_nix.proc.resolve(arena, io, env, "nix") catch null;
+    m.git_program = measureProgram(arena, io, env, "git", &m.git_probe_failure);
+    m.nix_program = measureProgram(arena, io, env, "nix", &m.nix_probe_failure);
     m.dev_shell = measureDevShell(arena, gpa, io, env, project_root, m.nix_program != null);
     m.container = measureContainer(arena, io, env);
     m.toolchain = measureToolchain(arena, io, env, project_root, m.dev_shell, m.container);
@@ -1370,6 +1414,22 @@ fn measureHost(
     if (m.driver.contains(.network_isolated)) {
         m.resolver_files = measureResolverFiles(io, m.toolchain, "");
     }
+}
+
+fn measureProgram(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    name: []const u8,
+    failure: *?[]const u8,
+) ?[]const u8 {
+    return chock_nix.proc.resolve(arena, io, env, name) catch |err| switch (err) {
+        error.ProgramNotFound => null,
+        else => {
+            failure.* = @errorName(err);
+            return null;
+        },
+    };
 }
 
 fn measureResolverFiles(io: std.Io, toolchain: ToolchainState, host_root: []const u8) ResolverFiles {
