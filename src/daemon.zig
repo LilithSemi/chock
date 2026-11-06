@@ -18,6 +18,7 @@ const sessions_cmd = @import("sessions.zig");
 const workspace_cmd = @import("workspace.zig");
 const interrupt = @import("interrupt.zig");
 const Exit = @import("exit.zig").Exit;
+const directory_help = @import("directory_help.zig");
 const tty = @import("tty.zig");
 const guest_limits = @import("guest_limits.zig");
 
@@ -367,9 +368,12 @@ pub fn main(
         tty.print(.plain, "chock daemon: tool calls run in a microVM guest, one a session\n", .{});
     }
 
-    const state_dir = chock_auth.paths.stateDir(arena, &env) catch |err| {
-        tty.print(.err, "chock daemon: the state directory could not be found: {t}\n", .{err});
-        return Exit.usage.code();
+    const state_dir = chock_auth.paths.stateDir(arena, &env) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("daemon", .state);
+            return Exit.usage.code();
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
     makeDirAll(io, state_dir) catch |err| {
         tty.print(.err, "chock daemon: {s} could not be made: {t}\n", .{ state_dir, err });

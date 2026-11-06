@@ -8,6 +8,7 @@ const chock_proto = @import("chock-proto");
 
 const session_paths = @import("session.zig");
 const sessions_cmd = @import("sessions.zig");
+const directory_help = @import("directory_help.zig");
 const Exit = @import("exit.zig").Exit;
 const tty = @import("tty.zig");
 
@@ -72,9 +73,12 @@ fn daemonAddress(
     }
 
     const text = options.daemon orelse env.get(control.address_env) orelse {
-        const state = chock_auth.paths.stateDir(arena, env) catch |err| {
-            tty.print(.err, "chock detach: the state directory could not be found: {t}\n", .{err});
-            return null;
+        const state = chock_auth.paths.stateDir(arena, env) catch |err| switch (err) {
+            error.NoHomeDirectory => {
+                directory_help.report("detach", .state);
+                return null;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
         };
         const path = try control.socketPathIn(arena, state);
         return .{ .unix = path };

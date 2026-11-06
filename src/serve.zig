@@ -6,6 +6,7 @@ const chock_auth = @import("chock-auth");
 const chock_proto = @import("chock-proto");
 
 const Exit = @import("exit.zig").Exit;
+const directory_help = @import("directory_help.zig");
 const tty = @import("tty.zig");
 
 const control = chock_proto.control;
@@ -131,9 +132,12 @@ pub fn main(
     };
 
     const daemon_text = options.daemon orelse env.get(control.address_env) orelse text: {
-        const state = chock_auth.paths.stateDir(arena, &env) catch |err| {
-            tty.print(.err, "chock serve: the state directory could not be found: {t}\n", .{err});
-            return Exit.usage.code();
+        const state = chock_auth.paths.stateDir(arena, &env) catch |err| switch (err) {
+            error.NoHomeDirectory => {
+                directory_help.report("serve", .state);
+                return Exit.usage.code();
+            },
+            error.OutOfMemory => return error.OutOfMemory,
         };
         const path = control.socketPathIn(arena, state) catch return Exit.faulted.code();
         break :text try std.fmt.allocPrint(arena, "unix:{s}", .{path});
@@ -190,9 +194,12 @@ pub fn main(
     probe.close(io);
 
     const socket_path = options.socket orelse path: {
-        const state = chock_auth.paths.stateDir(arena, &env) catch |err| {
-            tty.print(.err, "chock serve: the state directory could not be found: {t}\n", .{err});
-            return Exit.usage.code();
+        const state = chock_auth.paths.stateDir(arena, &env) catch |err| switch (err) {
+            error.NoHomeDirectory => {
+                directory_help.report("serve", .state);
+                return Exit.usage.code();
+            },
+            error.OutOfMemory => return error.OutOfMemory,
         };
         makeDirAll(io, state) catch |err| {
             tty.print(.err, "chock serve: {s} could not be made: {t}\n", .{ state, err });

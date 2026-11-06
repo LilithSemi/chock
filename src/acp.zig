@@ -13,6 +13,7 @@ const jsonrpc = acp.jsonrpc;
 const updates = acp.update;
 
 const Exit = @import("exit.zig").Exit;
+const directory_help = @import("directory_help.zig");
 const session_paths = @import("session.zig");
 const tty = @import("tty.zig");
 
@@ -93,9 +94,12 @@ pub fn main(
     };
 
     const daemon_text = options.daemon orelse env.get(control.address_env) orelse text: {
-        const state = chock_auth.paths.stateDir(arena, &env) catch |err| {
-            tty.print(.err, "chock acp: the state directory could not be found: {t}\n", .{err});
-            return Exit.usage.code();
+        const state = chock_auth.paths.stateDir(arena, &env) catch |err| switch (err) {
+            error.NoHomeDirectory => {
+                directory_help.report("acp", .state);
+                return Exit.usage.code();
+            },
+            error.OutOfMemory => return error.OutOfMemory,
         };
         const path = control.socketPathIn(arena, state) catch return Exit.faulted.code();
         break :text try std.fmt.allocPrint(arena, "unix:{s}", .{path});
