@@ -147,6 +147,7 @@ stdenv.mkDerivation (finalAttrs: {
   doInstallCheck = true;
 
   nativeInstallCheckInputs = [ versionCheckHook ];
+  versionCheckProgramArg = "--version";
 
   passthru.shell = mkShell {
     name = "chock-dev-shell";
