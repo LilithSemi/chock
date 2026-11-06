@@ -119,6 +119,7 @@ pub fn main(
     var diag: ?chock_auth.config.Diagnostic = null;
     defer if (diag) |*one| one.deinit(gpa);
     var loaded = chock_auth.config.load(gpa, io, config_dir, &diag) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
         error.NoConfigFile => {
             tty.print(
                 .err,

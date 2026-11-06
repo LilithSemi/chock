@@ -127,6 +127,8 @@ pub const CredentialState = union(enum) {
     missing: []const u8,
     directory_missing: directory_help.Kind,
     unconfigured: []const u8,
+    invalid_config: []const u8,
+    probe_failed: []const u8,
     unreadable: []const u8,
 };
 
@@ -1044,6 +1046,20 @@ fn credentialRow(arena: std.mem.Allocator, state: CredentialState) std.mem.Alloc
             .fix = "Run chock config init, edit its provider and model, then run chock login if that provider needs a credential.",
             .blocks = true,
         },
+        .invalid_config => |reason| .{
+            .name = "credential",
+            .state = .unavailable,
+            .means = try std.fmt.allocPrint(arena, "the existing configuration is invalid: {s}", .{reason}),
+            .fix = "Edit the existing configuration file. `chock config init` never replaces it.",
+            .blocks = true,
+        },
+        .probe_failed => |reason| .{
+            .name = "credential",
+            .state = .unavailable,
+            .means = try std.fmt.allocPrint(arena, "Chock could not check the configuration: {s}", .{reason}),
+            .fix = "Resolve the reported failure and run `chock doctor` again.",
+            .blocks = true,
+        },
         .unreadable => |reason| .{
             .name = "credential",
             .state = .unavailable,
@@ -1060,6 +1076,41 @@ test "an unconfigured credential points to the safe configuration initializer" {
 
     const row = try credentialRow(arena_state.allocator(), .{ .unconfigured = "there is no configuration" });
     try testing.expect(std.mem.indexOf(u8, row.fix, "chock config init") != null);
+    try testing.expect(row.blocks);
+}
+
+test "an invalid existing configuration tells the user to edit it instead of initializing over it" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "chock", .default_dir);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "chock/config.zon",
+        .data = ".{ .providers = 3 }",
+    });
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", root);
+    try env.put("XDG_DATA_HOME", root);
+
+    const state = measureCredential(arena, io, &env);
+    const reason = switch (state) {
+        .invalid_config => |text| text,
+        else => return error.TestUnexpectedResult,
+    };
+    const row = try credentialRow(arena, state);
+    try testing.expect(reason.len != 0);
+    try testing.expect(std.mem.indexOf(u8, row.means, "existing configuration is invalid") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "Edit the existing configuration") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "never replaces it") != null);
     try testing.expect(row.blocks);
 }
 
@@ -1973,10 +2024,11 @@ fn measureCredential(
                 chock_auth.config.file_name,
             }) catch "there is no configuration",
         };
+        if (err == error.OutOfMemory) return .{ .probe_failed = @errorName(err) };
         if (config_diag) |*d| return .{
-            .unconfigured = std.fmt.allocPrint(arena, "{f}", .{d}) catch @errorName(err),
+            .invalid_config = std.fmt.allocPrint(arena, "{f}", .{d}) catch @errorName(err),
         };
-        return .{ .unconfigured = @errorName(err) };
+        return .{ .probe_failed = @errorName(err) };
     };
 
     const instance = config.defaultInstance() orelse return .{
