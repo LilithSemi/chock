@@ -554,6 +554,11 @@ It blocks when neither `HOME` nor an absolute `XDG_STATE_HOME` selects a
 location, or when the location is not writable, because a session cannot start
 without somewhere outside the project for its log and workspace.
 
+Doctor also reads this project's `chock.zon` to report the `write^execute`
+hardening decision. If the policy cannot be read or validated, it adds a
+blocking `project policy` row with the diagnostic: `chock run` also refuses to
+start until the project policy is repaired.
+
 On an installation an organisation manages, it also reports what that
 organisation's policy bundle imposes: the audit sinks it requires, and every
 ceiling it sets on spending, on how far a spawn tree may grow, and on the paths

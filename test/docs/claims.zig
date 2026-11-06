@@ -1094,6 +1094,9 @@ test "automation report pages name every stable status value" {
     if (std.mem.indexOf(u8, doctor_section, "`session storage`") == null) {
         try wrong.print(arena, "docs/running.md does not name the doctor session-storage gate\n", .{});
     }
+    if (std.mem.indexOf(u8, doctor_section, "`project policy`") == null) {
+        try wrong.print(arena, "docs/running.md does not name the blocking doctor project-policy row\n", .{});
+    }
     for (try simpleEnumFields(arena, show_source, "const ShowProblem")) |field| {
         if (!try namesInTicks(show_section, field, arena)) {
             try wrong.print(arena, "docs/running.md names no session-show problem `{s}`\n", .{field});
