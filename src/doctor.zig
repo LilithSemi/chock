@@ -19,6 +19,7 @@ const run = @import("run.zig");
 const Exit = @import("exit.zig").Exit;
 const version_line = @import("main.zig").version_line;
 const tty = @import("tty.zig");
+const directory_help = @import("directory_help.zig");
 const ui = @import("ui.zig");
 
 const linux = std.os.linux;
@@ -122,6 +123,7 @@ pub const CredentialState = union(enum) {
     found: []const u8,
     not_needed,
     missing: []const u8,
+    directory_missing: directory_help.Kind,
     unconfigured: []const u8,
     unreadable: []const u8,
 };
@@ -960,6 +962,21 @@ fn credentialRow(arena: std.mem.Allocator, state: CredentialState) std.mem.Alloc
             .fix = "Run chock login for this provider instance.",
             .blocks = true,
         },
+        .directory_missing => |kind| .{
+            .name = "credential",
+            .state = .unavailable,
+            .means = try std.fmt.allocPrint(
+                arena,
+                "no session can be started: HOME and {s} do not select an absolute directory",
+                .{directory_help.variable(kind)},
+            ),
+            .fix = try std.fmt.allocPrint(
+                arena,
+                "Set HOME or an absolute {s}.",
+                .{directory_help.variable(kind)},
+            ),
+            .blocks = true,
+        },
         .unconfigured => |reason| .{
             .name = "credential",
             .state = .unavailable,
@@ -983,6 +1000,17 @@ test "an unconfigured credential points to the safe configuration initializer" {
 
     const row = try credentialRow(arena_state.allocator(), .{ .unconfigured = "there is no configuration" });
     try testing.expect(std.mem.indexOf(u8, row.fix, "chock config init") != null);
+    try testing.expect(row.blocks);
+}
+
+test "a missing credential directory names the environment value that fixes it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const row = try credentialRow(arena_state.allocator(), .{ .directory_missing = .data });
+    try testing.expect(std.mem.indexOf(u8, row.means, "XDG_DATA_HOME") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "XDG_DATA_HOME") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "config init") == null);
     try testing.expect(row.blocks);
 }
 
@@ -1683,11 +1711,13 @@ fn measureCredential(
     io: std.Io,
     env: *const std.process.Environ.Map,
 ) CredentialState {
-    const config_dir = chock_auth.paths.configDir(arena, env) catch |err| return .{
-        .unconfigured = @errorName(err),
+    const config_dir = chock_auth.paths.configDir(arena, env) catch |err| return switch (err) {
+        error.NoHomeDirectory => .{ .directory_missing = .config },
+        error.OutOfMemory => .{ .unconfigured = @errorName(err) },
     };
-    const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| return .{
-        .unconfigured = @errorName(err),
+    const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| return switch (err) {
+        error.NoHomeDirectory => .{ .directory_missing = .data },
+        error.OutOfMemory => .{ .unconfigured = @errorName(err) },
     };
 
     var config_diag: ?chock_auth.config.Diagnostic = null;

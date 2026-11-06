@@ -8,12 +8,15 @@ pub const Kind = enum {
     state,
 };
 
-pub fn report(command: []const u8, kind: Kind) void {
-    const variable = switch (kind) {
+pub fn variable(kind: Kind) []const u8 {
+    return switch (kind) {
         .config => "XDG_CONFIG_HOME",
         .data => "XDG_DATA_HOME",
         .state => "XDG_STATE_HOME",
     };
+}
+
+pub fn report(command: []const u8, kind: Kind) void {
     const directory = switch (kind) {
         .config => "configuration",
         .data => "data",
@@ -22,7 +25,7 @@ pub fn report(command: []const u8, kind: Kind) void {
     tty.print(
         .err,
         "chock {s}: set HOME or an absolute {s} to select the {s} directory\n",
-        .{ command, variable, directory },
+        .{ command, variable(kind), directory },
     );
 }
 
