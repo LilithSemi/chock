@@ -1222,6 +1222,7 @@ test "chock doctor refuses a machine that cannot run a session, with a code a sc
 
     try expectContains(run.out, doctor_first_run_heading);
     try expectContains(run.out, "credential");
+    try expectContains(run.out, "session storage");
     try expectContains(run.out, "workspace space");
 
     try expectContains(run.err, doctor_refusal);
@@ -1286,16 +1287,19 @@ test "chock doctor JSON is one versioned report with the same verdict" {
     var blocking: usize = 0;
     var saw_sandbox = false;
     var saw_first_run = false;
+    var saw_session_storage = false;
     for (parsed.value.rows) |row| {
         if (!std.mem.eql(u8, row.status, "ok")) not_on += 1;
         if (std.mem.eql(u8, row.status, "blocked")) blocking += 1;
         saw_sandbox = saw_sandbox or std.mem.eql(u8, row.section, "sandbox");
         saw_first_run = saw_first_run or std.mem.eql(u8, row.section, "first_run");
+        saw_session_storage = saw_session_storage or std.mem.eql(u8, row.name, "session storage");
     }
     try testing.expectEqual(parsed.value.not_on_rows, not_on);
     try testing.expectEqual(parsed.value.blocking_rows, blocking);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, run.out, "\n"));
     try testing.expect(saw_first_run);
+    try testing.expect(saw_session_storage);
     if (std.mem.eql(u8, parsed.value.sandbox_driver, "none")) {
         try testing.expect(parsed.value.driver_refusal != null);
         try testing.expect(!saw_sandbox);
