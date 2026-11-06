@@ -109,10 +109,11 @@ pub const Review = struct {
     files: []const File = &.{},
 
     pub const Kind = enum { git, overlay };
+    pub const Status = enum { added, deleted, modified, renamed, copied, type_changed, skipped };
     pub const File = struct {
         path: []const u8,
         old_path: []const u8 = "",
-        status: []const u8,
+        status: Status,
         reason: []const u8 = "",
         selectable: bool = true,
         binary: bool = false,

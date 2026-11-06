@@ -947,7 +947,7 @@ pub const Ui = struct {
             copy.* = .{
                 .path = arena.dupe(u8, file.path) catch return,
                 .old_path = arena.dupe(u8, file.old_path) catch return,
-                .status = arena.dupe(u8, file.status) catch return,
+                .status = file.status,
                 .reason = arena.dupe(u8, file.reason) catch return,
                 .selectable = file.selectable,
                 .binary = file.binary,
@@ -2463,9 +2463,9 @@ pub const Ui = struct {
         for (review.files) |file| {
             if (!file.selectable) {
                 const text = if (file.reason.len == 0)
-                    std.fmt.allocPrint(ctx.arena, " [ ] {s} {s}", .{ file.status, file.path }) catch file.path
+                    std.fmt.allocPrint(ctx.arena, " [ ] {s} {s}", .{ @tagName(file.status), file.path }) catch file.path
                 else
-                    std.fmt.allocPrint(ctx.arena, " [ ] {s} {s}: {s}", .{ file.status, file.path, file.reason }) catch file.path;
+                    std.fmt.allocPrint(ctx.arena, " [ ] {s} {s}: {s}", .{ @tagName(file.status), file.path, file.reason }) catch file.path;
                 addReviewRow(&lines, &seen, scroll_at, ctx.arena, self.bandRow(ctx, text, colors.fg_muted));
                 continue;
             }
@@ -2475,7 +2475,7 @@ pub const Ui = struct {
                 const atomic_note = if (file.atomic) " (whole file)" else "";
                 const text = std.fmt.allocPrint(ctx.arena, " [{s}] {s} {s}{s}", .{
                     if (choice.accepted) "x" else " ",
-                    file.status,
+                    @tagName(file.status),
                     file.path,
                     atomic_note,
                 }) catch file.path;
@@ -2497,7 +2497,7 @@ pub const Ui = struct {
             for (self.review_choices[first .. first + count]) |choice| accepted += @intFromBool(choice.accepted);
             const mark: []const u8 = if (accepted == count) "x" else if (accepted == 0) " " else "-";
             const header = self.bandRow(ctx, std.fmt.allocPrint(ctx.arena, " [{s}] {s} {s}", .{
-                mark, file.status, file.path,
+                mark, @tagName(file.status), file.path,
             }) catch file.path, colors.fg);
             if (group_at < max_review_taps) {
                 self.review_group_taps[group_at] = .{ .ui = self, .first = first, .len = count };
@@ -3787,8 +3787,8 @@ test "workspace review keeps whole-file and hunk choices separate" {
     const ui = try Ui.init(std.testing.allocator, std.testing.io, host_mod.quiet);
     defer ui.deinit();
     ui.showReview(.{ .kind = .git, .files = &.{
-        .{ .path = "image.bin", .status = "modified", .binary = true, .atomic = true },
-        .{ .path = "main.zig", .status = "modified", .hunks = &.{
+        .{ .path = "image.bin", .status = .modified, .binary = true, .atomic = true },
+        .{ .path = "main.zig", .status = .modified, .hunks = &.{
             .{ .number = 1, .header = "@@ -1 +1 @@" },
             .{ .number = 2, .header = "@@ -8 +8 @@" },
         } },
@@ -3818,14 +3818,14 @@ test "workspace review keeps skipped-file reasons separate from status" {
     defer ui.deinit();
     ui.showReview(.{ .kind = .overlay, .files = &.{.{
         .path = "pipe",
-        .status = "skipped",
+        .status = .skipped,
         .reason = "unsupported file kind",
         .selectable = false,
         .atomic = true,
     }} });
 
     try std.testing.expectEqual(@as(usize, 0), ui.review_choices.len);
-    try std.testing.expectEqualStrings("skipped", ui.review.?.files[0].status);
+    try std.testing.expectEqual(source_mod.Review.Status.skipped, ui.review.?.files[0].status);
     try std.testing.expectEqualStrings("unsupported file kind", ui.review.?.files[0].reason);
 }
 

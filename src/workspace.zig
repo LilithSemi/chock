@@ -624,10 +624,20 @@ pub const ReviewWire = struct {
     source: []const u8 = "",
     files: []const File = &.{},
 
+    pub const Status = enum {
+        added,
+        deleted,
+        modified,
+        renamed,
+        copied,
+        type_changed,
+        skipped,
+    };
+
     pub const File = struct {
         path: []const u8,
         old_path: []const u8 = "",
-        status: []const u8,
+        status: Status,
         reason: []const u8 = "",
         selectable: bool = true,
         binary: bool = false,
@@ -694,7 +704,7 @@ pub fn reviewJson(
                 }
                 files[at] = .{
                     .path = try arena.dupe(u8, one.path),
-                    .status = @tagName(one.kind),
+                    .status = overlayReviewStatus(one.kind),
                     .binary = binary,
                     .atomic = atomic,
                     .hunks = hunks,
@@ -704,7 +714,7 @@ pub fn reviewJson(
             for (report.skipped) |one| {
                 files[at] = .{
                     .path = try arena.dupe(u8, one.path),
-                    .status = "skipped",
+                    .status = .skipped,
                     .reason = try arena.dupe(u8, one.reason),
                     .selectable = false,
                     .atomic = true,
@@ -743,7 +753,7 @@ pub fn reviewJson(
         file.* = .{
             .path = try arena.dupe(u8, patch.new_path),
             .old_path = if (std.mem.eql(u8, patch.old_path, patch.new_path)) "" else try arena.dupe(u8, patch.old_path),
-            .status = @tagName(patch.status),
+            .status = gitReviewStatus(patch.status),
             .binary = patch.binary,
             .atomic = !patchSupportsHunks(patch),
             .hunks = hunks,
@@ -755,6 +765,25 @@ pub fn reviewJson(
         .source = source_ref,
         .files = files,
     }, .{});
+}
+
+fn overlayReviewStatus(kind: chock_workspace.overlay.ChangeKind) ReviewWire.Status {
+    return switch (kind) {
+        .added => .added,
+        .modified => .modified,
+        .deleted => .deleted,
+    };
+}
+
+fn gitReviewStatus(status: ziggit.DiffStatus) ReviewWire.Status {
+    return switch (status) {
+        .added => .added,
+        .deleted => .deleted,
+        .modified => .modified,
+        .renamed => .renamed,
+        .copied => .copied,
+        .type_changed => .type_changed,
+    };
 }
 
 fn wireHunks(arena: std.mem.Allocator, source: []const ziggit.Hunk) ![]const ReviewWire.Hunk {
