@@ -296,7 +296,7 @@ pub fn main(
         return Exit.usage.code();
     }
 
-    const org_rules = loadOrgRules(arena, io, &env, options.org_bundle) orelse
+    const org_rules = (try loadOrgRules(arena, io, &env, options.org_bundle)) orelse
         return Exit.refused.code();
     const action = switch (options.action) {
         .remove => remove_action,
@@ -405,20 +405,24 @@ fn loadOrgRules(
     io: std.Io,
     env: *const std.process.Environ.Map,
     given: ?[]const u8,
-) ?[]const chock_policy.table.Rule {
+) std.mem.Allocator.Error!?[]const chock_policy.table.Rule {
     const path = if (given) |named|
         named
     else path: {
-        const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| {
-            tty.print(
-                .err,
-                "chock sessions: the data directory is unknown ({s}), so this cannot tell whether " ++
-                    "an organisation requires these logs to be kept\n",
-                .{@errorName(err)},
-            );
-            return null;
+        const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| switch (err) {
+            error.NoHomeDirectory => {
+                directory_help.report("sessions", .data);
+                tty.print(
+                    .err,
+                    "chock sessions: without that directory, Chock cannot tell whether an " ++
+                        "organisation requires these logs to be kept\n",
+                    .{},
+                );
+                return null;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
         };
-        break :path std.fs.path.join(arena, &.{ data_dir, chock_policy.org.file_name }) catch return null;
+        break :path try std.fs.path.join(arena, &.{ data_dir, chock_policy.org.file_name });
     };
 
     var diag: ?chock_policy.org.Diagnostic = null;
@@ -428,6 +432,7 @@ fn loadOrgRules(
             tty.print(.err, "chock sessions: there is no org policy bundle at {s}\n", .{path});
             return null;
         },
+        error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (diag) |*one| {
                 tty.print(.err, "chock sessions: {f}\n", .{one});
@@ -4739,6 +4744,20 @@ test "verify refuses a name that is not a session identifier, and one this proje
 fn retentionBundle(arena: std.mem.Allocator, body: []const u8) !*const chock_policy.org.Bundle {
     const source = try std.fmt.allocPrintSentinel(arena, ".{{{s}}}", .{body}, 0);
     return chock_policy.org.parse(arena, source, null);
+}
+
+test "retention checks refuse safely when the data home is unknown" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+
+    var capture: tty.Capture = undefined;
+    capture.start(testing.io, testing.allocator);
+    defer capture.stop(testing.io);
+
+    try testing.expect((try loadOrgRules(testing.allocator, testing.io, &env, null)) == null);
+    try testing.expect(std.mem.indexOf(u8, capture.err(), "XDG_DATA_HOME") != null);
+    try testing.expect(std.mem.indexOf(u8, capture.err(), "requires these logs to be kept") != null);
+    try testing.expect(std.mem.indexOf(u8, capture.err(), "NoHomeDirectory") == null);
 }
 
 test "an installation with no org bundle removes and prunes exactly as it always did" {
