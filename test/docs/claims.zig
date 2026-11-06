@@ -894,6 +894,8 @@ test "the README checks configuration, provider, and machine in order" {
         return error.MissingDoctor;
     try testing.expect(init_at < probe_at);
     try testing.expect(probe_at < doctor_at);
+    try testing.expect(std.mem.indexOf(u8, getting_started, "chock login --provider KIND --name NAME") != null);
+    try testing.expect(std.mem.indexOf(u8, getting_started, "chock login --provider NAME") == null);
 }
 
 test "the exit code table has one row for each code, with the number the code has" {

@@ -139,9 +139,10 @@ for the task in it.
 The starter expects a local OpenAI-compatible server at
 `http://127.0.0.1:5000/v1` and needs no credential. Start that server, or edit
 the provider and model when you use a different one. Then run
-`chock config check` again and use `chock login --provider NAME` when that
-provider needs a stored login. `chock models --probe` tests the endpoint and
-credential before the first session.
+`chock config check` again. When the provider needs a stored login, use
+`chock login --provider KIND --name NAME`. Omit `--name` when the instance name
+is the same as its kind. `chock models --probe` tests the endpoint and credential
+before the first session.
 
 A first word is read as a command name, so a task given on the line goes after
 `--`. `chock fix the parser` is refused, because a typed `chock rnu` that
