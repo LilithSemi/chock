@@ -1948,7 +1948,7 @@ fn start(
         nix_caps,
     );
 
-    const nix_build = nixBuildFor(
+    const nix_build = try nixBuildFor(
         arena,
         io,
         env,
@@ -4743,7 +4743,7 @@ fn buildNamedPackages(
     const named = try std.mem.concat(arena, []const u8, &.{ given, caps.packages orelse &.{} });
     if (named.len == 0) return &.{};
 
-    const nix_program = chock_nix.proc.resolve(arena, io, env, "nix") catch {
+    const nix_program = (try resolveOptionalProgram(arena, io, env, "nix")) orelse {
         tty.print(
             .err,
             "chock run: {d} packages were named and nix is not on this machine's PATH, so " ++
@@ -4752,7 +4752,7 @@ fn buildNamedPackages(
         );
         return error.Reported;
     };
-    const nix_store_program = chock_nix.proc.resolve(arena, io, env, "nix-store") catch null;
+    const nix_store_program = try resolveOptionalProgram(arena, io, env, "nix-store");
 
     var built: std.ArrayList(chock_nix.provision.Provided) = .empty;
     for (named) |installable| {
@@ -4873,11 +4873,11 @@ fn provisioningFor(
         return null;
     }
 
-    const nix_program = chock_nix.proc.resolve(arena, io, env, "nix") catch {
+    const nix_program = (try resolveOptionalProgram(arena, io, env, "nix")) orelse {
         tty.detail("chock: provide_tool is off, because nix is not on this machine's PATH\n", .{});
         return null;
     };
-    const nix_store_program = chock_nix.proc.resolve(arena, io, env, "nix-store") catch null;
+    const nix_store_program = try resolveOptionalProgram(arena, io, env, "nix-store");
     if (nix_store_program == null or dev_shell_dir == null) {
         tty.print(
             .warn,
@@ -10348,12 +10348,12 @@ fn nixBuildFor(
     workspace_root: []const u8,
     caps: chock_policy.nix.Resolved,
     inputs: FlakeInputs,
-) ?NixBuild {
-    const nix_program = chock_nix.proc.resolve(arena, io, env, "nix") catch {
+) std.mem.Allocator.Error!?NixBuild {
+    const nix_program = (try resolveOptionalProgram(arena, io, env, "nix")) orelse {
         tty.detail("chock: nix_build is off, because nix is not on this machine's PATH\n", .{});
         return null;
     };
-    const nix_store_program = chock_nix.proc.resolve(arena, io, env, "nix-store") catch null;
+    const nix_store_program = try resolveOptionalProgram(arena, io, env, "nix-store");
     return .{
         .workspace_root = workspace_root,
         .caps = caps,
@@ -10364,6 +10364,31 @@ fn nixBuildFor(
             chock_nix.build.default_daemon_socket,
         .inputs = inputs,
     };
+}
+
+fn resolveOptionalProgram(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    name: []const u8,
+) std.mem.Allocator.Error!?[]const u8 {
+    return chock_nix.proc.resolve(arena, io, env, name) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+}
+
+test "optional program resolution preserves allocation failures" {
+    const gpa = testing.allocator;
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("PATH", "/bin");
+
+    var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        resolveOptionalProgram(failing.allocator(), testing.io, &env, "nix"),
+    );
 }
 
 const NixFetchGate = struct {
