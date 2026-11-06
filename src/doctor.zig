@@ -83,6 +83,8 @@ pub const DevShellState = union(enum) {
     no_flake,
     read: bool,
     failed: []const u8,
+    directory_missing: directory_help.Kind,
+    storage_unavailable: []const u8,
     no_nix,
 };
 
@@ -845,6 +847,26 @@ fn devShellRow(arena: std.mem.Allocator, state: DevShellState) std.mem.Allocator
             .means = try std.fmt.allocPrint(arena, "nix could not read it: {s}", .{reason}),
             .fix = "A session still runs. The toolchain row says what it mounts instead.",
         },
+        .directory_missing => |kind| .{
+            .name = "dev shell",
+            .state = .unavailable,
+            .means = try std.fmt.allocPrint(
+                arena,
+                "its state directory is unknown because neither HOME nor an absolute {s} is set",
+                .{directory_help.variable(kind)},
+            ),
+            .fix = try std.fmt.allocPrint(
+                arena,
+                "Set HOME or an absolute {s}. A session still runs on another toolchain until then.",
+                .{directory_help.variable(kind)},
+            ),
+        },
+        .storage_unavailable => |reason| .{
+            .name = "dev shell",
+            .state = .unavailable,
+            .means = try std.fmt.allocPrint(arena, "its state directory could not be made: {s}", .{reason}),
+            .fix = "Make the Chock state directory writable. A session still runs on another toolchain until then.",
+        },
         .no_nix => .{
             .name = "dev shell",
             .state = .unavailable,
@@ -1597,8 +1619,13 @@ fn measureDevShell(
     project_root: []const u8,
     has_nix: bool,
 ) DevShellState {
-    const dir = session_paths.devShellDir(arena, env, project_root) catch return .no_flake;
-    session_paths.createDevShellDir(io, dir) catch return .no_flake;
+    const dir = session_paths.devShellDir(arena, env, project_root) catch |err| return switch (err) {
+        error.NoHomeDirectory => .{ .directory_missing = .state },
+        error.OutOfMemory => .{ .storage_unavailable = @errorName(err) },
+    };
+    session_paths.createDevShellDir(io, dir) catch |err| return .{
+        .storage_unavailable = @errorName(err),
+    };
 
     var project_diag: ?chock_policy.nix.Diagnostic = null;
     defer if (project_diag) |*d| d.deinit(arena);
@@ -2673,6 +2700,57 @@ test "an invalid operator nix block is a failed dev shell probe" {
     };
     try testing.expect(std.mem.indexOf(u8, reason, "dev_shell field must be a string") != null);
     try testing.expect(std.mem.indexOf(u8, reason, "config.zon") != null);
+}
+
+test "a missing state home is not reported as a project without a flake" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+
+    const measured = measureDevShell(arena, gpa, testing.io, &env, "/project", false);
+    const kind = switch (measured) {
+        .directory_missing => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(directory_help.Kind.state, kind);
+
+    const row = try devShellRow(arena, measured);
+    try testing.expect(std.mem.indexOf(u8, row.means, "XDG_STATE_HOME") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "XDG_STATE_HOME") != null);
+}
+
+test "an unusable dev shell state directory is not reported as a project without a flake" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "not-a-directory", .data = "occupied" });
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+    const state_home = try std.fs.path.join(arena, &.{ root, "not-a-directory" });
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", state_home);
+
+    const measured = measureDevShell(arena, gpa, io, &env, root, false);
+    const reason = switch (measured) {
+        .storage_unavailable => |text| text,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(reason.len != 0);
+
+    const row = try devShellRow(arena, measured);
+    try testing.expect(std.mem.indexOf(u8, row.means, "state directory") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "writable") != null);
 }
 
 test "a failed container runtime probe is not reported as not installed" {
