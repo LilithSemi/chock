@@ -54,9 +54,11 @@ For a script or configuration deployment, request one JSON object on standard
 output. The document has schema `chock.config-check` version 1. A failed check
 sets `valid` to `false`, writes the diagnostic to standard error, and returns a
 nonzero status. Its `problem` field is `config_missing`, `config_invalid`,
-`config_unreadable`, or `default_provider_missing`. When the file parsed but a
-default names no provider, the JSON keeps that configured provider and model so
-a deployment can report the exact bad reference:
+`config_too_large`, `config_unreadable`, or `default_provider_missing`.
+`config_too_large` means the file exceeded the 256 KiB input limit and was not
+parsed. When the file parsed but a default names no provider, the JSON keeps
+that configured provider and model so a deployment can report the exact bad
+reference:
 
 ```
 chock config check --format json

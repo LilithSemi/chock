@@ -192,12 +192,17 @@ const CheckReport = struct {
 const CheckProblem = enum {
     config_missing,
     config_invalid,
+    config_too_large,
     config_unreadable,
     default_provider_missing,
 };
 
 fn problemForLoadError(err: anyerror) CheckProblem {
-    return if (err == error.ReadFailed) .config_unreadable else .config_invalid;
+    return switch (err) {
+        error.ReadFailed => .config_unreadable,
+        error.ConfigTooLarge => .config_too_large,
+        else => .config_invalid,
+    };
 }
 
 fn reportInvalid(
@@ -455,5 +460,5 @@ test "a named default must name an instance the file has" {
 test "configuration load failures have stable problem classes" {
     try std.testing.expectEqual(CheckProblem.config_unreadable, problemForLoadError(error.ReadFailed));
     try std.testing.expectEqual(CheckProblem.config_invalid, problemForLoadError(error.InvalidConfig));
-    try std.testing.expectEqual(CheckProblem.config_invalid, problemForLoadError(error.ConfigTooLarge));
+    try std.testing.expectEqual(CheckProblem.config_too_large, problemForLoadError(error.ConfigTooLarge));
 }
