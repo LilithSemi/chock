@@ -521,7 +521,7 @@ const RunResultUsage = struct {
 };
 
 const RunResultWorkspace = struct {
-    outcome: []const u8,
+    outcome: Applied,
     changed_files: []const []const u8 = &.{},
 };
 
@@ -536,7 +536,7 @@ const RunResult = struct {
     schema: []const u8 = "chock.run-result",
     version: u32 = 1,
     session_id: ?[]const u8,
-    status: []const u8,
+    status: Exit,
     exit_code: u8,
     final_answer: ?[]const u8,
     usage: RunResultUsage = .{},
@@ -571,13 +571,13 @@ fn writeRunResult(
         RunResultFold{};
     const result = RunResult{
         .session_id = if (started) |one| one.session_id else null,
-        .status = @tagName(exit),
+        .status = exit,
         .exit_code = exit.code(),
         .final_answer = folded.answer,
         .usage = folded.usage,
         .approvals = folded.approvals,
         .workspace = .{
-            .outcome = @tagName(applied),
+            .outcome = applied,
             .changed_files = folded.changed_files,
         },
         .audit_log = if (started) |one| one.paths.log else null,
@@ -14442,12 +14442,12 @@ test "the machine result folds the last answer, usage, and sorted changed paths 
 
     const encoded = try std.json.Stringify.valueAlloc(arena, RunResult{
         .session_id = id,
-        .status = "finished",
+        .status = .finished,
         .exit_code = 0,
         .final_answer = folded.answer,
         .usage = folded.usage,
         .approvals = folded.approvals,
-        .workspace = .{ .outcome = "landed", .changed_files = folded.changed_files },
+        .workspace = .{ .outcome = .landed, .changed_files = folded.changed_files },
         .audit_log = path,
     }, .{});
     try testing.expect(std.mem.indexOf(u8, encoded, "\"schema\":\"chock.run-result\"") != null);
