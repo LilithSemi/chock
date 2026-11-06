@@ -10,19 +10,21 @@ export TZ=UTC
 mkdir -p "$scratch/input" "$scratch/artifacts" "$scratch/stage"
 printf 'binary\n' > "$scratch/input/chock"
 printf 'license\n' > "$scratch/input/LICENSE"
+printf 'readme\n' > "$scratch/input/README.md"
 chmod +x "$scratch/input/chock"
 
 "$here/package-release" \
   "$scratch/artifacts" "$scratch/stage" chock-test-linux \
-  "$scratch/input/chock" "$scratch/input/LICENSE"
+  "$scratch/input/chock" "$scratch/input/LICENSE" "$scratch/input/README.md"
 cp "$scratch/artifacts/chock-test-linux.tar.gz" "$scratch/first.tar.gz"
 
-touch -t 203801190314 "$scratch/input/chock" "$scratch/input/LICENSE"
+touch -t 203801190314 \
+  "$scratch/input/chock" "$scratch/input/LICENSE" "$scratch/input/README.md"
 (
   umask 077
   "$here/package-release" \
     "$scratch/artifacts" "$scratch/stage" chock-test-linux \
-    "$scratch/input/chock" "$scratch/input/LICENSE"
+    "$scratch/input/chock" "$scratch/input/LICENSE" "$scratch/input/README.md"
 )
 cmp "$scratch/first.tar.gz" "$scratch/artifacts/chock-test-linux.tar.gz"
 
@@ -30,6 +32,7 @@ tar -tzf "$scratch/artifacts/chock-test-linux.tar.gz" > "$scratch/members"
 printf '%s\n' \
   chock-test-linux/ \
   chock-test-linux/LICENSE \
+  chock-test-linux/README.md \
   chock-test-linux/chock > "$scratch/expected-members"
 diff -u "$scratch/expected-members" "$scratch/members"
 tar --numeric-owner --full-time -tvzf \
@@ -39,14 +42,17 @@ awk '
     $5 == "00:00:00" && $6 == "chock-test-linux/" { root = 1 }
   $1 == "-rw-r--r--" && $2 == "0/0" && $4 == "2000-01-01" &&
     $5 == "00:00:00" && $6 == "chock-test-linux/LICENSE" { license = 1 }
+  $1 == "-rw-r--r--" && $2 == "0/0" && $4 == "2000-01-01" &&
+    $5 == "00:00:00" && $6 == "chock-test-linux/README.md" { readme = 1 }
   $1 == "-rwxr-xr-x" && $2 == "0/0" && $4 == "2000-01-01" &&
     $5 == "00:00:00" && $6 == "chock-test-linux/chock" { binary = 1 }
-  END { exit !(root && license && binary) }
+  END { exit !(root && license && readme && binary) }
 ' "$scratch/metadata"
 mkdir "$scratch/unpacked"
 tar -xzf "$scratch/artifacts/chock-test-linux.tar.gz" -C "$scratch/unpacked"
 test -x "$scratch/unpacked/chock-test-linux/chock"
 test ! -x "$scratch/unpacked/chock-test-linux/LICENSE"
+test ! -x "$scratch/unpacked/chock-test-linux/README.md"
 
 mkdir -p "$scratch/other"
 printf 'collision\n' > "$scratch/other/chock"
