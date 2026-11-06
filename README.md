@@ -95,9 +95,9 @@ it. Linux commonly provides `sha256sum`, while macOS provides `shasum`:
 ```sh
 archive=chock-VERSION-PLATFORM.tar.gz
 if command -v sha256sum >/dev/null 2>&1; then
-  grep -F "  $archive" SHA256SUMS | sha256sum --check
+  awk -v archive="$archive" '$2 == archive' SHA256SUMS | sha256sum --check
 else
-  grep -F "  $archive" SHA256SUMS | shasum -a 256 --check
+  awk -v archive="$archive" '$2 == archive' SHA256SUMS | shasum -a 256 --check
 fi
 ```
 
