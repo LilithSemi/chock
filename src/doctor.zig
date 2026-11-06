@@ -2992,12 +2992,17 @@ test "an unusable dev shell state directory is not reported as a project without
     defer env.deinit();
     try env.put("XDG_STATE_HOME", state_home);
 
+    var capture: tty.Capture = undefined;
+    capture.start(io, gpa);
+    defer capture.stop(io);
+
     const measured = measureDevShell(arena, gpa, io, &env, root, false);
     const reason = switch (measured) {
         .storage_unavailable => |text| text,
         else => return error.TestUnexpectedResult,
     };
     try testing.expect(reason.len != 0);
+    try testing.expect(std.mem.indexOf(u8, capture.err(), "making the session directory") != null);
 
     const row = try devShellRow(arena, measured);
     try testing.expect(std.mem.indexOf(u8, row.means, "state directory") != null);
