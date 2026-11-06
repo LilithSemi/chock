@@ -130,6 +130,12 @@ pub const CredentialState = union(enum) {
     unreadable: []const u8,
 };
 
+pub const CacheState = union(enum) {
+    ok,
+    directory_missing: directory_help.Kind,
+    refused: []const u8,
+};
+
 pub const LayerFamily = enum {
     none,
     namespaces,
@@ -175,7 +181,7 @@ pub const Measured = struct {
     container: ContainerState = .not_installed,
     toolchain: ToolchainState = .none,
     credential: CredentialState = .{ .unconfigured = "the configuration was not read" },
-    cache: Probe = .{ .refused = "the toolchain cache was not read" },
+    cache: CacheState = .{ .refused = "the toolchain cache was not read" },
     free_bytes: ?u64 = null,
 
     card_seal: Probe = .{ .absent = "the PC/SC transport was not read" },
@@ -1036,18 +1042,45 @@ test "a missing credential directory names the environment value that fixes it" 
     try testing.expect(row.blocks);
 }
 
-fn cacheRow(arena: std.mem.Allocator, probe: Probe) std.mem.Allocator.Error!Row {
-    return .{
-        .name = "toolchain cache",
-        .state = probe.state(),
-        .means = if (probe == .ok)
-            ""
-        else
-            try std.fmt.allocPrint(arena, "it could not be made: {s}", .{probe.why()}),
-        .why = "the directory a compiler writes into is there and writable",
-        .fix = if (probe == .ok) "" else "A session still runs. A compiler in it has nowhere but the workspace to write, " ++
-            "so every session recompiles from nothing.",
-        .blocks = false,
+test "a missing cache directory names the environment value that fixes it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const row = try cacheRow(arena_state.allocator(), .{ .directory_missing = .data });
+    try testing.expect(std.mem.indexOf(u8, row.means, "XDG_DATA_HOME") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "XDG_DATA_HOME") != null);
+    try testing.expect(!row.blocks);
+}
+
+fn cacheRow(arena: std.mem.Allocator, state: CacheState) std.mem.Allocator.Error!Row {
+    return switch (state) {
+        .ok => .{
+            .name = "toolchain cache",
+            .state = .on,
+            .means = "",
+            .why = "the directory a compiler writes into is there and writable",
+        },
+        .directory_missing => |kind| .{
+            .name = "toolchain cache",
+            .state = .unavailable,
+            .means = try std.fmt.allocPrint(
+                arena,
+                "its data directory is unknown because neither HOME nor an absolute {s} is set",
+                .{directory_help.variable(kind)},
+            ),
+            .fix = try std.fmt.allocPrint(
+                arena,
+                "Set HOME or an absolute {s}. A session still runs, but compilers otherwise recompile from nothing.",
+                .{directory_help.variable(kind)},
+            ),
+        },
+        .refused => |reason| .{
+            .name = "toolchain cache",
+            .state = .unavailable,
+            .means = try std.fmt.allocPrint(arena, "it could not be made: {s}", .{reason}),
+            .fix = "A session still runs. A compiler in it has nowhere but the workspace to write, " ++
+                "so every session recompiles from nothing.",
+        },
     };
 }
 
@@ -1315,8 +1348,9 @@ fn measureHost(
     m.credential = measureCredential(arena, io, env);
 
     m.cache = cache: {
-        const dir = session_paths.cacheDir(arena, env, project_root) catch |err| break :cache .{
-            .refused = @errorName(err),
+        const dir = session_paths.cacheDir(arena, env, project_root) catch |err| break :cache switch (err) {
+            error.NoHomeDirectory => .{ .directory_missing = .data },
+            error.OutOfMemory => .{ .refused = @errorName(err) },
         };
         _ = session_paths.createCacheDir(io, dir, null) catch |err| break :cache .{ .refused = @errorName(err) };
         break :cache .ok;
