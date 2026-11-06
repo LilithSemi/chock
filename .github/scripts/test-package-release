@@ -50,6 +50,9 @@ awk '
 ' "$scratch/metadata"
 mkdir "$scratch/unpacked"
 tar -xzf "$scratch/artifacts/chock-test-linux.tar.gz" -C "$scratch/unpacked"
+for name in chock LICENSE README.md; do
+  cmp "$scratch/input/$name" "$scratch/unpacked/chock-test-linux/$name"
+done
 test -x "$scratch/unpacked/chock-test-linux/chock"
 test ! -x "$scratch/unpacked/chock-test-linux/LICENSE"
 test ! -x "$scratch/unpacked/chock-test-linux/README.md"
