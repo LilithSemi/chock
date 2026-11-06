@@ -468,14 +468,16 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
         .name = "org policy",
         .state = .unavailable,
         .means = reason,
-        .fix = "Repair or remove the installed org-policy.zon. Chock refuses to start while its installation policy cannot be read.",
+        .fix = "Check the diagnostic. Repair an invalid or unreadable org-policy.zon, or resolve the reported system failure. " ++
+            "Chock refuses to start while its installation policy cannot be loaded.",
         .blocks = true,
     });
     if (m.project_policy_failure) |reason| try rows.append(arena, .{
         .name = "project policy",
         .state = .unavailable,
         .means = reason,
-        .fix = "Repair or remove this project's chock.zon policy. Chock refuses to start while it cannot be read.",
+        .fix = "Check the diagnostic. Repair an invalid or unreadable chock.zon, or resolve the reported system failure. " ++
+            "Chock refuses to start while project policy cannot be loaded.",
         .blocks = true,
     });
     for (m.org_ceilings) |means| try rows.append(arena, .{
@@ -3024,6 +3026,7 @@ test "an invalid installed org policy is a blocking doctor row" {
     try testing.expectEqual(ui.Layer.State.unavailable, row.state);
     try testing.expect(row.blocks);
     try testing.expect(std.mem.indexOf(u8, row.fix, "org-policy.zon") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "resolve the reported system failure") != null);
 }
 
 test "an invalid project policy blocks doctor instead of assuming strict hardening" {
@@ -3052,6 +3055,7 @@ test "an invalid project policy blocks doctor instead of assuming strict hardeni
     try testing.expect(row.blocks);
     try testing.expect(isFirstRunRow(row));
     try testing.expect(std.mem.indexOf(u8, row.fix, "chock.zon") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "resolve the reported system failure") != null);
 }
 
 test "a missing state home is not reported as a project without a flake" {
