@@ -1238,9 +1238,12 @@ fn start(
     const stack_id = try chooseSessionId(arena, io, env, project_root, options);
     const id = try arena.dupe(u8, &stack_id);
 
-    const paths = session_paths.pathsFor(arena, env, project_root, id) catch |err| {
-        tty.print(.err, "chock run: the session path could not be built: {s}\n", .{@errorName(err)});
-        return error.Reported;
+    const paths = session_paths.pathsFor(arena, env, project_root, id) catch |err| switch (err) {
+        error.NoHomeDirectory => {
+            directory_help.report("run", .state);
+            return error.Reported;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
     };
 
     if (options.adopt) try refuseAdoptWithNothingToAdopt(gpa, io, paths.log, id);
@@ -3398,15 +3401,18 @@ fn loadImage(
     io: std.Io,
     env: *const std.process.Environ.Map,
     project_root: []const u8,
-) !?chock_container.Image {
-    const named = switch (chock_container.config.load(arena, io, project_root) catch |err| {
-        tty.print(
-            .err,
-            "chock run: the container block of this project's chock.zon could not be read ({t}). " ++
-                "Fix the file, or remove the block to use this machine's own toolchain.\n",
-            .{err},
-        );
-        return error.Reported;
+) StartError!?chock_container.Image {
+    const named = switch (chock_container.config.load(arena, io, project_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            tty.print(
+                .err,
+                "chock run: the container block of this project's chock.zon could not be read ({t}). " ++
+                    "Fix the file, or remove the block to use this machine's own toolchain.\n",
+                .{err},
+            );
+            return error.Reported;
+        },
     }) {
         .none => return null,
         .refused => |text| {
@@ -3420,13 +3426,16 @@ fn loadImage(
     defer if (diag) |*d| d.deinit(arena);
     const sink = chock_container.sinkOf(arena, &diag);
 
-    const found = switch (chock_container.Runtime.detect(arena, io, env, &diag) catch |err| {
-        tty.print(
-            .err,
-            "chock run: this project names the image {s} and its runtime could not be run ({t}).\n",
-            .{ named, err },
-        );
-        return error.Reported;
+    const found = switch (chock_container.Runtime.detect(arena, io, env, &diag) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            tty.print(
+                .err,
+                "chock run: this project names the image {s} and its runtime could not be run ({t}).\n",
+                .{ named, err },
+            );
+            return error.Reported;
+        },
     }) {
         .not_installed => {
             tty.print(
@@ -3444,13 +3453,12 @@ fn loadImage(
     };
 
     const dir_name = try chock_container.reference.directoryName(arena, named);
-    const cache_dir = session_paths.imageDir(arena, env, dir_name) catch |err| {
-        tty.print(
-            .err,
-            "chock run: the directory for the image {s} is unknown ({t}), so it cannot be read.\n",
-            .{ named, err },
-        );
-        return error.Reported;
+    const cache_dir = session_paths.imageDir(arena, env, dir_name) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoHomeDirectory => {
+            directory_help.report("run", .state);
+            return error.Reported;
+        },
     };
     session_paths.createImageDir(io, cache_dir) catch |err| {
         tty.print(
@@ -3471,13 +3479,16 @@ fn loadImage(
         .on_extract = reportExtractingImage,
         .on_wait = reportWaitingForImage,
         .diag = sink,
-    }) catch |err| {
-        if (diag) |*fault| {
-            tty.print(.err, "chock run: the image {s} could not be read: {f}\n", .{ named, fault });
-        } else {
-            tty.print(.err, "chock run: the image {s} could not be read ({t})\n", .{ named, err });
-        }
-        return error.Reported;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (diag) |*fault| {
+                tty.print(.err, "chock run: the image {s} could not be read: {f}\n", .{ named, fault });
+            } else {
+                tty.print(.err, "chock run: the image {s} could not be read ({t})\n", .{ named, err });
+            }
+            return error.Reported;
+        },
     };
 
     switch (answer) {
@@ -14000,7 +14011,7 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
 
 const testing = std.testing;
 
-test "optional setup paths preserve allocation failure" {
+test "session setup paths preserve allocation failure" {
     const gpa = testing.allocator;
     var env: std.process.Environ.Map = .init(gpa);
     defer env.deinit();
@@ -14037,6 +14048,12 @@ test "optional setup paths preserve allocation failure" {
     try testing.expectError(
         error.OutOfMemory,
         devShellStagingDirFor(staging_allocator.allocator(), testing.io, &env, "/project"),
+    );
+
+    var image_allocator = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        loadImage(gpa, image_allocator.allocator(), testing.io, &env, "/project"),
     );
 }
 
