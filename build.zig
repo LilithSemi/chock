@@ -1743,6 +1743,7 @@ pub fn build(b: *std.Build) void {
     const chock_ui_tests = b.addTest(.{ .root_module = chock_ui });
     const run_chock_ui_tests = b.addRunArtifact(chock_ui_tests);
     test_step.dependOn(&run_chock_ui_tests.step);
+    module_test_steps.add(b, "test-ui", "Run the shared interface tests only", &run_chock_ui_tests.step);
 
     // The browser's own wiring, built for the host so its pure parts run here.
     // The page itself is wasm and cannot run on this machine; these are the

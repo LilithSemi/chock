@@ -362,3 +362,17 @@ test "a source that reaches nothing answers empty rather than failing" {
     try empty.answer("01", 1, .yes);
     try std.testing.expectEqual(@as(?[]const u8, null), empty.whyLast());
 }
+
+test "workspace review payloads decode stable statuses and optional reasons" {
+    const encoded =
+        \\{"kind":"overlay","files":[{"path":"pipe","status":"skipped","reason":"unsupported file kind","selectable":false},{"path":"main.zig","status":"modified"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(Review, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(Review.Kind.overlay, parsed.value.kind);
+    try std.testing.expectEqual(Review.Status.skipped, parsed.value.files[0].status);
+    try std.testing.expectEqualStrings("unsupported file kind", parsed.value.files[0].reason);
+    try std.testing.expectEqual(Review.Status.modified, parsed.value.files[1].status);
+    try std.testing.expectEqualStrings("", parsed.value.files[1].reason);
+}
