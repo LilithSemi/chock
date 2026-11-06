@@ -152,7 +152,7 @@ runs, and so does `echo "fix the parser" | chock`.
 
 Name your providers in `~/.config/chock/config.zon`. `chock config init` writes
 a starter only when no configuration exists. `chock config path` prints the
-exact platform- and XDG-aware location. `chock config example` prints the same
+exact XDG-aware location. `chock config example` prints the same
 starter without writing it. `chock config check` validates the result without
 reading a credential or contacting a provider. `chock models` shows the
 effective default, context limit, and adapter capabilities without contacting
