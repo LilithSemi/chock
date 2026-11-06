@@ -228,7 +228,7 @@ fn reportJson(
         }
     }
     const encoded = try std.json.Stringify.valueAlloc(arena, ModelsReport{
-        .default_provider = config.default_provider,
+        .default_provider = if (config.defaultInstance()) |instance| instance.name else null,
         .default_model = config.default_model,
         .probed = catalogues != null,
         .providers = providers,
@@ -568,7 +568,7 @@ test "a model description reports effective features without credential material
         \\           .context_tokens = 65536,
         \\           .capabilities = .{ .images = true } },
         \\    },
-        \\    .defaults = .{ .provider = "local", .model = "test-model" },
+        \\    .defaults = .{ .model = "test-model" },
         \\}
     , null);
     defer config.deinit();
@@ -630,6 +630,29 @@ test "the JSON model report is structured and contains no connection or credenti
     try std.testing.expect(parsed.value.providers[1].capabilities.provider_search);
     try std.testing.expect(std.mem.indexOf(u8, output, "never-print-this") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "127.0.0.1") == null);
+}
+
+test "the JSON model report exposes an inferred sole default" {
+    const gpa = std.testing.allocator;
+    var config = try chock_auth.config.parse(gpa,
+        \\.{
+        \\    .providers = .{
+        \\        .{ .name = "only", .kind = "openai-compat", .base_url = "http://127.0.0.1:5000/v1" },
+        \\    },
+        \\    .defaults = .{ .model = "test-model" },
+        \\}
+    , null);
+    defer config.deinit();
+
+    var capture: tty.Capture = undefined;
+    capture.start(std.testing.io, gpa);
+    defer capture.stop(std.testing.io);
+
+    try reportJson(gpa, &config, null, null);
+    const parsed = try std.json.parseFromSlice(ModelsReport, gpa, capture.out(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("only", parsed.value.default_provider.?);
+    try std.testing.expect(parsed.value.providers[0].is_default);
 }
 
 test "a rejected explicit credential is fixed at its source" {

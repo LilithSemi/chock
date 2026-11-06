@@ -123,6 +123,9 @@ provider instance does it.
 Run `chock models` to see the effective local view: provider instances, the
 default model, context limits, and the features each adapter can faithfully
 carry. `chock models --provider <name>` narrows that report to one instance.
+When the configuration names exactly one provider, that provider is the
+effective default even when `.defaults.provider` is absent. Human and JSON
+reports both show the effective choice.
 The command does not read credentials or contact the provider, so it reports
 configured and adapter capabilities rather than making an unverified claim
 about a remote model. The OpenAI Responses adapter reports provider-side
