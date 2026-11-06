@@ -22,6 +22,8 @@ const session = @import("../session.zig");
 
 const Refusal = migrate.Refusal;
 
+pub const home_fix = "set HOME to an absolute directory before importing Claude Code data";
+
 /// The one harness this build reads a transcript location for.
 pub const harness_name = "claude-code";
 
@@ -77,13 +79,12 @@ pub fn import(
         };
     }
 
-    const project_dir = homeProjectDir(arena, env, project_root) catch |err| return .{
-        .harness = harness,
-        .refused = try oneRefusal(arena, harness_name, try std.fmt.allocPrint(
-            arena,
-            "its transcript directory is unknown: {s}",
-            .{@errorName(err)},
-        )),
+    const project_dir = homeProjectDir(arena, env, project_root) catch |err| return switch (err) {
+        error.NoHomeDirectory => .{
+            .harness = harness,
+            .refused = try oneRefusal(arena, harness_name, home_fix),
+        },
+        error.OutOfMemory => error.OutOfMemory,
     };
 
     var names: std.ArrayList([]const u8) = .empty;
@@ -134,7 +135,7 @@ pub fn homeProjectDir(
     project_root: []const u8,
 ) (std.mem.Allocator.Error || error{NoHomeDirectory})![]const u8 {
     const home = env.get("HOME") orelse return error.NoHomeDirectory;
-    if (home.len == 0) return error.NoHomeDirectory;
+    if (home.len == 0 or !std.fs.path.isAbsolute(home)) return error.NoHomeDirectory;
 
     const slug = try arena.dupe(u8, project_root);
     for (slug) |*byte| {
@@ -348,6 +349,22 @@ fn lessThanBytes(_: void, a: []const u8, b: []const u8) bool {
 }
 
 const testing = std.testing;
+
+test "a relative home is an actionable transcript refusal" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", "relative/home");
+
+    const result = try import(arena, testing.io, &env, harness_name, "/some/project");
+    try testing.expectEqual(@as(usize, 0), result.imported.len);
+    try testing.expectEqual(@as(usize, 1), result.refused.len);
+    try testing.expectEqualStrings(home_fix, result.refused[0].reason);
+    try testing.expect(std.mem.indexOf(u8, result.refused[0].reason, "NoHomeDirectory") == null);
+}
 
 test "parseTimestampMs matches known epoch values" {
     try testing.expectEqual(@as(?i64, 0), parseTimestampMs("1970-01-01T00:00:00.000Z"));

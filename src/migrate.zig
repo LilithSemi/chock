@@ -678,13 +678,16 @@ fn importMemory(
         };
     }
 
-    const project_dir = transcript.homeProjectDir(arena, env, project_root) catch |err| return .{
-        .harness = harness,
-        .refused = try transcript.oneRefusal(
-            arena,
-            transcript.harness_name,
-            try std.fmt.allocPrint(arena, "its notes directory is unknown: {s}", .{@errorName(err)}),
-        ),
+    const project_dir = transcript.homeProjectDir(arena, env, project_root) catch |err| return switch (err) {
+        error.NoHomeDirectory => .{
+            .harness = harness,
+            .refused = try transcript.oneRefusal(
+                arena,
+                transcript.harness_name,
+                transcript.home_fix,
+            ),
+        },
+        error.OutOfMemory => error.OutOfMemory,
     };
     const notes_dir = try std.fs.path.join(arena, &.{ project_dir, "memory" });
 
@@ -1186,4 +1189,19 @@ test "a harness with no pinned notes location is refused by name" {
     try testing.expectEqual(@as(usize, 0), result.carried);
     try testing.expectEqual(@as(usize, 1), result.refused.len);
     try testing.expect(std.mem.indexOf(u8, result.refused[0].reason, "not pinned") != null);
+}
+
+test "a missing home is an actionable memory refusal" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+
+    const result = try importMemory(arena, testing.io, &env, transcript.harness_name, "/somewhere");
+    try testing.expectEqual(@as(usize, 0), result.carried);
+    try testing.expectEqual(@as(usize, 1), result.refused.len);
+    try testing.expectEqualStrings(transcript.home_fix, result.refused[0].reason);
+    try testing.expect(std.mem.indexOf(u8, result.refused[0].reason, "NoHomeDirectory") == null);
 }
