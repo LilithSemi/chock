@@ -520,7 +520,8 @@ test "the macOS release verifies the entitlement its documentation names" {
     const entitlement = try textBetween(plist, "<key>", "</key>");
     const microvm = try docText(docs, "docs/security/microvm.md");
 
-    try testing.expect(std.mem.indexOf(u8, workflow, "codesign --verify --strict result/bin/chock") != null);
+    try testing.expect(std.mem.indexOf(u8, workflow, "tar -xzf \"${mac_archive}\" -C verify-macos") != null);
+    try testing.expect(std.mem.indexOf(u8, workflow, "codesign --verify --strict \"${mac_binary}\"") != null);
     try testing.expect(std.mem.indexOf(u8, workflow, entitlement) != null);
     try testing.expect(std.mem.indexOf(u8, microvm, entitlement) != null);
 }

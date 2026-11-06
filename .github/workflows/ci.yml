@@ -265,12 +265,16 @@ jobs:
 
           # The microVM driver on Apple Silicon needs the Hypervisor
           # entitlement. Zig writes an ad hoc signature, but a later package
-          # fixup can invalidate it. Check the final store output that enters
-          # the archive, not an intermediate linker output.
+          # fixup can invalidate it. Check the copy extracted from the archive
+          # that is published, not an intermediate linker output.
           if [ "${RUNNER_OS}" = "macOS" ]; then
-            /usr/bin/codesign --verify --strict result/bin/chock
+            mac_archive="artifacts/${shapes[0]}.tar.gz"
+            mkdir verify-macos
+            tar -xzf "${mac_archive}" -C verify-macos
+            mac_binary="verify-macos/${shapes[0]}/chock"
+            /usr/bin/codesign --verify --strict "${mac_binary}"
             entitlements=$(
-              /usr/bin/codesign -d --entitlements :- result/bin/chock 2>/dev/null
+              /usr/bin/codesign -d --entitlements :- "${mac_binary}" 2>/dev/null
             )
             case "${entitlements}" in
               *'<key>com.apple.security.hypervisor</key>'*'<true/>'*) ;;
