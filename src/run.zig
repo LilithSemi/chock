@@ -1688,7 +1688,7 @@ fn start(
     const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
     const dev_shell_name = options.dev_shell orelse nix_caps.dev_shell;
 
-    const flake_inputs = fetchFlakeInputs(
+    const flake_inputs = try fetchFlakeInputs(
         arena,
         io,
         env,
@@ -4663,20 +4663,18 @@ fn fetchFlakeInputs(
     chain_links: []const chock_proto.event.SpawnLink,
     agent_kind: []const u8,
     model: []const u8,
-) FlakeInputs {
-    const lock_bytes = readProjectLock(arena, io, project_root) orelse return .{};
+) std.mem.Allocator.Error!FlakeInputs {
+    const lock_bytes = (try readProjectLock(arena, io, project_root)) orelse return .{};
 
-    const nix_program = chock_nix.proc.resolve(arena, io, env, "nix") catch return .{
+    const nix_program = (try resolveOptionalProgram(arena, io, env, "nix")) orelse return .{
         .missing = "nix is not on this machine's PATH, so no flake input was fetched",
     };
 
-    const chain = arena.alloc([]const u8, chain_links.len + 1) catch return .{
-        .missing = "this session ran out of memory before its flake inputs were fetched",
-    };
+    const chain = try arena.alloc([]const u8, chain_links.len + 1);
     for (chain_links, chain[0..chain_links.len]) |link, *slot| slot.* = link.agent_kind;
     chain[chain_links.len] = agent_kind;
 
-    const wanted = switch (chock_nix.inputs.wantsOf(arena, lock_bytes) catch return .{}) {
+    const wanted = switch (try chock_nix.inputs.wantsOf(arena, lock_bytes)) {
         .hosts => |list| list,
         else => &.{},
     };
@@ -4697,7 +4695,8 @@ fn fetchFlakeInputs(
         gate.gate(),
         project_root,
         lock_bytes,
-    ) catch {
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (diag) |*fault| tty.print(.warn, "chock: {f}\n", .{fault});
         return .{
             .wanted = wanted,
@@ -4719,14 +4718,29 @@ fn fetchFlakeInputs(
     }
 }
 
-fn readProjectLock(arena: std.mem.Allocator, io: std.Io, project_root: []const u8) ?[]const u8 {
-    const path = std.fs.path.join(arena, &.{ project_root, "flake.lock" }) catch return null;
+fn readProjectLock(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+) std.mem.Allocator.Error!?[]const u8 {
+    const path = try std.fs.path.join(arena, &.{ project_root, "flake.lock" });
     return std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
         arena,
         .limited(chock_nix.inputs.max_lock_bytes),
-    ) catch null;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+}
+
+test "project lock discovery preserves allocation failures" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        readProjectLock(failing.allocator(), testing.io, "/project"),
+    );
 }
 
 /// The installables a person named, with `--with` or in `.nix.packages`, built
@@ -11003,7 +11017,7 @@ const NixBuildToolRunner = struct {
         gate: chock_nix.fetch.Gate,
         installable: []const u8,
     ) std.mem.Allocator.Error!FlakeInputs {
-        const lock_bytes = readProjectLock(self.arena, io, settings.workspace_root) orelse return .{
+        const lock_bytes = (try readProjectLock(self.arena, io, settings.workspace_root)) orelse return .{
             .missing = "there is no flake.lock in the workspace, so nothing says where its " ++
                 "inputs come from.",
         };
