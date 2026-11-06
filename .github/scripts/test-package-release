@@ -4,6 +4,8 @@ set -eu
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT HUP INT TERM
+export SOURCE_DATE_EPOCH=946684800
+export TZ=UTC
 
 mkdir -p "$scratch/input" "$scratch/artifacts" "$scratch/stage"
 printf 'binary\n' > "$scratch/input/chock"
@@ -30,6 +32,17 @@ printf '%s\n' \
   chock-test-linux/LICENSE \
   chock-test-linux/chock > "$scratch/expected-members"
 diff -u "$scratch/expected-members" "$scratch/members"
+tar --numeric-owner --full-time -tvzf \
+  "$scratch/artifacts/chock-test-linux.tar.gz" > "$scratch/metadata"
+awk '
+  $1 == "drwxr-xr-x" && $2 == "0/0" && $4 == "2000-01-01" &&
+    $5 == "00:00:00" && $6 == "chock-test-linux/" { root = 1 }
+  $1 == "-rw-r--r--" && $2 == "0/0" && $4 == "2000-01-01" &&
+    $5 == "00:00:00" && $6 == "chock-test-linux/LICENSE" { license = 1 }
+  $1 == "-rwxr-xr-x" && $2 == "0/0" && $4 == "2000-01-01" &&
+    $5 == "00:00:00" && $6 == "chock-test-linux/chock" { binary = 1 }
+  END { exit !(root && license && binary) }
+' "$scratch/metadata"
 mkdir "$scratch/unpacked"
 tar -xzf "$scratch/artifacts/chock-test-linux.tar.gz" -C "$scratch/unpacked"
 test -x "$scratch/unpacked/chock-test-linux/chock"
