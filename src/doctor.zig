@@ -1600,14 +1600,27 @@ fn measureDevShell(
     const dir = session_paths.devShellDir(arena, env, project_root) catch return .no_flake;
     session_paths.createDevShellDir(io, dir) catch return .no_flake;
 
-    var policy_diag: ?chock_policy.nix.Diagnostic = null;
-    defer if (policy_diag) |*d| d.deinit(arena);
-    const block = chock_policy.nix.load(arena, io, project_root, &policy_diag) catch |err| {
-        if (policy_diag) |*fault| return .{
+    var project_diag: ?chock_policy.nix.Diagnostic = null;
+    defer if (project_diag) |*d| d.deinit(arena);
+    const project = chock_policy.nix.load(arena, io, project_root, &project_diag) catch |err| {
+        if (project_diag) |*fault| return .{
             .failed = std.fmt.allocPrint(arena, "{f}", .{fault}) catch @errorName(err),
         };
         return .{ .failed = @errorName(err) };
     };
+
+    const operator = operator: {
+        const config_dir = chock_auth.paths.configDir(arena, env) catch break :operator chock_policy.nix.Nix{};
+        var operator_diag: ?chock_policy.nix.Diagnostic = null;
+        defer if (operator_diag) |*d| d.deinit(arena);
+        break :operator chock_policy.nix.loadOperator(arena, io, config_dir, &operator_diag) catch |err| {
+            if (operator_diag) |*fault| return .{
+                .failed = std.fmt.allocPrint(arena, "{f}", .{fault}) catch @errorName(err),
+            };
+            return .{ .failed = @errorName(err) };
+        };
+    };
+    const shell_name = project.dev_shell orelse operator.dev_shell;
 
     var shell_diag: ?chock_nix.Diagnostic = null;
     defer if (shell_diag) |*d| d.deinit(gpa);
@@ -1615,7 +1628,7 @@ fn measureDevShell(
     const loaded = chock_nix.DevShell.load(gpa, io, .{
         .project_root = project_root,
         .cache_dir = dir,
-        .shell_name = block.dev_shell,
+        .shell_name = shell_name,
         .host_env = env,
         .diag = &shell_diag,
     }) catch |err| {
@@ -2629,6 +2642,37 @@ test "an invalid nix block is a failed dev shell probe" {
         else => return error.TestUnexpectedResult,
     };
     try testing.expect(std.mem.indexOf(u8, reason, "dev_shell field must be a string") != null);
+}
+
+test "an invalid operator nix block is a failed dev shell probe" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "chock", .default_dir);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "chock/config.zon",
+        .data = ".{ .nix = .{ .dev_shell = 3 } }",
+    });
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", root);
+    try env.put("XDG_STATE_HOME", root);
+
+    const measured = measureDevShell(arena, gpa, io, &env, root, false);
+    const reason = switch (measured) {
+        .failed => |text| text,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(std.mem.indexOf(u8, reason, "dev_shell field must be a string") != null);
+    try testing.expect(std.mem.indexOf(u8, reason, "config.zon") != null);
 }
 
 test "a failed container runtime probe is not reported as not installed" {
