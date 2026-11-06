@@ -903,6 +903,7 @@ pub fn build(b: *std.Build) void {
     // Same reasoning as run_net_tests above.
     run_auth_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_auth_tests.step);
+    module_test_steps.add(b, "test-auth", "Run configuration and credential library tests only", &run_auth_tests.step);
 
     // check.zig's own tests need a real socket server, test/core/fake_provider.zig,
     // to drive std.http.Client against, and Zig 0.16 refuses a relative @import

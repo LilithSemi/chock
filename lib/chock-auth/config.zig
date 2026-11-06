@@ -741,6 +741,23 @@ fn readWholeFile(
 
 const testing = std.testing;
 
+test "the provider kind catalogue names every wire value once" {
+    const field_count = @typeInfo(Kind).@"enum".field_names.len;
+    var seen: [field_count]bool = @splat(false);
+    var count: usize = 0;
+    var names = std.mem.splitSequence(u8, Kind.all_wire_names, ", ");
+    while (names.next()) |name| {
+        const kind = Kind.fromWireName(name) orelse return error.UnknownCatalogueKind;
+        const index: usize = @intCast(@backingInt(kind));
+        try testing.expect(!seen[index]);
+        seen[index] = true;
+        count += 1;
+    }
+
+    try testing.expectEqual(field_count, count);
+    for (seen) |present| try testing.expect(present);
+}
+
 test "an instance with no name takes its kind as the name, and a named one keeps its own" {
     const gpa = testing.allocator;
     var config = try parse(gpa,
