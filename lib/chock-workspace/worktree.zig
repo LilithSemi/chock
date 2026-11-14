@@ -90,33 +90,15 @@ pub fn countUncommitted(
     project_root: []const u8,
     diag: ?*?Diagnostic,
 ) Error!Uncommitted {
-    var status_output = try git.run(allocator, io, env, project_root, status_argv, diag);
-    defer status_output.deinit(allocator);
-    switch (status_output.term) {
-        .exited => |code| if (code != 0) return error.GitFailed,
-        else => return error.GitFailed,
-    }
+    const found = try git.changes(allocator, io, env, project_root, diag) orelse return error.GitFailed;
+    defer git.freeChanges(allocator, found);
 
     var counts = Uncommitted{};
-    var seen_paths: std.StringHashMapUnmanaged(void) = .empty;
-    defer seen_paths.deinit(allocator);
-
-    var entries = std.mem.splitScalar(u8, status_output.stdout, 0);
-    while (entries.next()) |entry| {
-        if (entry.len < 4) continue; // too short to hold "XY " plus a path
-        const rel_path = entry[3..];
-        if (seen_paths.contains(rel_path)) continue;
-        try seen_paths.put(allocator, rel_path, {});
-        if (std.mem.startsWith(u8, entry, "??")) counts.untracked += 1 else counts.modified += 1;
+    for (found) |one| {
+        if (one.untracked) counts.untracked += 1 else counts.modified += 1;
     }
     return counts;
 }
-
-/// The one `git status` call this file makes, spelled once.
-const status_argv = &[_][]const u8{
-    "--no-optional-locks",   "status",       "--porcelain=v1", "-z",
-    "--untracked-files=all", "--no-renames",
-};
 
 pub const Worktree = struct {
     path: []u8,
@@ -247,10 +229,9 @@ pub const Worktree = struct {
         });
     }
 
-    /// `git status` runs with `--untracked-files=all`, `--no-renames`, and
-    /// `--no-optional-locks`, so a new file is named, a rename is two
-    /// entries, and the index is never rewritten. A path named twice is
-    /// imported once; one bad path does not abort the run.
+    /// A new file is named, a rename is two entries, and the index is never
+    /// rewritten. A path named twice is imported once; one bad path does not
+    /// abort the run.
     pub fn importUncommitted(
         self: Worktree,
         allocator: std.mem.Allocator,
@@ -258,28 +239,13 @@ pub const Worktree = struct {
         env: *const std.process.Environ.Map,
         diag: ?*?Diagnostic,
     ) Error!ImportReport {
-        var status_output = try git.run(allocator, io, env, self.project_root, status_argv, diag);
-        defer status_output.deinit(allocator);
-        switch (status_output.term) {
-            .exited => |code| if (code != 0) return error.GitFailed,
-            else => return error.GitFailed,
-        }
+        const found = try git.changes(allocator, io, env, self.project_root, diag) orelse return error.GitFailed;
+        defer git.freeChanges(allocator, found);
 
         var report = ImportReport{};
         errdefer report.deinit(allocator);
 
-        var seen_paths: std.StringHashMapUnmanaged(void) = .empty;
-        defer seen_paths.deinit(allocator);
-
-        // -z turns off git's own quoting, so slicing off the leading "XY " gives back the exact bytes.
-        var entries = std.mem.splitScalar(u8, status_output.stdout, 0);
-        while (entries.next()) |entry| {
-            if (entry.len < 4) continue; // too short to hold "XY " plus a path
-            const rel_path = entry[3..];
-            if (seen_paths.contains(rel_path)) continue;
-            try seen_paths.put(allocator, rel_path, {});
-            try self.importPath(allocator, io, entry, &report);
-        }
+        for (found) |one| try self.importPath(allocator, io, one, &report);
 
         return report;
     }
@@ -288,10 +254,10 @@ pub const Worktree = struct {
         self: Worktree,
         allocator: std.mem.Allocator,
         io: std.Io,
-        entry: []const u8,
+        change: git.Change,
         report: *ImportReport,
     ) Error!void {
-        const rel_path = entry[3..];
+        const rel_path = change.path;
         try validateRelativePath(rel_path);
 
         const source_path = try std.fs.path.join(allocator, &.{ self.project_root, rel_path });
@@ -306,8 +272,7 @@ pub const Worktree = struct {
 
         const found_kind = kind orelse return removeFromWorktree(allocator, io, rel_path, target_path, report);
 
-        // "??" is the code --untracked-files=all gives a path git never tracked.
-        const is_new = std.mem.startsWith(u8, entry, "??");
+        const is_new = change.untracked;
 
         switch (found_kind) {
             .file => return copyRegularFile(allocator, io, rel_path, source_path, target_path, is_new, report),
@@ -438,14 +403,9 @@ pub const Worktree = struct {
         env: *const std.process.Environ.Map,
         diag: ?*?Diagnostic,
     ) Error![]u8 {
-        var reading_env = try env.clone(allocator);
-        defer reading_env.deinit();
-        try reading_env.put("GIT_ALTERNATE_OBJECT_DIRECTORIES", self.object_store_source);
-        // The session's own HEAD is in the copy, so GIT_DIR points this read at it instead.
-        if (self.worktree_meta_is_copy) {
-            try reading_env.put("GIT_DIR", self.worktree_meta_bind_source);
-        }
-        return readHeadWith(allocator, io, &reading_env, self.path, diag);
+        // The session's own HEAD is in the copy, so it is read from there instead.
+        const git_dir: ?[]const u8 = if (self.worktree_meta_is_copy) self.worktree_meta_bind_source else null;
+        return readHeadWith(allocator, io, env, self.path, git_dir, diag);
     }
 
     /// An idle session answers false; a session that changed nothing cannot make the project dirty.
@@ -472,14 +432,7 @@ pub const Worktree = struct {
         env: *const std.process.Environ.Map,
         diag: ?*?Diagnostic,
     ) Error!void {
-        var output = try git.run(allocator, io, env, self.project_root, &.{
-            "worktree", "remove", "--force", self.path,
-        }, diag);
-        defer output.deinit(allocator);
-        const failed = switch (output.term) {
-            .exited => |code| code != 0,
-            else => true,
-        };
+        const failed = try removeLinked(allocator, io, env, self.project_root, self.worktree_id, self.path, diag);
 
         deleteFileAbsolute(io, self.pointer_path, diag) catch {};
         // The project's own real config.worktree is never touched here.
@@ -619,23 +572,12 @@ pub fn createAtWithLayout(
     const worktree_path = try std.fs.path.join(allocator, &.{ scratch_dir, session_id });
     errdefer allocator.free(worktree_path);
 
-    var add_output = try git.run(allocator, io, env, project_root, &.{
-        "worktree", "add", "--detach", worktree_path, revision,
-    }, diag);
-    defer add_output.deinit(allocator);
-    switch (add_output.term) {
-        .exited => |code| if (code != 0) return error.GitFailed,
-        else => return error.GitFailed,
-    }
-    // From here on the worktree is registered; a failure below must undo that.
-    errdefer cleanupFailedAdd(allocator, io, env, project_root, worktree_path);
-
-    const dotgit_path = try std.fs.path.join(allocator, &.{ worktree_path, ".git" });
-    defer allocator.free(dotgit_path);
-    const worktree_id = try readWorktreeId(allocator, io, dotgit_path, diag);
+    const worktree_id = try addLinked(allocator, io, env, project_root, session_id, worktree_path, revision, diag);
     errdefer allocator.free(worktree_id);
+    // From here on the worktree is registered; a failure below must undo that.
+    errdefer cleanupFailedAdd(allocator, io, env, project_root, worktree_id, worktree_path);
 
-    const base_commit = try readHeadWith(allocator, io, env, worktree_path, diag);
+    const base_commit = try readHeadWith(allocator, io, env, worktree_path, null, diag);
     errdefer allocator.free(base_commit);
 
     const project_root_owned = try allocator.dupe(u8, project_root);
@@ -1037,15 +979,10 @@ fn readHeadWith(
     io: std.Io,
     env: *const std.process.Environ.Map,
     worktree_path: []const u8,
+    git_dir: ?[]const u8,
     diag: ?*?Diagnostic,
 ) Error![]u8 {
-    var output = try git.run(allocator, io, env, worktree_path, &.{ "rev-parse", "HEAD" }, diag);
-    defer output.deinit(allocator);
-    switch (output.term) {
-        .exited => |code| if (code != 0) return error.GitFailed,
-        else => return error.GitFailed,
-    }
-    return allocator.dupe(u8, std.mem.trimEnd(u8, output.stdout, "\n"));
+    return try git.headCommit(allocator, io, env, worktree_path, git_dir, diag) orelse error.GitFailed;
 }
 
 fn validateSessionId(session_id: []const u8) Error!void {
@@ -1055,17 +992,93 @@ fn validateSessionId(session_id: []const u8) Error!void {
     if (std.mem.indexOfScalar(u8, session_id, '/') != null) return error.InvalidSessionId;
 }
 
-fn cleanupFailedAdd(
+/// ziggit names the worktree `name` and refuses when that is taken. git picks a free name,
+/// so the name comes back from the `.git` file when git did the work.
+fn addLinked(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    name: []const u8,
+    worktree_path: []const u8,
+    revision: []const u8,
+    diag: ?*?Diagnostic,
+) Error![]u8 {
+    git.addWorktree(allocator, io, env, project_root, name, worktree_path, revision, diag) catch |err| switch (err) {
+        error.Unsupported => return addLinkedByGit(allocator, io, env, project_root, worktree_path, revision, diag),
+        error.Refused => return error.GitFailed,
+        else => |e| return e,
+    };
+    return allocator.dupe(u8, name);
+}
+
+fn addLinkedByGit(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
     project_root: []const u8,
     worktree_path: []const u8,
-) void {
-    var output = git.run(allocator, io, env, project_root, &.{
+    revision: []const u8,
+    diag: ?*?Diagnostic,
+) Error![]u8 {
+    var output = try git.run(allocator, io, env, project_root, &.{
+        "worktree", "add", "--detach", worktree_path, revision,
+    }, diag);
+    defer output.deinit(allocator);
+    switch (output.term) {
+        .exited => |code| if (code != 0) return error.GitFailed,
+        else => return error.GitFailed,
+    }
+    const dotgit_path = try std.fs.path.join(allocator, &.{ worktree_path, ".git" });
+    defer allocator.free(dotgit_path);
+    return readWorktreeId(allocator, io, dotgit_path, diag);
+}
+
+/// True when the worktree could not be removed.
+fn removeLinked(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    worktree_id: []const u8,
+    worktree_path: []const u8,
+    diag: ?*?Diagnostic,
+) Error!bool {
+    git.removeWorktree(allocator, io, env, project_root, worktree_id, diag) catch |err| switch (err) {
+        error.Unsupported => return removeLinkedByGit(allocator, io, env, project_root, worktree_path, diag),
+        error.Refused => return true,
+        else => |e| return e,
+    };
+    return false;
+}
+
+fn removeLinkedByGit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    worktree_path: []const u8,
+    diag: ?*?Diagnostic,
+) Error!bool {
+    var output = try git.run(allocator, io, env, project_root, &.{
         "worktree", "remove", "--force", worktree_path,
-    }, null) catch return;
-    output.deinit(allocator);
+    }, diag);
+    defer output.deinit(allocator);
+    return switch (output.term) {
+        .exited => |code| code != 0,
+        else => true,
+    };
+}
+
+fn cleanupFailedAdd(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    worktree_id: []const u8,
+    worktree_path: []const u8,
+) void {
+    _ = removeLinked(allocator, io, env, project_root, worktree_id, worktree_path, null) catch {};
 }
 
 fn readWorktreeId(
@@ -1482,7 +1495,7 @@ test "finding 4: the copy holds what git worktree add wrote, and a commondir a h
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
     errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
-    for ([_][]const u8{ "HEAD", "index", "gitdir", "logs/HEAD" }) |name| {
+    for ([_][]const u8{ "HEAD", "index", "gitdir", "logs" }) |name| {
         const in_copy = try std.fs.path.join(allocator, &.{ worktree.worktree_meta_bind_source, name });
         defer allocator.free(in_copy);
         try std.testing.expect(try existsOnDisk(std.testing.io, in_copy));
@@ -1828,11 +1841,7 @@ test "remove frees its memory and deletes the pointer file even when git worktre
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
 
-    var commondir_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const commondir_path = try std.fmt.bufPrintSentinel(&commondir_buffer, "{s}/commondir", .{worktree.worktree_meta_source}, 0);
-    var commondir_file = try std.Io.Dir.createFileAbsolute(std.testing.io, commondir_path, .{});
-    try commondir_file.writeStreamingAll(std.testing.io, "/nonexistent\n");
-    commondir_file.close(std.testing.io);
+    try std.Io.Dir.cwd().deleteTree(std.testing.io, worktree.worktree_meta_source);
 
     const pointer_path = try allocator.dupe(u8, worktree.pointer_path);
     defer allocator.free(pointer_path);
@@ -3123,4 +3132,226 @@ test "adopt binds the project's own config.worktree when the project has one" {
         taken.worktree_config_worktree_source,
     );
     try made.remove(allocator, std.testing.io, &project.env, null);
+}
+
+test "git accepts a worktree that ziggit made, and works inside it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    var made = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
+    defer made.remove(allocator, std.testing.io, &project.env, null) catch {};
+    try std.testing.expectEqualStrings("sess1", made.worktree_id);
+
+    var status = try git.run(allocator, std.testing.io, &project.env, made.path, &.{ "status", "--porcelain" }, null);
+    defer status.deinit(allocator);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, status.term);
+    try std.testing.expectEqualStrings("", status.stdout);
+
+    var head = try git.run(allocator, std.testing.io, &project.env, made.path, &.{ "rev-parse", "HEAD" }, null);
+    defer head.deinit(allocator);
+    try std.testing.expectEqualStrings(project.head_sha, std.mem.trimEnd(u8, head.stdout, "\n"));
+
+    var list = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "worktree", "list", "--porcelain" }, null);
+    defer list.deinit(allocator);
+    const want_line = try std.fmt.allocPrint(allocator, "worktree {s}\nHEAD {s}\ndetached\n", .{ made.path, project.head_sha });
+    defer allocator.free(want_line);
+    try std.testing.expect(std.mem.indexOf(u8, list.stdout, want_line) != null);
+
+    var fsck = try git.run(allocator, std.testing.io, &project.env, made.path, &.{"fsck"}, null);
+    defer fsck.deinit(allocator);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, fsck.term);
+
+    const new_path = try std.fs.path.join(allocator, &.{ made.path, "new.txt" });
+    defer allocator.free(new_path);
+    var edit = try std.Io.Dir.createFileAbsolute(std.testing.io, new_path, .{});
+    edit.close(std.testing.io);
+    var add = try git.run(allocator, std.testing.io, &project.env, made.path, &.{ "add", "new.txt" }, null);
+    defer add.deinit(allocator);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, add.term);
+    var commit = try git.run(allocator, std.testing.io, &project.env, made.path, &.{ "-c", "user.name=Test", "-c", "user.email=t@example.com", "commit", "-m", "inside" }, null);
+    defer commit.deinit(allocator);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, commit.term);
+
+    var moved = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "rev-parse", "HEAD" }, null);
+    defer moved.deinit(allocator);
+    try std.testing.expectEqualStrings(project.head_sha, std.mem.trimEnd(u8, moved.stdout, "\n"));
+}
+
+test "a worktree ziggit made can be removed by git, and ziggit removes one git made" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    var made = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
+    defer made.keep(allocator);
+    var removed = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "worktree", "remove", "--force", made.path }, null);
+    defer removed.deinit(allocator);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, removed.term);
+
+    const by_git = try std.fs.path.join(allocator, &.{ project.scratch_path, "bygit" });
+    defer allocator.free(by_git);
+    var added = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "worktree", "add", "--detach", by_git, "HEAD" }, null);
+    defer added.deinit(allocator);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, added.term);
+    try git.removeWorktree(allocator, std.testing.io, &project.env, project.root_path, "bygit", null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, by_git, .{}));
+}
+
+test "a session id that names a worktree already registered is refused" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    var first = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
+    defer first.remove(allocator, std.testing.io, &project.env, null) catch {};
+
+    const other = try std.fs.path.join(allocator, &.{ project.scratch_path, "elsewhere" });
+    defer allocator.free(other);
+    try std.testing.expectError(
+        error.Refused,
+        git.addWorktree(allocator, std.testing.io, &project.env, project.root_path, "sess1", other, "HEAD", null),
+    );
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, other, .{}));
+}
+
+test "a project with a config.worktree gets its worktree from git, with the config copied" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    const config_path = try std.fs.path.join(allocator, &.{ project.root_path, ".git", "config.worktree" });
+    defer allocator.free(config_path);
+    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, config_path, .{});
+    file.close(std.testing.io);
+
+    const target = try std.fs.path.join(allocator, &.{ project.scratch_path, "sess1" });
+    defer allocator.free(target);
+    try std.testing.expectError(
+        error.Unsupported,
+        git.addWorktree(allocator, std.testing.io, &project.env, project.root_path, "sess1", target, "HEAD", null),
+    );
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, target, .{}));
+}
+
+fn gitOk(allocator: std.mem.Allocator, project: *TestProject, cwd: []const u8, argv: []const []const u8) !void {
+    var output = try git.run(allocator, std.testing.io, &project.env, cwd, argv, null);
+    defer output.deinit(allocator);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, output.term);
+}
+
+fn projectFile(allocator: std.mem.Allocator, project: *TestProject, rel: []const u8, contents: []const u8) !void {
+    const path = try std.fs.path.joinZ(allocator, &.{ project.root_path, rel });
+    defer allocator.free(path);
+    if (std.fs.path.dirname(rel)) |dir| {
+        const dir_path = try std.fs.path.join(allocator, &.{ project.root_path, dir });
+        defer allocator.free(dir_path);
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, dir_path);
+    }
+    try writeFile(path, contents);
+}
+
+/// The session worktree must hold the bytes real git writes, and ziggit must have declined it.
+fn expectGitFilteredCheckout(allocator: std.mem.Allocator, project: *TestProject, tracked: []const u8, want: []const u8) !void {
+    const probe = try std.fs.path.join(allocator, &.{ project.scratch_path, "probe" });
+    defer allocator.free(probe);
+    try std.testing.expectError(
+        error.Unsupported,
+        git.addWorktree(allocator, std.testing.io, &project.env, project.root_path, "probe", probe, "HEAD", null),
+    );
+
+    const oracle = try std.fs.path.join(allocator, &.{ project.scratch_path, "oracle" });
+    defer allocator.free(oracle);
+    try gitOk(allocator, project, project.root_path, &.{ "worktree", "add", "--detach", oracle, "HEAD" });
+    const oracle_file = try std.fs.path.join(allocator, &.{ oracle, tracked });
+    defer allocator.free(oracle_file);
+    const expected = try readFile(allocator, oracle_file);
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(want, expected);
+
+    var made = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
+    defer made.remove(allocator, std.testing.io, &project.env, null) catch {};
+    const made_file = try std.fs.path.join(allocator, &.{ made.path, tracked });
+    defer allocator.free(made_file);
+    const got = try readFile(allocator, made_file);
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+test "a clean and smudge filter makes the worktree come from git" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    try gitOk(allocator, &project, project.root_path, &.{ "config", "filter.up.smudge", "tr a-z A-Z" });
+    try gitOk(allocator, &project, project.root_path, &.{ "config", "filter.up.clean", "cat" });
+    try projectFile(allocator, &project, ".gitattributes", "tracked.txt filter=up\n");
+    try gitOk(allocator, &project, project.root_path, &.{ "add", ".gitattributes" });
+    try gitOk(allocator, &project, project.root_path, &.{ "commit", "-m", "filter" });
+
+    try expectGitFilteredCheckout(allocator, &project, "tracked.txt", "HELLO\n");
+}
+
+test "core.autocrlf makes the worktree come from git" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    try gitOk(allocator, &project, project.root_path, &.{ "config", "core.autocrlf", "true" });
+    try expectGitFilteredCheckout(allocator, &project, "tracked.txt", "hello\r\n");
+}
+
+test "an eol attribute in a subdirectory makes the worktree come from git" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    try projectFile(allocator, &project, "sub/.gitattributes", "*.txt text eol=crlf\n");
+    try projectFile(allocator, &project, "sub/a.txt", "line\n");
+    try gitOk(allocator, &project, project.root_path, &.{ "add", "sub" });
+    try gitOk(allocator, &project, project.root_path, &.{ "commit", "-m", "sub" });
+
+    try expectGitFilteredCheckout(allocator, &project, "sub/a.txt", "line\r\n");
+}
+
+test "an eol attribute in info/attributes makes the worktree come from git" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    try projectFile(allocator, &project, ".git/info/attributes", "*.txt text eol=crlf\n");
+    try expectGitFilteredCheckout(allocator, &project, "tracked.txt", "hello\r\n");
+}
+
+test "an attribute that does not change file bytes leaves the worktree to ziggit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    try projectFile(allocator, &project, ".gitattributes", "# comment\n*.png binary -diff\n*.zig diff=zig\n");
+    try gitOk(allocator, &project, project.root_path, &.{ "add", ".gitattributes" });
+    try gitOk(allocator, &project, project.root_path, &.{ "commit", "-m", "attrs" });
+
+    const target = try std.fs.path.join(allocator, &.{ project.scratch_path, "plain" });
+    defer allocator.free(target);
+    try git.addWorktree(allocator, std.testing.io, &project.env, project.root_path, "plain", target, "HEAD", null);
+    try git.removeWorktree(allocator, std.testing.io, &project.env, project.root_path, "plain", null);
 }

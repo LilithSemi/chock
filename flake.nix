@@ -75,6 +75,12 @@
         };
       };
 
+      nixosModules.chock-daemon = import ./nix/modules/nixos-daemon.nix;
+      homeManagerModules = {
+        default = import ./nix/modules/home-manager.nix;
+        chock = import ./nix/modules/home-manager.nix;
+      };
+
       devShells = forAllSystems (
         { pkgs, ... }:
         {
@@ -129,6 +135,11 @@
         {
           inherit (pkgs) chock;
           formatting = treefmtEval.${system}.config.build.check self;
+        }
+        // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
+          nixos-daemon = import ./nix/tests/daemon.nix { inherit pkgs self; };
+          nixos-daemon-local = import ./nix/tests/daemon-local.nix { inherit pkgs self; };
+          nixos-daemon-git-forge = import ./nix/tests/daemon-git-forge.nix { inherit pkgs self; };
         }
       );
     };

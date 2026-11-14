@@ -637,7 +637,7 @@ fn removeProjectIdentity(
     if (still_set) return error.TheProjectStillStatesAnIdentity;
 }
 
-test "a bare git commit inside the sandbox succeeds on a project that states no identity, and the commit is Chock's own" {
+fn commitInsideSandbox(configured: ?struct { name: []const u8, email: []const u8 }, expected: []const u8) !void {
     // `git config` cannot make an identity because the whole of `.git` is mounted read only. No `-c` flag anywhere here.
     const allocator = std.testing.allocator;
 
@@ -652,6 +652,9 @@ test "a bare git commit inside the sandbox succeeds on a project that states no 
 
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+    var identity_arena = std.heap.ArenaAllocator.init(allocator);
+    defer identity_arena.deinit();
+    if (configured) |identity| try workspace.useIdentity(identity_arena.allocator(), .{ .name = identity.name, .email = identity.email });
 
     const wt = workspace.kind.worktree;
 
@@ -683,8 +686,19 @@ test "a bare git commit inside the sandbox succeeds on a project that states no 
 
     // Both: git takes author and committer from separate variables.
     try std.testing.expectEqualStrings(
-        "Chock\nchock@lilithsemi.com\nChock\nchock@lilithsemi.com",
+        expected,
         std.mem.trimEnd(u8, shown.stdout, "\n"),
+    );
+}
+
+test "a bare git commit inside the sandbox succeeds on a project that states no identity, and the commit is Chock's own" {
+    try commitInsideSandbox(null, "chock\nchock@localhost\nchock\nchock@localhost");
+}
+
+test "a bare git commit inside the sandbox carries the identity the project configured" {
+    try commitInsideSandbox(
+        .{ .name = "Acme Bot", .email = "bot@acme.com" },
+        "Acme Bot\nbot@acme.com\nAcme Bot\nbot@acme.com",
     );
 }
 
@@ -1241,4 +1255,27 @@ test "adopt takes the deny list from the project, not from the checkout it inher
 
     const term = try runProbe(allocator, &second, root_tmp, "read", target);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+}
+
+test "git inside the sandbox has automatic maintenance switched off" {
+    const allocator = std.testing.allocator;
+
+    const git_path = (try findGitOnPath(allocator, std.testing.io)) orelse return error.SkipZigTest;
+    defer allocator.free(git_path);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .exited = 0 },
+        try runProbe(allocator, &workspace, root_tmp, "git-maintenance-off", git_path),
+    );
 }

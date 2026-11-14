@@ -8,7 +8,7 @@ Start with [running.md](running.md) for a session end to end.
 
 ## Using a session
 
-- [using/tools.md](using/tools.md) - the 25 tools, what each one asks for, how
+- [using/tools.md](using/tools.md) - the 26 tools, what each one asks for, how
   every call is gated, and `provide_tool` for a program the session has not
   got.
 - [using/nix.md](using/nix.md) - `nix_eval` and `nix_build`, what a build may
@@ -79,6 +79,8 @@ Start with [running.md](running.md) for a session end to end.
 
 - [operate/daemon.md](operate/daemon.md) - `chock daemon`, `chock serve`, the
   control protocol, and handing a session over with `chock detach`.
+- [operate/service.md](operate/service.md) - authenticated multi-user operation,
+  SQL coordination, shared sessions, hosting modes, lifecycle, and Nix deployment.
 - [operate/toolchains.md](operate/toolchains.md) - the dev shell, a container
   image instead, where a compiler writes, and every path in a tool call's mount
   tree.

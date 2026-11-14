@@ -375,17 +375,25 @@ pub fn pruneWorktrees(
     const is_repository = chock_workspace.git.isRepository(arena, io, env, project_root, null) catch return;
     if (!is_repository) return;
 
+    if (chock_workspace.git.pruneWorktrees(arena, io, env, project_root, null)) |_| {
+        return;
+    } else |err| switch (err) {
+        error.Unsupported => {},
+        else => {
+            tty.print(.err, prune_hint, .{ project_root, @errorName(err), project_root });
+            return;
+        },
+    }
+
     var output = chock_workspace.git.run(arena, io, env, project_root, &.{ "worktree", "prune" }, null) catch |err| {
-        tty.print(
-            .err,
-            "chock workspace: the worktree records in {s} could not be pruned ({s}). " ++
-                "Run: git -C {s} worktree prune\n",
-            .{ project_root, @errorName(err), project_root },
-        );
+        tty.print(.err, prune_hint, .{ project_root, @errorName(err), project_root });
         return;
     };
     defer output.deinit(arena);
 }
+
+const prune_hint = "chock workspace: the worktree records in {s} could not be pruned ({s}). " ++
+    "Run: git -C {s} worktree prune\n";
 
 const ParseError = error{ HelpWanted, BadArguments };
 
@@ -1026,13 +1034,11 @@ pub fn selectWorkspace(
     const commit = selectionGit(arena, io, &git_env, project_root, &.{ "commit-tree", tree, "-p", opened.base_commit, "-m", message }) catch
         return Exit.faulted.code();
     const result_ref = std.fmt.allocPrint(arena, "refs/chock/selected/{s}", .{session_id}) catch return Exit.faulted.code();
-    var previous = chock_workspace.git.run(arena, io, &git_env, project_root, &.{ "rev-parse", "--verify", result_ref }, null) catch
+    var ref_diag: ?chock_workspace.Diagnostic = null;
+    const expected = chock_workspace.git.resolveRef(arena, io, &git_env, project_root, result_ref, &ref_diag) catch |err| {
+        sayRefFault("select", result_ref, err, ref_diag);
         return Exit.faulted.code();
-    defer previous.deinit(arena);
-    const expected = switch (previous.term) {
-        .exited => |code| if (code == 0) std.mem.trimEnd(u8, previous.stdout, "\n") else "",
-        else => "",
-    };
+    } orelse "";
     _ = selectionGit(arena, io, &git_env, project_root, &.{ "update-ref", result_ref, commit, expected }) catch return Exit.refused.code();
 
     const accepted = selectionNames(arena, options.paths, options.hunks) catch return Exit.faulted.code();
@@ -1177,6 +1183,14 @@ fn applyWholePatch(
     const oid = patch.new_oid.?.toHex(&oid_buffer);
     const mode = try std.fmt.allocPrint(arena, "{o}", .{@backingInt(patch.new_mode.?)});
     _ = try selectionGit(arena, io, env, project_root, &.{ "update-index", "--add", "--cacheinfo", mode, oid, patch.new_path });
+}
+
+fn sayRefFault(command: []const u8, ref: []const u8, err: anyerror, diag: ?chock_workspace.Diagnostic) void {
+    if (diag) |held| {
+        tty.print(.err, "chock workspace {s}: {s} could not be read: {s} ({f})\n", .{ command, ref, @errorName(err), &held });
+    } else {
+        tty.print(.err, "chock workspace {s}: {s} could not be read: {s}\n", .{ command, ref, @errorName(err) });
+    }
 }
 
 fn selectionGit(
@@ -1469,7 +1483,15 @@ pub fn undoSelection(
         }
     }
     const result_ref = std.fmt.allocPrint(arena, "refs/chock/selected/{s}", .{session_id}) catch return Exit.faulted.code();
-    const previous = selectionGit(arena, io, env, project_root, &.{ "rev-parse", "--verify", result_ref }) catch return Exit.usage.code();
+    var ref_diag: ?chock_workspace.Diagnostic = null;
+    const found = chock_workspace.git.resolveRef(arena, io, env, project_root, result_ref, &ref_diag) catch |err| {
+        sayRefFault("undo", result_ref, err, ref_diag);
+        return Exit.faulted.code();
+    };
+    const previous = found orelse {
+        tty.print(.err, "chock workspace undo: there is no result at {s}.\n", .{result_ref});
+        return Exit.usage.code();
+    };
     _ = selectionGit(arena, io, env, project_root, &.{ "update-ref", "-d", result_ref, previous }) catch return Exit.refused.code();
     recordSelection(arena, io, log_path, session_id, .{ .source = result_ref, .result = "", .undone = true }) catch {
         _ = selectionGit(arena, io, env, project_root, &.{ "update-ref", result_ref, previous, "" }) catch {};

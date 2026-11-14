@@ -22,34 +22,56 @@ jobs:
     with:
       fail-fast: false
 
-  test-sandbox:
-    # **Not held behind DeterminateCI, unlike the artefact build.** This is the
-    # job that proves the sandbox, so it is the one whose failure a person most
-    # wants early. It shares the cache, so it builds little that DeterminateCI
-    # has not already built.
+  # **Desktop binaries are built by nix on their native runners.** The macOS
+  # driver links the Security framework, which needs the macOS SDK, and a Linux
+  # runner has none. No x86 target is ever built or emulated on an ARM runner.
+  build:
+    # **Not held behind DeterminateCI.** This job proves the sandbox, so it is
+    # the one whose failure a person most wants early, and waiting would only
+    # pay for itself if the two jobs shared a cache.
     permissions:
       id-token: write
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux
+          # **Apple Silicon only, and no `x86_64-macos`.** macOS 27 shipped on
+          # 2026-09-14 and dropped every Intel Mac; Tahoe 26 was the last
+          # release that ran on one, and it holds security updates only into
+          # 2028. A new tool shipping an Intel Mac binary now is building for a
+          # platform that ended this month.
+          - runner: macos-latest
+            target: aarch64-darwin
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
 
-      - name: Test the release helpers
+      - name: Require the native runner architecture
+        env:
+          CHOCK_RELEASE_TARGET: ${{ matrix.target }}
         run: |
-          .github/scripts/test-release-version
-          .github/scripts/test-publish-tagged-release
-          .github/scripts/test-publish-rolling-release
+          set -euo pipefail
+          case "${CHOCK_RELEASE_TARGET}:$(uname -m)" in
+            x86_64-linux:x86_64|aarch64-linux:aarch64|aarch64-darwin:arm64)
+              ;;
+            *)
+              echo "::error::refusing to build ${CHOCK_RELEASE_TARGET} on $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
 
       - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3 # v3
 
+      # **So this job reads what DeterminateCI already built.** Without it every
+      # runner rebuilds the same derivations from source.
       - uses: DeterminateSystems/flakehub-cache-action@3ac6f3c19fc52eeb1408fd434bd1b4ed4266bf25 # v3
-
-      - name: Test reproducible release packaging
-        run: nix develop .#release --command .github/scripts/test-package-release
 
       - name: Permit the nested user namespace
         if: runner.os == 'Linux'
@@ -130,48 +152,6 @@ jobs:
           fi
           nix develop --command zig build test --summary all
 
-  # **Every platform is built by nix on its own runner, and nothing is cross
-  # compiled.** The macOS driver links the Security framework, which needs the
-  # macOS SDK, and a Linux runner has none: a cross compile of it fails at the
-  # link. Building each system natively also means the artefact a reader
-  # downloads is the derivation CI checked, and not a second build made a
-  # different way.
-  build:
-    # **After DeterminateCI, and not beside it.** That job already builds the
-    # flake on every platform, so running this one first would build the same
-    # derivations twice and would do it again on a commit DeterminateCI was
-    # about to reject. Waiting costs wall clock and saves the work.
-    needs: [DeterminateCI]
-    permissions:
-      id-token: write
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            target: x86_64-linux
-          - runner: ubuntu-24.04-arm
-            target: aarch64-linux
-          # **Apple Silicon only, and no `x86_64-macos`.** macOS 27 shipped on
-          # 2026-09-14 and dropped every Intel Mac; Tahoe 26 was the last
-          # release that ran on one, and it holds security updates only into
-          # 2028. A new tool shipping an Intel Mac binary now is building for a
-          # platform that ended this month.
-          - runner: macos-latest
-            target: aarch64-darwin
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          fetch-depth: 0
-
-      - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3 # v3
-
-      # **So this job reads what DeterminateCI already built.** Without it every
-      # runner rebuilds the same derivations from source.
-      - uses: DeterminateSystems/flakehub-cache-action@3ac6f3c19fc52eeb1408fd434bd1b4ed4266bf25 # v3
-
       - name: Build and package this platform
         run: |
           set -euo pipefail
@@ -238,9 +218,16 @@ jobs:
             shapes+=("chock-${{ matrix.target }}")
           fi
           for shape in "${shapes[@]}"; do
-            nix develop .#release --command \
-              ./.github/scripts/package-release artifacts stage "${shape}" \
-              result/bin/chock LICENSE README.md
+            if [ "${RUNNER_OS}" = "macOS" ]; then
+              nix develop .#release --command env \
+                "CHOCK_CODESIGN_ENTITLEMENTS=${GITHUB_WORKSPACE}/build/hypervisor.plist" \
+                ./.github/scripts/package-release artifacts stage "${shape}" \
+                result/bin/chock LICENSE README.md
+            else
+              nix develop .#release --command \
+                ./.github/scripts/package-release artifacts stage "${shape}" \
+                result/bin/chock LICENSE README.md
+            fi
           done
 
           if [ -n "${guest_kernel_name}" ]; then
@@ -275,17 +262,16 @@ jobs:
             mkdir verify-macos
             tar -xzf "${mac_archive}" -C verify-macos
             mac_binary="verify-macos/${shapes[0]}/chock"
+            entitlements_file="verify-macos/entitlements.plist"
             /usr/bin/codesign --verify --strict "${mac_binary}"
-            entitlements=$(
-              /usr/bin/codesign -d --entitlements :- "${mac_binary}" 2>/dev/null
-            )
-            case "${entitlements}" in
-              *'<key>com.apple.security.hypervisor</key>'*'<true/>'*) ;;
-              *)
-                echo "::error::the macOS binary lacks its Hypervisor entitlement" >&2
-                exit 1
-                ;;
-            esac
+            /usr/bin/codesign -d --entitlements :- "${mac_binary}" \
+              > "${entitlements_file}" 2>/dev/null
+            if ! /usr/libexec/PlistBuddy \
+              -c 'Print :com.apple.security.hypervisor' "${entitlements_file}" \
+              2>/dev/null | grep -qx true; then
+              echo "::error::the macOS binary lacks its Hypervisor entitlement" >&2
+              exit 1
+            fi
           fi
 
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -299,7 +285,7 @@ jobs:
   # was already on master. Publishing is what is held back, not building.
   success:
     if: always()
-    needs: [DeterminateCI, test-sandbox, build]
+    needs: [DeterminateCI, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -310,8 +296,8 @@ jobs:
       # **`if: always()` reports success whatever happened above**, so without
       # this a failed test would show a green gate. Cancelled and skipped count
       # too: a run somebody stopped, and a job that never ran because the job
-      # before it failed, have both proved nothing. None of the three jobs
-      # carries a condition of its own, so skipped can only mean that.
+      # before it failed, have both proved nothing. Neither job carries a
+      # condition of its own, so skipped can only mean that.
       - name: Refuse if anything this gate waits on did not pass
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
         run: |
@@ -322,9 +308,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Only the publishing steps below run nix, and they run on master and on
+      # a tag alone. A pull request installs nothing here.
       - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3 # v3
+        if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
 
       - uses: DeterminateSystems/flakehub-cache-action@3ac6f3c19fc52eeb1408fd434bd1b4ed4266bf25 # v3
+        if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
 
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:

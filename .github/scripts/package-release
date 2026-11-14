@@ -47,6 +47,27 @@ for source do
   fi
 done
 
+# The macOS release binary is copied and chmodded above. Re-sign that exact
+# staged file after its final mode is set so the archive carries the
+# Hypervisor entitlement and a valid ad-hoc code signature. Other package
+# shapes leave this unset and remain byte-for-byte unchanged by codesign.
+if [ -n "${CHOCK_CODESIGN_ENTITLEMENTS:-}" ]; then
+  test -x /usr/bin/codesign || {
+    echo "package-release: codesign is required when signing entitlements are configured" >&2
+    exit 1
+  }
+  test -f "$CHOCK_CODESIGN_ENTITLEMENTS" || {
+    echo "package-release: entitlement plist not found: $CHOCK_CODESIGN_ENTITLEMENTS" >&2
+    exit 1
+  }
+  test -f "$root/chock" || {
+    echo "package-release: entitlement signing requires a chock executable in the package" >&2
+    exit 1
+  }
+  /usr/bin/codesign --force --sign - \
+    --entitlements "$CHOCK_CODESIGN_ENTITLEMENTS" "$root/chock"
+fi
+
 tar --sort=name \
     --owner=0 --group=0 --numeric-owner \
     --mtime="@${SOURCE_DATE_EPOCH:-0}" \

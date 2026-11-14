@@ -8,6 +8,7 @@ pub const org = @import("chock-policy/org.zig");
 pub const access = @import("chock-policy/access.zig");
 pub const hardening = @import("chock-policy/hardening.zig");
 pub const apply = @import("chock-policy/apply.zig");
+pub const identity = @import("chock-policy/identity.zig");
 pub const limits = @import("chock-policy/limits.zig");
 pub const instructions = @import("chock-policy/instructions.zig");
 pub const context = @import("chock-policy/context.zig");

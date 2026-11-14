@@ -119,6 +119,21 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         addGitRuntimeMounts(arena, &mounts, &rules, git_path) catch return 3;
         const git_env = buildGitCommitEnv(arena, passed_env, false) catch return 3;
         return runGitPushFlow(arena, root, cwd, mounts.items, rules.items, git_env, url);
+    } else if (std.mem.eql(u8, op, "git-maintenance-off")) {
+        addGitRuntimeMounts(arena, &mounts, &rules, target_or_git) catch return 3;
+        const git_env = buildGitCommitEnv(arena, passed_env, false) catch return 3;
+        // The pattern argument makes the exit status say whether the value matched.
+        for ([_][]const []const u8{
+            &.{ "config", "--get", "gc.auto", "^0$" },
+            &.{ "config", "--get", "maintenance.auto", "^false$" },
+        }) |step| {
+            const term = runGitStep(arena, root, cwd, mounts.items, rules.items, git_env, step) orelse return 3;
+            if (!exitedZero(term)) {
+                std.debug.print("git did not report {s} as off\n", .{step[2]});
+                return 5;
+            }
+        }
+        return 0;
     } else if (std.mem.eql(u8, op, "git-commit") or std.mem.eql(u8, op, "git-alternate-tamper")) {
         addGitRuntimeMounts(arena, &mounts, &rules, target_or_git) catch return 3;
         const bogus_alternate = std.mem.eql(u8, op, "git-alternate-tamper");

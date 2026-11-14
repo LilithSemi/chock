@@ -33,8 +33,16 @@ pub const rules: []const table.Rule = &.{
 
     .{ .action = "secret.use.*", .decision = .ask },
 
-    // `git.push`, `git.clone`, `git.fetch`, `git.pull` and `git.unknown` are
-    // absent because each one reaches another host.
+    // `git.clone`, `git.fetch`, `git.pull` and `git.unknown` are absent because
+    // each one reaches another host. A push is denied, and a rule that names
+    // `git.push` does not name `git.push.force`, so force has its own row.
+    // A pack file makes the session's objects impossible to land, so the
+    // commands that write one are denied.
+    .{ .action = "git.push", .decision = .deny },
+    .{ .action = "git.push.force", .decision = .deny },
+    .{ .action = "git.gc", .decision = .deny },
+    .{ .action = "git.repack", .decision = .deny },
+    .{ .action = "git.prune", .decision = .deny },
     .{ .action = "git.add", .decision = .allow },
     .{ .action = "git.am", .decision = .allow },
     .{ .action = "git.apply", .decision = .allow },
@@ -48,17 +56,14 @@ pub const rules: []const table.Rule = &.{
     .{ .action = "git.config", .decision = .allow },
     .{ .action = "git.filter-branch", .decision = .allow },
     .{ .action = "git.fsck", .decision = .allow },
-    .{ .action = "git.gc", .decision = .allow },
     .{ .action = "git.hash-object", .decision = .allow },
     .{ .action = "git.init", .decision = .allow },
     .{ .action = "git.merge", .decision = .allow },
     .{ .action = "git.mv", .decision = .allow },
     .{ .action = "git.notes", .decision = .allow },
-    .{ .action = "git.prune", .decision = .allow },
     .{ .action = "git.rebase", .decision = .allow },
     .{ .action = "git.reflog", .decision = .allow },
     .{ .action = "git.remote", .decision = .allow },
-    .{ .action = "git.repack", .decision = .allow },
     .{ .action = "git.replace", .decision = .allow },
     .{ .action = "git.reset", .decision = .allow },
     .{ .action = "git.restore", .decision = .allow },
@@ -460,4 +465,34 @@ test "a project rule denying every exec class still denies a path that could not
 
     try std.testing.expectEqual(table.Decision.deny, t.evaluateKindAlone(key("exec.workspace.build%2Esh")));
     try std.testing.expectEqual(table.Decision.ask, t.evaluateKindAlone(key("exec.unparsed")));
+}
+
+test "a push, a forced push and every command that writes a pack answer deny with no chock.zon" {
+    const gpa = std.testing.allocator;
+    const t = try emptyTable(gpa);
+    defer table.Table.destroy(gpa, t);
+
+    const denied = [_][]const u8{ "git.push", "git.push.force", "git.gc", "git.repack", "git.prune" };
+    for (denied) |action| {
+        try std.testing.expectEqual(table.Decision.deny, t.evaluateKindAlone(key(action)));
+    }
+    try std.testing.expectEqual(table.Decision.allow, t.evaluateKindAlone(key("git.commit")));
+}
+
+test "a rule that asks for git.push does not let a forced push through" {
+    const gpa = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "git.push", .decision = .ask },
+        \\        },
+        \\    },
+        \\}
+    ;
+    const t = try table.Table.parse(gpa, source, null);
+    defer table.Table.destroy(gpa, t);
+
+    try std.testing.expectEqual(table.Decision.ask, t.evaluateKindAlone(key("git.push")));
+    try std.testing.expectEqual(table.Decision.deny, t.evaluateKindAlone(key("git.push.force")));
 }

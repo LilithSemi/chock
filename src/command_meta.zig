@@ -15,6 +15,7 @@ pub const entries = [_]Entry{
     .{ .name = "models", .summary = "List configured providers, models, and usable capabilities." },
     .{ .name = "daemon", .summary = "Own sessions, and answer every client that asks about one." },
     .{ .name = "serve", .summary = "Put a browser in front of a daemon. Owns no session itself." },
+    .{ .name = "worker", .summary = "Run a client-hosted daemon session on this machine." },
     .{ .name = "acp", .summary = "Speak the agent client protocol, so an editor can drive Chock." },
     .{ .name = "memory", .summary = "Read or clear the notes agents wrote about this project." },
     .{ .name = "cache", .summary = "Show or empty the toolchain cache this project's tool calls write." },

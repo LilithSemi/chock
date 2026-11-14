@@ -23,6 +23,7 @@ const fetch_mod = @import("fetch.zig");
 const search_mod = @import("search.zig");
 const ask_mod = @import("ask.zig");
 const handback_mod = @import("handback.zig");
+const commit_mod = @import("commit.zig");
 const hooks_mod = @import("hooks.zig");
 const redact = @import("redact.zig");
 
@@ -253,6 +254,7 @@ pub const Deps = struct {
     searcher: ?search_mod.Searcher = null,
     asker: ?ask_mod.Asker = null,
     handback: ?handback_mod.Handback = null,
+    committer: ?commit_mod.Committer = null,
     redact: redact.Policy = .{},
     /// The project's lifecycle hooks, in the order it wrote them.
     hooks: []const hooks_mod.Hook = &.{},
@@ -1380,7 +1382,7 @@ fn gateToolCall(
         if (!on_attribute.permitted) return try gateRefusal(
             allocator,
             call,
-            try arbiter_mod.refusalText(allocator, call.tool, on_attribute),
+            try refusalFor(allocator, call, actions.attribute, on_attribute),
         );
 
         const flake_action = actions.flake orelse return null;
@@ -1389,7 +1391,7 @@ fn gateToolCall(
         return try gateRefusal(
             allocator,
             call,
-            try arbiter_mod.refusalText(allocator, call.tool, on_flake),
+            try refusalFor(allocator, call, flake_action, on_flake),
         );
     }
 
@@ -1412,7 +1414,7 @@ fn gateToolCall(
         return try gateRefusal(
             allocator,
             call,
-            try arbiter_mod.refusalText(allocator, call.tool, answer),
+            try refusalFor(allocator, call, action, answer),
         );
     }
 
@@ -1431,7 +1433,7 @@ fn gateToolCall(
         return try gateRefusal(
             allocator,
             call,
-            try arbiter_mod.refusalText(allocator, call.tool, answer),
+            try refusalFor(allocator, call, action, answer),
         );
     }
 
@@ -1447,7 +1449,19 @@ fn gateToolCall(
     const answer = try decideAction(allocator, io, locked, deps, call, action);
     if (answer.permitted) return null;
 
-    return try gateRefusal(allocator, call, try arbiter_mod.refusalText(allocator, call.tool, answer));
+    return try gateRefusal(allocator, call, try refusalFor(allocator, call, action, answer));
+}
+
+/// A policy deny names the action, because the tool name alone does not say
+/// what was refused. Any other answer keeps the tool name.
+fn refusalFor(
+    allocator: std.mem.Allocator,
+    call: event.ToolCall,
+    action: []const u8,
+    answer: arbiter_mod.Answer,
+) std.mem.Allocator.Error![]u8 {
+    const subject = if (std.mem.eql(u8, answer.outcome, arbiter_mod.denied_by_policy)) action else call.tool;
+    return arbiter_mod.refusalText(allocator, subject, answer);
 }
 
 fn decideAction(
@@ -1935,7 +1949,8 @@ fn isInternalTool(name: []const u8) bool {
         std.mem.eql(u8, name, search_tool_name) or
         std.mem.eql(u8, name, ask_tool_name) or
         std.mem.eql(u8, name, title_tool_name) or
-        std.mem.eql(u8, name, request_tool_name);
+        std.mem.eql(u8, name, request_tool_name) or
+        std.mem.eql(u8, name, commit_tool_name);
 }
 
 fn runInternalTool(
@@ -1983,6 +1998,8 @@ fn runInternalTool(
         try runSetTitle(allocator, io, locked, session, deps, call)
     else if (std.mem.eql(u8, call.tool, request_tool_name))
         try runRequestAction(allocator, io, locked, deps, call)
+    else if (std.mem.eql(u8, call.tool, commit_tool_name))
+        try runGitCommit(allocator, io, deps, call)
     else
         unreachable;
     errdefer freeInternalResult(allocator, result);
@@ -2736,6 +2753,65 @@ fn runSearch(
     };
 }
 
+pub const commit_tool_name = @tagName(tools.Tool.git_commit);
+
+fn runGitCommit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    deps: Deps,
+    call: event.ToolCall,
+) Error!event.ToolResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const parsed = std.json.parseFromSlice(
+        tools.GitCommitArgs,
+        arena,
+        call.arguments,
+        .{ .ignore_unknown_fields = true },
+    ) catch return fetchRefusal(allocator, call, try allocator.dupe(
+        u8,
+        commit_tool_name ++ " needs a JSON object with the field \"message\", and optionally " ++
+            "\"paths\" holding the paths to commit.",
+    ));
+
+    if (commit_mod.messageIsBlank(parsed.value.message)) return fetchRefusal(
+        allocator,
+        call,
+        try allocator.dupe(u8, commit_mod.message_is_blank),
+    );
+
+    // Checked before the host is asked, because a path that climbs out of the project
+    // is the agent's mistake and naming it back is the whole of the answer.
+    if (parsed.value.paths) |paths| for (paths) |path| {
+        if (tools.leavesProject(path, deps.project_root)) return fetchRefusal(
+            allocator,
+            call,
+            try commit_mod.pathLeavesProject(allocator, path),
+        );
+    };
+
+    const committer = deps.committer orelse return fetchRefusal(
+        allocator,
+        call,
+        try allocator.dupe(u8, commit_mod.has_no_committer),
+    );
+
+    const answer = try committer.commit(arena, io, .{
+        .message = parsed.value.message,
+        .paths = parsed.value.paths,
+    });
+    return switch (answer) {
+        .refused => |why| fetchRefusal(allocator, call, try allocator.dupe(u8, why)),
+        .made => |made| .{
+            .call_id = try allocator.dupe(u8, call.call_id),
+            .output = try commit_mod.textForModel(allocator, made),
+            .is_error = false,
+            .truncated = false,
+        },
+    };
+}
 pub const ask_tool_name = @tagName(tools.Tool.ask_user);
 
 fn runAskUser(
@@ -3826,6 +3902,54 @@ test "a build whose action is denied does not run, and the model is told" {
         }
     }
     try testing.expect(saw_error_result);
+}
+
+test "a policy deny names the action it refused, and a review refusal keeps the tool name" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    inline for (.{
+        .{ "denied_by_policy", "policy denied \"" },
+        .{ "refused_by_user", "\"read_file\" needs approval" },
+    }) |case| {
+        var backing = try chock_proto.storage.Memory.init(allocator, "01DENYNAMESACTION");
+        const store = backing.storage();
+        defer store.close(io);
+
+        var fake_client = FakeClient{ .turns = &.{
+            .{ .deltas = &.{.{ .tool_call = .{
+                .index = 0,
+                .id = "call1",
+                .name = "read_file",
+                .arguments = "{\"path\":\"a.txt\"}",
+            } }} },
+            .{ .deltas = &.{.{ .text = "done" }} },
+        } };
+        var fake_tools = FakeToolRunner{ .output = "ok" };
+        var judge = TestArbiter{ .answer = .{ .permitted = false, .outcome = case[0] } };
+
+        var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+        deps.arbiter = judge.arbiter();
+        try run(allocator, io, deps);
+
+        var replay = try store.replay(allocator, io, 0);
+        defer replay.deinit();
+        var said: ?[]u8 = null;
+        defer if (said) |owned| allocator.free(owned);
+        while (try replay.next(io)) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value.event == .tool_result) {
+                said = try allocator.dupe(u8, parsed.value.event.tool_result.output);
+            }
+        }
+        try testing.expect(std.mem.indexOf(u8, said.?, case[1]) != null);
+        if (std.mem.eql(u8, case[0], "denied_by_policy")) {
+            try testing.expect(!std.mem.eql(u8, judge.sawDetail(), "read_file"));
+            const named = try std.fmt.allocPrint(allocator, "policy denied \"{s}\"", .{judge.sawDetail()});
+            defer allocator.free(named);
+            try testing.expect(std.mem.indexOf(u8, said.?, named) != null);
+        }
+    }
 }
 
 test "a build whose attribute path cannot be named is refused, and nobody is asked" {
@@ -9218,6 +9342,181 @@ test "a session with no fetcher reads nothing and says so" {
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"url\"") != null);
 }
 
+const FakeCommitter = struct {
+    allocator: std.mem.Allocator,
+    calls: usize = 0,
+    message: []u8 = &.{},
+    paths: usize = 0,
+    took_every_change: bool = false,
+
+    fn deinit(self: *FakeCommitter) void {
+        self.allocator.free(self.message);
+    }
+
+    fn committer(self: *FakeCommitter) commit_mod.Committer {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = commit_mod.Committer.VTable{ .commit = commitFn };
+
+    fn commitFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        ask: commit_mod.Ask,
+    ) commit_mod.Error!commit_mod.Answer {
+        _ = io;
+        const self: *FakeCommitter = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        self.allocator.free(self.message);
+        self.message = try self.allocator.dupe(u8, ask.message);
+        self.took_every_change = ask.paths == null;
+        self.paths = if (ask.paths) |paths| paths.len else 0;
+        return .{ .made = .{
+            .id = try gpa.dupe(u8, "0123456789abcdef0123456789abcdef01234567"),
+            .branch = try gpa.dupe(u8, "chock/01S"),
+            .files = 1,
+        } };
+    }
+};
+
+fn driveCommit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    id: []const u8,
+    arguments: []const u8,
+    fake_committer: ?*FakeCommitter,
+) !struct { refused: bool, output: []u8, action_calls: usize } {
+    var backing = try chock_proto.storage.Memory.init(allocator, id);
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = commit_tool_name,
+            .arguments = arguments,
+        } }} },
+        .{ .deltas = &.{.{ .text = "done" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "the sandboxed tool runner, never reached" };
+    var judge = ActionArbiter{};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    if (fake_committer) |one| deps.committer = one.committer();
+    try run(allocator, io, deps);
+
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .tool_result => |result| return .{
+                .refused = result.is_error,
+                .output = try allocator.dupe(u8, result.output),
+                .action_calls = judge.calls,
+            },
+            else => {},
+        }
+    }
+    return error.NoToolResult;
+}
+
+test "a git_commit call is gated under git.commit and reaches the committer" {
+    const allocator = testing.allocator;
+    var fake = FakeCommitter{ .allocator = allocator };
+    defer fake.deinit();
+
+    const outcome = try driveCommit(
+        allocator,
+        testing.io,
+        "01COMMITGATE",
+        "{\"message\":\"fix the leak in the reader\",\"paths\":[\"a.txt\",\"dir\"]}",
+        &fake,
+    );
+    defer allocator.free(outcome.output);
+
+    try testing.expect(!outcome.refused);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqualStrings("fix the leak in the reader", fake.message);
+    try testing.expectEqual(@as(usize, 2), fake.paths);
+    try testing.expect(std.mem.indexOf(u8, outcome.output, "chock/01S") != null);
+}
+
+test "no paths at all asks the committer for every change" {
+    const allocator = testing.allocator;
+    var fake = FakeCommitter{ .allocator = allocator };
+    defer fake.deinit();
+
+    const outcome = try driveCommit(
+        allocator,
+        testing.io,
+        "01COMMITALL",
+        "{\"message\":\"take the lot\"}",
+        &fake,
+    );
+    defer allocator.free(outcome.output);
+
+    try testing.expect(!outcome.refused);
+    try testing.expect(fake.took_every_change);
+}
+
+test "a blank message is refused and the committer is never asked" {
+    const allocator = testing.allocator;
+    for ([_][]const u8{
+        "{\"message\":\"\"}",
+        "{\"message\":\"   \"}",
+        "{\"message\":\"\\n\\n\"}",
+    }, 0..) |arguments, i| {
+        var fake = FakeCommitter{ .allocator = allocator };
+        defer fake.deinit();
+
+        var id_buffer: [12]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "01COMMITBL{d}", .{i});
+        const outcome = try driveCommit(allocator, testing.io, id, arguments, &fake);
+        defer allocator.free(outcome.output);
+
+        try testing.expect(outcome.refused);
+        try testing.expectEqual(@as(usize, 0), fake.calls);
+        try testing.expectEqualStrings(commit_mod.message_is_blank, outcome.output);
+    }
+}
+
+test "a path that climbs out of the project is refused and names itself back" {
+    const allocator = testing.allocator;
+    var fake = FakeCommitter{ .allocator = allocator };
+    defer fake.deinit();
+
+    const outcome = try driveCommit(
+        allocator,
+        testing.io,
+        "01COMMITESC",
+        "{\"message\":\"sneak\",\"paths\":[\"a.txt\",\"../elsewhere/b.txt\"]}",
+        &fake,
+    );
+    defer allocator.free(outcome.output);
+
+    try testing.expect(outcome.refused);
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+    try testing.expect(std.mem.indexOf(u8, outcome.output, "../elsewhere/b.txt") != null);
+}
+
+test "a session with no committer says so rather than failing silently" {
+    const allocator = testing.allocator;
+    const outcome = try driveCommit(
+        allocator,
+        testing.io,
+        "01COMMITNONE",
+        "{\"message\":\"anything\"}",
+        null,
+    );
+    defer allocator.free(outcome.output);
+
+    try testing.expect(outcome.refused);
+    try testing.expectEqualStrings(commit_mod.has_no_committer, outcome.output);
+}
 const FakeSearcher = struct {
     allocator: std.mem.Allocator,
     result: []const u8 = "the results",

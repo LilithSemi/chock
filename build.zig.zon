@@ -9,8 +9,8 @@
             .hash = "vulcan-0.0.0-d6EfZFBzxACTD8hewzXG1xRLTYG9G1oa7-4DPIMJdYBV",
         },
         .phantom = .{
-            .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#1461c16a50c184bfc01ba5ffe811a0b2e30663c2",
-            .hash = "phantom-0.1.0-HsUDTIKPLwBtAd2ebTaLj1UfgHFJndLAj9Pa9gNKUiYr",
+            .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#0e6dda03cd7e5a88f909b6f1df81deee3795e84d",
+            .hash = "phantom-0.1.0-HsUDTC2bLwA5D4JDGMjxS0Xy3ReeLtqKnoEaw0pVcAm2",
         },
         .udev = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/udev.zig#5b76bbccde9ef7bcb9b6447c0f2454f2ade51733",
@@ -33,8 +33,8 @@
             .hash = "palisade-0.1.0-kI7k7wBYCACmg_K3izmw3Kf-cMYYu82uo2Z7y_DGhe5n",
         },
         .ziggit = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/ziggit#884b9f44194b59e0a19c7e32ffbecb11310342dc",
-            .hash = "ziggit-0.1.0-KYLpgYXNFABoWgLmMApxFgdX5PmoPW9oyM1PDNmqtvhM",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/ziggit#fbc8ea381229552193de7b2ba56f0040b39e0606",
+            .hash = "ziggit-0.1.0-KYLpgd76GQAopCC5YurCK2vTJ3C8g3E32vxsjnrQw8Wb",
         },
         .pcsc = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/pcsc.zig#9fa2f723e7747db81b4b238da23d85be37bcb88b",
@@ -53,8 +53,55 @@
             .hash = "llm_provider-0.1.0-P6m-95CdBgDvDArAXHpkn-JNNj4QDY5mzU3i1fEtrfFq",
         },
         .oauth = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/oauth.zig#8a435cf8d2724fbe7931f0909d5e71d393df7f3c",
-            .hash = "oauth-0.1.0-jO2OUe0VAgA3cg8fMDZQXFkn--7ciG6OwYLeZubY07Ys",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/oauth.zig#2169d3227c85bfab6369f9c90a05cc1c21a828d7",
+            .hash = "oauth-0.1.0-jO2OUY0mAgD8uEh3gLNRjyAVMNQd-noWY-jwfl4ef6Yx",
+        },
+        .zurl = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/zurl#05e334d0dce80cd3e7ce0ca0a8392b79f746da93",
+            .hash = "zurl-0.1.0-eM4POcUhkABuSEp7bfsJFXS8zV4W1I0BLXT7V9Ke5tmu",
+        },
+        .quarry = .{
+            .url = "git+https://git.lilithsemi.com/QuarryDB/quarry#759aad8a4254fb74e8c8a4f5ddf1d2fe94db5f7a",
+            .hash = "quarry-0.1.0-3wpLtOrVHADkPRglQZ-428EnvfagN-CAiOoMEgvGd5on",
+        },
+        .opentelemetry = .{
+            .url = "git+https://github.com/open-telemetry/opentelemetry-zig#d5ca5933a19f6ca8d4218316a44e9b7e861db51e",
+            .hash = "opentelemetry-0.0.1-U_uKJ0NrKQAzcNAV-XWBFwY78-dEy3qMpMnM82y41Pt_",
+        },
+        // OpenTelemetry marks these as lazy because its bindings are committed.
+        // They are still part of our offline build closure: Zig resolves them
+        // when the SDK module is imported, and Nix builds cannot fetch from GitHub.
+        .opentelemetry_proto = .{
+            .url = "git+https://github.com/open-telemetry/opentelemetry-proto?ref=v1.11.0#790608c4d51e6ffc12210b541e8514cbed9e91a4",
+            .hash = "N-V-__8AAIOkBQAVntdoElRMXVcOsnc-qJUZDDT8auh8Z3aj",
+        },
+        .@"protoc-linux-aarch_64" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-aarch_64.zip",
+            .hash = "N-V-__8AAJtTpABBCU2sJAPkeqWvUtTttRQ-OsmdzFEIUSDi",
+        },
+        .@"protoc-linux-x86_64" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-x86_64.zip",
+            .hash = "N-V-__8AAMtRpADAGtPCqgS57gPLl02TIK7HbJ1MkIm4Eq8F",
+        },
+        .@"protoc-linux-x86_32" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-x86_32.zip",
+            .hash = "N-V-__8AAI98sgALeHzk_97rNng7AXDOLHKXDxkSlzanbKOy",
+        },
+        .@"protoc-osx-aarch_64" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-osx-aarch_64.zip",
+            .hash = "N-V-__8AAEMzlwBZp20Y1DKVJqyV3AsG1IteRnb4aUF3gHSn",
+        },
+        .@"protoc-osx-x86_64" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-osx-x86_64.zip",
+            .hash = "N-V-__8AADN7mAAz1e7gPxuQfAAIPUvhsh2xZqntvaO9KAi_",
+        },
+        .@"protoc-win64" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-win64.zip",
+            .hash = "N-V-__8AABekzACgnTDmenHY7N0E55oHnTfOliLw8ReYHEDH",
+        },
+        .@"protoc-linux-s390" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-s390_64.zip",
+            .hash = "N-V-__8AAMvu4gDIIsn0ocNRIfwtpNpmoIeDbJY_zvRdSp83",
         },
     },
     .paths = .{

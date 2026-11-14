@@ -1807,7 +1807,7 @@ test "a bare git commit in a run_command tool call works with no identity in the
     if (std.mem.indexOf(
         u8,
         log_outcome.output,
-        "author Chock <chock@lilithsemi.com> committer Chock <chock@lilithsemi.com>",
+        "author chock <chock@localhost> committer chock <chock@localhost>",
     ) == null) {
         try std.testing.expectEqualStrings("", log_outcome.output);
     }
@@ -3281,7 +3281,7 @@ test "an instruction file that says the agent may push changes neither the polic
         .tool = "request_action",
         .action = "git.push",
     };
-    try std.testing.expectEqual(chock_policy.table.Decision.ask, table.evaluateKindAlone(key));
+    try std.testing.expectEqual(chock_policy.table.Decision.deny, table.evaluateKindAlone(key));
 
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;

@@ -148,6 +148,16 @@ const Options = struct {
     max_cost: ?f64 = null,
     currency: []const u8 = "",
     message_words: []const []const u8 = &.{},
+    /// Set only by the daemon after resolving an authenticated login token.
+    author_identity_id: ?[]const u8 = null,
+    /// A turn the daemon runs for somebody at a browser, rather than one a
+    /// person started on this machine.
+    daemon_hosted: bool = false,
+    /// Replaces the host user's config only for an ACL-authorized daemon turn.
+    daemon_provider: ?DaemonProvider = null,
+    /// A client-hosted worker may obtain agent questions from a remote session
+    /// channel instead of this process's terminal.
+    worker_asker: ?chock_core.ask.Asker = null,
     display: ?Display = null,
     help_wanted: bool = false,
 };
@@ -157,6 +167,19 @@ const Output = enum { human, json, jsonl };
 pub const Display = struct {
     attach: ui.Attach,
     first_message: []const u8 = "",
+};
+
+/// A provider selected by the authenticated daemon control plane. Its token is
+/// already resolved within the daemon's credential boundary and is zeroed by
+/// the worker after this run completes.
+pub const DaemonProvider = struct {
+    name: []const u8,
+    kind: chock_auth.config.Kind,
+    base_url: []const u8,
+    token: []const u8,
+    model: []const u8,
+    context_tokens: ?u64 = null,
+    capabilities: chock_auth.config.Capabilities = .{},
 };
 
 const ForkRequest = struct { at: ?u64 };
@@ -172,7 +195,7 @@ pub fn main(
 
     // Session setup is torn down before fork, and the session runtime cannot
     // own worker threads that would be stranded in the child.
-    return mainWith(arena, gpa, environ, exe_path, args, null, true);
+    return mainWith(arena, gpa, environ, exe_path, args, null, true, false, null, null, null);
 }
 
 /// Run one daemon-owned turn in the calling worker. The daemon owns process
@@ -184,7 +207,46 @@ pub fn mainForDaemon(
     exe_path: []const u8,
     args: []const []const u8,
 ) !u8 {
-    return mainWith(arena, gpa, environ, exe_path, args, null, false);
+    return mainWith(arena, gpa, environ, exe_path, args, null, false, true, null, null, null);
+}
+
+/// Run a daemon turn whose initial message came from a resolved authenticated
+/// identity. The author is never accepted from command-line input.
+pub fn mainForDaemonAs(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    environ: std.process.Environ,
+    exe_path: []const u8,
+    args: []const []const u8,
+    author_identity_id: []const u8,
+) !u8 {
+    return mainWith(arena, gpa, environ, exe_path, args, null, false, true, author_identity_id, null, null);
+}
+
+pub fn mainForDaemonWithProviderAs(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    environ: std.process.Environ,
+    exe_path: []const u8,
+    args: []const []const u8,
+    author_identity_id: []const u8,
+    provider: DaemonProvider,
+) !u8 {
+    return mainWith(arena, gpa, environ, exe_path, args, null, false, true, author_identity_id, provider, null);
+}
+
+/// Run a locally hosted turn with an optional worker ask channel. A null
+/// channel keeps the normal local terminal asker; approvals remain governed
+/// by the session's existing approval flow and policy.
+pub fn mainForClientWorker(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    environ: std.process.Environ,
+    exe_path: []const u8,
+    args: []const []const u8,
+    asker: ?chock_core.ask.Asker,
+) !u8 {
+    return mainWith(arena, gpa, environ, exe_path, args, null, false, false, null, null, asker);
 }
 
 pub fn mainWithInterface(
@@ -199,7 +261,7 @@ pub fn mainWithInterface(
     return mainWith(arena, gpa, environ, exe_path, args, .{
         .attach = attach,
         .first_message = first_message,
-    }, true);
+    }, true, false, null, null, null);
 }
 
 pub fn readOptions(arena: std.mem.Allocator, args: []const []const u8) !?Options {
@@ -223,10 +285,18 @@ fn mainWith(
     args: []const []const u8,
     display: ?Display,
     install_signals: bool,
+    daemon_hosted: bool,
+    author_identity_id: ?[]const u8,
+    daemon_provider: ?DaemonProvider,
+    worker_asker: ?chock_core.ask.Asker,
 ) !u8 {
     var options = (try readOptions(arena, args)) orelse return Exit.usage.code();
     if (options.help_wanted) return Exit.finished.code();
     options.display = display;
+    options.author_identity_id = author_identity_id;
+    options.daemon_hosted = daemon_hosted;
+    options.daemon_provider = daemon_provider;
+    options.worker_asker = worker_asker;
     const machine = options.output != .human;
     if (machine) tty.setHumanOut(false);
     defer if (machine) tty.setHumanOut(true);
@@ -803,6 +873,7 @@ const Started = struct {
     billing: chock_cost.prices.Billing,
     subagents: chock_policy.subagents.Limits,
     apply_mode: ApplyMode,
+    identity: chock_policy.identity.Identity,
     language_server: ?chock_core.lsp_driver.Settings,
     device_source: ?*chock_core.devices.HostSource,
     device_tree: ?chock_net.DeviceTree,
@@ -1098,6 +1169,61 @@ fn reportGivenRules(rules: []const chock_policy.table.Rule) void {
     }
 }
 
+const PushSource = enum {
+    org_bundle,
+    policy_rule_flag,
+    project_file,
+    shipped_default,
+
+    fn text(self: PushSource) []const u8 {
+        return switch (self) {
+            .org_bundle => "an org bundle",
+            .policy_rule_flag => "--policy-rule",
+            .project_file => "this project's chock.zon",
+            .shipped_default => "the shipped default",
+        };
+    }
+};
+
+fn ruleNamesPush(rules: []const chock_policy.table.Rule) bool {
+    for (rules) |rule| {
+        if (rule.action != null and chock_policy.table.patternMatches(rule.action, "git.push")) return true;
+    }
+    return false;
+}
+
+/// Names the layer that answers `git.push`, by the layer order the table reads.
+fn pushSource(
+    policy: *const chock_policy.table.Table,
+    effective: chock_policy.table.Decision,
+) PushSource {
+    for (policy.org) |rule| {
+        if (rule.action != null and chock_policy.table.patternMatches(rule.action, "git.push") and
+            rule.decision == effective) return .org_bundle;
+    }
+    if (ruleNamesPush(policy.given)) return .policy_rule_flag;
+    if (ruleNamesPush(policy.policy.rules)) return .project_file;
+    return .shipped_default;
+}
+
+fn reportPushDecision(
+    policy: *const chock_policy.table.Table,
+    agent_kind: []const u8,
+    model: []const u8,
+) void {
+    const effective = policy.evaluateKindAlone(.{
+        .agent_kind = agent_kind,
+        .model = model,
+        .tool = "run_command",
+        .action = "git.push",
+    });
+    tty.print(
+        .plain,
+        "chock run: git.push is {s}, from {s}.\n",
+        .{ @tagName(effective), pushSource(policy, effective).text() },
+    );
+}
+
 fn loadPolicyUnder(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -1264,7 +1390,28 @@ fn start(
 
     var config_diag: ?chock_auth.config.Diagnostic = null;
     defer if (config_diag) |*d| d.deinit(arena);
-    var config = chock_auth.config.load(arena, io, config_dir, &config_diag) catch |err| switch (err) {
+    var config: chock_auth.config.Config = if (options.daemon_provider) |provider| blk: {
+        const instances = try gpa.alloc(chock_auth.config.Instance, 1);
+        instances[0] = .{
+            .name = provider.name,
+            .kind = provider.kind,
+            .base_url = provider.base_url,
+            .credential = .{ .token = provider.token },
+            .context_tokens = provider.context_tokens,
+            .capabilities = provider.capabilities,
+        };
+        break :blk .{
+            .gpa = gpa,
+            .providers_arena = std.heap.ArenaAllocator.init(gpa),
+            .defaults_arena = std.heap.ArenaAllocator.init(gpa),
+            .providers = &.{},
+            .credential_store = .file,
+            .defaults = .{},
+            .instances = instances,
+            .default_provider = provider.name,
+            .default_model = provider.model,
+        };
+    } else chock_auth.config.load(arena, io, config_dir, &config_diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.NoConfigFile => {
             tty.print(
@@ -1514,6 +1661,7 @@ fn start(
 
     const policy = try loadPolicyUnder(arena, io, project_root, org_bundle, options.policy_rules);
     reportGivenRules(options.policy_rules);
+    reportPushDecision(policy, options.agent_kind, model);
 
     const declared_binds = try workspaceBinds(
         arena,
@@ -1645,6 +1793,12 @@ fn start(
     if (restored_workspace) tty.print(.plain, "chock: restored the workspace at the fork point\n", .{});
 
     try attachBinds(arena, io, &workspace, declared_binds, taken == null and !restored_workspace);
+
+    const identity = loadIdentity(arena, io, project_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Reported => return error.Reported,
+    };
+    try workspace.useIdentity(arena, identity);
 
     var sandbox_config = workspace.sandboxConfig(arena, paths.root) catch |err| {
         tty.print(.err, "chock run: the sandbox could not be described: {s}\n", .{@errorName(err)});
@@ -2061,7 +2215,7 @@ fn start(
     ) catch return error.OutOfMemory;
 
     if (first_message) |text| {
-        appendUserMessage(gpa, io, storage, text) catch |err| {
+        appendUserMessage(gpa, io, storage, text, options.author_identity_id) catch |err| {
             tty.print(.err, "chock run: the message could not be written to the log: {s}\n", .{@errorName(err)});
             return error.Reported;
         };
@@ -2105,6 +2259,7 @@ fn start(
         .billing = billing,
         .subagents = subagent_limits,
         .apply_mode = apply_mode,
+        .identity = identity,
         .language_server = language_server,
         .device_source = device_source,
         .device_tree = if (device_source == null) null else device_wiring.device_tree,
@@ -4458,7 +4613,26 @@ const ApplyMode = struct {
     mode: ?chock_policy.apply.Mode = .merge,
     decision: chock_policy.table.Decision = .allow,
     asked_for: chock_policy.apply.Mode = .merge,
+    claimed_identity_in_message: bool = false,
 };
+
+fn loadIdentity(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+) error{ OutOfMemory, Reported }!chock_policy.identity.Identity {
+    var diag: ?chock_policy.identity.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+    return chock_policy.identity.load(arena, io, project_root, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (diag) |*d| {
+            tty.print(.err, "chock run: the identity block in chock.zon could not be read: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the identity block in chock.zon could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
+}
 
 const bounded_mode_fmt = "this session's work would land as {s}, and the policy answers {t} " ++
     "for {s}, so the work waits at its ref and no branch of yours moves.";
@@ -4504,7 +4678,12 @@ fn applyModeFor(
         decision,
         chock_policy.apply.integrate_action,
     });
-    return .{ .mode = bounded, .decision = decision, .asked_for = settings.mode };
+    return .{
+        .mode = bounded,
+        .decision = decision,
+        .asked_for = settings.mode,
+        .claimed_identity_in_message = settings.claimed_identity_in_message,
+    };
 }
 
 const FlakeInputs = struct {
@@ -5843,6 +6022,30 @@ const ApprovalLock = @typeInfo(
     @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
 ).error_union.payload;
 
+/// The actions whose policy deny a person has already been told how to allow.
+/// A deny repeats on every refused call, and the advice is only worth reading once.
+const Advised = struct {
+    actions: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn deinit(self: *Advised, gpa: std.mem.Allocator) void {
+        var keys = self.actions.keyIterator();
+        while (keys.next()) |key| gpa.free(key.*);
+        self.actions.deinit(gpa);
+    }
+
+    fn tell(self: *Advised, gpa: std.mem.Allocator, watching: chock_core.Loop.Observer, action: []const u8) void {
+        if (self.actions.contains(action)) return;
+        const key = gpa.dupe(u8, action) catch return;
+        self.actions.putNoClobber(gpa, key, {}) catch {
+            gpa.free(key);
+            return;
+        };
+        const text = chock_core.arbiter.denialAdvice(gpa, action) catch return;
+        defer gpa.free(text);
+        watching.onNotice(text);
+    }
+};
+
 const SessionArbiter = struct {
     gpa: std.mem.Allocator,
     environ: std.process.Environ,
@@ -5852,6 +6055,10 @@ const SessionArbiter = struct {
     screen: ?*ui.Ui = null,
     folded: ?chock_proto.state.PolicyFold = null,
     folded_at: u64 = 0,
+    /// Where the advice for a person goes: the same notice line the screen or the
+    /// printer shows for a rate limit wait.
+    observer: ?chock_core.Loop.Observer = null,
+    advised: Advised = .{},
 
     fn arbiter(self: *SessionArbiter) chock_core.arbiter.Arbiter {
         return .{ .ptr = self, .vtable = &vtable };
@@ -5859,6 +6066,7 @@ const SessionArbiter = struct {
 
     fn deinit(self: *SessionArbiter) void {
         if (self.folded) |*session| session.deinit();
+        self.advised.deinit(self.gpa);
     }
 
     const vtable = chock_core.arbiter.Arbiter.VTable{ .decide = decideFn };
@@ -5942,6 +6150,10 @@ const SessionArbiter = struct {
                 "chock: the approval of {s} could not be shown or recorded: {t}\n",
                 .{ ask.action, err },
             );
+        }
+
+        if (outcome == .denied_by_policy) {
+            if (self.observer) |watching| self.advised.tell(self.gpa, watching, ask.action);
         }
 
         return .{
@@ -7137,6 +7349,8 @@ fn carryCommit(
         .new_id = params.new_id,
         .wanted = wanted,
         .copies = copies,
+        .claimed_identity_in_message = started.apply_mode.claimed_identity_in_message,
+        .identity = started.identity,
     }, &describe_diag) catch |err| {
         if (describe_diag) |*fault| {
             tty.print(
@@ -7304,6 +7518,7 @@ fn recordIntegration(
                 .moved => "",
                 .park => |p| p.why.wireName(),
             },
+            .claimed = if (moved) |m| m.claimed else "",
         },
     }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| {
         tty.print(
@@ -12222,7 +12437,10 @@ fn runSession(
             .agent_kind = options.agent_kind,
             .model = started.model,
         },
-        .host_agent = env.get(chock_broker.agentproxy.env_socket) orelse "",
+        // A daemon-hosted turn acts for somebody at a browser on another
+        // machine, so the agent in the daemon's own environment belongs to the
+        // operator and never to them.
+        .host_agent = if (options.daemon_hosted) "" else env.get(chock_broker.agentproxy.env_socket) orelse "",
         .live = if (started.redact.secrets.len != 0)
             &@constCast(started.redact.secrets)[started.redact.secrets.len - 1]
         else
@@ -12439,12 +12657,13 @@ fn runSession(
         .handback = session_handback.handback(),
         .fetcher = fetcher.fetcher(),
         .searcher = if (searcher) |*one| one.searcher() else null,
-        .asker = if (screen != null) display_asker.asker() else question_prompt.asker(),
+        .asker = options.worker_asker orelse if (screen != null) display_asker.asker() else question_prompt.asker(),
         .redact = started.redact,
         .hooks = started.hooks,
         .session_id = started.session_id,
     };
     deps.max_turns = options.max_turns;
+    session_arbiter.observer = deps.observer;
 
     var turns: usize = 0;
     while (true) {
@@ -12453,7 +12672,7 @@ fn runSession(
                 .done => break,
                 .message => |next| {
                     defer gpa.free(next);
-                    try appendUserMessage(gpa, io, started.storage, next);
+                    try appendUserMessage(gpa, io, started.storage, next, null);
                 },
                 .take_up => |id| {
                     take_up.* = id;
@@ -12838,7 +13057,11 @@ const JsonLineObserver = struct {
 
     fn onPieceFn(_: *anyopaque, _: chock_core.Loop.Piece) void {}
 
-    fn onNoticeFn(_: *anyopaque, _: []const u8) void {}
+    /// Standard output carries the machine records, so a notice meant for a
+    /// person goes to standard error rather than nowhere.
+    fn onNoticeFn(_: *anyopaque, text: []const u8) void {
+        tty.print(.warn, "chock: {s}\n", .{text});
+    }
 
     fn push(self: *JsonLineObserver) void {
         var replay = self.storage.replay(self.gpa, self.io, self.next_offset) catch return;
@@ -13183,6 +13406,7 @@ fn appendUserMessage(
     io: std.Io,
     storage: chock_proto.storage.Storage,
     text: []const u8,
+    author_identity_id: ?[]const u8,
 ) !void {
     var locked = try storage.lock(io);
     defer locked.unlock(io) catch {};
@@ -13190,7 +13414,11 @@ fn appendUserMessage(
     _ = try locked.append(
         gpa,
         io,
-        .{ .message = .{ .role = .user, .content = &content } },
+        .{ .message = .{
+            .role = .user,
+            .content = &content,
+            .author_id = author_identity_id orelse "",
+        } },
         std.Io.Timestamp.now(io, .real).toMilliseconds(),
     );
 }
@@ -14981,6 +15209,32 @@ test "--dev-shell takes a value, and a run that names none leaves the file to de
     try testing.expectEqual(@as(?[]const u8, null), quiet.dev_shell);
 }
 
+test "the push line names the layer that answers, and the shipped default denies" {
+    const gpa = std.testing.allocator;
+    const key = chock_policy.table.Key{
+        .agent_kind = "main",
+        .model = "m",
+        .tool = "run_command",
+        .action = "git.push",
+    };
+
+    const bare = try chock_policy.table.Table.parse(gpa, ".{}", null);
+    defer chock_policy.table.Table.destroy(gpa, bare);
+    try std.testing.expectEqual(chock_policy.table.Decision.deny, bare.evaluateKindAlone(key));
+    try std.testing.expectEqual(PushSource.shipped_default, pushSource(bare, .deny));
+
+    const given = [_]chock_policy.table.Rule{.{ .action = "git.push", .decision = .ask }};
+    const flagged = try chock_policy.table.Table.parseLayered(gpa, ".{}", .{ .given = &given }, null);
+    defer chock_policy.table.Table.destroy(gpa, flagged);
+    try std.testing.expectEqual(PushSource.policy_rule_flag, pushSource(flagged, flagged.evaluateKindAlone(key)));
+
+    const org = [_]chock_policy.table.Rule{.{ .action = "git.push", .decision = .deny }};
+    const bundled = try chock_policy.table.Table.parseLayered(gpa, ".{}", .{ .given = &given, .org = &org }, null);
+    defer chock_policy.table.Table.destroy(gpa, bundled);
+    try std.testing.expectEqual(chock_policy.table.Decision.deny, bundled.evaluateKindAlone(key));
+    try std.testing.expectEqual(PushSource.org_bundle, pushSource(bundled, .deny));
+}
+
 test "--policy-rule is repeatable, and a shape that is not <action>=<decision> is refused" {
     const gpa = testing.allocator;
 
@@ -15567,8 +15821,12 @@ test "a project with no chock.zon answers allow for git commit and ask for a pus
         );
     }
 
+    try testing.expectEqual(
+        chock_policy.table.Decision.deny,
+        policy.evaluateKindAlone(key.of("git.push")),
+    );
+
     for ([_][]const u8{
-        "git.push",
         "git.clone",
         "git.fetch",
         "git.pull",
@@ -15955,11 +16213,13 @@ test "the log records the landing that happened, and not the mode the project co
     var branch = "refs/heads/main".*;
     var from = "1111111111111111111111111111111111111111".*;
     var to = "2222222222222222222222222222222222222222".*;
+    var claimed = "Claimed-Author: Mallory <m@evil.example>".*;
     recordIntegration(gpa, io, &locked, asked_the_person, "refs/chock/one", .{ .moved = .{
         .landing = .merge,
         .branch = &branch,
         .from = &from,
         .to = &to,
+        .claimed = &claimed,
     } });
     recordIntegration(gpa, io, &locked, asked_the_person, "refs/chock/two", .{
         .park = .{ .wanted = .merge, .why = .dirty_tree },
@@ -15983,6 +16243,7 @@ test "the log records the landing that happened, and not the mode the project co
     try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"parked\":\"dirty_tree\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"parked\":\"policy_refused\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"claimed\":\"Claimed-Author: Mallory <m@evil.example>\"") != null);
 }
 
 test "the line about a mode the policy took away is said again once the display is up" {
@@ -19879,6 +20140,24 @@ test "a subagent is refused a model its parent could not use" {
         refuseProviderAndModel(arena, policy, &.{}, .{}, "hub", "big"),
     );
     try testing.expect(std.mem.indexOf(u8, said.err(), "spawn chain") == null);
+}
+
+test "the advice for a policy deny reaches the observer once per action, however often it is refused" {
+    const gpa = testing.allocator;
+    var recording = RecordingObserver{ .gpa = gpa };
+    defer recording.deinit();
+    var advised = Advised{};
+    defer advised.deinit(gpa);
+
+    const watching = recording.observer();
+    advised.tell(gpa, watching, "git.push");
+    advised.tell(gpa, watching, "git.push");
+    advised.tell(gpa, watching, "git.push");
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, recording.said.items, "notice "));
+    try testing.expect(std.mem.indexOf(u8, recording.said.items, "--policy-rule git.push=ask") != null);
+
+    advised.tell(gpa, watching, "git.gc");
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, recording.said.items, "notice "));
 }
 
 const RecordingObserver = struct {

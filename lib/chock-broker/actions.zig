@@ -6,6 +6,7 @@ const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
 const chock_version = @import("chock-version");
 const chock_workspace = @import("chock-workspace");
+const ziggit = @import("ziggit");
 const Broker = @import("Broker.zig");
 const diagnostic = @import("diagnostic.zig");
 const integrate = @import("integrate.zig");
@@ -13,6 +14,11 @@ const network = @import("network.zig");
 pub const Diagnostic = diagnostic.Diagnostic;
 
 const event = chock_proto.event;
+
+/// A person approving a change has to see every line it touches. An exact rename
+/// hides nothing, since the content is identical either way. An inexact one folds
+/// the edit into the move header, so only a perfect match counts as a rename here.
+const review_diff: ziggit.DiffOptions = .{ .rename_threshold = 100 };
 const git = chock_workspace.git;
 
 pub const Kind = enum {
@@ -57,6 +63,8 @@ pub const GitPush = struct {
     old_id: []const u8,
     new_id: []const u8,
     commits: []const u8,
+    /// Without this a push the remote cannot fast forward is refused.
+    force: bool = false,
 };
 
 pub const GitBranchDelete = struct {
@@ -159,15 +167,23 @@ pub const WorkspaceApply = struct {
             new_id: []const u8,
             wanted: integrate.Wanted,
             copies: []const []const u8 = &.{},
+            claimed_identity_in_message: bool = false,
+            identity: chock_policy.identity.Identity = .{},
         },
         diag: ?*?Diagnostic,
     ) DescribeError!WorkspaceApply {
-        // Read from git: `.git/objects` is wrong for a worktree or bare repo.
-        const project_object_store = try describeGit(arena, io, ctx.env, params.repository, &.{
-            "rev-parse", "--path-format=absolute", "--git-path", "objects",
-        }, diag);
+        var repo = try integrate.openRepository(arena, io, params.repository, .{ .alternate_directories = &.{params.scratch_object_store} }, diag);
+        defer repo.deinit();
 
-        const old_id = readRef(arena, io, ctx.env, params.repository, params.ref) catch |err| return err;
+        // The common directory: `.git/objects` is wrong for a worktree or bare repo.
+        var common_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const common_len = repo.layout.common_dir.realPath(io, &common_buffer) catch |err| {
+            var no_detail: ?ziggit.Diagnostic = null;
+            return integrate.refused(arena, diag, params.repository, err, &no_detail);
+        };
+        const project_object_store = try std.fs.path.join(arena, &.{ common_buffer[0..common_len], "objects" });
+
+        const old_id = try readRef(arena, &repo, params.ref, diag);
 
         // Before the object list: a merge/rebase/squash builds new commits the list must hold.
         const integration = try integrate.planning(arena, io, ctx.env, .{
@@ -177,23 +193,13 @@ pub const WorkspaceApply = struct {
             .wanted = params.wanted,
             .ref = params.ref,
             .new_id = params.new_id,
+            .claimed_identity_in_message = params.claimed_identity_in_message,
+            .identity = params.identity,
         }, diag);
 
         const objects = try looseObjects(arena, io, params.scratch_object_store, diag);
 
-        // The scratch store is an alternate here. git never writes to one.
-        var reading_env = try ctx.env.clone(arena);
-        defer reading_env.deinit();
-        try reading_env.put("GIT_ALTERNATE_OBJECT_DIRECTORIES", params.scratch_object_store);
-
-        const diff = if (old_id.len > 0)
-            try describeGit(arena, io, &reading_env, params.repository, &.{
-                "diff", old_id, params.new_id,
-            }, diag)
-        else
-            try describeGit(arena, io, &reading_env, params.repository, &.{
-                "show", "--format=%H%n%s%n", params.new_id,
-            }, diag);
+        const diff = try describeChange(arena, &repo, old_id, params.new_id, diag);
 
         return .{
             .repository = params.repository,
@@ -210,45 +216,82 @@ pub const WorkspaceApply = struct {
     }
 };
 
-fn describeGit(
+/// What a person reads before work lands: the diff from `old_id`, or for a new ref the commit
+/// itself, headed by its id and subject as `git show` does.
+fn describeChange(
     arena: std.mem.Allocator,
-    io: std.Io,
-    env: *const std.process.Environ.Map,
-    cwd: []const u8,
-    argv: []const []const u8,
+    repo: *ziggit.Repository,
+    old_id: []const u8,
+    new_id: []const u8,
     diag: ?*?Diagnostic,
 ) DescribeError![]u8 {
-    var output = try git.run(arena, io, env, cwd, argv, null);
-    defer output.deinit(arena);
-    const exited_zero = switch (output.term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-    if (!exited_zero) {
-        if (diagnostic.wants(diag)) {
-            _ = diagnostic.note(diag, .{ .git_refused_a_description = try arena.dupe(u8, output.stderr) });
-        }
-        return error.GitFailed;
+    var fault: ?ziggit.Diagnostic = null;
+    defer if (fault) |*it| it.deinit(arena);
+    const new = ziggit.Oid.parse(repo.format, new_id) catch |err|
+        return integrate.refused(arena, diag, new_id, err, &fault);
+
+    var text: std.Io.Writer.Allocating = .init(arena);
+    var changes: ziggit.Diff = undefined;
+    if (old_id.len > 0) {
+        const old = ziggit.Oid.parse(repo.format, old_id) catch |err|
+            return integrate.refused(arena, diag, old_id, err, &fault);
+        changes = ziggit.diffCommits(arena, &repo.odb, old, new, review_diff, &fault) catch |err|
+            return integrate.refused(arena, diag, "the diff to apply", err, &fault);
+    } else {
+        const bytes = repo.odb.readAlloc(arena, new, integrate.max_commit_bytes, &fault) catch |err|
+            return integrate.refused(arena, diag, new_id, err, &fault);
+        const commit = ziggit.Commit.parse(arena, repo.format, bytes) catch |err|
+            return integrate.refused(arena, diag, new_id, err, &fault);
+        const subject = try integrate.subjectOf(arena, commit.message);
+        text.writer.print("{s}\n{s}\n\n\n", .{ new_id, subject }) catch return error.OutOfMemory;
+        // `git show` diffs a commit against its first parent, and a root commit against nothing.
+        const base: ?ziggit.Oid = if (commit.parents.len > 0) blk: {
+            const parent = repo.odb.readAlloc(arena, commit.parents[0], integrate.max_commit_bytes, &fault) catch |err|
+                return integrate.refused(arena, diag, "the parent of the commit", err, &fault);
+            const parent_commit = ziggit.Commit.parse(arena, repo.format, parent) catch |err|
+                return integrate.refused(arena, diag, "the parent of the commit", err, &fault);
+            break :blk parent_commit.tree;
+        } else null;
+        changes = ziggit.diffTrees(arena, &repo.odb, base, commit.tree, review_diff, &fault) catch |err|
+            return integrate.refused(arena, diag, "the diff to apply", err, &fault);
     }
-    return arena.dupe(u8, std.mem.trimEnd(u8, output.stdout, "\n"));
+    for (changes.patches) |patch| {
+        patch.writeUnified(&text.writer) catch return error.OutOfMemory;
+        writeSubprojectLines(&text.writer, patch) catch return error.OutOfMemory;
+    }
+    return arena.dupe(u8, std.mem.trimEnd(u8, text.written(), "\n"));
+}
+
+/// A submodule has no text to diff, so the diff names the commit it points at, as git does.
+fn writeSubprojectLines(w: *std.Io.Writer, patch: ziggit.Patch) std.Io.Writer.Error!void {
+    const old_pointer = patch.old_mode == .gitlink and patch.status != .added;
+    const new_pointer = patch.new_mode == .gitlink and patch.status != .deleted;
+    if (!old_pointer and !new_pointer) return;
+    var old_hex: [ziggit.Oid.max_formatted_length]u8 = undefined;
+    var new_hex: [ziggit.Oid.max_formatted_length]u8 = undefined;
+    try w.writeAll(if (old_pointer) "--- a/" else "--- /dev/null\n");
+    if (old_pointer) try w.print("{s}\n", .{patch.old_path});
+    try w.writeAll(if (new_pointer) "+++ b/" else "+++ /dev/null\n");
+    if (new_pointer) try w.print("{s}\n", .{patch.new_path});
+    try w.print("@@ -{s} +{s} @@\n", .{ if (old_pointer) "1" else "0,0", if (new_pointer) "1" else "0,0" });
+    if (old_pointer) try w.print("-Subproject commit {s}\n", .{patch.old_oid.?.toHex(&old_hex)});
+    if (new_pointer) try w.print("+Subproject commit {s}\n", .{patch.new_oid.?.toHex(&new_hex)});
 }
 
 fn readRef(
     arena: std.mem.Allocator,
-    io: std.Io,
-    env: *const std.process.Environ.Map,
-    repository: []const u8,
+    repo: *ziggit.Repository,
     ref: []const u8,
+    diag: ?*?Diagnostic,
 ) DescribeError![]u8 {
-    var output = try git.run(arena, io, env, repository, &.{ "rev-parse", "--verify", "--quiet", ref }, null);
-    defer output.deinit(arena);
-    return switch (output.term) {
-        .exited => |code| if (code == 0)
-            arena.dupe(u8, std.mem.trimEnd(u8, output.stdout, "\n"))
-        else
-            arena.dupe(u8, ""),
-        else => error.GitFailed,
+    var fault: ?ziggit.Diagnostic = null;
+    defer if (fault) |*it| it.deinit(arena);
+    const id = repo.refs.resolve(ref, &fault) catch |err| switch (err) {
+        error.RefNotFound, error.InvalidRefName => return arena.dupe(u8, ""),
+        else => return integrate.refused(arena, diag, ref, err, &fault),
     };
+    var hex: [ziggit.Oid.max_formatted_length]u8 = undefined;
+    return arena.dupe(u8, id.toHex(&hex));
 }
 
 /// A pack file refuses the description; only `git gc` writes one, and Chock never runs it.
@@ -353,8 +396,14 @@ pub const Action = union(Kind) {
             ),
             .git_push => |a| std.fmt.allocPrint(
                 gpa,
-                "set {s} on {s} ({s}) to {s}",
-                .{ a.remote_ref, a.remote, a.remote_url, shortId(a.new_id) },
+                "{s} {s} on {s} ({s}) to {s}",
+                .{
+                    if (a.force) "force-set" else "set",
+                    a.remote_ref,
+                    a.remote,
+                    a.remote_url,
+                    shortId(a.new_id),
+                },
             ),
             .git_branch_delete => |a| std.fmt.allocPrint(
                 gpa,
@@ -447,6 +496,7 @@ pub const Action = union(Kind) {
                 \\ref on the remote: {s}
                 \\that ref is at: {s}
                 \\that ref moves to: {s}
+                \\force: {s}
                 \\what moves onto the remote:
                 \\{s}
             , .{
@@ -456,6 +506,7 @@ pub const Action = union(Kind) {
                 a.remote_ref,
                 if (a.old_id.len > 0) a.old_id else "nothing, the ref is not there yet",
                 a.new_id,
+                if (a.force) "yes, the remote loses any commit the new tip does not hold" else "no, a push that would drop commits is refused",
                 a.commits,
             }),
             .git_branch_delete => |a| std.fmt.allocPrint(gpa,
@@ -890,6 +941,16 @@ fn performGitCommit(
     return .{ .git_commit = .{ .commit_id = commit_id } };
 }
 
+/// Only a push that asked to force carries a lease, and a lease accepts a non fast forward.
+fn pushArgv(arena: std.mem.Allocator, a: GitPush) std.mem.Allocator.Error![]const []const u8 {
+    const refspec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ a.new_id, a.remote_ref });
+    if (a.force and a.old_id.len > 0) {
+        const lease = try std.fmt.allocPrint(arena, "--force-with-lease={s}:{s}", .{ a.remote_ref, a.old_id });
+        return arena.dupe([]const u8, &.{ "push", lease, a.remote, refspec });
+    }
+    return arena.dupe([]const u8, &.{ "push", a.remote, refspec });
+}
+
 fn performGitPush(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -897,16 +958,19 @@ fn performGitPush(
     a: GitPush,
     diag: ?*?Diagnostic,
 ) PerformError!Result {
-    const refspec = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ a.new_id, a.remote_ref });
-    defer gpa.free(refspec);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    if (a.old_id.len > 0) {
-        const lease = try std.fmt.allocPrint(gpa, "--force-with-lease={s}:{s}", .{ a.remote_ref, a.old_id });
-        defer gpa.free(lease);
-        gpa.free(try runGit(gpa, io, ctx, a.repository, &.{ "push", lease, a.remote, refspec }, diag));
-    } else {
-        gpa.free(try runGit(gpa, io, ctx, a.repository, &.{ "push", a.remote, refspec }, diag));
+    if (!a.force) {
+        // A plain push refuses a non fast forward itself, but it takes no expected value.
+        const listed = try runGit(gpa, io, ctx, a.repository, &.{ "ls-remote", a.remote, a.remote_ref }, diag);
+        defer gpa.free(listed);
+        const at = listed[0 .. std.mem.indexOfAny(u8, listed, "\t ") orelse listed.len];
+        if (!std.mem.eql(u8, at, a.old_id)) return error.GitFailed;
     }
+
+    gpa.free(try runGit(gpa, io, ctx, a.repository, try pushArgv(arena, a), diag));
 
     return .{ .git_push = .{
         .remote_ref = try gpa.dupe(u8, a.remote_ref),
@@ -1635,6 +1699,208 @@ test "an approved workspace.apply moves the objects and updates the ref" {
     try testing.expectEqualStrings("the agent wrote this", shown);
 }
 
+/// What `describeChange` writes for two commits, beside what `git diff` and `git show` write for the same two.
+fn expectChangeAgrees(project: *const TestProject, arena: std.mem.Allocator, old_id: []const u8, new_id: []const u8) !void {
+    var repo = try integrate.openRepository(arena, testing.io, project.root_path, .{}, null);
+    defer repo.deinit();
+    const mine = try describeChange(arena, &repo, old_id, new_id, null);
+    const theirs = if (old_id.len > 0)
+        try gitOk(arena, &project.env, project.root_path, &.{ "diff", old_id, new_id })
+    else
+        try gitOk(arena, &project.env, project.root_path, &.{ "show", "--format=%H%n%s%n", new_id });
+    try testing.expectEqualStrings(try withoutHunkContext(arena, theirs), try withoutEmptyIndexLine(arena, mine));
+}
+
+/// A change of mode alone gets an `index` line here that names one id twice. Git leaves the line out.
+fn withoutEmptyIndexLine(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "index ")) {
+            const ids = line["index ".len..];
+            const dots = std.mem.indexOf(u8, ids, "..") orelse 0;
+            const rest = ids[@min(dots + 2, ids.len)..];
+            if (std.mem.eql(u8, ids[0..dots], rest)) continue;
+        }
+        if (!first) try out.append(arena, '\n');
+        first = false;
+        try out.appendSlice(arena, line);
+    }
+    return out.items;
+}
+
+/// Git ends a hunk header with the nearest line above it that looks like a function. This diff does not.
+fn withoutHunkContext(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try out.append(arena, '\n');
+        first = false;
+        const header_end = if (std.mem.startsWith(u8, line, "@@ ")) std.mem.indexOfPos(u8, line, 3, " @@") else null;
+        try out.appendSlice(arena, if (header_end) |at| line[0 .. at + 3] else line);
+    }
+    return out.items;
+}
+
+fn commitAll(project: *const TestProject, arena: std.mem.Allocator, message: []const u8) ![]const u8 {
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "add", "-A" });
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "commit", "-m", message });
+    return gitOk(arena, &project.env, project.root_path, &.{ "rev-parse", "HEAD" });
+}
+
+fn writeInProject(project: *const TestProject, arena: std.mem.Allocator, name: []const u8, contents: []const u8) !void {
+    const path = try std.fs.path.join(arena, &.{ project.root_path, name });
+    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(testing.io, dir);
+    try writeFileAbsolute(testing.io, path, contents);
+}
+
+test "the text a person reads for an edit, an addition and a deletion is what git diff writes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(testing.allocator, tmp);
+    defer project.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try writeInProject(&project, arena, "keep.txt", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n");
+    try writeInProject(&project, arena, "gone.txt", "going\n");
+    const old = try commitAll(&project, arena, "setup");
+    try writeInProject(&project, arena, "keep.txt", "one\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nnine\nten\nmore");
+    try writeInProject(&project, arena, "tracked.txt", "");
+    try writeInProject(&project, arena, "deep/er/new.txt", "fresh\n");
+    try std.Io.Dir.deleteFileAbsolute(testing.io, try std.fs.path.join(arena, &.{ project.root_path, "gone.txt" }));
+    const new = try commitAll(&project, arena, "change");
+    try expectChangeAgrees(&project, arena, old, new);
+}
+
+test "a mode change, a binary file, a symlink and an exact rename are all written for the reader" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(testing.allocator, tmp);
+    defer project.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try writeInProject(&project, arena, "script.sh", "#!/bin/sh\n");
+    try writeInProject(&project, arena, "old name.txt", "a file that moves\nwith two lines\n");
+    try writeInProject(&project, arena, "blob.bin", "\x00\x01\x02 before");
+    const old = try commitAll(&project, arena, "setup");
+
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "mv", "old name.txt", "new name.txt" });
+    try writeInProject(&project, arena, "blob.bin", "\x00\x01\x02 after");
+    try writeInProject(&project, arena, "other.bin", "\x00\xff");
+    try std.Io.Dir.cwd().symLink(testing.io, "tracked.txt", try std.fs.path.join(arena, &.{ project.root_path, "link" }), .{});
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "add", "-A" });
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "update-index", "--chmod=+x", "script.sh" });
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "commit", "-m", "change" });
+    const new = try gitOk(arena, &project.env, project.root_path, &.{ "rev-parse", "HEAD" });
+    try expectChangeAgrees(&project, arena, old, new);
+
+    // The scenario must hold each thing a reviewer looks for, or agreement says nothing.
+    const written = try gitOk(arena, &project.env, project.root_path, &.{ "diff", old, new });
+    for ([_][]const u8{ "old mode 100644", "new mode 100755", "rename from old name.txt", "Binary files", "new file mode 120000" }) |needle| {
+        if (std.mem.indexOf(u8, written, needle) == null) try testing.expectEqualStrings(needle, written);
+    }
+}
+
+test "a rename with an edit reads as a deletion and an addition, so every changed line is still shown" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(testing.allocator, tmp);
+    defer project.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try writeInProject(&project, arena, "before.txt", "one\ntwo\nthree\nfour\nfive\nsix\n");
+    const old = try commitAll(&project, arena, "setup");
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "mv", "before.txt", "after.txt" });
+    try writeInProject(&project, arena, "after.txt", "one\ntwo\nthree\nfour\nfive\nSIX\n");
+    const new = try commitAll(&project, arena, "move and edit");
+
+    var repo = try integrate.openRepository(arena, testing.io, project.root_path, .{}, null);
+    defer repo.deinit();
+    const mine = try describeChange(arena, &repo, old, new, null);
+    try testing.expect(std.mem.indexOf(u8, try gitOk(arena, &project.env, project.root_path, &.{ "diff", old, new }), "rename from before.txt") != null);
+    for ([_][]const u8{ "deleted file mode 100644", "-six", "new file mode 100644", "+SIX", "a/before.txt", "b/after.txt" }) |needle| {
+        try testing.expect(std.mem.indexOf(u8, mine, needle) != null);
+    }
+}
+
+test "a submodule that is added, moved and removed names the commit it points at" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(testing.allocator, tmp);
+    defer project.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const first = try gitOk(arena, &project.env, project.root_path, &.{ "rev-parse", "HEAD" });
+    try writeInProject(&project, arena, "other.txt", "other\n");
+    const second = try commitAll(&project, arena, "second");
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "update-index", "--add", "--cacheinfo", try std.fmt.allocPrint(arena, "160000,{s},module", .{first}) });
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "commit", "-m", "add the submodule" });
+    const added = try gitOk(arena, &project.env, project.root_path, &.{ "rev-parse", "HEAD" });
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "update-index", "--cacheinfo", try std.fmt.allocPrint(arena, "160000,{s},module", .{second}) });
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "commit", "-m", "move the submodule" });
+    const moved = try gitOk(arena, &project.env, project.root_path, &.{ "rev-parse", "HEAD" });
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "update-index", "--force-remove", "module" });
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "commit", "-m", "remove the submodule" });
+    const removed = try gitOk(arena, &project.env, project.root_path, &.{ "rev-parse", "HEAD" });
+
+    try expectChangeAgrees(&project, arena, second, added);
+    try expectChangeAgrees(&project, arena, added, moved);
+    try expectChangeAgrees(&project, arena, moved, removed);
+}
+
+test "a file that becomes a symlink shows the old mode, the new mode and both contents" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(testing.allocator, tmp);
+    defer project.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try writeInProject(&project, arena, "swap", "was a file\n");
+    const old = try commitAll(&project, arena, "setup");
+    try std.Io.Dir.deleteFileAbsolute(testing.io, try std.fs.path.join(arena, &.{ project.root_path, "swap" }));
+    try std.Io.Dir.cwd().symLink(testing.io, "tracked.txt", try std.fs.path.join(arena, &.{ project.root_path, "swap" }), .{});
+    const new = try commitAll(&project, arena, "change");
+
+    var repo = try integrate.openRepository(arena, testing.io, project.root_path, .{}, null);
+    defer repo.deinit();
+    const mine = try describeChange(arena, &repo, old, new, null);
+    // Git writes this as a deletion and an addition; the same facts are all here.
+    for ([_][]const u8{ "old mode 100644", "new mode 120000", "-was a file", "+tracked.txt" }) |needle| {
+        if (std.mem.indexOf(u8, mine, needle) == null) try testing.expectEqualStrings(needle, mine);
+    }
+}
+
+test "a new ref is described by the commit's id, its subject and what it adds, a root commit included" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(testing.allocator, tmp);
+    defer project.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root = try gitOk(arena, &project.env, project.root_path, &.{ "rev-parse", "HEAD" });
+    try expectChangeAgrees(&project, arena, "", root);
+
+    try writeInProject(&project, arena, "next.txt", "next\n");
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "add", "-A" });
+    _ = try gitOk(arena, &project.env, project.root_path, &.{ "commit", "-m", "a subject that\nwraps\n\nand a body" });
+    const child = try gitOk(arena, &project.env, project.root_path, &.{ "rev-parse", "HEAD" });
+    try expectChangeAgrees(&project, arena, "", child);
+}
+
 test "a refused workspace.apply leaves the user's repository byte for byte unchanged" {
     // Objects and refs both: a refused ref leaves refs identical and the object list longer.
     const gpa = testing.allocator;
@@ -2220,6 +2486,90 @@ test "git.push refuses when the remote is no longer where the user was told" {
     const remote_after = try gitOk(gpa, &project.env, remote_path, &.{ "rev-parse", "refs/heads/main" });
     defer gpa.free(remote_after);
     try testing.expectEqualStrings(remote_now, remote_after);
+}
+
+test "a push that was not asked to force builds no lease, and a forced one builds exactly one" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var push: GitPush = .{
+        .repository = "/home/ross/project",
+        .remote = "origin",
+        .remote_url = "https://example.invalid/ross/project.git",
+        .remote_ref = "refs/heads/main",
+        .old_id = "1111111111111111111111111111111111111111",
+        .new_id = "2222222222222222222222222222222222222222",
+        .commits = "2222222 raise the limit",
+    };
+    const plain = try pushArgv(arena, push);
+    try testing.expectEqual(@as(usize, 3), plain.len);
+    for (plain) |arg| try testing.expect(std.mem.indexOf(u8, arg, "force") == null);
+
+    push.force = true;
+    const forced = try pushArgv(arena, push);
+    try testing.expectEqual(@as(usize, 4), forced.len);
+    try testing.expectEqualStrings("--force-with-lease=refs/heads/main:1111111111111111111111111111111111111111", forced[1]);
+
+    const forced_summary = try (Action{ .git_push = push }).summary(arena);
+    try testing.expect(std.mem.indexOf(u8, forced_summary, "force") != null);
+    push.force = false;
+    const plain_summary = try (Action{ .git_push = push }).summary(arena);
+    try testing.expect(std.mem.indexOf(u8, plain_summary, "force") == null);
+}
+
+test "git.push without force refuses a rewrite of the remote, and with force replaces it" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(gpa, tmp);
+    defer project.deinit();
+
+    var remote_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const remote_path = try std.fmt.bufPrintSentinel(&remote_buffer, "{s}/remote.git", .{project.scratch_path}, 0);
+    try std.Io.Dir.createDirAbsolute(io, remote_path, .default_dir);
+    gpa.free(try gitOk(gpa, &project.env, remote_path, &.{ "init", "--bare", "-b", "main" }));
+    gpa.free(try gitOk(gpa, &project.env, project.root_path, &.{ "remote", "add", "origin", remote_path }));
+
+    // The remote holds a commit that the new tip, a sibling of it, does not.
+    const changed = try std.fs.path.join(gpa, &.{ project.root_path, "tracked.txt" });
+    defer gpa.free(changed);
+    try writeFileAbsolute(io, changed, "remote side\n");
+    gpa.free(try gitOk(gpa, &project.env, project.root_path, &.{ "commit", "-am", "remote side" }));
+    gpa.free(try gitOk(gpa, &project.env, project.root_path, &.{ "push", "origin", "refs/heads/main:refs/heads/main" }));
+    const old_id = try gitOk(gpa, &project.env, project.root_path, &.{ "rev-parse", "HEAD" });
+    defer gpa.free(old_id);
+    gpa.free(try gitOk(gpa, &project.env, project.root_path, &.{ "reset", "--hard", "HEAD~1" }));
+    try writeFileAbsolute(io, changed, "local side\n");
+    gpa.free(try gitOk(gpa, &project.env, project.root_path, &.{ "commit", "-am", "local side" }));
+    const new_id = try gitOk(gpa, &project.env, project.root_path, &.{ "rev-parse", "HEAD" });
+    defer gpa.free(new_id);
+
+    const ctx = Context{ .env = &project.env };
+    const rewrite: GitPush = .{
+        .repository = project.root_path,
+        .remote = "origin",
+        .remote_url = remote_path,
+        .remote_ref = "refs/heads/main",
+        .old_id = old_id,
+        .new_id = new_id,
+        .commits = "local side",
+    };
+    try testing.expectError(error.GitFailed, askAndAnswer(gpa, io, .approved_by_user, ctx, testAsk(.{ .git_push = rewrite })));
+    const kept = try gitOk(gpa, &project.env, remote_path, &.{ "rev-parse", "refs/heads/main" });
+    defer gpa.free(kept);
+    try testing.expectEqualStrings(old_id, kept);
+
+    var forced = rewrite;
+    forced.force = true;
+    var attempt = try askAndAnswer(gpa, io, .approved_by_user, ctx, testAsk(.{ .git_push = forced }));
+    try testing.expect(attempt == .done);
+    defer attempt.done.result.deinit(gpa);
+    const replaced = try gitOk(gpa, &project.env, remote_path, &.{ "rev-parse", "refs/heads/main" });
+    defer gpa.free(replaced);
+    try testing.expectEqualStrings(new_id, replaced);
 }
 
 test "an approved git.branch.delete removes the branch, and a moved branch is refused" {

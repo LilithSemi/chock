@@ -120,7 +120,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   zigDeps = zig.fetchDeps {
     inherit (finalAttrs) src pname version;
-    hash = "sha256-DyTznIycyOV42TepVCqffKrmGixIJUaRONqzB+1BGz0=";
+    hash = "sha256-EKB48hSspw5yy/Mzh0gsM94TH7YYhnLkDkrgVGwjzP8=";
   };
 
   nativeBuildInputs = [
@@ -149,38 +149,72 @@ stdenv.mkDerivation (finalAttrs: {
   nativeInstallCheckInputs = [ versionCheckHook ];
   versionCheckProgramArg = "--version";
 
-  passthru.shell = mkShell {
-    name = "chock-dev-shell";
-    packages = [
-      zig
-      git
-      zls
-      typescript
-      mcp-server-time
-      mcp-probe-http
-      tree-sitter
-      pkg-config
-      vulkan-loader
-    ]
-    ++ lib.optionals useAndroidSdk [
-      androidSdk
-      gradle_8
-      jdk
-    ];
+  passthru = {
+    shell = mkShell {
+      name = "chock-dev-shell";
+      packages = [
+        zig
+        git
+        zls
+        typescript
+        mcp-server-time
+        mcp-probe-http
+        tree-sitter
+        pkg-config
+        vulkan-loader
+      ]
+      ++ lib.optionals useAndroidSdk [
+        androidSdk
+        gradle_8
+        jdk
+      ];
 
-    env = {
-      TREE_SITTER_PARSERS = "${treeSitterParsers}";
-      CHOCK_PARSER_MODULES = "${astWasmModules}";
-    }
-    // lib.optionalAttrs useAndroidSdk {
-      JAVA_HOME = jdk.home;
-      ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
-      ANDROID_NDK_ROOT = "${androidSdk}/libexec/android-sdk/ndk-bundle";
+      env = {
+        TREE_SITTER_PARSERS = "${treeSitterParsers}";
+        CHOCK_PARSER_MODULES = "${astWasmModules}";
+      }
+      // lib.optionalAttrs useAndroidSdk {
+        JAVA_HOME = jdk.home;
+        ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
+        # Gradle refuses to build when ANDROID_HOME and ANDROID_SDK_ROOT name
+        # different directories, and the host can already have the second one.
+        ANDROID_SDK_ROOT = "${androidSdk}/libexec/android-sdk";
+        ANDROID_NDK_ROOT = "${androidSdk}/libexec/android-sdk/ndk-bundle";
+      };
+
+      shellHook = lib.optionalString useAndroidSdk ''
+        export GRADLE_OPTS="-Dorg.gradle.project.android.aapt2FromMavenOverride=$(echo "$ANDROID_HOME/build-tools/"*/aapt2) ''${GRADLE_OPTS:-}"
+      '';
     };
+  }
+  // lib.optionalAttrs useAndroidSdk {
+    # Not a flake output yet. Phantom's gradle project reads the Android Gradle
+    # Plugin from Google's Maven repository, and a nix build has no network, so
+    # this needs a vendored dependency set before a builder can make the APK.
+    android = finalAttrs.finalPackage.overrideAttrs (old: {
+      pname = "chock-android";
 
-    shellHook = lib.optionalString useAndroidSdk ''
-      export GRADLE_OPTS="-Dorg.gradle.project.android.aapt2FromMavenOverride=$(echo "$ANDROID_HOME/build-tools/"*/aapt2) ''${GRADLE_OPTS:-}"
-    '';
+      nativeBuildInputs = old.nativeBuildInputs ++ [
+        androidSdk
+        gradle_8
+        jdk
+      ];
+
+      env = (old.env or { }) // {
+        JAVA_HOME = jdk.home;
+        ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
+        ANDROID_NDK_ROOT = "${androidSdk}/libexec/android-sdk/ndk-bundle";
+      };
+
+      zigBuildFlags = old.zigBuildFlags ++ [ "-Dtarget=aarch64-linux-android" ];
+
+      preBuild = ''
+        export GRADLE_OPTS="-Dorg.gradle.project.android.aapt2FromMavenOverride=$(echo "$ANDROID_HOME/build-tools/"*/aapt2) ''${GRADLE_OPTS:-}"
+      '';
+
+      doCheck = false;
+      doInstallCheck = false;
+    });
   };
 
   meta = {

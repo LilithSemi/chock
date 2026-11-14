@@ -1036,6 +1036,27 @@ test "a policy of allow never appends a request, and the log says the policy all
     try testing.expectEqual(@as(usize, 1), events);
 }
 
+test "an unconfigured project denies git.push and appends no request" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01BROKER");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    var waiter = TestWaiter{};
+    const broker = try testBroker(gpa, ".{}", &waiter);
+    defer table.Table.destroy(gpa, broker.policy);
+
+    const outcome = try broker.request(gpa, io, store, &locked, testRequest("git.push"), null);
+    try testing.expectEqual(Outcome.denied_by_policy, outcome);
+    try testing.expectEqual(@as(usize, 0), try countKind(gpa, io, store, .approval_request));
+    try testing.expectEqual(@as(usize, 0), waiter.waits);
+}
+
 test "a policy of deny never appends a request either" {
     const gpa = testing.allocator;
     const io = testing.io;

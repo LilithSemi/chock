@@ -1607,7 +1607,7 @@ test "an action no rule names resolves to ask, never to allow" {
     for ([_][:0]const u8{ ".{ .policy = .{} }", ".{}", ".{ .models = .{} }" }) |empty_source| {
         const empty = try Table.parse(gpa, empty_source, null);
         defer Table.destroy(gpa, empty);
-        try std.testing.expectEqual(Decision.ask, empty.evaluateKindAlone(testKey("main", "git.push")));
+        try std.testing.expectEqual(Decision.ask, empty.evaluateKindAlone(testKey("main", "git.ls-remote")));
         try std.testing.expectEqual(Decision.ask, empty.evaluateKindAlone(testKey("main", "workspace.apply")));
     }
 }
@@ -1790,7 +1790,7 @@ test "an ordinary hierarchy with no chock.zon rules at all still loads" {
     const table = try Table.parse(gpa, source, null);
     defer Table.destroy(gpa, table);
     try std.testing.expectEqual(Decision.allow, table.evaluateKindAlone(testKey("worker", "call.write_file")));
-    try std.testing.expectEqual(Decision.ask, table.evaluateKindAlone(testKey("worker", "git.push")));
+    try std.testing.expectEqual(Decision.ask, table.evaluateKindAlone(testKey("worker", "git.ls-remote")));
 }
 
 test "a field name with a typo inside the policy block is refused, not ignored" {
@@ -1809,7 +1809,7 @@ test "a field name with a typo inside the policy block is refused, not ignored" 
 
     const table = try Table.parse(gpa, ".{ .models = .{ .main = \"sonnet\" } }", null);
     defer Table.destroy(gpa, table);
-    try std.testing.expectEqual(Decision.ask, table.evaluateKindAlone(testKey("main", "git.push")));
+    try std.testing.expectEqual(Decision.ask, table.evaluateKindAlone(testKey("main", "git.ls-remote")));
 }
 
 test "the table cannot be changed after a session starts" {
@@ -2001,7 +2001,7 @@ test "a name that holds the byte the read time check invents is refused" {
         \\            .{ .kind = "c", .parent = "p" },
         \\        },
         \\        .rules = .{
-        \\            .{ .agent_kind = "c", .decision = .ask },
+        \\            .{ .agent_kind = "c", .decision = .deny },
         \\            .{ .agent_kind = "p", .action = "git.push", .decision = .allow },
         \\        },
         \\    },
@@ -2215,7 +2215,7 @@ test "a file larger than the byte cap, and a project with no file, are both repo
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = oversized[4..] });
     const table = try Table.load(gpa, std.testing.io, project_root, null);
     defer Table.destroy(gpa, table);
-    try std.testing.expectEqual(Decision.ask, table.evaluateKindAlone(testKey("main", "git.push")));
+    try std.testing.expectEqual(Decision.ask, table.evaluateKindAlone(testKey("main", "git.ls-remote")));
 }
 
 test "the names in a refusal reach the caller, and no longer only a terminal" {

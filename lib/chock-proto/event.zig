@@ -129,6 +129,9 @@ pub const Kind = enum {
     hook_run,
     mcp_request,
     style_check,
+    worker_cancel,
+    agent_question,
+    agent_answer,
     unknown,
 
     pub fn wireName(self: Kind) []const u8 {
@@ -181,6 +184,9 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .hook_run = "hook.run",
     .mcp_request = "mcp.request",
     .style_check = "style.check",
+    .worker_cancel = "worker.cancel",
+    .agent_question = "agent.question",
+    .agent_answer = "agent.answer",
     .unknown = "unknown",
 });
 
@@ -571,11 +577,32 @@ pub const Message = struct {
     role: Role,
     content: []const ContentPart,
     model_alias: []const u8 = "",
+    /// Stable daemon identity UUID for a human-authored message. Empty for
+    /// legacy, CLI, and agent messages that have no authenticated author.
+    author_id: []const u8 = "",
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
-    pub const jsonStringify = forward.jsonStringify;
     pub const jsonParse = forward.jsonParse;
+
+    pub fn jsonStringify(self: Message, jw: *std.json.Stringify) std.json.Stringify.Error!void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.objectField("model_alias");
+        try jw.write(self.model_alias);
+        if (self.author_id.len != 0) {
+            try jw.objectField("author_id");
+            try jw.write(self.author_id);
+        }
+        for (self.extra.members) |member| {
+            try jw.objectField(member.name);
+            try jw.write(member.value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ToolCall = struct {
@@ -692,11 +719,40 @@ pub const ApprovalResponse = struct {
     review: ReviewVerdict = .none,
     /// Never travels back to the agent that asked.
     review_note: []const u8 = "",
+    /// Stable OIDC identity UUID for an authenticated HTTP approval response.
+    /// Empty for local CLI and older control clients.
+    responder_id: []const u8 = "",
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
-    pub const jsonStringify = forward.jsonStringify;
     pub const jsonParse = forward.jsonParse;
+
+    pub fn jsonStringify(self: ApprovalResponse, jw: *std.json.Stringify) std.json.Stringify.Error!void {
+        try jw.beginObject();
+        try jw.objectField("request_id");
+        try jw.write(self.request_id);
+        try jw.objectField("decision");
+        try jw.write(self.decision);
+        try jw.objectField("responder");
+        try jw.write(self.responder);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("tool_call_id");
+        try jw.write(self.tool_call_id);
+        try jw.objectField("review");
+        try jw.write(self.review);
+        try jw.objectField("review_note");
+        try jw.write(self.review_note);
+        if (self.responder_id.len != 0) {
+            try jw.objectField("responder_id");
+            try jw.write(self.responder_id);
+        }
+        for (self.extra.members) |member| {
+            try jw.objectField(member.name);
+            try jw.write(member.value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Git or SSH asked for a credential; the answer skips the log, going straight to the broker.
@@ -961,6 +1017,8 @@ pub const WorkspaceIntegrate = struct {
     branch_from: []const u8,
     branch_to: []const u8,
     parked: []const u8,
+    /// The author and committer lines the landed work claimed, one per line. Empty when nothing landed.
+    claimed: []const u8 = "",
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
@@ -1283,6 +1341,27 @@ pub const UnknownEvent = struct {
     payload: std.json.Value,
 };
 
+/// An authenticated person requested that the current client-hosted turn stop.
+/// This is an ordered command in the canonical transcript, not a signal sent
+/// to the worker process.
+pub const WorkerCancel = struct {
+    requested_by: []const u8,
+};
+
+/// A client-hosted agent asked the people sharing its session for information.
+/// The event envelope ID is the stable request ID used by `agent.answer`.
+pub const AgentQuestion = struct {
+    text: []const u8,
+    options: []const []const u8 = &.{},
+};
+
+/// A person answered an `agent.question`; this carries no approval authority.
+pub const AgentAnswer = struct {
+    request_id: u64,
+    answer: []const u8,
+    responder_id: []const u8,
+};
+
 pub const Event = union(Kind) {
     session_start: SessionStart,
     session_config: SessionConfig,
@@ -1318,6 +1397,9 @@ pub const Event = union(Kind) {
     hook_run: HookRun,
     mcp_request: McpRequest,
     style_check: StyleCheck,
+    worker_cancel: WorkerCancel,
+    agent_question: AgentQuestion,
+    agent_answer: AgentAnswer,
     unknown: UnknownEvent,
 
     pub fn jsonStringify(self: Event, jw: *std.json.Stringify) std.json.Stringify.Error!void {
@@ -1439,6 +1521,50 @@ test "an envelope survives a round trip through JSON" {
     try std.testing.expectEqual(original.time_ms, parsed.value.time_ms);
     try std.testing.expectEqual(@as(u32, 1), parsed.value.version);
     try std.testing.expectEqualStrings("hello", parsed.value.event.message.content[0].text);
+}
+
+test "authenticated human message authorship is additive and omitted for legacy messages" {
+    const allocator = std.testing.allocator;
+    const content = [_]ContentPart{.{ .text = "please review" }};
+    const legacy: Event = .{ .message = .{ .role = .user, .content = &content } };
+    const legacy_json = try std.json.Stringify.valueAlloc(allocator, legacy, .{});
+    defer allocator.free(legacy_json);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_json, "author_id") == null);
+
+    const authored: Event = .{ .message = .{
+        .role = .user,
+        .content = &content,
+        .author_id = "00000000-0000-4000-8000-000000000001",
+    } };
+    const authored_json = try std.json.Stringify.valueAlloc(allocator, authored, .{});
+    defer allocator.free(authored_json);
+    const parsed = try std.json.parseFromSlice(Event, allocator, authored_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("00000000-0000-4000-8000-000000000001", parsed.value.message.author_id);
+}
+
+test "authenticated approval responder is additive and omitted for legacy responses" {
+    const allocator = std.testing.allocator;
+    const legacy: Event = .{ .approval_response = .{
+        .request_id = 5,
+        .decision = .approved_by_user,
+        .responder = "",
+    } };
+    const legacy_json = try std.json.Stringify.valueAlloc(allocator, legacy, .{});
+    defer allocator.free(legacy_json);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_json, "responder_id") == null);
+
+    const authored: Event = .{ .approval_response = .{
+        .request_id = 5,
+        .decision = .approved_by_user,
+        .responder = "",
+        .responder_id = "00000000-0000-4000-8000-000000000001",
+    } };
+    const authored_json = try std.json.Stringify.valueAlloc(allocator, authored, .{});
+    defer allocator.free(authored_json);
+    const parsed = try std.json.parseFromSlice(Event, allocator, authored_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("00000000-0000-4000-8000-000000000001", parsed.value.approval_response.responder_id);
 }
 
 test "a path record survives a round trip, caveat and overflow count included" {
@@ -1943,6 +2069,9 @@ test "no serialized envelope contains a raw newline, whatever the Kind, and ever
         .{ .device_exposed = .{ .attempt = nl, .action = nl, .decision = nl } },
         .{ .network_summary = .{ .granted = 3, .refused = 1, .diagnostic = nl } },
         .{ .unknown = .{ .kind = "future.kind", .payload = .{ .string = nl } } },
+        .{ .worker_cancel = .{ .requested_by = nl } },
+        .{ .agent_question = .{ .text = nl, .options = &.{ "a", "b" } } },
+        .{ .agent_answer = .{ .request_id = 17, .answer = nl, .responder_id = nl } },
     };
 
     for (events) |event| {

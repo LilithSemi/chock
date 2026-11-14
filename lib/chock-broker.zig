@@ -33,6 +33,8 @@ pub const socket = @import("chock-broker/socket.zig");
 
 pub const handover = @import("chock-broker/handover.zig");
 
+pub const git_write = @import("chock-broker/git_write.zig");
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

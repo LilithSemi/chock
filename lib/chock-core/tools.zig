@@ -220,6 +220,7 @@ pub const Tool = enum {
     ask_user,
     set_title,
     request_action,
+    git_commit,
 
     pub fn needs(self: Tool) Capability {
         return switch (self) {
@@ -248,6 +249,7 @@ pub const Tool = enum {
             .ask_user,
             .set_title,
             .request_action,
+            .git_commit,
             => .tool_calls,
         };
     }
@@ -280,6 +282,7 @@ pub const Tool = enum {
             .ask_user,
             .set_title,
             .request_action,
+            .git_commit,
             => true,
         };
     }
@@ -299,6 +302,8 @@ pub const Tool = enum {
     const call_prefix = "call";
 
     const web_search_action = "web.search";
+
+    const git_commit_action = "git.commit";
 
     const unparsed_action = exec_prefix ++ ".unparsed";
 
@@ -432,6 +437,7 @@ pub const Tool = enum {
             .nix_build => null,
             .read_skill => null,
             .web_search => writeWhole(buffer, web_search_action),
+            .git_commit => writeWhole(buffer, git_commit_action),
             .read_file,
             .read_image,
             .list_directory,
@@ -483,13 +489,14 @@ pub const Tool = enum {
             .ask_user,
             .set_title,
             .request_action,
+            .git_commit,
             => false,
         };
     }
 
     pub fn writesToWorkspace(self: Tool) bool {
         return switch (self) {
-            .write_file, .edit_file, .run_command => true,
+            .write_file, .edit_file, .run_command, .git_commit => true,
             .read_file,
             .read_image,
             .list_directory,
@@ -686,6 +693,11 @@ pub const Tool = enum {
                 "the way is allowed too, and a site's own robots.txt is honoured. There is no " ++
                 "way to send a header, a credential, or a body: this reads, and it never writes " ++
                 "to a remote service.",
+            .git_commit => "Record the work so far as a commit on this session's own branch. " ++
+                "It is not a push and it does not reach anybody else's history: landing the " ++
+                "session is a separate step a person approves. You never run \"git add\", so " ++
+                "name the paths you mean or leave them out to take every change. A commit of " ++
+                "nothing, or with no message, is refused.",
             .web_search => "Search the web and get back a list of results. Use it to find a " ++
                 "page worth reading with fetch_url, or to check a fact fetch_url alone cannot " ++
                 "settle. A result is written by whoever published the page it points to and is " ++
@@ -764,6 +776,7 @@ pub const Tool = enum {
             .ask_user => AskUserArgs,
             .set_title => SetTitleArgs,
             .request_action => RequestActionArgs,
+            .git_commit => GitCommitArgs,
         };
     }
 };
@@ -908,9 +921,17 @@ pub const Registry = struct {
                 call,
                 try allocator.dupe(u8, request_needs_a_session),
             ),
+            .git_commit => toolErrorResult(
+                allocator,
+                call,
+                try allocator.dupe(u8, commit_needs_a_session),
+            ),
         };
     }
 };
+
+pub const commit_needs_a_session = "nothing was committed: a commit is made on the " ++
+    "session's own branch, and this tool call was run without a session.";
 
 pub const spawn_needs_a_session = "no subagent was started: a spawn is measured against the " ++
     "session that would own the child, and this tool call was run without one.";
@@ -1296,6 +1317,21 @@ pub const ProvideToolArgs = struct {
         .program = "The package name, alone. Not a path, not a URL, and not a flake reference: " ++
             "\"ripgrep\", or \"python3Packages.requests\" for a package inside a set. Where the " ++
             "name is looked up is set by the project and you cannot change it.",
+    };
+};
+
+pub const GitCommitArgs = struct {
+    message: []const u8,
+    paths: ?[]const []const u8 = null,
+
+    pub const docs = .{
+        .message = "Why this change was made, in the imperative, such as \"fix the leak in " ++
+            "the reader\". The first line stands alone as the subject. A blank line and then " ++
+            "a body may follow it.",
+        .paths = "The paths to commit, one per entry, relative to the project root. A path " ++
+            "that names a directory takes everything beneath it, and a path you have deleted " ++
+            "records the deletion. Leave it out to commit every change in the workspace, " ++
+            "which is what you usually want.",
     };
 };
 
@@ -2320,7 +2356,7 @@ fn deniedPathResult(
     ));
 }
 
-fn leavesProject(path: []const u8, project_root: []const u8) bool {
+pub fn leavesProject(path: []const u8, project_root: []const u8) bool {
     var rest = path;
     if (std.fs.path.isAbsolute(path)) {
         if (!std.fs.path.isAbsolute(project_root)) return true;
@@ -4811,7 +4847,7 @@ test "every tool in the enum is offered, and each one is named exactly once" {
         "write_memory",   "spawn_agent",   "update_plan",    "provide_tool",
         "serve_port",     "nix_eval",      "nix_build",      "restrict_self",
         "fetch_url",      "web_search",    "ask_user",       "set_title",
-        "request_action",
+        "request_action", "git_commit",
     };
     try std.testing.expectEqual(expected.len, defs.len);
     for (expected, defs) |name, def| try std.testing.expectEqualStrings(name, def.name);
@@ -5178,6 +5214,13 @@ test "a tool with no argument to read is named after itself, once each" {
             );
             continue;
         }
+        if (tool == .git_commit) {
+            try std.testing.expectEqualStrings(
+                "git.commit",
+                tool.actionInto(&buffer, null, "", &.{}).?,
+            );
+            continue;
+        }
         try std.testing.expectEqualStrings(
             "call." ++ f_name,
             tool.actionInto(&buffer, null, "", &.{}).?,
@@ -5190,6 +5233,13 @@ test "web_search names the action web.search and not call.web_search" {
     const action = Tool.web_search.actionInto(&buffer, null, "", &.{}).?;
     try std.testing.expectEqualStrings("web.search", action);
     try std.testing.expect(!std.mem.eql(u8, action, "call.web_search"));
+}
+
+test "git_commit names the action git.commit, so it shares the policy row git itself uses" {
+    var buffer: [Tool.max_action_bytes]u8 = undefined;
+    const action = Tool.git_commit.actionInto(&buffer, null, "", &.{}).?;
+    try std.testing.expectEqualStrings("git.commit", action);
+    try std.testing.expect(!std.mem.eql(u8, action, "call.git_commit"));
 }
 
 test "run_command on a program under the Nix store names the program, left to right" {

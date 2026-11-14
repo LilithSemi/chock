@@ -79,9 +79,11 @@ pub const Diagnostic = union(enum) {
     pub const Call = enum {
         git_spawn,
         git_wait,
+        repository_read,
         scratch_object_store_create,
         config_worktree_check,
         worktree_git_file_read,
+        worktree_dir_create,
         git_pointer_file_create,
         git_pointer_file_write,
         empty_scratch_file_create,
@@ -126,9 +128,11 @@ pub const Diagnostic = union(enum) {
             return switch (self) {
                 .git_spawn => "starting git",
                 .git_wait => "waiting for git",
+                .repository_read => "reading the repository",
                 .scratch_object_store_create => "creating the scratch object store",
                 .config_worktree_check => "checking for config.worktree",
                 .worktree_git_file_read => "reading the worktree's own .git file",
+                .worktree_dir_create => "creating the worktree directory",
                 .git_pointer_file_create => "creating the replacement .git file",
                 .git_pointer_file_write => "writing the replacement .git file",
                 .empty_scratch_file_create => "creating the empty config.worktree scratch file",

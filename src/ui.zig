@@ -2,6 +2,7 @@
 //! It runs as a second `chock_core.Loop.Observer`, and the transcript is `src/run.zig`'s own buffer.
 
 const std = @import("std");
+const telemetry = @import("chock-telemetry");
 const phantom = @import("phantom");
 const chock_core = @import("chock-core");
 const sessions_cmd = @import("sessions.zig");
@@ -151,6 +152,7 @@ pub fn logMessage(
     if (comptime saysKeymapFailed(level, format)) {
         if (keymap_watch.watching) keymap_watch.failed = true;
     }
+    telemetry.log(level, scope, format, args);
     std.log.defaultLog(level, scope, format, args);
 }
 
@@ -2310,6 +2312,18 @@ test "a new-session request is consumed exactly once" {
     try testing.expect(!h.screen.takeNewSessionRequest());
 }
 
+test "a client-hosted session request retains its explicit placement" {
+    const h = try Headless.open(testing.allocator);
+    defer h.close();
+
+    try testing.expectEqual(@as(?chock_ui.source.Placement, null), h.screen.takeNewSessionPlacement());
+    h.screen.requestClientSession();
+    try testing.expectEqual(@as(?chock_ui.source.Placement, .client), h.screen.takeNewSessionPlacement());
+    try testing.expectEqual(@as(?chock_ui.source.Placement, null), h.screen.takeNewSessionPlacement());
+    h.screen.requestNewSession();
+    try testing.expectEqual(@as(?chock_ui.source.Placement, .daemon), h.screen.takeNewSessionPlacement());
+}
+
 test "the compact session landing explains a failed load and offers retry" {
     const gpa = testing.allocator;
     const h = try Headless.openScaffold(gpa);
@@ -2343,6 +2357,7 @@ test "the wide scaffold keeps plan navigation outside the transcript" {
     try testing.expect(h.screen.paint());
 
     const shown = try screenText(h);
+    try testing.expect(std.mem.indexOf(u8, shown, "New client-hosted session") != null);
     try testing.expect(std.mem.indexOf(u8, shown, "0/4 done") != null);
     try testing.expect(std.mem.indexOf(u8, shown, "read the fold") != null);
     try testing.expectEqual(h.screen.width, h.screen.transcriptBandRoom().width);

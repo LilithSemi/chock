@@ -1,6 +1,6 @@
 # The tools
 
-The agent has 25 tools, and every one that touches the machine goes through the
+The agent has 26 tools, and every one that touches the machine goes through the
 sandbox: `read_file`, `list_directory`, `glob`, `grep`, `write_file`,
 `edit_file`, `run_command`, `read_memory` and `write_memory`. Only
 `run_command` takes a command. The rest name a path, a pattern, or the text to
@@ -46,7 +46,7 @@ disk at session start. It is offered only to a session that found at least one,
 and the answer says who wrote it, because a skill from a repository or a package
 is a stranger's writing. [skills.md](skills.md) is the whole of it.
 
-The last eleven are described here or on a page of their own:
+The last twelve are described here or on a page of their own:
 
 | Tool | What it asks for | Page |
 |---|---|---|
@@ -61,6 +61,7 @@ The last eleven are described here or on a page of their own:
 | `web_search` | one query against a search engine | [search.md](../configure/search.md) |
 | `request_action` | whether a brokered act is available | [approvals.md](approvals.md) |
 | `update_plan` | a task list you can watch | [running.md](../running.md) |
+| `git_commit` | the work recorded on the session branch | [approvals.md](approvals.md) |
 
 ## Every call is gated
 

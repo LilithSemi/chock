@@ -8,10 +8,22 @@
 const std = @import("std");
 const phantom = @import("phantom");
 const chock_ui = @import("chock-ui");
-const event = @import("chock-proto").event;
+const chock_proto = @import("chock-proto");
+const event = chock_proto.event;
+const control = chock_proto.control;
 
 const ui_source = chock_ui.source;
 const Source = ui_source.Source;
+
+/// Browser callers pass the current host without a scheme so Phantom can bind
+/// the request to the page's origin. Native mobile callers may persist an
+/// explicit HTTP or HTTPS scheme, which must survive instead of becoming the
+/// malformed `http://https://…` URL.
+fn requestUrl(arena: std.mem.Allocator, origin: []const u8, target: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, origin, "https://") or std.mem.startsWith(u8, origin, "http://"))
+        return std.fmt.allocPrint(arena, "{s}{s}", .{ origin, target });
+    return std.fmt.allocPrint(arena, "http://{s}{s}", .{ origin, target });
+}
 
 /// The most one reply may be. A session list or a page of lines past this is a
 /// daemon answering something other than what was asked.
@@ -43,6 +55,127 @@ pub const Web = struct {
     /// longest path Linux takes is written out here.
     project_query: [4096 + 16]u8 = undefined,
 
+    pub const AclRule = struct {
+        resource_kind: []const u8,
+        resource_id: []const u8,
+        principal_kind: []const u8,
+        principal_id: []const u8,
+        capability: []const u8,
+        effect: []const u8,
+    };
+
+    pub const AuthStatus = struct { mode: []const u8, setup: bool };
+    pub const LocalCredentials = struct { username: []const u8, password: []const u8 };
+    pub const LocalPasswordChange = struct {
+        current_password: []const u8,
+        new_password: []const u8,
+    };
+    pub const OidcConfiguration = struct {
+        provider: []const u8,
+        issuer: []const u8,
+        discovery_url: ?[]const u8 = null,
+        client_id: []const u8,
+        client_secret: ?[]const u8 = null,
+        admin_subject: []const u8,
+    };
+
+    /// Read the service's first-run/authentication mode without exposing any
+    /// identity-provider credentials or account data.
+    pub fn authStatus(self: *Web, arena: std.mem.Allocator) ui_source.Error!AuthStatus {
+        const said = try self.get(arena, "/api/auth/status");
+        const found = std.json.parseFromSliceLeaky(AuthStatus, arena, said, .{}) catch {
+            self.note("the service authentication status could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn localSetup(self: *Web, arena: std.mem.Allocator, credentials: LocalCredentials) ui_source.Error!void {
+        const payload = std.json.Stringify.valueAlloc(arena, credentials, .{}) catch return error.OutOfMemory;
+        const headers = [_]std.http.Header{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "x-chock-phantom-auth", .value = "true" },
+        };
+        _ = try self.sendMethod(arena, "/api/setup/local", .POST, payload, &headers);
+    }
+
+    pub fn localLogin(self: *Web, arena: std.mem.Allocator, credentials: LocalCredentials) ui_source.Error!void {
+        const payload = std.json.Stringify.valueAlloc(arena, credentials, .{}) catch return error.OutOfMemory;
+        const headers = [_]std.http.Header{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "x-chock-phantom-auth", .value = "true" },
+        };
+        _ = try self.sendMethod(arena, "/api/auth/local", .POST, payload, &headers);
+    }
+
+    pub fn changeLocalPassword(self: *Web, arena: std.mem.Allocator, change: LocalPasswordChange) ui_source.Error!void {
+        const payload = std.json.Stringify.valueAlloc(arena, change, .{}) catch return error.OutOfMemory;
+        _ = try self.post(arena, "/api/auth/password", payload);
+    }
+
+    pub fn oidcSetup(self: *Web, arena: std.mem.Allocator, configuration: OidcConfiguration) ui_source.Error!void {
+        const payload = std.json.Stringify.valueAlloc(arena, configuration, .{}) catch return error.OutOfMemory;
+        _ = try self.post(arena, "/api/setup/oidc", payload);
+    }
+
+    pub const WorkerCredential = struct {
+        token: []const u8,
+        expires_ms: i64,
+    };
+
+    pub const CreatedTeamInvitation = struct { id: []const u8, token: []const u8, expires_ms: i64 };
+    pub const TeamInvitationRow = struct {
+        id: []const u8,
+        role: []const u8,
+        created_ms: i64,
+        expires_ms: i64,
+        revoked: bool,
+        redeemed: bool,
+        expired: bool,
+    };
+
+    /// Mint a session-scoped worker bearer. The response is intentionally not
+    /// cached by this source; callers should display it once and discard it.
+    pub fn createWorkerCredential(
+        self: *Web,
+        arena: std.mem.Allocator,
+        session: []const u8,
+    ) ui_source.Error!WorkerCredential {
+        const payload = std.json.Stringify.valueAlloc(arena, .{ .session = session }, .{}) catch
+            return error.OutOfMemory;
+        const said = try self.post(arena, "/api/worker/token", payload);
+        const found = std.json.parseFromSliceLeaky(WorkerCredential, arena, said, .{}) catch {
+            self.note("the daemon's worker credential response could not be read");
+            return error.Refused;
+        };
+        if (found.token.len != 43 or found.expires_ms <= 0) {
+            self.note("the daemon returned an invalid worker credential");
+            return error.Refused;
+        }
+        self.clear();
+        return found;
+    }
+
+    /// Revoke a worker bearer using the only authority it carries: itself.
+    pub fn revokeWorkerCredential(self: *Web, arena: std.mem.Allocator, token: []const u8) ui_source.Error!void {
+        const value = std.fmt.allocPrint(arena, "Bearer {s}", .{token}) catch return error.OutOfMemory;
+        defer std.crypto.secureZero(u8, value);
+        const headers = [_]std.http.Header{.{ .name = "authorization", .value = value }};
+        _ = try self.sendMethod(arena, "/api/worker/revoke", .POST, "", &headers);
+        self.clear();
+    }
+    pub const AclRecord = struct { id: []const u8, rule: AclRule };
+    pub const ProviderRow = struct {
+        id: []const u8,
+        name: []const u8,
+        provider_kind: []const u8,
+        scope_kind: []const u8,
+        scope_id: ?[]const u8 = null,
+        configuration: []const u8,
+        has_credential: bool,
+    };
+
     pub fn init(gpa: std.mem.Allocator, owner: *phantom.BuildOwner, origin: []const u8) Web {
         return .{ .gpa = gpa, .owner = owner, .origin = origin };
     }
@@ -61,6 +194,46 @@ pub const Web = struct {
         self.said = null;
         self.gpa.free(self.watching_project);
         self.watching_project = &.{};
+    }
+
+    /// Create in a registered project selected from the Projects screen. The
+    /// project root is URL-encoded and independently checked by the gateway's
+    /// project ACL before it reaches the daemon.
+    pub fn createInProject(
+        self: *Web,
+        arena: std.mem.Allocator,
+        placement: ui_source.Placement,
+        project_root: []const u8,
+    ) ui_source.Error![]const u8 {
+        const target = std.fmt.allocPrint(arena, "/api/create?placement={s}&project={f}", .{
+            @tagName(placement),
+            std.fmt.alt(@as(std.Uri.Component, .{ .raw = project_root }), .formatEscaped),
+        }) catch return error.OutOfMemory;
+        const response = std.mem.trim(u8, try self.post(arena, target, ""), " \t\r\n");
+        const end = std.mem.indexOfAny(u8, response, "\t\r\n") orelse response.len;
+        if (end == 0) {
+            self.note("the daemon returned no session identifier");
+            return error.Refused;
+        }
+        self.clear();
+        return response[0..end];
+    }
+
+    /// Attach a session created by the local `chock` daemon to a registered
+    /// service project, making its transcript available to ACL and sharing.
+    pub fn registerExistingSession(
+        self: *Web,
+        arena: std.mem.Allocator,
+        project_root: []const u8,
+        session_id: []const u8,
+    ) ui_source.Error!void {
+        const target = std.fmt.allocPrint(arena, "/api/session/register?project={f}", .{
+            std.fmt.alt(@as(std.Uri.Component, .{ .raw = project_root }), .formatEscaped),
+        }) catch return error.OutOfMemory;
+        const payload = std.json.Stringify.valueAlloc(arena, .{ .session = session_id }, .{}) catch
+            return error.OutOfMemory;
+        _ = try self.post(arena, target, payload);
+        self.clear();
     }
 
     /// Follow one session, and look up which project it is in.
@@ -93,6 +266,15 @@ pub const Web = struct {
         )}) catch "";
     }
 
+    /// The project needed to authorize an address-bar session route.
+    pub fn locationProject(self: *Web) []const u8 {
+        if (self.watching_project.len == 0) return "";
+        return std.fmt.bufPrint(&self.project_query, "?project={f}", .{std.fmt.alt(
+            @as(std.Uri.Component, .{ .raw = self.watching_project }),
+            .formatEscaped,
+        )}) catch "";
+    }
+
     /// `&project=...` for a request about the session being followed, or nothing
     /// when serve's own project is the right one.
     fn namedProject(self: *Web, arena: std.mem.Allocator) []const u8 {
@@ -107,9 +289,386 @@ pub const Web = struct {
         return .{ .ptr = self, .vtable = &vtable, .name = "daemon" };
     }
 
+    pub fn projects(self: *Web, arena: std.mem.Allocator) ui_source.Error![]const control.ProjectRow {
+        const said = try self.get(arena, "/api/projects");
+        const found = std.json.parseFromSliceLeaky([]const control.ProjectRow, arena, said, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            self.note("the daemon's project list could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn people(self: *Web, arena: std.mem.Allocator) ui_source.Error![]const control.PersonRow {
+        const said = try self.get(arena, "/api/people");
+        const found = std.json.parseFromSliceLeaky([]const control.PersonRow, arena, said, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            self.note("the daemon's people directory could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn revokePersonSessions(self: *Web, arena: std.mem.Allocator, identity_id: []const u8) ui_source.Error!u64 {
+        const payload = std.json.Stringify.valueAlloc(arena, .{ .identity_id = identity_id }, .{}) catch
+            return error.OutOfMemory;
+        const said = try self.post(arena, "/api/people", payload);
+        const Reply = struct { revoked: u64 };
+        const found = std.json.parseFromSliceLeaky(Reply, arena, said, .{}) catch {
+            self.note("the daemon's credential revocation result could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found.revoked;
+    }
+
+    pub fn createLocalAccount(
+        self: *Web,
+        arena: std.mem.Allocator,
+        username: []const u8,
+        password: []const u8,
+    ) ui_source.Error![]const u8 {
+        const payload = std.json.Stringify.valueAlloc(arena, .{
+            .action = "create_local",
+            .username = username,
+            .password = password,
+        }, .{}) catch return error.OutOfMemory;
+        const said = try self.post(arena, "/api/people", payload);
+        const Reply = struct { identity_id: []const u8 };
+        const found = std.json.parseFromSliceLeaky(Reply, arena, said, .{}) catch {
+            self.note("the new local account result could not be read");
+            return error.Refused;
+        };
+        if (found.identity_id.len != 36) {
+            self.note("the new local account identifier was malformed");
+            return error.Refused;
+        }
+        self.clear();
+        return found.identity_id;
+    }
+
+    pub fn resetLocalAccountPassword(
+        self: *Web,
+        arena: std.mem.Allocator,
+        identity_id: []const u8,
+        password: []const u8,
+    ) ui_source.Error!void {
+        const payload = std.json.Stringify.valueAlloc(arena, .{
+            .action = "reset_local_password",
+            .identity_id = identity_id,
+            .password = password,
+        }, .{}) catch return error.OutOfMemory;
+        _ = try self.post(arena, "/api/people", payload);
+        self.clear();
+    }
+
+    pub fn setLocalAccountEnabled(
+        self: *Web,
+        arena: std.mem.Allocator,
+        identity_id: []const u8,
+        enabled: bool,
+    ) ui_source.Error!void {
+        const payload = std.json.Stringify.valueAlloc(arena, .{
+            .action = "set_local_account_enabled",
+            .identity_id = identity_id,
+            .enabled = enabled,
+        }, .{}) catch return error.OutOfMemory;
+        _ = try self.post(arena, "/api/people", payload);
+        self.clear();
+    }
+
+    pub fn setInstanceRole(
+        self: *Web,
+        arena: std.mem.Allocator,
+        identity_id: []const u8,
+        instance_admin: bool,
+    ) ui_source.Error!void {
+        const role: []const u8 = if (instance_admin) "instance_admin" else "member";
+        const payload = std.json.Stringify.valueAlloc(arena, .{
+            .action = "set_instance_role",
+            .identity_id = identity_id,
+            .role = role,
+        }, .{}) catch return error.OutOfMemory;
+        _ = try self.post(arena, "/api/people", payload);
+        self.clear();
+    }
+
+    pub fn createProject(
+        self: *Web,
+        arena: std.mem.Allocator,
+        name: []const u8,
+        root: []const u8,
+    ) ui_source.Error!control.ProjectRow {
+        const payload = std.json.Stringify.valueAlloc(arena, .{ .name = name, .root = root }, .{}) catch
+            return error.OutOfMemory;
+        const said = try self.post(arena, "/api/projects", payload);
+        const found = std.json.parseFromSliceLeaky(control.ProjectRow, arena, said, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            self.note("the daemon's project response could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn createGitProject(
+        self: *Web,
+        arena: std.mem.Allocator,
+        name: []const u8,
+        repository_url: []const u8,
+    ) ui_source.Error!control.ProjectRow {
+        const payload = std.json.Stringify.valueAlloc(arena, .{ .name = name, .repository_url = repository_url }, .{}) catch
+            return error.OutOfMemory;
+        const said = try self.post(arena, "/api/projects", payload);
+        const found = std.json.parseFromSliceLeaky(control.ProjectRow, arena, said, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            self.note("the daemon's project response could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn setProjectArchived(
+        self: *Web,
+        arena: std.mem.Allocator,
+        project_id: []const u8,
+        archived: bool,
+    ) ui_source.Error!void {
+        const payload = std.json.Stringify.valueAlloc(arena, .{
+            .action = "set_status",
+            .project_id = project_id,
+            .status = if (archived) "archived" else "ready",
+        }, .{}) catch return error.OutOfMemory;
+        _ = try self.post(arena, "/api/projects", payload);
+        self.clear();
+    }
+
+    pub fn cancelSession(self: *Web, arena: std.mem.Allocator, session: []const u8) ui_source.Error!void {
+        const target = std.fmt.allocPrint(arena, "/api/cancel?session={s}{s}", .{ session, self.namedProject(arena) }) catch
+            return error.OutOfMemory;
+        _ = try self.post(arena, target, "");
+    }
+
+    pub fn answerAgentQuestion(
+        self: *Web,
+        arena: std.mem.Allocator,
+        session: []const u8,
+        request: u64,
+        answer_text: []const u8,
+    ) ui_source.Error!void {
+        const target = std.fmt.allocPrint(
+            arena,
+            "/api/agent-answer?session={s}&request={d}{s}",
+            .{ session, request, self.namedProject(arena) },
+        ) catch return error.OutOfMemory;
+        _ = try self.post(arena, target, answer_text);
+    }
+
+    pub fn teams(self: *Web, arena: std.mem.Allocator) ui_source.Error![]const control.TeamRow {
+        const said = try self.get(arena, "/api/teams");
+        const found = std.json.parseFromSliceLeaky([]const control.TeamRow, arena, said, .{ .ignore_unknown_fields = true }) catch {
+            self.note("the daemon's team list could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn createTeam(self: *Web, arena: std.mem.Allocator, name: []const u8) ui_source.Error!control.TeamRow {
+        const payload = std.json.Stringify.valueAlloc(arena, .{ .name = name }, .{}) catch return error.OutOfMemory;
+        const said = try self.post(arena, "/api/teams", payload);
+        const found = std.json.parseFromSliceLeaky(control.TeamRow, arena, said, .{ .ignore_unknown_fields = true }) catch {
+            self.note("the daemon's team response could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn teamPeople(self: *Web, arena: std.mem.Allocator, team: []const u8) ui_source.Error![]const control.TeamPersonRow {
+        const target = std.fmt.allocPrint(arena, "/api/team-members?team={s}", .{team}) catch return error.OutOfMemory;
+        const said = try self.get(arena, target);
+        const found = std.json.parseFromSliceLeaky([]const control.TeamPersonRow, arena, said, .{ .ignore_unknown_fields = true }) catch {
+            self.note("the daemon's team membership could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn setTeamMember(self: *Web, arena: std.mem.Allocator, team: []const u8, identity_id: []const u8, role: []const u8) ui_source.Error!void {
+        const target = std.fmt.allocPrint(arena, "/api/team-members?team={s}", .{team}) catch return error.OutOfMemory;
+        const payload = std.json.Stringify.valueAlloc(arena, .{ .identity_id = identity_id, .role = role }, .{}) catch return error.OutOfMemory;
+        _ = try self.post(arena, target, payload);
+    }
+
+    pub fn teamInvitations(self: *Web, arena: std.mem.Allocator, team: []const u8) ui_source.Error![]const TeamInvitationRow {
+        const target = std.fmt.allocPrint(arena, "/api/team-invites?team={s}", .{team}) catch return error.OutOfMemory;
+        const said = try self.get(arena, target);
+        const found = std.json.parseFromSliceLeaky([]const TeamInvitationRow, arena, said, .{ .ignore_unknown_fields = true }) catch {
+            self.note("the daemon's team invitations could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn createTeamInvitation(self: *Web, arena: std.mem.Allocator, team: []const u8, role: []const u8) ui_source.Error!CreatedTeamInvitation {
+        const payload = std.json.Stringify.valueAlloc(arena, .{ .action = "create", .team = team, .role = role }, .{}) catch return error.OutOfMemory;
+        const said = try self.post(arena, "/api/team-invites", payload);
+        const found = std.json.parseFromSliceLeaky(CreatedTeamInvitation, arena, said, .{}) catch {
+            self.note("the daemon's invitation response could not be read");
+            return error.Refused;
+        };
+        if (found.id.len != 36 or found.token.len != 43 or found.expires_ms <= 0) {
+            self.note("the daemon returned an invalid invitation");
+            return error.Refused;
+        }
+        self.clear();
+        return found;
+    }
+
+    pub fn redeemTeamInvitation(self: *Web, arena: std.mem.Allocator, token: []const u8) ui_source.Error!void {
+        const payload = std.json.Stringify.valueAlloc(arena, .{ .action = "redeem", .token = token }, .{}) catch return error.OutOfMemory;
+        _ = try self.post(arena, "/api/team-invites", payload);
+    }
+
+    pub fn revokeTeamInvitation(self: *Web, arena: std.mem.Allocator, team: []const u8, invitation: []const u8) ui_source.Error!void {
+        const target = std.fmt.allocPrint(arena, "/api/team-invites?team={s}&invitation={s}", .{ team, invitation }) catch return error.OutOfMemory;
+        _ = try self.sendMethod(arena, target, .DELETE, "", &.{});
+    }
+
+    pub fn aclRules(self: *Web, arena: std.mem.Allocator, resource_kind: []const u8, resource_id: []const u8) ui_source.Error![]const AclRecord {
+        const target = std.fmt.allocPrint(arena, "/api/acl-rules?resource_kind={s}&resource_id={s}", .{ resource_kind, resource_id }) catch return error.OutOfMemory;
+        const said = try self.get(arena, target);
+        const found = std.json.parseFromSliceLeaky([]const AclRecord, arena, said, .{ .ignore_unknown_fields = true }) catch {
+            self.note("the daemon's ACL rules could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn setAclRule(self: *Web, arena: std.mem.Allocator, resource_kind: []const u8, resource_id: []const u8, principal_kind: []const u8, principal_id: []const u8, capability: []const u8, effect: []const u8) ui_source.Error!void {
+        const payload = std.json.Stringify.valueAlloc(arena, .{
+            .resource_kind = resource_kind,
+            .resource_id = resource_id,
+            .principal_kind = principal_kind,
+            .principal_id = principal_id,
+            .capability = capability,
+            .effect = effect,
+        }, .{}) catch return error.OutOfMemory;
+        _ = try self.post(arena, "/api/acl-rules", payload);
+    }
+
+    pub fn removeAclRule(self: *Web, arena: std.mem.Allocator, rule_id: []const u8) ui_source.Error!void {
+        const target = std.fmt.allocPrint(arena, "/api/acl-rules?rule_id={s}", .{rule_id}) catch return error.OutOfMemory;
+        _ = try self.sendMethod(arena, target, .DELETE, "", &.{});
+    }
+
+    pub fn providers(self: *Web, arena: std.mem.Allocator) ui_source.Error![]const ProviderRow {
+        const said = try self.get(arena, "/api/providers");
+        const found = std.json.parseFromSliceLeaky([]const ProviderRow, arena, said, .{ .ignore_unknown_fields = true }) catch {
+            self.note("the daemon's providers could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn createProvider(self: *Web, arena: std.mem.Allocator, name: []const u8, provider_kind: []const u8, scope_kind: []const u8, scope_id: []const u8, configuration: []const u8, credential_ref: []const u8) ui_source.Error![]const u8 {
+        const payload = std.json.Stringify.valueAlloc(arena, .{
+            .name = name,
+            .provider_kind = provider_kind,
+            .scope_kind = scope_kind,
+            .scope_id = scope_id,
+            .configuration = configuration,
+            .credential_ref = credential_ref,
+        }, .{}) catch return error.OutOfMemory;
+        const response = try self.post(arena, "/api/providers", payload);
+        const Result = struct { id: []const u8 };
+        const parsed = std.json.parseFromSliceLeaky(Result, arena, response, .{}) catch {
+            self.note("the daemon's provider response could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return parsed.id;
+    }
+
+    pub fn removeProvider(self: *Web, arena: std.mem.Allocator, provider_id: []const u8) ui_source.Error!void {
+        const target = std.fmt.allocPrint(arena, "/api/providers?provider_id={s}", .{provider_id}) catch return error.OutOfMemory;
+        _ = try self.sendMethod(arena, target, .DELETE, "", &.{});
+    }
+
+    pub fn sessionPeople(
+        self: *Web,
+        arena: std.mem.Allocator,
+        session: []const u8,
+    ) ui_source.Error![]const control.SessionPersonRow {
+        const target = std.fmt.allocPrint(arena, "/api/session-members?session={s}", .{session}) catch
+            return error.OutOfMemory;
+        const said = try self.get(arena, target);
+        const found = std.json.parseFromSliceLeaky([]const control.SessionPersonRow, arena, said, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            self.note("the daemon's session people list could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn touchSessionPresence(self: *Web, arena: std.mem.Allocator, session: []const u8) ui_source.Error!void {
+        const target = std.fmt.allocPrint(arena, "/api/session-presence?session={s}", .{session}) catch
+            return error.OutOfMemory;
+        _ = try self.post(arena, target, "");
+    }
+
+    pub fn sessionPresence(
+        self: *Web,
+        arena: std.mem.Allocator,
+        session: []const u8,
+    ) ui_source.Error![]const control.SessionPresenceRow {
+        const target = std.fmt.allocPrint(arena, "/api/session-presence?session={s}", .{session}) catch
+            return error.OutOfMemory;
+        const said = try self.get(arena, target);
+        const found = std.json.parseFromSliceLeaky([]const control.SessionPresenceRow, arena, said, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            self.note("the daemon's session presence could not be read");
+            return error.Refused;
+        };
+        self.clear();
+        return found;
+    }
+
+    pub fn shareSession(
+        self: *Web,
+        arena: std.mem.Allocator,
+        session: []const u8,
+        identity_id: []const u8,
+        role: []const u8,
+    ) ui_source.Error!void {
+        const target = std.fmt.allocPrint(arena, "/api/session-members?session={s}", .{session}) catch
+            return error.OutOfMemory;
+        const payload = std.json.Stringify.valueAlloc(arena, .{
+            .identity_id = identity_id,
+            .role = role,
+        }, .{}) catch return error.OutOfMemory;
+        _ = try self.post(arena, target, payload);
+    }
+
     const vtable: Source.VTable = .{
         .sessions = sessions,
         .create = create,
+        .createPlaced = createPlaced,
         .events = events,
         .asks = asks,
         .prompt = prompt,
@@ -132,8 +691,7 @@ pub const Web = struct {
         // A scheme so the client can parse it. Which scheme the browser really
         // uses is the page's own, resolved on the far side of `fetch`: see
         // phantom's `web_net.requestUrl`.
-        const url = std.fmt.allocPrint(arena, "http://{s}{s}", .{ self.origin, target }) catch
-            return error.OutOfMemory;
+        const url = requestUrl(arena, self.origin, target) catch return error.OutOfMemory;
 
         var body: std.Io.Writer.Allocating = .init(arena);
         const reply = self.owner.http().fetch(.{
@@ -149,7 +707,7 @@ pub const Web = struct {
             return error.Unreachable;
         };
 
-        if (reply.status != .ok) {
+        if (reply.status != .ok and reply.status != .created) {
             const detail = std.mem.trim(u8, body.written(), " \t\r\n");
             var room: [512]u8 = undefined;
             self.note(if (detail.len != 0)
@@ -226,8 +784,18 @@ pub const Web = struct {
         ptr: *anyopaque,
         arena: std.mem.Allocator,
     ) ui_source.Error![]const u8 {
+        return createPlaced(ptr, arena, .daemon);
+    }
+
+    fn createPlaced(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        placement: ui_source.Placement,
+    ) ui_source.Error![]const u8 {
         const self: *Web = @ptrCast(@alignCast(ptr));
-        const response = std.mem.trim(u8, try self.post(arena, "/api/create", ""), " \t\r\n");
+        const target = std.fmt.allocPrint(arena, "/api/create?placement={s}", .{@tagName(placement)}) catch
+            return error.OutOfMemory;
+        const response = std.mem.trim(u8, try self.post(arena, target, ""), " \t\r\n");
         const end = std.mem.indexOfAny(u8, response, "\t\r\n") orelse response.len;
         if (end == 0) {
             self.note("the daemon returned no session identifier");
@@ -249,8 +817,8 @@ pub const Web = struct {
         const self: *Web = @ptrCast(@alignCast(ptr));
         const said = try self.get(arena, std.fmt.allocPrint(
             arena,
-            "/api/lines?session={s}&after={d}",
-            .{ session, after },
+            "/api/lines?session={s}&after={d}{s}",
+            .{ session, after, self.namedProject(arena) },
         ) catch return error.OutOfMemory);
         return self.envelopesIn(arena, said);
     }
@@ -285,8 +853,8 @@ pub const Web = struct {
 
         const said = try self.get(arena, std.fmt.allocPrint(
             arena,
-            "/api/lines?session={s}&after=0",
-            .{session},
+            "/api/lines?session={s}&after=0{s}",
+            .{ session, self.namedProject(arena) },
         ) catch return error.OutOfMemory);
         const entries = try self.envelopesIn(arena, said);
 
@@ -447,18 +1015,29 @@ pub const Web = struct {
         target: []const u8,
         payload: []const u8,
     ) ui_source.Error![]const u8 {
+        return self.sendMethod(arena, target, .POST, payload, &.{});
+    }
+
+    fn sendMethod(
+        self: *Web,
+        arena: std.mem.Allocator,
+        target: []const u8,
+        method: std.http.Method,
+        payload: []const u8,
+        extra_headers: []const std.http.Header,
+    ) ui_source.Error![]const u8 {
         if (!self.reachable()) return error.Unreachable;
-        const url = std.fmt.allocPrint(arena, "http://{s}{s}", .{ self.origin, target }) catch
-            return error.OutOfMemory;
+        const url = requestUrl(arena, self.origin, target) catch return error.OutOfMemory;
 
         var body: std.Io.Writer.Allocating = .init(arena);
         const reply = self.owner.http().fetch(.{
             .url = url,
-            .method = .POST,
+            .method = method,
             // Keep an empty POST body present. On native std.http this emits a
             // zero content length; treating it as null leaves a body-bearing
             // method underspecified and can trip the Android client assertion.
             .payload = payload,
+            .extra_headers = extra_headers,
             .response_writer = &body.writer,
         }) catch |err| {
             // The error and the address together. Without them a refused
@@ -491,8 +1070,12 @@ pub const Web = struct {
         return body.written();
     }
 
-    fn whyLast(ptr: *anyopaque) ?[]const u8 {
+    pub fn whyLast(ptr: *anyopaque) ?[]const u8 {
         const self: *Web = @ptrCast(@alignCast(ptr));
+        return self.said;
+    }
+
+    pub fn lastError(self: *const Web) ?[]const u8 {
         return self.said;
     }
 
@@ -540,6 +1123,17 @@ fn entriesIn(arena: std.mem.Allocator, said: []const u8) ?[]const ui_source.Entr
 }
 
 const testing = std.testing;
+
+test "native server URLs preserve HTTPS while browser hosts get a placeholder scheme" {
+    const arena = testing.allocator;
+    const secure = try requestUrl(arena, "https://daemon.example:7374", "/api/projects");
+    defer arena.free(secure);
+    try testing.expectEqualStrings("https://daemon.example:7374/api/projects", secure);
+
+    const local = try requestUrl(arena, "192.168.1.20:7374", "/api/projects");
+    defer arena.free(local);
+    try testing.expectEqualStrings("http://192.168.1.20:7374/api/projects", local);
+}
 
 test "a reply is read as the events the log holds, not as words about them" {
     var room = std.heap.ArenaAllocator.init(testing.allocator);

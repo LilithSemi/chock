@@ -16,22 +16,33 @@ const deny_mod = @import("deny.zig");
 const binds_mod = @import("binds.zig");
 const palisade = @import("palisade");
 const chock_net = @import("chock-net");
+const chock_policy = @import("chock-policy");
 
 pub const Error = worktree_mod.Error || overlay_mod.Error || deny_mod.Error || error{
     OverlayCannotBeAdopted,
     ChockZonIsSymlink,
 };
 
-/// The sandbox has no `HOME` and `.git` is read only, so git has no configured identity to fall back to.
-pub const identity_name = "Chock";
-pub const identity_email = "chock@lilithsemi.com";
+/// How many entries the identity takes in a sandbox environment.
+pub const identity_entries = 4;
 
-/// No project may override this. No `GIT_AUTHOR_DATE` or `GIT_COMMITTER_DATE`, so git reads the real clock.
-pub const identity_env = [_][]const u8{
-    "GIT_AUTHOR_NAME=" ++ identity_name,
-    "GIT_AUTHOR_EMAIL=" ++ identity_email,
-    "GIT_COMMITTER_NAME=" ++ identity_name,
-    "GIT_COMMITTER_EMAIL=" ++ identity_email,
+/// The sandbox has no `HOME` and `.git` is read only, so git has no configured identity to fall back to.
+/// The project's `identity` block may set it. Never `GIT_AUTHOR_DATE` or `GIT_COMMITTER_DATE`, so git reads the real clock.
+const default_identity_env = [identity_entries][]const u8{
+    "GIT_AUTHOR_NAME=" ++ chock_policy.identity.default_name,
+    "GIT_AUTHOR_EMAIL=" ++ chock_policy.identity.default_email,
+    "GIT_COMMITTER_NAME=" ++ chock_policy.identity.default_name,
+    "GIT_COMMITTER_EMAIL=" ++ chock_policy.identity.default_email,
+};
+
+/// Git runs `gc --auto` itself after a commit or a fetch, and a pack it writes makes the session unlandable.
+/// Config arrives as environment because `.git` is read only. A caller that adds config entries of its own must count these two.
+pub const maintenance_env = [_][]const u8{
+    "GIT_CONFIG_COUNT=2",
+    "GIT_CONFIG_KEY_0=gc.auto",
+    "GIT_CONFIG_VALUE_0=0",
+    "GIT_CONFIG_KEY_1=maintenance.auto",
+    "GIT_CONFIG_VALUE_1=false",
 };
 
 /// Neither `mounts` call opens or mounts anything; `chock-sandbox`'s own `buildRoot` performs it.
@@ -49,6 +60,8 @@ pub const Workspace = struct {
     deny_paths: []const []u8,
     /// Empty until `attachBinds` runs.
     binds: []binds_mod.Attached = &.{},
+    /// The entries `sandboxConfig` hands out; `useIdentity` replaces them.
+    identity_env: [identity_entries][]const u8 = default_identity_env,
 
     /// On Darwin, `scratch_dir` must share the project's volume, or `error.ScratchOnAnotherVolume`.
     pub fn open(
@@ -444,6 +457,21 @@ pub const Workspace = struct {
         return binds_mod.writeBack(allocator, io, self.binds, report);
     }
 
+    /// The strings belong to `allocator`, which must outlive every config made from `self`.
+    /// Call it once, with the project's `identity` block, before `sandboxConfig`.
+    pub fn useIdentity(
+        self: *Workspace,
+        allocator: std.mem.Allocator,
+        identity: chock_policy.identity.Identity,
+    ) std.mem.Allocator.Error!void {
+        self.identity_env = .{
+            try std.fmt.allocPrint(allocator, "GIT_AUTHOR_NAME={s}", .{identity.name}),
+            try std.fmt.allocPrint(allocator, "GIT_AUTHOR_EMAIL={s}", .{identity.email}),
+            try std.fmt.allocPrint(allocator, "GIT_COMMITTER_NAME={s}", .{identity.name}),
+            try std.fmt.allocPrint(allocator, "GIT_COMMITTER_EMAIL={s}", .{identity.email}),
+        };
+    }
+
     /// The caller owns the returned slices; every string in them is a
     /// slice into `self` and stays valid only as long as `self` does.
     pub fn sandboxConfig(
@@ -458,7 +486,8 @@ pub const Workspace = struct {
         // The identity comes first for both backings; without it git refuses to commit.
         var env: std.ArrayList([]const u8) = .empty;
         errdefer env.deinit(allocator);
-        try env.appendSlice(allocator, &identity_env);
+        try env.appendSlice(allocator, &self.identity_env);
+        try env.appendSlice(allocator, &maintenance_env);
 
         const cwd = self.sandboxRoot();
 
@@ -984,7 +1013,7 @@ test "sandboxConfig for the worktree kind needs no namespace, so an ordinary cal
     try std.testing.expect(config.rules.len > 0);
     try std.testing.expectEqualStrings(workspace.kind.worktree.project_root, config.cwd);
 
-    try std.testing.expectEqual(identity_env.len + 2, config.env.len);
+    try std.testing.expectEqual(identity_entries + maintenance_env.len + 2, config.env.len);
     var found_object_directory = false;
     var found_alternate = false;
     for (config.env) |entry| {
@@ -999,10 +1028,10 @@ test "both backings carry the git identity, author and committer, and neither ca
     const allocator = std.testing.allocator;
 
     const wanted = [_][]const u8{
-        "GIT_AUTHOR_NAME=Chock",
-        "GIT_AUTHOR_EMAIL=chock@lilithsemi.com",
-        "GIT_COMMITTER_NAME=Chock",
-        "GIT_COMMITTER_EMAIL=chock@lilithsemi.com",
+        "GIT_AUTHOR_NAME=" ++ chock_policy.identity.default_name,
+        "GIT_AUTHOR_EMAIL=" ++ chock_policy.identity.default_email,
+        "GIT_COMMITTER_NAME=" ++ chock_policy.identity.default_name,
+        "GIT_COMMITTER_EMAIL=" ++ chock_policy.identity.default_email,
     };
 
     for ([_]bool{ true, false }) |as_git_repository| {
@@ -1040,6 +1069,40 @@ test "both backings carry the git identity, author and committer, and neither ca
     }
 }
 
+test "the default identity is chock at localhost, and a configured one replaces both halves in the sandbox" {
+    try std.testing.expectEqualStrings("chock", chock_policy.identity.default_name);
+    try std.testing.expectEqualStrings("chock@localhost", chock_policy.identity.default_email);
+
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    var workspace = try Workspace.openWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+    try workspace.useIdentity(arena_state.allocator(), .{ .name = "Acme Bot", .email = "bot@acme.com" });
+
+    const config = try workspace.sandboxConfig(allocator, "/does-not-need-to-exist-for-this-check");
+    defer allocator.free(config.mounts);
+    defer allocator.free(config.rules);
+    defer allocator.free(config.env);
+    for ([_][]const u8{
+        "GIT_AUTHOR_NAME=Acme Bot",
+        "GIT_AUTHOR_EMAIL=bot@acme.com",
+        "GIT_COMMITTER_NAME=Acme Bot",
+        "GIT_COMMITTER_EMAIL=bot@acme.com",
+    }) |entry| {
+        var found = false;
+        for (config.env) |candidate| {
+            if (std.mem.eql(u8, candidate, entry)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
 test "sandboxConfig for the overlay kind needs no namespace either, so an ordinary caller can call it directly" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1058,7 +1121,7 @@ test "sandboxConfig for the overlay kind needs no namespace either, so an ordina
     try std.testing.expect(config.mounts.len > 0);
     try std.testing.expect(config.rules.len > 0);
     try std.testing.expectEqualStrings(workspace.kind.overlay.project, config.cwd);
-    try std.testing.expectEqual(identity_env.len, config.env.len);
+    try std.testing.expectEqual(identity_entries + maintenance_env.len, config.env.len);
 
     const overlay_entry = switch (config.mounts[0]) {
         .overlay => |o| o,

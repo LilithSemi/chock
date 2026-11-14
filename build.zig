@@ -243,6 +243,7 @@ pub fn build(b: *std.Build) void {
     const run_control_tests = b.addRunArtifact(control_tests);
     run_control_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_control_tests.step);
+    module_test_steps.add(b, "test-control", "Run control protocol tests only", &run_control_tests.step);
 
     // The policy table the broker evaluates. Like chock-net and chock-io,
     // it imports no other chock library and has no build.zig of its own: it
@@ -262,6 +263,11 @@ pub fn build(b: *std.Build) void {
     // an overlay's own mount list, and Sandbox.spawn all need to agree on,
     // field for field. chock-policy comes in for the `workspace` block, whose
     // binds this builds the mount list from.
+    // Git as a library rather than a spawned binary. The workspace builds and
+    // reads worktrees, the broker reads refs and diffs, and the binary reviews
+    // and applies them, so all three take it directly.
+    const ziggit = b.dependency("ziggit", .{ .target = target, .optimize = optimize });
+
     const chock_workspace = b.addModule("chock-workspace", .{
         .root_source_file = b.path("lib/chock-workspace.zig"),
         .target = target,
@@ -271,6 +277,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "palisade", .module = palisade },
             .{ .name = "chock-policy", .module = chock_policy },
             .{ .name = "chock-zon", .module = chock_zon },
+            .{ .name = "ziggit", .module = ziggit.module("ziggit") },
         },
     });
 
@@ -316,6 +323,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "palisade", .module = palisade },
                 .{ .name = "chock-policy", .module = chock_policy },
                 .{ .name = "chock-zon", .module = chock_zon },
+                .{ .name = "ziggit", .module = ziggit.module("ziggit") },
                 .{ .name = "overlay_helper_path", .module = overlay_helper_path_options.createModule() },
             },
         }),
@@ -502,8 +510,9 @@ pub fn build(b: *std.Build) void {
     // chock-policy, because the table is the broker's own state. It also
     // imports chock-workspace: five of the eight acts a broker can do are git
     // operations, and lib/chock-workspace/git.zig is the only file in Chock
-    // that talks to git, so lib/chock-broker/actions.zig calls that one rather
-    // than keeping a second spawn of git that could drift from it.
+    // that spawns git, so lib/chock-broker/actions.zig calls that one rather
+    // than keeping a second spawn of git that could drift from it. Reads go
+    // through ziggit now, and both libraries take it directly.
     // chock-workspace does not import chock-broker, so this makes no cycle. It
     // does not import chock-core: the loop calls the broker, never the other
     // way round, which is what lets the broker move into its own process later.
@@ -526,6 +535,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "chock-net", .module = chock_net },
             .{ .name = "palisade", .module = palisade },
             .{ .name = "chock-version", .module = chock_version_module },
+            .{ .name = "ziggit", .module = ziggit.module("ziggit") },
+            // Ancestry, which the front module does not re-export.
+            .{ .name = "ziggit-revwalk", .module = ziggit.module("ziggit-revwalk") },
         },
     });
 
@@ -1682,7 +1694,9 @@ pub fn build(b: *std.Build) void {
     //
     // **A Mac needs the hypervisor entitlement**, which an ad hoc signature
     // carries: see `docs/security/microvm.md` for the one command, and for why
-    // an unsigned binary gets `HV_DENIED` rather than a diagnosable fault.
+    // an unsigned binary gets `HV_DENIED` rather than a diagnosable fault. The
+    // release packager re-signs its staged copy after chmod and CI inspects the
+    // binary extracted from the final archive.
     //
     // Two files behind one module name, so every build compiles: the one that cannot
     // run a guest answers `available = false`, which the daemon reads before it
@@ -1763,6 +1777,33 @@ pub fn build(b: *std.Build) void {
     const run_web_tests = b.addRunArtifact(web_tests);
     test_step.dependOn(&run_web_tests.step);
 
+    // The native remote shell is built for the host as well as Android so its
+    // settings-backed server picker and persistence format are covered by the
+    // ordinary test gate without requiring an NDK on the test machine.
+    const remote_app_test = b.createModule(.{
+        .root_source_file = b.path("src/web/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "phantom", .module = phantom.module("phantom") },
+            .{ .name = "chock-ui", .module = chock_ui },
+            .{ .name = "chock-proto", .module = chock_proto },
+        },
+    });
+    const android_test_module = b.createModule(.{
+        .root_source_file = b.path("src/android/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "phantom", .module = phantom.module("phantom") },
+            .{ .name = "chock-remote-app", .module = remote_app_test },
+        },
+    });
+    const android_tests = b.addTest(.{ .root_module = android_test_module });
+    const run_android_tests = b.addRunArtifact(android_tests);
+    test_step.dependOn(&run_android_tests.step);
+    module_test_steps.add(b, "test-android", "Run the Android remote-shell tests only", &run_android_tests.step);
+
     // The browser build. `addApp` makes its own wasm phantom and injects it into
     // every module passed here, so these instances must not import phantom
     // themselves: a second instance would give types that do not match. One
@@ -1838,21 +1879,57 @@ pub fn build(b: *std.Build) void {
         run_web_bundle.addFileArg2(web_dist.dir.path(b, name), .{});
     }
 
-    // Structured Git diffs for workspace review and selective application.
-    // Keeping this as a direct dependency makes that API explicit instead of
-    // reaching through fix's private dependency graph.
-    const ziggit = b.dependency("ziggit", .{ .target = target, .optimize = optimize });
-
     // OAuth lives outside Chock. The binary is where the flows run, because
     // `chock login` owns the browser and the loopback socket, and the store
     // keeps only the credential a flow produced. So chock-auth imports none of
     // these and no library test binary links them.
     const oauth = b.dependency("oauth", .{ .target = target, .optimize = optimize });
+    // The service's OIDC transport uses the host's configured trust store,
+    // allowing enterprise identity providers with administrator-installed CAs.
+    const zurl = b.dependency("zurl", .{ .target = target, .optimize = optimize });
+    // Daemon-owned identity, membership, and placement state. The personal
+    // deployment uses SQLite and a hosted daemon may use PostgreSQL through
+    // this same Quarry import.
+    const quarry = b.dependency("quarry", .{ .target = target, .optimize = optimize });
+    const opentelemetry = b.dependency("opentelemetry", .{ .target = target });
+
+    const telemetry_module = b.createModule(.{
+        .root_source_file = b.path("src/telemetry.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "opentelemetry-sdk", .module = opentelemetry.module("sdk") }},
+    });
+    const telemetry_tests = b.addTest(.{ .root_module = telemetry_module });
+    const run_telemetry_tests = b.addRunArtifact(telemetry_tests);
+    test_step.dependOn(&run_telemetry_tests.step);
+    module_test_steps.add(b, "test-telemetry", "Run OpenTelemetry configuration tests only", &run_telemetry_tests.step);
+
+    const chock_daemon = b.addModule("chock-daemon", .{
+        .root_source_file = b.path("lib/chock-daemon.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "oauth-core", .module = oauth.module("oauth-core") },
+            .{ .name = "quarry", .module = quarry.module("quarry") },
+        },
+    });
+    const daemon_tests = b.addTest(.{ .root_module = chock_daemon });
+    const run_daemon_tests = b.addRunArtifact(daemon_tests);
+    run_daemon_tests.skip_foreign_checks = true;
+    // A PostgreSQL integration test runs when native server tools are on PATH;
+    // do not reuse a cached skip when the caller's tool environment changes.
+    run_daemon_tests.has_side_effects = true;
+    test_step.dependOn(&run_daemon_tests.step);
+    module_test_steps.add(b, "test-daemon", "Run the daemon state tests only", &run_daemon_tests.step);
 
     const exe_imports = [_]std.Build.Module.Import{
+        .{ .name = "zurl", .module = zurl.module("zurl") },
+        .{ .name = "chock-telemetry", .module = telemetry_module },
         .{ .name = "oauth-core", .module = oauth.module("oauth-core") },
         .{ .name = "oauth-mcp", .module = oauth.module("oauth-mcp") },
         .{ .name = "oauth-openai", .module = oauth.module("oauth-openai") },
+        .{ .name = "quarry", .module = quarry.module("quarry") },
+        .{ .name = "chock-daemon", .module = chock_daemon },
         .{ .name = "chock-vmm", .module = vmm_module },
         .{ .name = "phantom", .module = phantom.module("phantom") },
         .{ .name = "chock-ui", .module = chock_ui },

@@ -544,7 +544,11 @@ pub const Session = struct {
 
         const answer_about_call = try self.askAbout(gpa, io, offer, call.call_id);
         if (!answer_about_call.permitted) return .{
-            .text = try arbiter.refusalText(gpa, name, answer_about_call),
+            .text = try arbiter.refusalText(
+                gpa,
+                if (std.mem.eql(u8, answer_about_call.outcome, arbiter.denied_by_policy)) offer.action else name,
+                answer_about_call,
+            ),
             .is_error = true,
         };
 
@@ -1401,7 +1405,10 @@ test "an MCP tool the table allowed is still asked about on every call, so a lat
     const second = (try bench.session.dispatch(gpa, testing.io, callOf("get_current_time", "{}"))).?;
     defer gpa.free(second.text);
     try testing.expect(second.is_error);
-    try testing.expect(std.mem.indexOf(u8, second.text, "denied_by_policy") != null);
+    try testing.expect(std.mem.indexOf(u8, second.text, "nobody was asked") != null);
+    const named = try std.fmt.allocPrint(gpa, "policy denied \"{s}\"", .{bench.session.find("get_current_time").?.action});
+    defer gpa.free(named);
+    try testing.expect(std.mem.indexOf(u8, second.text, named) != null);
     try testing.expectEqual(@as(usize, 2), bench.judge.asks);
     try testing.expectEqual(@as(usize, 1), bench.fake.calls);
 }

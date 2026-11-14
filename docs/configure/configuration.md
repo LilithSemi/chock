@@ -616,6 +616,47 @@ of the project are each refused by name, and the session does not start. So are
 The session start names every bind it made, with what the name resolved to and
 the mode it arrived under.
 
+### Who the commits say they are
+
+Chock makes two kinds of commit. The agent makes one inside the sandbox, and
+Chock makes one when it lands the work on a branch of yours. Both carry the
+same identity, `chock <chock@localhost>`. The sandbox has no `HOME` and binds
+`.git` read only, so git has no identity of its own to fall back to, and the
+agent never picks one.
+
+The `identity` block replaces it:
+
+```zon
+.{
+    .identity = .{ .name = "Acme Bot", .email = "bot@acme.com" },
+}
+```
+
+Either half may be left out, and the default fills it.
+
+Both halves reach a commit header, so Chock refuses a value that could end or
+split a header line: an empty or blank half, a `<` or a `>`, a line break, and
+a NUL byte. The message names which half and why, and the session does not
+start.
+
+What the agent's own commit claimed is kept. The landing records it in the
+session log, on the row for the landing. The `apply` block can also write it
+into the landed commit's message, as `Claimed-Author:` and `Claimed-Committer:`
+trailers:
+
+```zon
+.{
+    .apply = .{ .mode = .merge, .claimed_identity_in_message = true },
+}
+```
+
+It is off by default, so a landed message stays clean. The log holds the claim
+either way.
+
+`chock.zon` is a file in the repository, so work that lands a change to the
+`identity` block changes the identity the next session uses. The landing shows
+that change like any other.
+
 ### When Chock refuses the file
 
 A fault in `chock.zon` stops the session before the agent runs. The message

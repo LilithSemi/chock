@@ -99,6 +99,7 @@ pub const Ask = struct {
 };
 
 pub const Decision = enum { yes, no };
+pub const Placement = enum { daemon, client };
 
 /// A stable, renderer-neutral description of one isolated workspace review.
 /// The same shape feeds the terminal, desktop and browser interfaces.
@@ -164,6 +165,13 @@ pub const Source = struct {
         create: *const fn (
             ptr: *anyopaque,
             arena: std.mem.Allocator,
+        ) Error![]const u8,
+
+        /// Make an empty session with an explicit execution placement.
+        createPlaced: *const fn (
+            ptr: *anyopaque,
+            arena: std.mem.Allocator,
+            placement: Placement,
         ) Error![]const u8,
 
         /// The events of one session after `at`. Answering an empty slice means
@@ -238,6 +246,10 @@ pub const Source = struct {
         return self.vtable.create(self.ptr, arena);
     }
 
+    pub fn createPlaced(self: Source, arena: std.mem.Allocator, placement: Placement) Error![]const u8 {
+        return self.vtable.createPlaced(self.ptr, arena, placement);
+    }
+
     pub fn events(
         self: Source,
         arena: std.mem.Allocator,
@@ -297,6 +309,7 @@ pub const empty: Source = .{
     .vtable = &.{
         .sessions = emptySessions,
         .create = emptyCreate,
+        .createPlaced = emptyCreatePlaced,
         .events = emptyEvents,
         .asks = emptyAsks,
         .prompt = emptyPrompt,
@@ -315,6 +328,10 @@ fn emptySessions(_: *anyopaque, _: std.mem.Allocator) Error![]const Session {
 }
 
 fn emptyCreate(_: *anyopaque, arena: std.mem.Allocator) Error![]const u8 {
+    return arena.dupe(u8, "") catch error.OutOfMemory;
+}
+
+fn emptyCreatePlaced(_: *anyopaque, arena: std.mem.Allocator, _: Placement) Error![]const u8 {
     return arena.dupe(u8, "") catch error.OutOfMemory;
 }
 

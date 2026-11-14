@@ -210,7 +210,10 @@ codesign --sign - --entitlements <plist> --force <binary>
 
 with the plist naming one key, `<key>com.apple.security.hypervisor</key>
 <true/>`. No Developer ID is needed to run a guest on the machine the binary
-was built on.
+was built on. The release packager signs the staged macOS executable after
+setting its final mode, then CI extracts the published archive and verifies
+both its signature and entitlement. This catches packaging changes that leave
+the build output signed but the distributed binary unusable.
 
 ### The Seatbelt profile does not need widening
 

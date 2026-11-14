@@ -1,6 +1,7 @@
 //! The daemon's control protocol: a greeting, a request, then a reply of
-//! lines until the connection closes. Unknown fields are tolerated; any other
-//! wire change bumps `protocol_version`.
+//! lines until the connection closes. Additive verbs keep existing clients on
+//! protocol version 1; changes that alter existing messages require a version
+//! change.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -200,10 +201,46 @@ pub fn peerUid(handle: std.posix.fd_t) ?std.posix.uid_t {
     }
 }
 
+/// The primary group of a local Unix peer, when the kernel exposes it.
+/// Supplementary groups are deliberately not consulted.
+pub fn peerGid(handle: std.posix.fd_t) ?std.posix.gid_t {
+    switch (builtin.os.tag) {
+        .linux => {
+            const Ucred = extern struct { pid: i32, uid: u32, gid: u32 };
+            var credentials: Ucred = undefined;
+            var length: std.posix.socklen_t = @sizeOf(Ucred);
+            const rc = std.os.linux.getsockopt(
+                handle,
+                std.os.linux.SOL.SOCKET,
+                std.os.linux.SO.PEERCRED,
+                @ptrCast(&credentials),
+                &length,
+            );
+            if (std.posix.errno(rc) != .SUCCESS or length != @sizeOf(Ucred)) return null;
+            if (credentials.pid == 0 or credentials.gid == std.math.maxInt(u32)) return null;
+            return credentials.gid;
+        },
+        else => return null,
+    }
+}
+
 /// An unnamed peer is refused; absence is never permissive.
 pub fn peerAllowed(uid: ?std.posix.uid_t, owner_uid: std.posix.uid_t) bool {
     const said = uid orelse return false;
     return said == owner_uid;
+}
+
+pub fn peerGroupAllowed(gid: ?std.posix.gid_t, allowed_gid: ?std.posix.gid_t) bool {
+    const said = gid orelse return false;
+    const allowed = allowed_gid orelse return false;
+    return said == allowed;
+}
+
+test "local group authorization accepts only the configured primary group" {
+    try std.testing.expect(peerGroupAllowed(42, 42));
+    try std.testing.expect(!peerGroupAllowed(41, 42));
+    try std.testing.expect(!peerGroupAllowed(null, 42));
+    try std.testing.expect(!peerGroupAllowed(42, null));
 }
 
 pub fn refusalFor(writer: *std.Io.Writer, address: Address, err: Address.ConnectError) std.Io.Writer.Error!void {
@@ -383,6 +420,35 @@ pub const Verb = enum {
     projects,
     watch,
     answer,
+    auth_status,
+    auth_local_setup,
+    auth_local_login,
+    auth_oidc_setup,
+    auth_oidc_begin,
+    auth_oidc_exchange,
+    auth_session,
+    auth_logout,
+    auth_authorize,
+    auth_project_create,
+    auth_project_list,
+    auth_session_create,
+    auth_session_register,
+    auth_session_register_placed,
+    auth_session_member,
+    auth_session_people,
+    auth_session_presence,
+    auth_session_host,
+    auth_worker_event,
+    auth_worker_read,
+    auth_worker_token,
+    auth_people,
+    auth_team,
+    auth_acl,
+    auth_provider,
+    auth_prompt,
+    auth_cancel,
+    auth_answer,
+    auth_agent_answer,
 };
 
 /// `read` is space separated, the rest tab separated; `src/detach.zig` already speaks them.
@@ -403,6 +469,45 @@ pub const Request = union(Verb) {
     projects: void,
     watch: Watch,
     answer: Answer_,
+    /// Authentication mode and first-run state, queried by the local gateway.
+    auth_status: void,
+    /// Initial local administrator credentials, JSON encoded then base64url encoded.
+    auth_local_setup: AuthLocalCredentials,
+    /// Local account credentials, JSON encoded then base64url encoded.
+    auth_local_login: AuthLocalCredentials,
+    /// First-run OIDC configuration, JSON encoded then base64url encoded.
+    auth_oidc_setup: AuthOidcSetup,
+    /// JSON encoded then base64url encoded; asks the daemon to create and
+    /// retain the PKCE attempt before returning an authorization URL/state.
+    auth_oidc_begin: AuthOidcBegin,
+    /// A JSON payload encoded as base64url, containing the callback code and
+    /// short-lived PKCE values. The daemon exchanges and verifies it.
+    auth_oidc_exchange: AuthOidcExchange,
+    auth_session: AuthSession,
+    auth_logout: AuthLogout,
+    /// Authorize one resource against a resolved daemon login session.
+    auth_authorize: AuthAuthorize,
+    auth_project_create: AuthProjectCreate,
+    auth_project_list: AuthProjectList,
+    auth_session_create: AuthSessionCreate,
+    auth_session_register: AuthSessionRegister,
+    auth_session_register_placed: AuthSessionRegisterPlaced,
+    auth_session_member: AuthSessionMember,
+    auth_session_people: AuthSessionPeople,
+    auth_session_presence: AuthSessionPresence,
+    auth_session_host: AuthSessionHost,
+    auth_worker_event: AuthWorkerEvent,
+    auth_worker_read: AuthWorkerRead,
+    auth_worker_token: AuthWorkerToken,
+    /// Request the administrator-only identity directory.
+    auth_people: AuthPeople,
+    auth_team: AuthTeam,
+    auth_acl: AuthAcl,
+    auth_provider: AuthProvider,
+    auth_prompt: AuthPrompt,
+    auth_cancel: AuthCancel,
+    auth_answer: AuthAnswer,
+    auth_agent_answer: AuthAgentAnswer,
 
     pub const Start = struct { project: []const u8, message: []const u8 };
     pub const Adopt = struct { project: []const u8, session: []const u8 };
@@ -433,6 +538,91 @@ pub const Request = union(Verb) {
         session: []const u8,
         request_id: u64,
         decision: Answer,
+    };
+    pub const AuthOidcBegin = struct { input: []const u8 };
+    pub const AuthOidcExchange = struct { exchange: []const u8 };
+    pub const AuthOidcSetup = struct { configuration: []const u8 };
+    pub const AuthLocalCredentials = struct { credentials: []const u8 };
+    pub const AuthSession = struct { token: []const u8 };
+    pub const AuthLogout = struct { token: []const u8 };
+    pub const AuthAuthorize = struct {
+        token: []const u8,
+        resource_kind: []const u8,
+        resource_id: []const u8,
+        capability: []const u8,
+    };
+    pub const AuthProjectCreate = struct { token: []const u8, project_json: []const u8 };
+    pub const AuthProjectList = struct { token: []const u8 };
+    pub const AuthSessionCreate = struct { token: []const u8, project: []const u8, placement: []const u8 };
+    pub const AuthSessionRegister = struct { token: []const u8, session: []const u8, project: []const u8 };
+    pub const AuthSessionRegisterPlaced = struct { token: []const u8, session: []const u8, project: []const u8, placement: []const u8 };
+    pub const AuthSessionMember = struct { token: []const u8, session: []const u8, identity: []const u8, role: []const u8 };
+    pub const AuthSessionPeople = struct { token: []const u8, session: []const u8 };
+    pub const AuthSessionPresence = struct { token: []const u8, action: []const u8, session: []const u8 };
+    pub const AuthSessionHost = struct {
+        token: []const u8,
+        action: []const u8,
+        session: []const u8,
+        placement: []const u8,
+        host_id: []const u8,
+        generation: u64 = 0,
+    };
+    pub const AuthWorkerEvent = struct {
+        token: []const u8,
+        session: []const u8,
+        host_id: []const u8,
+        generation: u64,
+        event_id: u64,
+        event_json: []const u8,
+    };
+    pub const AuthWorkerRead = struct {
+        token: []const u8,
+        session: []const u8,
+        host_id: []const u8,
+        generation: u64,
+        after: u64,
+    };
+    pub const AuthWorkerToken = struct { token: []const u8, session: []const u8 };
+    pub const AuthPeople = struct { token: []const u8, action: []const u8 = "list", identity: []const u8 = "" };
+    pub const AuthTeam = struct {
+        token: []const u8,
+        action: []const u8,
+        team: []const u8 = "",
+        identity: []const u8 = "",
+        role: []const u8 = "",
+        payload: []const u8 = "",
+    };
+    pub const AuthAcl = struct {
+        token: []const u8,
+        action: []const u8,
+        resource_kind: []const u8 = "",
+        resource_id: []const u8 = "",
+        rule_id: []const u8 = "",
+        payload: []const u8 = "",
+    };
+    pub const AuthProvider = struct {
+        token: []const u8,
+        action: []const u8,
+        provider_id: []const u8 = "",
+        payload: []const u8 = "",
+    };
+    /// Message is base64url-encoded so tabs/newlines remain data in v1 framing.
+    pub const AuthPrompt = struct { token: []const u8, project: []const u8, session: []const u8, message: []const u8 };
+    pub const AuthCancel = struct { token: []const u8, project: []const u8, session: []const u8 };
+    pub const AuthAnswer = struct {
+        token: []const u8,
+        project: []const u8,
+        session: []const u8,
+        request_id: u64,
+        decision: Answer,
+    };
+    /// The answer is base64url encoded so newlines remain data in v1 framing.
+    pub const AuthAgentAnswer = struct {
+        token: []const u8,
+        project: []const u8,
+        session: []const u8,
+        request_id: u64,
+        answer: []const u8,
     };
 
     pub const ParseError = error{
@@ -512,6 +702,138 @@ pub const Request = union(Verb) {
                         return error.BadArguments,
                 },
             },
+            .auth_status => .{ .auth_status = {} },
+            .auth_local_setup => .{ .auth_local_setup = .{ .credentials = try field(asked.rest, 0, 1) } },
+            .auth_local_login => .{ .auth_local_login = .{ .credentials = try field(asked.rest, 0, 1) } },
+            .auth_oidc_setup => .{ .auth_oidc_setup = .{ .configuration = try field(asked.rest, 0, 1) } },
+            .auth_oidc_begin => .{ .auth_oidc_begin = .{ .input = try field(asked.rest, 0, 1) } },
+            .auth_oidc_exchange => .{ .auth_oidc_exchange = .{ .exchange = try field(asked.rest, 0, 1) } },
+            .auth_session => .{ .auth_session = .{ .token = try field(asked.rest, 0, 1) } },
+            .auth_logout => .{ .auth_logout = .{ .token = try field(asked.rest, 0, 1) } },
+            .auth_authorize => .{ .auth_authorize = .{
+                .token = try field(asked.rest, 0, 4),
+                .resource_kind = try field(asked.rest, 1, 4),
+                .resource_id = try field(asked.rest, 2, 4),
+                .capability = try field(asked.rest, 3, 4),
+            } },
+            .auth_project_create => .{ .auth_project_create = .{
+                .token = try field(asked.rest, 0, 2),
+                .project_json = try field(asked.rest, 1, 2),
+            } },
+            .auth_project_list => .{ .auth_project_list = .{ .token = try field(asked.rest, 0, 1) } },
+            .auth_session_create => .{ .auth_session_create = .{
+                .token = try field(asked.rest, 0, 3),
+                .project = try field(asked.rest, 1, 3),
+                .placement = try field(asked.rest, 2, 3),
+            } },
+            .auth_session_register => .{ .auth_session_register = .{
+                .token = try field(asked.rest, 0, 3),
+                .session = try field(asked.rest, 1, 3),
+                .project = try field(asked.rest, 2, 3),
+            } },
+            .auth_session_register_placed => .{ .auth_session_register_placed = .{
+                .token = try field(asked.rest, 0, 4),
+                .session = try field(asked.rest, 1, 4),
+                .project = try field(asked.rest, 2, 4),
+                .placement = try field(asked.rest, 3, 4),
+            } },
+            .auth_session_member => .{ .auth_session_member = .{
+                .token = try field(asked.rest, 0, 4),
+                .session = try field(asked.rest, 1, 4),
+                .identity = try field(asked.rest, 2, 4),
+                .role = try field(asked.rest, 3, 4),
+            } },
+            .auth_session_people => .{ .auth_session_people = .{
+                .token = try field(asked.rest, 0, 2),
+                .session = try field(asked.rest, 1, 2),
+            } },
+            .auth_session_presence => .{ .auth_session_presence = .{
+                .token = try field(asked.rest, 0, 3),
+                .action = try field(asked.rest, 1, 3),
+                .session = try field(asked.rest, 2, 3),
+            } },
+            .auth_session_host => .{ .auth_session_host = .{
+                .token = try field(asked.rest, 0, 6),
+                .action = try field(asked.rest, 1, 6),
+                .session = try field(asked.rest, 2, 6),
+                .placement = try field(asked.rest, 3, 6),
+                .host_id = try field(asked.rest, 4, 6),
+                .generation = std.fmt.parseInt(u64, try field(asked.rest, 5, 6), 10) catch return error.BadArguments,
+            } },
+            .auth_worker_event => .{ .auth_worker_event = .{
+                .token = try field(asked.rest, 0, 6),
+                .session = try field(asked.rest, 1, 6),
+                .host_id = try field(asked.rest, 2, 6),
+                .generation = std.fmt.parseInt(u64, try field(asked.rest, 3, 6), 10) catch return error.BadArguments,
+                .event_id = std.fmt.parseInt(u64, try field(asked.rest, 4, 6), 10) catch return error.BadArguments,
+                .event_json = try field(asked.rest, 5, 6),
+            } },
+            .auth_worker_read => .{ .auth_worker_read = .{
+                .token = try field(asked.rest, 0, 5),
+                .session = try field(asked.rest, 1, 5),
+                .host_id = try field(asked.rest, 2, 5),
+                .generation = std.fmt.parseInt(u64, try field(asked.rest, 3, 5), 10) catch return error.BadArguments,
+                .after = std.fmt.parseInt(u64, try field(asked.rest, 4, 5), 10) catch return error.BadArguments,
+            } },
+            .auth_worker_token => .{ .auth_worker_token = .{
+                .token = try field(asked.rest, 0, 2),
+                .session = try field(asked.rest, 1, 2),
+            } },
+            .auth_people => blk: {
+                if (std.mem.indexOfScalar(u8, asked.rest, '\t') == null) break :blk .{ .auth_people = .{ .token = asked.rest } };
+                break :blk .{ .auth_people = .{
+                    .token = try field(asked.rest, 0, 3),
+                    .action = try field(asked.rest, 1, 3),
+                    .identity = try field(asked.rest, 2, 3),
+                } };
+            },
+            .auth_team => .{ .auth_team = .{
+                .token = try field(asked.rest, 0, 6),
+                .action = try field(asked.rest, 1, 6),
+                .team = try field(asked.rest, 2, 6),
+                .identity = try field(asked.rest, 3, 6),
+                .role = try field(asked.rest, 4, 6),
+                .payload = try field(asked.rest, 5, 6),
+            } },
+            .auth_acl => .{ .auth_acl = .{
+                .token = try field(asked.rest, 0, 6),
+                .action = try field(asked.rest, 1, 6),
+                .resource_kind = try field(asked.rest, 2, 6),
+                .resource_id = try field(asked.rest, 3, 6),
+                .rule_id = try field(asked.rest, 4, 6),
+                .payload = try field(asked.rest, 5, 6),
+            } },
+            .auth_provider => .{ .auth_provider = .{
+                .token = try field(asked.rest, 0, 4),
+                .action = try field(asked.rest, 1, 4),
+                .provider_id = try field(asked.rest, 2, 4),
+                .payload = try field(asked.rest, 3, 4),
+            } },
+            .auth_prompt => .{ .auth_prompt = .{
+                .token = try field(asked.rest, 0, 4),
+                .project = try field(asked.rest, 1, 4),
+                .session = try field(asked.rest, 2, 4),
+                .message = try field(asked.rest, 3, 4),
+            } },
+            .auth_cancel => .{ .auth_cancel = .{
+                .token = try field(asked.rest, 0, 3),
+                .project = try field(asked.rest, 1, 3),
+                .session = try field(asked.rest, 2, 3),
+            } },
+            .auth_answer => .{ .auth_answer = .{
+                .token = try field(asked.rest, 0, 5),
+                .project = try field(asked.rest, 1, 5),
+                .session = try field(asked.rest, 2, 5),
+                .request_id = std.fmt.parseInt(u64, try field(asked.rest, 3, 5), 10) catch return error.BadArguments,
+                .decision = Answer.parse(try field(asked.rest, 4, 5)) orelse return error.BadArguments,
+            } },
+            .auth_agent_answer => .{ .auth_agent_answer = .{
+                .token = try field(asked.rest, 0, 5),
+                .project = try field(asked.rest, 1, 5),
+                .session = try field(asked.rest, 2, 5),
+                .request_id = std.fmt.parseInt(u64, try field(asked.rest, 3, 5), 10) catch return error.BadArguments,
+                .answer = try field(asked.rest, 4, 5),
+            } },
         };
     }
 
@@ -545,6 +867,74 @@ pub const Request = union(Verb) {
                 one.request_id,
                 @tagName(one.decision),
             }),
+            .auth_status => try writer.writeAll("auth_status\n"),
+            .auth_local_setup => |one| try writer.print("auth_local_setup {s}\n", .{one.credentials}),
+            .auth_local_login => |one| try writer.print("auth_local_login {s}\n", .{one.credentials}),
+            .auth_oidc_setup => |one| try writer.print("auth_oidc_setup {s}\n", .{one.configuration}),
+            .auth_oidc_begin => |one| try writer.print("auth_oidc_begin {s}\n", .{one.input}),
+            .auth_oidc_exchange => |one| try writer.print("auth_oidc_exchange {s}\n", .{one.exchange}),
+            .auth_session => |one| try writer.print("auth_session {s}\n", .{one.token}),
+            .auth_logout => |one| try writer.print("auth_logout {s}\n", .{one.token}),
+            .auth_authorize => |one| try writer.print("auth_authorize {s}\t{s}\t{s}\t{s}\n", .{
+                one.token, one.resource_kind, one.resource_id, one.capability,
+            }),
+            .auth_project_create => |one| try writer.print("auth_project_create {s}\t{s}\n", .{
+                one.token, one.project_json,
+            }),
+            .auth_project_list => |one| try writer.print("auth_project_list {s}\n", .{one.token}),
+            .auth_session_create => |one| try writer.print("auth_session_create {s}\t{s}\t{s}\n", .{
+                one.token, one.project, one.placement,
+            }),
+            .auth_session_register => |one| try writer.print("auth_session_register {s}\t{s}\t{s}\n", .{
+                one.token, one.session, one.project,
+            }),
+            .auth_session_register_placed => |one| try writer.print("auth_session_register_placed {s}\t{s}\t{s}\t{s}\n", .{
+                one.token, one.session, one.project, one.placement,
+            }),
+            .auth_session_member => |one| try writer.print("auth_session_member {s}\t{s}\t{s}\t{s}\n", .{
+                one.token, one.session, one.identity, one.role,
+            }),
+            .auth_session_people => |one| try writer.print("auth_session_people {s}\t{s}\n", .{
+                one.token, one.session,
+            }),
+            .auth_session_presence => |one| try writer.print("auth_session_presence {s}\t{s}\t{s}\n", .{
+                one.token, one.action, one.session,
+            }),
+            .auth_session_host => |one| try writer.print("auth_session_host {s}\t{s}\t{s}\t{s}\t{s}\t{d}\n", .{
+                one.token, one.action, one.session, one.placement, one.host_id, one.generation,
+            }),
+            .auth_worker_event => |one| try writer.print("auth_worker_event {s}\t{s}\t{s}\t{d}\t{d}\t{s}\n", .{
+                one.token, one.session, one.host_id, one.generation, one.event_id, one.event_json,
+            }),
+            .auth_worker_read => |one| try writer.print("auth_worker_read {s}\t{s}\t{s}\t{d}\t{d}\n", .{
+                one.token, one.session, one.host_id, one.generation, one.after,
+            }),
+            .auth_worker_token => |one| try writer.print("auth_worker_token {s}\t{s}\n", .{ one.token, one.session }),
+            .auth_people => |one| if (std.mem.eql(u8, one.action, "list"))
+                try writer.print("auth_people {s}\n", .{one.token})
+            else
+                try writer.print("auth_people {s}\t{s}\t{s}\n", .{ one.token, one.action, one.identity }),
+            .auth_team => |one| try writer.print("auth_team {s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+                one.token, one.action, one.team, one.identity, one.role, one.payload,
+            }),
+            .auth_acl => |one| try writer.print("auth_acl {s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+                one.token, one.action, one.resource_kind, one.resource_id, one.rule_id, one.payload,
+            }),
+            .auth_provider => |one| try writer.print("auth_provider {s}\t{s}\t{s}\t{s}\n", .{
+                one.token, one.action, one.provider_id, one.payload,
+            }),
+            .auth_prompt => |one| try writer.print("auth_prompt {s}\t{s}\t{s}\t{s}\n", .{
+                one.token, one.project, one.session, one.message,
+            }),
+            .auth_cancel => |one| try writer.print("auth_cancel {s}\t{s}\t{s}\n", .{
+                one.token, one.project, one.session,
+            }),
+            .auth_answer => |one| try writer.print("auth_answer {s}\t{s}\t{s}\t{d}\t{s}\n", .{
+                one.token, one.project, one.session, one.request_id, @tagName(one.decision),
+            }),
+            .auth_agent_answer => |one| try writer.print("auth_agent_answer {s}\t{s}\t{s}\t{d}\t{s}\n", .{
+                one.token, one.project, one.session, one.request_id, one.answer,
+            }),
         }
     }
 };
@@ -566,6 +956,7 @@ pub fn verbOf(request: []const u8) ?struct { verb: Verb, rest: []const u8 } {
 }
 
 pub const no_verb_text = text: {
+    @setEvalBranchQuota(2000);
     var built: []const u8 = "the request is none of";
     for (std.enums.values(Verb), 0..) |verb, index| {
         if (index != 0) built = built ++ (if (index + 1 == std.enums.values(Verb).len) " and" else ",");
@@ -613,11 +1004,20 @@ pub const Answer = enum {
 /// Never alias a local struct, or a local field changes the wire; every field defaults, none a pass.
 /// One project, as a picker shows it.
 pub const ProjectRow = struct {
+    /// Stable UUID of a daemon-registered project. Empty for a legacy
+    /// filesystem-discovered row that has not been registered yet.
+    id: []const u8 = "",
     /// The directory the project is in, or empty where nothing recorded it.
     root: []const u8 = "",
+    /// Durable provisioning source, distinct from the current execution root.
+    source_kind: []const u8 = "",
+    source_locator: []const u8 = "",
     /// What to call it. Never empty.
     name: []const u8,
     sessions: usize = 0,
+    status: []const u8 = "ready",
+    /// Whether the authenticated identity may change project settings.
+    can_manage: bool = false,
 
     pub fn toJson(self: ProjectRow, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fmt.allocPrint(gpa, "{f}", .{std.json.fmt(self, .{})});
@@ -675,6 +1075,41 @@ pub const SessionRow = struct {
     }
 };
 
+pub const SessionPersonRow = struct {
+    identity_id: []const u8,
+    display_name: []const u8 = "",
+    email: []const u8 = "",
+    role: ?[]const u8 = null,
+};
+
+pub const SessionPresenceRow = struct {
+    identity_id: []const u8,
+    display_name: []const u8 = "",
+    last_seen_ms: i64,
+};
+
+pub const TeamRow = struct {
+    id: []const u8,
+    name: []const u8,
+    role: []const u8,
+};
+
+pub const TeamPersonRow = struct {
+    identity_id: []const u8,
+    display_name: []const u8 = "",
+    email: []const u8 = "",
+    role: ?[]const u8 = null,
+};
+
+pub const PersonRow = struct {
+    identity_id: []const u8,
+    display_name: []const u8 = "",
+    email: []const u8 = "",
+    instance_role: []const u8,
+    local_account: bool = false,
+    local_account_disabled: bool = false,
+};
+
 pub fn verdictName(verdict: chain.Verdict) []const u8 {
     return @tagName(verdict);
 }
@@ -717,6 +1152,9 @@ pub const max_request_bytes: usize = 1024 * 1024;
 pub const Feed = struct {
     /// Inclusive: the first event back is one the client has, so it's dropped.
     after: u64 = 0,
+    /// Byte offset immediately after the last event written by `events`.
+    /// Worker ingress uses this as its optimistic append cursor.
+    end_offset: u64 = 0,
     ended: bool = false,
     sent: usize = 0,
 
@@ -745,12 +1183,14 @@ pub const Feed = struct {
     ) Error!bool {
         var replay = try store.replay(gpa, io, self.after);
         defer replay.deinit();
+        self.end_offset = replay.at();
 
         var any = false;
         var first = true;
         var this_call: usize = 0;
         while (try replay.next(io)) |parsed| {
             defer parsed.deinit();
+            self.end_offset = replay.at();
 
             if (first) {
                 first = false;
@@ -776,6 +1216,37 @@ pub const Feed = struct {
         return any;
     }
 };
+
+test "a bounded feed resumes after its last record and keeps append offset separate" {
+    const gpa = testing.allocator;
+    var memory = try storage.Memory.init(gpa, "01TESTSESSION");
+    defer memory.deinit();
+    const store = memory.storage();
+    var locked = try store.lock(testing.io);
+    const first_id = try locked.append(gpa, testing.io, .{ .unknown = .{ .kind = "test_one", .payload = .null } }, 1);
+    const second_id = try locked.append(gpa, testing.io, .{ .unknown = .{ .kind = "test_two", .payload = .null } }, 2);
+    const third_id = try locked.append(gpa, testing.io, .{ .unknown = .{ .kind = "test_three", .payload = .null } }, 3);
+    try locked.unlock(testing.io);
+
+    var feed: Feed = .{};
+    var first_output: std.Io.Writer.Allocating = .init(gpa);
+    defer first_output.deinit();
+    try testing.expect(try feed.events(gpa, testing.io, store, &first_output.writer, 2));
+    try testing.expectEqual(second_id, feed.after);
+    try testing.expectEqual(third_id, feed.end_offset);
+    try testing.expect(std.mem.indexOf(u8, first_output.written(), "test_one") != null);
+    try testing.expect(std.mem.indexOf(u8, first_output.written(), "test_two") != null);
+    try testing.expect(std.mem.indexOf(u8, first_output.written(), "test_three") == null);
+    try testing.expect(first_id != second_id);
+
+    var resumed: Feed = .{ .after = feed.after };
+    var second_output: std.Io.Writer.Allocating = .init(gpa);
+    defer second_output.deinit();
+    try testing.expect(try resumed.events(gpa, testing.io, store, &second_output.writer, 2));
+    try testing.expectEqual(third_id, resumed.after);
+    try testing.expectEqual(memory.bytes.items.len, resumed.end_offset);
+    try testing.expect(std.mem.indexOf(u8, second_output.written(), "test_three") != null);
+}
 
 /// The request waits for the greeting. `said` points into `reader`'s buffer; `each` returns false to stop.
 pub fn exchange(
@@ -876,6 +1347,306 @@ test "the only words a client can put in an answer are yes and no" {
     );
 }
 
+test "additive OIDC session verbs keep their v1 request spelling" {
+    const examples = [_]Request{
+        .{ .auth_oidc_setup = .{ .configuration = "eyJwcm92aWRlciI6ImthbmlkbSJ9" } },
+        .{ .auth_oidc_begin = .{ .input = "eyJyZWRpcmVjdF91cmkiOiJodHRwcyJ9" } },
+        .{ .auth_oidc_exchange = .{ .exchange = "eyJjb2RlIjoiY29kZSJ9" } },
+        .{ .auth_session = .{ .token = "opaque-session-token" } },
+        .{ .auth_logout = .{ .token = "opaque-session-token" } },
+        .{ .auth_authorize = .{
+            .token = "opaque-session-token",
+            .resource_kind = "project",
+            .resource_id = "project-uuid",
+            .capability = "project_view",
+        } },
+        .{ .auth_project_create = .{
+            .token = "opaque-session-token",
+            .project_json = "eyJuYW1lIjoiRGVtbyJ9",
+        } },
+        .{ .auth_session_create = .{
+            .token = "opaque-session-token",
+            .project = "/work/project",
+            .placement = "client",
+        } },
+        .{ .auth_session_register = .{
+            .token = "opaque-session-token",
+            .session = "01JQSESSION0000000000000000",
+            .project = "/work/project",
+        } },
+        .{ .auth_session_register_placed = .{
+            .token = "opaque-session-token",
+            .session = "01JQSESSION0000000000000000",
+            .project = "/work/project",
+            .placement = "client",
+        } },
+        .{ .auth_session_member = .{
+            .token = "opaque-session-token",
+            .session = "01JQSESSION0000000000000000",
+            .identity = "00000000-0000-4000-8000-000000000001",
+            .role = "editor",
+        } },
+        .{ .auth_session_people = .{
+            .token = "opaque-session-token",
+            .session = "01JQSESSION0000000000000000",
+        } },
+        .{ .auth_session_presence = .{
+            .token = "opaque-session-token",
+            .action = "touch",
+            .session = "01JQSESSION0000000000000000",
+        } },
+        .{ .auth_session_host = .{
+            .token = "opaque-session-token",
+            .action = "claim",
+            .session = "01JQSESSION0000000000000000",
+            .placement = "client",
+            .host_id = "00000000-0000-4000-8000-000000000099",
+        } },
+        .{ .auth_worker_event = .{
+            .token = "opaque-session-token",
+            .session = "01JQSESSION0000000000000000",
+            .host_id = "00000000-0000-4000-8000-000000000099",
+            .generation = 7,
+            .event_id = 4096,
+            .event_json = "eyJtZXNzYWdlIjp7fX0",
+        } },
+        .{ .auth_worker_read = .{
+            .token = "opaque-session-token",
+            .session = "01JQSESSION0000000000000000",
+            .host_id = "00000000-0000-4000-8000-000000000099",
+            .generation = 7,
+            .after = 4096,
+        } },
+        .{ .auth_worker_token = .{
+            .token = "opaque-session-token",
+            .session = "01JQSESSION0000000000000000",
+        } },
+        .{ .auth_people = .{ .token = "opaque-session-token" } },
+        .{ .auth_team = .{
+            .token = "opaque-session-token",
+            .action = "create",
+            .payload = "eyJuYW1lIjoiUmV2aWV3ZXJzIn0",
+        } },
+        .{ .auth_prompt = .{
+            .token = "opaque-session-token",
+            .project = "/work/project",
+            .session = "01JQSESSION0000000000000000",
+            .message = "dGFiIG5ldy1saW5lIGRhdGE",
+        } },
+        .{ .auth_cancel = .{
+            .token = "opaque-session-token",
+            .project = "/work/project",
+            .session = "01JQSESSION0000000000000000",
+        } },
+        .{ .auth_answer = .{
+            .token = "opaque-session-token",
+            .project = "/work/project",
+            .session = "01JQSESSION0000000000000000",
+            .request_id = 17,
+            .decision = .yes,
+        } },
+        .{ .auth_agent_answer = .{
+            .token = "opaque-session-token",
+            .project = "/work/project",
+            .session = "01JQSESSION0000000000000000",
+            .request_id = 4096,
+            .answer = "dGFiIG5ldy1saW5lIGRhdGE",
+        } },
+    };
+    const expected = [_][]const u8{
+        "auth_oidc_setup eyJwcm92aWRlciI6ImthbmlkbSJ9\n",
+        "auth_oidc_begin eyJyZWRpcmVjdF91cmkiOiJodHRwcyJ9\n",
+        "auth_oidc_exchange eyJjb2RlIjoiY29kZSJ9\n",
+        "auth_session opaque-session-token\n",
+        "auth_logout opaque-session-token\n",
+        "auth_authorize opaque-session-token\tproject\tproject-uuid\tproject_view\n",
+        "auth_project_create opaque-session-token\teyJuYW1lIjoiRGVtbyJ9\n",
+        "auth_session_create opaque-session-token\t/work/project\tclient\n",
+        "auth_session_register opaque-session-token\t01JQSESSION0000000000000000\t/work/project\n",
+        "auth_session_register_placed opaque-session-token\t01JQSESSION0000000000000000\t/work/project\tclient\n",
+        "auth_session_member opaque-session-token\t01JQSESSION0000000000000000\t00000000-0000-4000-8000-000000000001\teditor\n",
+        "auth_session_people opaque-session-token\t01JQSESSION0000000000000000\n",
+        "auth_session_presence opaque-session-token\ttouch\t01JQSESSION0000000000000000\n",
+        "auth_session_host opaque-session-token\tclaim\t01JQSESSION0000000000000000\tclient\t00000000-0000-4000-8000-000000000099\t0\n",
+        "auth_worker_event opaque-session-token\t01JQSESSION0000000000000000\t00000000-0000-4000-8000-000000000099\t7\t4096\teyJtZXNzYWdlIjp7fX0\n",
+        "auth_worker_read opaque-session-token\t01JQSESSION0000000000000000\t00000000-0000-4000-8000-000000000099\t7\t4096\n",
+        "auth_worker_token opaque-session-token\t01JQSESSION0000000000000000\n",
+        "auth_people opaque-session-token\n",
+        "auth_team opaque-session-token\tcreate\t\t\t\teyJuYW1lIjoiUmV2aWV3ZXJzIn0\n",
+        "auth_prompt opaque-session-token\t/work/project\t01JQSESSION0000000000000000\tdGFiIG5ldy1saW5lIGRhdGE\n",
+        "auth_cancel opaque-session-token\t/work/project\t01JQSESSION0000000000000000\n",
+        "auth_answer opaque-session-token\t/work/project\t01JQSESSION0000000000000000\t17\tyes\n",
+        "auth_agent_answer opaque-session-token\t/work/project\t01JQSESSION0000000000000000\t4096\tdGFiIG5ldy1saW5lIGRhdGE\n",
+    };
+    for (examples, expected) |request, line| {
+        var buffer: [256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try request.write(&writer);
+        try testing.expectEqualStrings(line, writer.buffered());
+        const parsed = try Request.parse(std.mem.trimEnd(u8, line, "\n"));
+        switch (request) {
+            .auth_oidc_setup => |one| try testing.expectEqualStrings(one.configuration, parsed.auth_oidc_setup.configuration),
+            .auth_oidc_begin => |one| try testing.expectEqualStrings(one.input, parsed.auth_oidc_begin.input),
+            .auth_oidc_exchange => |one| try testing.expectEqualStrings(one.exchange, parsed.auth_oidc_exchange.exchange),
+            .auth_session => |one| try testing.expectEqualStrings(one.token, parsed.auth_session.token),
+            .auth_logout => |one| try testing.expectEqualStrings(one.token, parsed.auth_logout.token),
+            .auth_authorize => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_authorize.token);
+                try testing.expectEqualStrings(one.resource_kind, parsed.auth_authorize.resource_kind);
+                try testing.expectEqualStrings(one.resource_id, parsed.auth_authorize.resource_id);
+                try testing.expectEqualStrings(one.capability, parsed.auth_authorize.capability);
+            },
+            .auth_project_create => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_project_create.token);
+                try testing.expectEqualStrings(one.project_json, parsed.auth_project_create.project_json);
+            },
+            .auth_session_create => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_session_create.token);
+                try testing.expectEqualStrings(one.project, parsed.auth_session_create.project);
+                try testing.expectEqualStrings(one.placement, parsed.auth_session_create.placement);
+            },
+            .auth_session_register => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_session_register.token);
+                try testing.expectEqualStrings(one.session, parsed.auth_session_register.session);
+                try testing.expectEqualStrings(one.project, parsed.auth_session_register.project);
+            },
+            .auth_session_register_placed => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_session_register_placed.token);
+                try testing.expectEqualStrings(one.session, parsed.auth_session_register_placed.session);
+                try testing.expectEqualStrings(one.project, parsed.auth_session_register_placed.project);
+                try testing.expectEqualStrings(one.placement, parsed.auth_session_register_placed.placement);
+            },
+            .auth_session_member => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_session_member.token);
+                try testing.expectEqualStrings(one.session, parsed.auth_session_member.session);
+                try testing.expectEqualStrings(one.identity, parsed.auth_session_member.identity);
+                try testing.expectEqualStrings(one.role, parsed.auth_session_member.role);
+            },
+            .auth_session_people => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_session_people.token);
+                try testing.expectEqualStrings(one.session, parsed.auth_session_people.session);
+            },
+            .auth_session_presence => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_session_presence.token);
+                try testing.expectEqualStrings(one.action, parsed.auth_session_presence.action);
+                try testing.expectEqualStrings(one.session, parsed.auth_session_presence.session);
+            },
+            .auth_session_host => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_session_host.token);
+                try testing.expectEqualStrings(one.action, parsed.auth_session_host.action);
+                try testing.expectEqualStrings(one.session, parsed.auth_session_host.session);
+                try testing.expectEqualStrings(one.placement, parsed.auth_session_host.placement);
+                try testing.expectEqualStrings(one.host_id, parsed.auth_session_host.host_id);
+                try testing.expectEqual(one.generation, parsed.auth_session_host.generation);
+            },
+            .auth_worker_event => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_worker_event.token);
+                try testing.expectEqualStrings(one.session, parsed.auth_worker_event.session);
+                try testing.expectEqualStrings(one.host_id, parsed.auth_worker_event.host_id);
+                try testing.expectEqual(one.generation, parsed.auth_worker_event.generation);
+                try testing.expectEqual(one.event_id, parsed.auth_worker_event.event_id);
+                try testing.expectEqualStrings(one.event_json, parsed.auth_worker_event.event_json);
+            },
+            .auth_worker_read => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_worker_read.token);
+                try testing.expectEqualStrings(one.session, parsed.auth_worker_read.session);
+                try testing.expectEqualStrings(one.host_id, parsed.auth_worker_read.host_id);
+                try testing.expectEqual(one.generation, parsed.auth_worker_read.generation);
+                try testing.expectEqual(one.after, parsed.auth_worker_read.after);
+            },
+            .auth_worker_token => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_worker_token.token);
+                try testing.expectEqualStrings(one.session, parsed.auth_worker_token.session);
+            },
+            .auth_people => |one| try testing.expectEqualStrings(one.token, parsed.auth_people.token),
+            .auth_team => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_team.token);
+                try testing.expectEqualStrings(one.action, parsed.auth_team.action);
+                try testing.expectEqualStrings(one.team, parsed.auth_team.team);
+                try testing.expectEqualStrings(one.identity, parsed.auth_team.identity);
+                try testing.expectEqualStrings(one.role, parsed.auth_team.role);
+                try testing.expectEqualStrings(one.payload, parsed.auth_team.payload);
+            },
+            .auth_prompt => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_prompt.token);
+                try testing.expectEqualStrings(one.project, parsed.auth_prompt.project);
+                try testing.expectEqualStrings(one.session, parsed.auth_prompt.session);
+                try testing.expectEqualStrings(one.message, parsed.auth_prompt.message);
+            },
+            .auth_cancel => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_cancel.token);
+                try testing.expectEqualStrings(one.project, parsed.auth_cancel.project);
+                try testing.expectEqualStrings(one.session, parsed.auth_cancel.session);
+            },
+            .auth_answer => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_answer.token);
+                try testing.expectEqualStrings(one.project, parsed.auth_answer.project);
+                try testing.expectEqualStrings(one.session, parsed.auth_answer.session);
+                try testing.expectEqual(one.request_id, parsed.auth_answer.request_id);
+                try testing.expectEqual(one.decision, parsed.auth_answer.decision);
+            },
+            .auth_agent_answer => |one| {
+                try testing.expectEqualStrings(one.token, parsed.auth_agent_answer.token);
+                try testing.expectEqualStrings(one.project, parsed.auth_agent_answer.project);
+                try testing.expectEqualStrings(one.session, parsed.auth_agent_answer.session);
+                try testing.expectEqual(one.request_id, parsed.auth_agent_answer.request_id);
+                try testing.expectEqualStrings(one.answer, parsed.auth_agent_answer.answer);
+            },
+            else => unreachable,
+        }
+    }
+    try testing.expectEqual(@as(u32, 1), protocol_version);
+}
+
+test "ACL administration stays additive in control protocol v1" {
+    const request: Request = .{ .auth_acl = .{
+        .token = "opaque-session-token",
+        .action = "list",
+        .resource_kind = "project",
+        .resource_id = "00000000-0000-4000-8000-000000000001",
+    } };
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try request.write(&writer);
+    const expected = "auth_acl opaque-session-token\tlist\tproject\t00000000-0000-4000-8000-000000000001\t\t\n";
+    try testing.expectEqualStrings(expected, writer.buffered());
+    const parsed = try Request.parse(std.mem.trimEnd(u8, expected, "\n"));
+    try testing.expectEqualStrings("list", parsed.auth_acl.action);
+    try testing.expectEqualStrings("project", parsed.auth_acl.resource_kind);
+}
+
+test "people credential revocation stays additive in control protocol v1" {
+    const request: Request = .{ .auth_people = .{
+        .token = "opaque-session-token",
+        .action = "revoke-sessions",
+        .identity = "00000000-0000-4000-8000-000000000001",
+    } };
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try request.write(&writer);
+    const expected = "auth_people opaque-session-token\trevoke-sessions\t00000000-0000-4000-8000-000000000001\n";
+    try testing.expectEqualStrings(expected, writer.buffered());
+    const parsed = try Request.parse(std.mem.trimEnd(u8, expected, "\n"));
+    try testing.expectEqualStrings("opaque-session-token", parsed.auth_people.token);
+    try testing.expectEqualStrings("revoke-sessions", parsed.auth_people.action);
+    try testing.expectEqualStrings("00000000-0000-4000-8000-000000000001", parsed.auth_people.identity);
+    try testing.expectEqual(@as(u32, 1), protocol_version);
+}
+
+test "provider management stays additive in control protocol v1" {
+    const request: Request = .{ .auth_provider = .{
+        .token = "opaque-session-token",
+        .action = "list",
+    } };
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try request.write(&writer);
+    const expected = "auth_provider opaque-session-token\tlist\t\t\n";
+    try testing.expectEqualStrings(expected, writer.buffered());
+    const parsed = try Request.parse(std.mem.trimEnd(u8, expected, "\n"));
+    try testing.expectEqualStrings("list", parsed.auth_provider.action);
+}
+
 test "every verb round trips from a request to a line and back" {
     const id = "01JQ" ++ @as([22]u8, @splat('A'));
     const requests = [_]Request{
@@ -900,6 +1671,35 @@ test "every verb round trips from a request to a line and back" {
         .{ .watch = .{ .project = "/home/ross/chock", .session = id, .after = 128 } },
         .{ .answer = .{ .project = "/home/ross/chock", .session = id, .request_id = 9, .decision = .yes } },
         .{ .answer = .{ .project = "/home/ross/chock", .session = id, .request_id = 9, .decision = .no } },
+        .{ .auth_status = {} },
+        .{ .auth_local_setup = .{ .credentials = "eyJ1c2VybmFtZSI6ImFkbWluIn0" } },
+        .{ .auth_local_login = .{ .credentials = "eyJ1c2VybmFtZSI6ImFkbWluIn0" } },
+        .{ .auth_oidc_setup = .{ .configuration = "eyJwcm92aWRlciI6ImthbmlkbSJ9" } },
+        .{ .auth_oidc_begin = .{ .input = "eyJyZWRpcmVjdF91cmkiOiJodHRwcyJ9" } },
+        .{ .auth_oidc_exchange = .{ .exchange = "eyJjb2RlIjoiY29kZSJ9" } },
+        .{ .auth_session = .{ .token = "opaque-token" } },
+        .{ .auth_logout = .{ .token = "opaque-token" } },
+        .{ .auth_authorize = .{ .token = "opaque-token", .resource_kind = "project", .resource_id = "project-id", .capability = "project_view" } },
+        .{ .auth_project_create = .{ .token = "opaque-token", .project_json = "{}" } },
+        .{ .auth_project_list = .{ .token = "opaque-token" } },
+        .{ .auth_session_create = .{ .token = "opaque-token", .project = "project-id", .placement = "daemon" } },
+        .{ .auth_session_register = .{ .token = "opaque-token", .session = id, .project = "project-id" } },
+        .{ .auth_session_register_placed = .{ .token = "opaque-token", .session = id, .project = "project-id", .placement = "client" } },
+        .{ .auth_session_member = .{ .token = "opaque-token", .session = id, .identity = "identity-id", .role = "editor" } },
+        .{ .auth_session_people = .{ .token = "opaque-token", .session = id } },
+        .{ .auth_session_presence = .{ .token = "opaque-token", .action = "touch", .session = id } },
+        .{ .auth_session_host = .{ .token = "opaque-token", .action = "claim", .session = id, .placement = "client", .host_id = "host-id", .generation = 7 } },
+        .{ .auth_worker_event = .{ .token = "opaque-token", .session = id, .host_id = "host-id", .generation = 7, .event_id = 4096, .event_json = "{}" } },
+        .{ .auth_worker_read = .{ .token = "opaque-token", .session = id, .host_id = "host-id", .generation = 7, .after = 9 } },
+        .{ .auth_worker_token = .{ .token = "opaque-token", .session = id } },
+        .{ .auth_people = .{ .token = "opaque-token" } },
+        .{ .auth_team = .{ .token = "opaque-token", .action = "member", .team = "team-id", .identity = "identity-id", .role = "editor", .payload = "{}" } },
+        .{ .auth_acl = .{ .token = "opaque-token", .action = "create", .resource_kind = "project", .resource_id = "project-id", .rule_id = "rule-id", .payload = "{}" } },
+        .{ .auth_provider = .{ .token = "opaque-token", .action = "list", .provider_id = "provider-id", .payload = "{}" } },
+        .{ .auth_prompt = .{ .token = "opaque-token", .project = "project-id", .session = id, .message = "hello" } },
+        .{ .auth_cancel = .{ .token = "opaque-token", .project = "project-id", .session = id } },
+        .{ .auth_answer = .{ .token = "opaque-token", .project = "project-id", .session = id, .request_id = 17, .decision = .yes } },
+        .{ .auth_agent_answer = .{ .token = "opaque-token", .project = "project-id", .session = id, .request_id = 18, .answer = "approved" } },
     };
 
     var seen = std.EnumSet(Verb).empty;
@@ -1249,7 +2049,7 @@ test "a greeting round trips, each side has its own spelling, and only equal num
 
 test "the version on the wire is the protocol's own number and not the program's" {
     try testing.expectEqual(u32, @TypeOf(protocol_version));
-    try testing.expect(protocol_version >= 1);
+    try testing.expectEqual(@as(u32, 1), protocol_version);
 
     var buffer: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);

@@ -73,6 +73,8 @@ pub const Landing = enum {
 
 pub const Settings = struct {
     mode: Mode = .merge,
+    /// The session log always holds the claim. This only adds it to the landed commit's message.
+    claimed_identity_in_message: bool = false,
 };
 
 /// Null is "no landing at all", and a caller that reads null parks the work.
@@ -149,6 +151,7 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
 
 const WireSettings = struct {
     mode: ?Mode = null,
+    claimed_identity_in_message: ?bool = null,
 };
 
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) ParseError!Settings {
@@ -201,6 +204,7 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
 
     var settings: Settings = .{};
     if (wire.mode) |mode| settings.mode = mode;
+    if (wire.claimed_identity_in_message) |on| settings.claimed_identity_in_message = on;
     return settings;
 }
 
@@ -291,6 +295,15 @@ test "each mode is read back by name" {
         const settings = try parse(gpa, source, null);
         try testing.expectEqualStrings(name, settings.mode.wireName());
     }
+}
+
+test "the claimed identity stays out of the commit message unless the project turns it on" {
+    const gpa = testing.allocator;
+    try testing.expect(!(try parse(gpa, ".{}", null)).claimed_identity_in_message);
+    try testing.expect(!(try parse(gpa, ".{ .apply = .{ .mode = .squash } }", null)).claimed_identity_in_message);
+    const on = try parse(gpa, ".{ .apply = .{ .claimed_identity_in_message = true } }", null);
+    try testing.expect(on.claimed_identity_in_message);
+    try testing.expectEqual(Mode.merge, on.mode);
 }
 
 test "a misspelled field is refused and is never read as the default" {

@@ -341,6 +341,19 @@ pub const Ui = struct {
     /// Set by the navigation action and consumed by the application wiring,
     /// which owns the source capable of creating the session.
     new_requested: bool = false,
+    new_placement: source_mod.Placement = .daemon,
+    /// Set by the Sessions navigation item and handled by the application shell.
+    sessions_requested: bool = false,
+    /// Set by the Projects navigation item and handled by the application shell.
+    projects_requested: bool = false,
+    /// Set by the Teams navigation item and handled by the application shell.
+    teams_requested: bool = false,
+    /// Set by the People navigation item and handled by the application shell.
+    people_requested: bool = false,
+    /// Set by the Providers navigation item and handled by the application shell.
+    providers_requested: bool = false,
+    /// Session sharing is owned by the application shell's authenticated source.
+    share_requested: bool = false,
     fork_requested: ?ForkRequest = null,
     review_requested: ?ReviewAction = null,
     review: ?source_mod.Review = null,
@@ -910,6 +923,13 @@ pub const Ui = struct {
     }
 
     pub fn requestNewSession(self: *Ui) void {
+        self.new_placement = .daemon;
+        self.new_requested = true;
+        self.host.invalidate();
+    }
+
+    pub fn requestClientSession(self: *Ui) void {
+        self.new_placement = .client;
         self.new_requested = true;
         self.host.invalidate();
     }
@@ -918,6 +938,48 @@ pub const Ui = struct {
         const requested = self.new_requested;
         self.new_requested = false;
         return requested;
+    }
+
+    pub fn takeNewSessionPlacement(self: *Ui) ?source_mod.Placement {
+        if (!self.new_requested) return null;
+        self.new_requested = false;
+        return self.new_placement;
+    }
+
+    pub fn takeProjectsRequest(self: *Ui) bool {
+        const asked = self.projects_requested;
+        self.projects_requested = false;
+        return asked;
+    }
+
+    pub fn takeSessionsRequest(self: *Ui) bool {
+        const asked = self.sessions_requested;
+        self.sessions_requested = false;
+        return asked;
+    }
+
+    pub fn takeTeamsRequest(self: *Ui) bool {
+        const asked = self.teams_requested;
+        self.teams_requested = false;
+        return asked;
+    }
+
+    pub fn takeProvidersRequest(self: *Ui) bool {
+        const asked = self.providers_requested;
+        self.providers_requested = false;
+        return asked;
+    }
+
+    pub fn takePeopleRequest(self: *Ui) bool {
+        const asked = self.people_requested;
+        self.people_requested = false;
+        return asked;
+    }
+
+    pub fn takeShareRequest(self: *Ui) bool {
+        const asked = self.share_requested;
+        self.share_requested = false;
+        return asked;
     }
 
     pub fn takeReviewRequest(self: *Ui) ?ReviewRequest {
@@ -1342,6 +1404,26 @@ pub const Ui = struct {
                 },
                 else => {},
             },
+            .approval_response => |response| if (response.responder_id.len != 0)
+                self.sayFmt(.chock, "approval answered by identity {s}", .{response.responder_id}),
+            .worker_cancel => self.say(.chock, "turn cancellation requested"),
+            .agent_question => |question| {
+                self.say(.chock, "the agent is asking for information:");
+                self.endLine();
+                self.say(.chock, question.text);
+                self.endLine();
+                for (question.options, 1..) |option, index| self.sayFmt(.chock, "{d}) {s}", .{ index, option });
+                self.say(.chock, "People with session_prompt access can answer in the composer below. The answer is shared with this session.");
+                self.endLine();
+            },
+            .agent_answer => |answer| {
+                self.sayFmt(.chock, "agent question {d} answered by identity {s}:", .{
+                    answer.request_id,
+                    answer.responder_id,
+                });
+                self.say(.chock, answer.answer);
+                self.endLine();
+            },
             .tool_call => |call| self.beginCall(call),
             .tool_result => |result| self.finishCall(result),
             .compaction => |folded| {
@@ -1445,8 +1527,11 @@ pub const Ui = struct {
                     self.endLine();
                     self.turn_open = false;
                 },
-                .user => for (m.content) |part| {
-                    if (part == .text) self.saidByUser(part.text);
+                .user => {
+                    if (m.author_id.len != 0) self.sayFmt(.chock, "from identity {s}", .{m.author_id});
+                    for (m.content) |part| {
+                        if (part == .text) self.saidByUser(part.text);
+                    }
                 },
                 else => self.foldEvent(id, ev),
             },
@@ -1856,9 +1941,20 @@ pub const Ui = struct {
     }
 
     fn scaffoldView(self: *Ui, ctx: *phantom.BuildContext) phantom.Widget {
+        return rootWithBody(ctx, self, .{ .ctx = self, .build = buildBody });
+    }
+
+    /// Build the shared application navigation around a caller-owned route.
+    /// The caller's builder is retained by Phantom's scaffold and must point
+    /// at state that outlives the scaffold.
+    pub fn rootWithBody(
+        ctx: *phantom.BuildContext,
+        self: *Ui,
+        body: phantom.NavigationScaffold.Builder,
+    ) phantom.Widget {
         const colors = phantom.ColorScheme.tokyoNight();
         const scaffold = ctx.new(phantom.NavigationScaffold{
-            .body = .{ .ctx = self, .build = buildBody },
+            .body = body,
             .navigation = .{ .ctx = self, .build = buildNavigation },
             .title = .{ .ctx = self, .build = buildTitle },
             .breakpoint = navigation_breakpoint,
@@ -1912,6 +2008,43 @@ pub const Ui = struct {
             .ctx = self,
             .child = ctx.new(phantom.Text{ .text = "New session" }).widget(),
         }).widget();
+        const new_client_session = ctx.new(phantom.Button{
+            .variant = .secondary,
+            .padding = .symmetric(12, 8),
+            .on_tap = onNavigationNewClient,
+            .ctx = self,
+            .child = ctx.new(phantom.Text{ .text = "New client-hosted session" }).widget(),
+        }).widget();
+
+        const projects = ctx.new(phantom.Button{
+            .variant = .secondary,
+            .padding = .symmetric(12, 8),
+            .on_tap = onNavigationProjects,
+            .ctx = self,
+            .child = ctx.new(phantom.Text{ .text = "Projects" }).widget(),
+        }).widget();
+
+        const teams = ctx.new(phantom.Button{
+            .variant = .secondary,
+            .padding = .symmetric(12, 8),
+            .on_tap = onNavigationTeams,
+            .ctx = self,
+            .child = ctx.new(phantom.Text{ .text = "Teams" }).widget(),
+        }).widget();
+        const providers = ctx.new(phantom.Button{
+            .variant = .secondary,
+            .padding = .symmetric(12, 8),
+            .on_tap = onNavigationProviders,
+            .ctx = self,
+            .child = ctx.new(phantom.Text{ .text = "Providers" }).widget(),
+        }).widget();
+        const people = ctx.new(phantom.Button{
+            .variant = .secondary,
+            .padding = .symmetric(12, 8),
+            .on_tap = onNavigationPeople,
+            .ctx = self,
+            .child = ctx.new(phantom.Text{ .text = "People" }).widget(),
+        }).widget();
 
         const sessions = ctx.new(phantom.Button{
             .variant = if (self.sidebar == .plan) .secondary else .primary,
@@ -1942,7 +2075,12 @@ pub const Ui = struct {
         const rows = self.navigationRows(ctx, colors, navigation_width - 24);
         var navigation_children: std.ArrayList(phantom.Widget) = .empty;
         navigation_children.append(ctx.arena, heading) catch {};
+        navigation_children.append(ctx.arena, projects) catch {};
+        navigation_children.append(ctx.arena, teams) catch {};
+        navigation_children.append(ctx.arena, people) catch {};
+        navigation_children.append(ctx.arena, providers) catch {};
         navigation_children.append(ctx.arena, new_session) catch {};
+        navigation_children.append(ctx.arena, new_client_session) catch {};
         navigation_children.append(ctx.arena, ctx.new(phantom.Padding{
             .insets = .{ .top = 8 },
             .child = ctx.new(phantom.Text{ .text = "" }).widget(),
@@ -2072,6 +2210,7 @@ pub const Ui = struct {
 
     fn onNavigationSessions(ptr: *anyopaque) void {
         const self: *Ui = @ptrCast(@alignCast(ptr));
+        self.sessions_requested = true;
         self.toggleSessions();
         self.host.invalidate();
     }
@@ -2079,6 +2218,41 @@ pub const Ui = struct {
     fn onNavigationNew(ptr: *anyopaque) void {
         const self: *Ui = @ptrCast(@alignCast(ptr));
         self.requestNewSession();
+    }
+
+    fn onNavigationNewClient(ptr: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ptr));
+        self.requestClientSession();
+    }
+
+    fn onNavigationProjects(ptr: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ptr));
+        self.projects_requested = true;
+        self.host.invalidate();
+    }
+
+    fn onNavigationTeams(ptr: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ptr));
+        self.teams_requested = true;
+        self.host.invalidate();
+    }
+
+    fn onNavigationProviders(ptr: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ptr));
+        self.providers_requested = true;
+        self.host.invalidate();
+    }
+
+    fn onNavigationPeople(ptr: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ptr));
+        self.people_requested = true;
+        self.host.invalidate();
+    }
+
+    fn onShareSession(ptr: *anyopaque) void {
+        const self: *Ui = @ptrCast(@alignCast(ptr));
+        self.share_requested = true;
+        self.host.invalidate();
     }
 
     fn onNavigationPlan(ptr: *anyopaque) void {
@@ -2179,6 +2353,13 @@ pub const Ui = struct {
             .ctx = self,
             .child = ctx.new(phantom.Text{ .text = "New session" }).widget(),
         }).widget();
+        const new_client_session = ctx.new(phantom.Button{
+            .variant = .secondary,
+            .padding = .symmetric(12, 8),
+            .on_tap = onNavigationNewClient,
+            .ctx = self,
+            .child = ctx.new(phantom.Text{ .text = "New client session" }).widget(),
+        }).widget();
         const rows = self.navigationRows(ctx, colors, @max(0, self.width - 32));
         var children: std.ArrayList(phantom.Widget) = .empty;
         children.append(ctx.arena, ctx.new(phantom.Padding{
@@ -2187,7 +2368,17 @@ pub const Ui = struct {
         }).widget()) catch {};
         children.append(ctx.arena, ctx.new(phantom.Padding{
             .insets = .{ .bottom = 16 },
-            .child = new_session,
+            .child = ctx.new(phantom.Row(.{
+                .children = ctx.newSlice(phantom.Widget, &.{
+                    ctx.new(phantom.Expanded(.{ .child = new_session })).widget(),
+                    ctx.new(phantom.Expanded(.{
+                        .child = ctx.new(phantom.Padding{
+                            .insets = .{ .left = 8 },
+                            .child = new_client_session,
+                        }).widget(),
+                    })).widget(),
+                }),
+            })).widget(),
         }).widget()) catch {};
         children.appendSlice(ctx.arena, rows) catch {};
         return ctx.new(phantom.DecoratedBox{
@@ -2581,7 +2772,7 @@ pub const Ui = struct {
     }
 
     fn headerRows(
-        self: *const Ui,
+        self: *Ui,
         ctx: *phantom.BuildContext,
         colors: phantom.ColorScheme,
     ) []const phantom.Widget {
@@ -2597,6 +2788,13 @@ pub const Ui = struct {
                 .off => colors.red,
             })) catch {};
         }
+        if (self.current_session.len != 0) pieces.append(ctx.arena, ctx.new(phantom.Button{
+            .variant = .secondary,
+            .padding = .symmetric(8, 4),
+            .on_tap = onShareSession,
+            .ctx = self,
+            .child = ctx.new(phantom.Text{ .text = "Share" }).widget(),
+        }).widget()) catch {};
 
         const line = ctx.new(phantom.Row(.{ .children = pieces.items })).widget();
         return ctx.newSlice(phantom.Widget, &.{line});
@@ -3783,6 +3981,33 @@ test "the fork command requests the latest completed turn" {
     try std.testing.expect(ui.takeForkRequest() == null);
 }
 
+test "the Providers navigation request is consumed once by the application shell" {
+    const ui = try Ui.init(std.testing.allocator, std.testing.io, host_mod.quiet);
+    defer ui.deinit();
+
+    Ui.onNavigationProviders(ui);
+    try std.testing.expect(ui.takeProvidersRequest());
+    try std.testing.expect(!ui.takeProvidersRequest());
+}
+
+test "the People navigation request is consumed once by the application shell" {
+    const ui = try Ui.init(std.testing.allocator, std.testing.io, host_mod.quiet);
+    defer ui.deinit();
+
+    Ui.onNavigationPeople(ui);
+    try std.testing.expect(ui.takePeopleRequest());
+    try std.testing.expect(!ui.takePeopleRequest());
+}
+
+test "the Sessions navigation request is consumed once by the application shell" {
+    const ui = try Ui.init(std.testing.allocator, std.testing.io, host_mod.quiet);
+    defer ui.deinit();
+
+    Ui.onNavigationSessions(ui);
+    try std.testing.expect(ui.takeSessionsRequest());
+    try std.testing.expect(!ui.takeSessionsRequest());
+}
+
 test "workspace review keeps whole-file and hunk choices separate" {
     const ui = try Ui.init(std.testing.allocator, std.testing.io, host_mod.quiet);
     defer ui.deinit();
@@ -3864,4 +4089,81 @@ test "switching transcripts drops actions from the previous session" {
     ui.clearTranscript();
     try std.testing.expect(!ui.submitted);
     try std.testing.expect(ui.takeForkRequest() == null);
+}
+
+/// Taps the middle of each button in turn and answers which navigation requests
+/// that reached. The rectangles are read again before every tap, because a tap
+/// rebuilds the tree and moves what is under it.
+fn tapsThatReachNavigation(gpa: std.mem.Allocator, ui: *Ui, size: phantom.LogicalSize) !Reached {
+    var calls = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer calls.deinit();
+    const app = try phantom.web.init(
+        gpa,
+        calls.ops(),
+        phantom.Root.of(Ui, Ui.rootOf, ui),
+        size,
+        1.0,
+        .path,
+    );
+    defer app.deinit();
+
+    var reached: Reached = .{};
+    var at: usize = 0;
+    while (at < 64) : (at += 1) {
+        var rects: std.ArrayList(phantom.PhysicalRect) = .empty;
+        defer rects.deinit(gpa);
+        navigationButtons(gpa, app.root, &rects);
+        if (at >= rects.items.len) break;
+        const rect = rects.items[at];
+        app.dispatchTap(rect.x + rect.width * 0.5, rect.y + rect.height * 0.5);
+        if (ui.takeProjectsRequest()) reached.projects = true;
+        if (ui.takeTeamsRequest()) reached.teams = true;
+        if (ui.takePeopleRequest()) reached.people = true;
+        if (ui.takeProvidersRequest()) reached.providers = true;
+    }
+    return reached;
+}
+
+const Reached = struct {
+    projects: bool = false,
+    teams: bool = false,
+    people: bool = false,
+    providers: bool = false,
+};
+
+fn navigationButtons(
+    gpa: std.mem.Allocator,
+    el: *phantom.Element,
+    out: *std.ArrayList(phantom.PhysicalRect),
+) void {
+    if (std.mem.eql(u8, el.type_name, @typeName(phantom.Button))) {
+        if (el.renderObject()) |ro| {
+            if (ro.size.width > 0 and ro.size.height > 0) out.append(gpa, .{
+                .x = ro.origin.x,
+                .y = ro.origin.y,
+                .width = ro.size.width,
+                .height = ro.size.height,
+            }) catch {};
+        }
+    }
+    if (el.child) |child| navigationButtons(gpa, child, out);
+    for (el.children.items) |child| navigationButtons(gpa, child, out);
+}
+
+test "a tap where a navigation button is drawn reaches that button" {
+    const gpa = std.testing.allocator;
+    // A window wide enough for the side panel, and one narrow enough that the
+    // panel is a drawer, because a tap has to find the button in both.
+    for ([_]phantom.LogicalSize{
+        .{ .width = 1280, .height = 800 },
+        .{ .width = 420, .height = 900 },
+    }) |size| {
+        const ui = try Ui.init(gpa, std.testing.io, host_mod.quiet);
+        defer ui.deinit();
+        const reached = try tapsThatReachNavigation(gpa, ui, size);
+        try std.testing.expect(reached.projects);
+        try std.testing.expect(reached.teams);
+        try std.testing.expect(reached.people);
+        try std.testing.expect(reached.providers);
+    }
 }

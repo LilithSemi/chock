@@ -26,17 +26,26 @@ const migrate_cmd = @import("migrate.zig");
 const approve_cmd = @import("approve.zig");
 const doctor_cmd = @import("doctor.zig");
 const askpass_cmd = @import("askpass.zig");
+const worker_cmd = @import("worker.zig");
 const guest_cmd = @import("guest.zig");
 const interrupt = @import("interrupt.zig");
 const tty = @import("tty.zig");
 const ui = @import("ui.zig");
 const command_meta = @import("command_meta.zig");
+const telemetry = @import("chock-telemetry");
 
 pub const session = @import("session.zig");
 
 pub const daemon = @import("daemon.zig");
 
+/// Transport primitives for the client-hosted worker command.
+pub const worker_http = @import("worker_http.zig");
+
 pub const std_options: std.Options = .{ .logFn = ui.logMessage };
+
+/// Preserve Zig's standard panic output while attempting an opt-in OTLP crash
+/// event before the process terminates.
+pub const panic = std.debug.FullPanic(telemetry.panic);
 
 /// What `std.debug` prints a panic or a segfault through. Only the crash
 /// handler differs from the default: the terminal goes back to the shell
@@ -185,6 +194,11 @@ pub const commands = [_]Command{
         .run = serve_cmd.main,
     },
     .{
+        .name = "worker",
+        .summary = "Run a client-hosted daemon session on this machine.",
+        .run = worker_cmd.main,
+    },
+    .{
         .name = "acp",
         .summary = "Speak the agent client protocol, so an editor can drive Chock.",
         .run = acp_cmd.main,
@@ -323,6 +337,10 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, std.fs.path.basename(args[0]), chock_broker.askpass.link_name)) {
         return askpass_cmd.main(init, args[0], args[1..]);
     }
+
+    telemetry.init(init.gpa, init.io, init.environ_map);
+    defer telemetry.deinit();
+    telemetry.event("chock.process.started", .info, &.{});
 
     if (args.len < 2 or namesNoCommand(args[1])) {
         const rest = (try setUpOutput(arena, init.io, init.environ_map, args[1..])) orelse
