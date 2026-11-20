@@ -470,7 +470,7 @@ test "every external action in CI is pinned to an immutable revision" {
     try testing.expectEqualStrings("", wrong.items);
 }
 
-test "release provenance covers archives and their checksum manifest" {
+test "release provenance covers archives, APKs, and their checksum manifest" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -481,6 +481,7 @@ test "release provenance covers archives and their checksum manifest" {
     const subjects =
         \\          subject-path: |
         \\            artifacts/chock-*.tar.gz
+        \\            artifacts/chock-*.apk
         \\            artifacts/SHA256SUMS
     ;
     try testing.expect(std.mem.indexOf(u8, workflow, subjects) != null);

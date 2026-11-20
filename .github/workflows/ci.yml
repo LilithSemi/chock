@@ -165,6 +165,13 @@ jobs:
 
           nix build .#default --print-build-logs
 
+          # Android's SDK and Gradle build are supported by the x86_64 Linux
+          # flake output. Build the APK on that matrix member and let the
+          # aggregate release job publish it beside the desktop archives.
+          if [ "${{ matrix.target }}" = x86_64-linux ]; then
+            nix build .#android --out-link result-android --print-build-logs
+          fi
+
           # A guest is Linux even when its host is macOS. Build its kernel and
           # initrd on each Linux runner and publish them as an optional archive
           # of their own, so a Mac can use the aarch64 images without making
@@ -191,6 +198,16 @@ jobs:
           esac
 
           mkdir -p artifacts
+
+          if [ "${{ matrix.target }}" = x86_64-linux ]; then
+            cp result-android/bin/chock-android-release.apk \
+              "artifacts/chock-${version}-android.apk"
+            if [ "${permanent_name}" = 1 ]; then
+              cp result-android/bin/chock-android-release.apk \
+                artifacts/chock-android.apk
+            fi
+          fi
+
           # **A tarball and not a bare binary.** Apache-2.0 asks that the
           # licence travels with the distribution, and a bare binary carries
           # nothing. A tarball also keeps the executable bit, which a browser
@@ -277,7 +294,14 @@ jobs:
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: chock-${{ matrix.target }}
-          path: artifacts/
+          path: artifacts/*.tar.gz
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        if: matrix.target == 'x86_64-linux'
+        with:
+          name: chock-android
+          path: artifacts/*.apk
           if-no-files-found: error
 
   # **Runs on every event, pull requests included.** The packaging path used to
@@ -330,7 +354,7 @@ jobs:
           # about boundaries, downloaded with nothing to check it against, is
           # the first thing a sceptic points at. Written here, after every
           # platform has arrived, so one file covers them all.
-          ( cd artifacts && sha256sum chock-*.tar.gz > SHA256SUMS )
+          ( cd artifacts && sha256sum chock-*.tar.gz chock-*.apk > SHA256SUMS )
 
           ls -l artifacts
           cat artifacts/SHA256SUMS
@@ -346,6 +370,7 @@ jobs:
         with:
           subject-path: |
             artifacts/chock-*.tar.gz
+            artifacts/chock-*.apk
             artifacts/SHA256SUMS
 
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
