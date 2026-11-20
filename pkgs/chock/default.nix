@@ -188,9 +188,6 @@ stdenv.mkDerivation (finalAttrs: {
     };
   }
   // lib.optionalAttrs useAndroidSdk {
-    # Not a flake output yet. Phantom's gradle project reads the Android Gradle
-    # Plugin from Google's Maven repository, and a nix build has no network, so
-    # this needs a vendored dependency set before a builder can make the APK.
     android = finalAttrs.finalPackage.overrideAttrs (old: {
       pname = "chock-android";
 
@@ -200,6 +197,15 @@ stdenv.mkDerivation (finalAttrs: {
         jdk
       ];
 
+      mitmCache = gradle_8.fetchDeps {
+        pkg = finalAttrs.finalPackage.android;
+        data = ./android-deps.json;
+      };
+      gradleUpdateScript = ''
+        runHook preBuild
+        zig build -Dtarget=aarch64-linux-android --release=safe
+      '';
+
       env = (old.env or { }) // {
         JAVA_HOME = jdk.home;
         ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
@@ -208,8 +214,24 @@ stdenv.mkDerivation (finalAttrs: {
 
       zigBuildFlags = old.zigBuildFlags ++ [ "-Dtarget=aarch64-linux-android" ];
 
+      postConfigure = old.postConfigure + ''
+        # Zig requires a URI scheme, while the Gradle dependency proxy exports
+        # only host:port.
+        if [[ "$http_proxy" != *://* ]]; then
+          export http_proxy="http://$http_proxy"
+          export https_proxy="http://$https_proxy"
+        fi
+      '';
+
       preBuild = ''
+        export ANDROID_USER_HOME="$TMPDIR/android"
+        mkdir -p "$ANDROID_USER_HOME"
         export GRADLE_OPTS="-Dorg.gradle.project.android.aapt2FromMavenOverride=$(echo "$ANDROID_HOME/build-tools/"*/aapt2) ''${GRADLE_OPTS:-}"
+        # Phantom launches Gradle as a child process, so it cannot see the
+        # setup hook's shell function that normally supplies these flags.
+        if [[ -n "''${MITM_CACHE_CA:-}" ]]; then
+          export GRADLE_OPTS="-Dhttp.proxyHost=$MITM_CACHE_HOST -Dhttp.proxyPort=$MITM_CACHE_PORT -Dhttps.proxyHost=$MITM_CACHE_HOST -Dhttps.proxyPort=$MITM_CACHE_PORT -Djavax.net.ssl.trustStore=$MITM_CACHE_KEYSTORE -Djavax.net.ssl.trustStorePassword=$MITM_CACHE_KS_PWD $GRADLE_OPTS"
+        fi
       '';
 
       doCheck = false;

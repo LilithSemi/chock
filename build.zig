@@ -6,6 +6,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const gpu_drivers = b.option([]const u8, "gpu-drivers", "Specific GPU drivers to enable, defaults to Prism's choice.");
+    const version_text = b.option(
+        []const u8,
+        "version",
+        "What this build calls itself, as a semantic version. Defaults to build.zig.zon.",
+    ) orelse @import("build.zig.zon").version;
 
     // A mobile target is the remote interface, not the Chock daemon. Its root
     // receives only the protocol, UI, and remote-client imports; host-only
@@ -51,7 +56,7 @@ pub fn build(b: *std.Build) void {
             .name = .{ .default = "Chock" },
             .summary = .{ .default = "The Chock interface for Android" },
             .android = .{
-                .permissions = &.{.internet},
+                .permissions = &.{ .internet, .network_state, .wifi_state },
                 .uses_cleartext_traffic = true,
             },
             .root = b.path("src/android/main.zig"),
@@ -88,12 +93,6 @@ pub fn build(b: *std.Build) void {
     // the path to hash its contents and refuses a directory. The tests want the
     // string and no dependency on what is in the tree.
     const repo_root = b.pathResolve(&.{ b.root.root_dir.path orelse ".", b.root.sub_path });
-
-    const version_text = b.option(
-        []const u8,
-        "version",
-        "What this build calls itself, as a semantic version. Defaults to build.zig.zon.",
-    ) orelse @import("build.zig.zon").version;
 
     // **The manifest, and never the option.** This value names the directory a
     // packaged plugin is installed into, which is a property of the source

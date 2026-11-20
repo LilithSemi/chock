@@ -110,7 +110,6 @@
           #
           # A Mac takes the optional aarch64 guest archive from a release, or
           # uses a configured Linux builder. See `docs/security/microvm.md`.
-          onLinux = lib.hasSuffix "-linux" system;
           guest = import ./pkgs/chock/guest.nix {
             inherit lib;
             hostPkgs = pkgs;
@@ -120,11 +119,14 @@
         {
           default = pkgs.chock;
         }
-        // lib.optionalAttrs onLinux {
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # The two things a microVM guest boots, each its own derivation. The
           # release workflow puts them in an optional architecture archive.
           guest-kernel = guest.kernel;
           guest-initrd = guest.initrd;
+        }
+        // lib.optionalAttrs (pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isx86_64) {
+          inherit (pkgs.chock) android;
         }
       );
 
