@@ -75,12 +75,10 @@ const Server = struct {
 
         var stream = self.net_server.accept(self.io) catch return false;
         defer stream.close(self.io);
-        const peer = stream.socket.handle;
-
         var buffer: [8192]u8 = undefined;
-        const read = std.posix.read(peer, &buffer) catch return false;
-        if (read == 0) return false;
-        const request = buffer[0..read];
+        var stream_reader = stream.reader(self.io, &buffer);
+        const reader = &stream_reader.interface;
+        const request = readHttpHead(reader) catch return false;
         self.requests += 1;
 
         if (headerIn(request, "authorization: ")) |value| {
@@ -102,8 +100,20 @@ const Server = struct {
             "HTTP/1.1 403 Forbidden\r\n" ++
                 "Content-Length: 0\r\n" ++
                 "Connection: close\r\n\r\n";
-        _ = chock_broker.socket.writeAll(peer, reply);
+        _ = chock_broker.socket.writeAll(stream.socket.handle, reply);
         return true;
+    }
+
+    fn readHttpHead(reader: *std.Io.Reader) ![]u8 {
+        var head: std.Io.Writer.Allocating = .init(testing.allocator);
+        errdefer head.deinit();
+        while (true) {
+            const buffered = try reader.peekGreedy(1);
+            if (buffered.len == 0) return error.EndOfStream;
+            try head.writer.writeAll(buffered);
+            reader.toss(buffered.len);
+            if (std.mem.indexOf(u8, head.written(), "\r\n\r\n") != null) return head.written();
+        }
     }
 
     fn authorizationValue(self: *const Server) []const u8 {
@@ -232,7 +242,11 @@ fn push(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Pushed {
     var looks: usize = 0;
     while (looks < 400) : (looks += 1) {
         _ = server.serve(5);
-        _ = endpoint.step(gpa, io, &locked, asker, 20) catch {};
+        // Poll briefly when idle, but allow the helper time to send its frame
+        // after connecting, especially when the test runner is under load.
+        if (chock_broker.socket.readable(endpoint.server.socket.handle, 20)) {
+            _ = try endpoint.step(gpa, io, &locked, asker, 1000);
+        }
         if (settled) continue;
         const asked = endpoint.answered + endpoint.refused;
         if (server.authorizationValue().len != 0 or (asked >= 1 and endpoint.answered == 0)) {
