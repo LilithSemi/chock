@@ -2454,6 +2454,12 @@ pub fn build(b: *std.Build) void {
         const run_broker_push_tests = b.addRunArtifact(broker_push_tests);
         run_broker_push_tests.skip_foreign_checks = true;
         test_step.dependOn(&run_broker_push_tests.step);
+        module_test_steps.add(
+            b,
+            "test-broker-push",
+            "Run the real git push tests only",
+            &run_broker_push_tests.step,
+        );
     }
 
     // The guest half: what a plugin author imports. It reads the author's own
