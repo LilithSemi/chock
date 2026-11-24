@@ -7913,6 +7913,27 @@ const GitCredentials = struct {
         ));
         try entries.append(gpa, try gpa.dupe(u8, "LC_ALL=C"));
         try entries.append(gpa, try gpa.dupe(u8, "GIT_TERMINAL_PROMPT=0"));
+        if (chock_broker.git_remote.userIn(url)) |carried| {
+            // The workspace fills the first slots, and the count covers them too.
+            const filled = (chock_workspace.maintenance_env.len - 1) / 2;
+            const config = try chock_broker.git_remote.usernameConfigFor(gpa, carried, filled);
+            defer config.deinit(gpa);
+            try entries.append(gpa, try std.fmt.allocPrint(
+                gpa,
+                "{s}={s}",
+                .{ chock_broker.git_remote.config_count_var, config.count },
+            ));
+            try entries.append(gpa, try std.fmt.allocPrint(
+                gpa,
+                "{s}={s}",
+                .{ config.key_var, config.key },
+            ));
+            try entries.append(gpa, try std.fmt.allocPrint(
+                gpa,
+                "{s}={s}",
+                .{ config.value_var, config.value },
+            ));
+        }
         self.env = try entries.toOwnedSlice(gpa);
 
         self.armed_call = try gpa.dupe(u8, call_id);

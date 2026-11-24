@@ -271,6 +271,86 @@ pub fn hostIn(url: []const u8) ?[]const u8 {
     return if (rest.len == 0) null else rest;
 }
 
+/// The user name a URL carries, with the scope it belongs to.
+pub const UrlUser = struct {
+    scheme: []const u8,
+    /// Host and port, which is what `credential.<url>` matches a request on.
+    authority: []const u8,
+    name: []const u8,
+};
+
+pub const config_count_var = "GIT_CONFIG_COUNT";
+
+/// One `credential.<url>.username` setting, in environment form.
+pub const UsernameConfig = struct {
+    /// What `GIT_CONFIG_COUNT` becomes, which covers every slot and not only this one.
+    count: []u8,
+    key_var: []u8,
+    key: []u8,
+    value_var: []u8,
+    value: []const u8,
+
+    pub fn deinit(self: *const UsernameConfig, gpa: std.mem.Allocator) void {
+        gpa.free(self.count);
+        gpa.free(self.key_var);
+        gpa.free(self.key);
+        gpa.free(self.value_var);
+    }
+};
+
+/// git parses the user name out of the URL, drops it when the first challenge
+/// comes back, and then asks for a user name, which the helper refuses. This
+/// setting gives the same name back, for the one host the URL names.
+///
+/// git reads config out of numbered environment slots under one count, so this
+/// takes the slot after the ones the caller filled.
+pub fn usernameConfigFor(
+    gpa: std.mem.Allocator,
+    user: UrlUser,
+    filled_slots: usize,
+) std.mem.Allocator.Error!UsernameConfig {
+    const count = try std.fmt.allocPrint(gpa, "{d}", .{filled_slots + 1});
+    errdefer gpa.free(count);
+
+    const key_var = try std.fmt.allocPrint(gpa, "GIT_CONFIG_KEY_{d}", .{filled_slots});
+    errdefer gpa.free(key_var);
+
+    const key = try std.fmt.allocPrint(
+        gpa,
+        "credential.{s}://{s}.username",
+        .{ user.scheme, user.authority },
+    );
+    errdefer gpa.free(key);
+
+    const value_var = try std.fmt.allocPrint(gpa, "GIT_CONFIG_VALUE_{d}", .{filled_slots});
+
+    return .{
+        .count = count,
+        .key_var = key_var,
+        .key = key,
+        .value_var = value_var,
+        .value = user.name,
+    };
+}
+
+/// Cut the path first, like `hostIn`, or a path can carry a false user name.
+pub fn userIn(url: []const u8) ?UrlUser {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return null;
+    const scheme = url[0..scheme_end];
+    if (scheme.len == 0) return null;
+
+    var rest = url[scheme_end + 3 ..];
+    if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
+
+    const mark = std.mem.lastIndexOfScalar(u8, rest, '@') orelse return null;
+    const name = rest[0..mark];
+    const authority = rest[mark + 1 ..];
+    if (name.len == 0 or authority.len == 0) return null;
+    // A URL that holds its own password asks the helper for nothing.
+    if (std.mem.indexOfScalar(u8, name, ':') != null) return null;
+    return .{ .scheme = scheme, .authority = authority, .name = name };
+}
+
 fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
     return std.ascii.eqlIgnoreCase(haystack[0..needle.len], needle);
@@ -419,4 +499,28 @@ test "the host of a remote is cut in the order that stops a crafted url" {
 
     try testing.expectEqual(@as(?[]const u8, null), hostIn("/srv/p.git"));
     try testing.expectEqual(@as(?[]const u8, null), hostIn("https:///p.git"));
+}
+
+test "the user name a url carries is read, and a path cannot forge one" {
+    const plain = userIn("https://you@git.example.com/p.git").?;
+    try testing.expectEqualStrings("https", plain.scheme);
+    try testing.expectEqualStrings("git.example.com", plain.authority);
+    try testing.expectEqualStrings("you", plain.name);
+
+    const ported = userIn("http://you@127.0.0.1:8080/p.git").?;
+    try testing.expectEqualStrings("127.0.0.1:8080", ported.authority);
+
+    try testing.expectEqual(@as(?UrlUser, null), userIn("https://git.example.com/p.git"));
+    try testing.expectEqual(@as(?UrlUser, null), userIn("https://evil.example/x@github.com"));
+    try testing.expectEqual(@as(?UrlUser, null), userIn("https://you:secret@git.example.com/p.git"));
+    try testing.expectEqual(@as(?UrlUser, null), userIn("https://@git.example.com/p.git"));
+    try testing.expectEqual(@as(?UrlUser, null), userIn("git@example.com:p.git"));
+
+    const config = try usernameConfigFor(testing.allocator, ported, 2);
+    defer config.deinit(testing.allocator);
+    try testing.expectEqualStrings("3", config.count);
+    try testing.expectEqualStrings("GIT_CONFIG_KEY_2", config.key_var);
+    try testing.expectEqualStrings("credential.http://127.0.0.1:8080.username", config.key);
+    try testing.expectEqualStrings("GIT_CONFIG_VALUE_2", config.value_var);
+    try testing.expectEqualStrings("you", config.value);
 }

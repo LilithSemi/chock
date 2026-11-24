@@ -2447,6 +2447,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "chock-broker", .module = chock_broker },
                     .{ .name = "chock-policy", .module = chock_policy },
                     .{ .name = "chock-proto", .module = chock_proto },
+                    .{ .name = "chock-workspace", .module = chock_workspace },
                     .{ .name = "chock_path", .module = chock_path_options.createModule() },
                 },
             }),

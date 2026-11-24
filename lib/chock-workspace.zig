@@ -12,6 +12,7 @@ pub const overlay = @import("chock-workspace/overlay.zig");
 const workspace = @import("chock-workspace/Workspace.zig");
 pub const Workspace = workspace.Workspace;
 pub const KindTag = workspace.KindTag;
+pub const maintenance_env = workspace.maintenance_env;
 
 test {
     @import("std").testing.refAllDecls(@This());

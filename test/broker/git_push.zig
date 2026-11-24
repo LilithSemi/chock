@@ -6,8 +6,10 @@ const std = @import("std");
 const chock_broker = @import("chock-broker");
 const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
+const chock_workspace = @import("chock-workspace");
 
 const askpass = chock_broker.askpass;
+const git_remote = chock_broker.git_remote;
 const table = chock_policy.table;
 const testing = std.testing;
 
@@ -284,6 +286,21 @@ fn push(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Pushed {
     try env.put("GIT_AUTHOR_EMAIL", "chock@example.com");
     try env.put("GIT_COMMITTER_NAME", "chock");
     try env.put("GIT_COMMITTER_EMAIL", "chock@example.com");
+
+    // What a session carries, in the slots a session fills, so a git that drops
+    // the user name out of the URL still asks this test for the password.
+    const maintenance = chock_workspace.maintenance_env;
+    for (maintenance) |entry| {
+        const at = std.mem.indexOfScalar(u8, entry, '=').?;
+        try env.put(entry[0..at], entry[at + 1 ..]);
+    }
+    if (git_remote.userIn(remote)) |carried| {
+        const config = try git_remote.usernameConfigFor(gpa, carried, (maintenance.len - 1) / 2);
+        defer config.deinit(gpa);
+        try env.put(git_remote.config_count_var, config.count);
+        try env.put(config.key_var, config.key);
+        try env.put(config.value_var, config.value);
+    }
 
     try run(gpa, io, repo, &env, &.{ git_path, "init", "-q", "-b", "main" });
     try writeFileAbsolute(io, try joined(gpa, repo, "a"), "one\n");
