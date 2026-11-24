@@ -36,13 +36,65 @@ const Pushed = struct {
     said: []u8,
     log: []u8,
     authorization: []u8,
+    prompt: []u8,
     answered: usize,
     refused: usize,
+    strangers: usize,
+    requests: usize,
 
     fn deinit(self: *Pushed) void {
         self.gpa.free(self.said);
         self.gpa.free(self.log);
         self.gpa.free(self.authorization);
+        self.gpa.free(self.prompt);
+    }
+
+    /// Every test here wants git to ask for the password and for nothing
+    /// else. A bare `expect` on a count leaves nothing to read: which leg of
+    /// the push stopped early is in these numbers and in what git printed.
+    fn expectAsked(self: *const Pushed, answered: usize, refused: usize) !void {
+        if (!std.mem.startsWith(u8, self.prompt, "Password for")) {
+            self.report("the helper was asked for something other than a password");
+            return error.WrongPrompt;
+        }
+        if (self.answered == answered and self.refused == refused) return;
+        self.report("the helper was asked for something else than this test expects");
+        return error.WrongPromptCount;
+    }
+
+    fn expectCredential(self: *const Pushed) !void {
+        if (self.authorization.len != 0) return;
+        self.report("no credential reached the server");
+        return error.NoCredentialArrived;
+    }
+
+    fn report(self: *const Pushed, what: []const u8) void {
+        std.debug.print(
+            \\
+            \\git_push: {s}
+            \\  answered {d}, refused {d}, strangers {d}, requests {d}
+            \\  the prompt the helper sent: {s}
+            \\  git said: {s}
+            \\
+        , .{
+            what,
+            self.answered,
+            self.refused,
+            self.strangers,
+            self.requests,
+            self.prompt,
+            self.said,
+        });
+        if (std.mem.startsWith(u8, self.prompt, "Username for")) {
+            std.debug.print(
+                \\  This git asked for a user name, and the remote URL carries one.
+                \\  git 2.56.0 against curl 8.23.0 does that, and against curl 8.22.0
+                \\  it asks for the password. The helper refuses a user name on
+                \\  purpose, so the push stops at the first question. A git that is
+                \\  given `credential.username` never asks it.
+                \\
+            , .{});
+        }
     }
 };
 
@@ -78,7 +130,7 @@ const Server = struct {
         var buffer: [8192]u8 = undefined;
         var stream_reader = stream.reader(self.io, &buffer);
         const reader = &stream_reader.interface;
-        const request = readHttpHead(reader) catch return false;
+        const request = readHttpHead(reader, stream.socket.handle) catch return false;
         defer testing.allocator.free(request);
         self.requests += 1;
 
@@ -105,10 +157,13 @@ const Server = struct {
         return true;
     }
 
-    fn readHttpHead(reader: *std.Io.Reader) ![]u8 {
+    fn readHttpHead(reader: *std.Io.Reader, handle: std.posix.fd_t) ![]u8 {
         var head: std.Io.Writer.Allocating = .init(testing.allocator);
         errdefer head.deinit();
         while (true) {
+            // Every peek below needs bytes off the socket, so a peer that
+            // connects and then says nothing cannot hold this test.
+            if (!chock_broker.socket.readable(handle, 2000)) return error.NothingSaid;
             const buffered = reader.peekGreedy(4) catch |err| switch (err) {
                 error.EndOfStream => return error.EndOfStream,
                 else => return err,
@@ -231,52 +286,83 @@ fn push(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Pushed {
     try run(gpa, io, repo, &env, &.{ git_path, "add", "a" });
     try run(gpa, io, repo, &env, &.{ git_path, "commit", "-q", "-m", "one" });
 
-    const out_path = try std.fmt.allocPrint(gpa, "{s}/said", .{dir});
-    defer gpa.free(out_path);
-    var said_file = try std.Io.Dir.createFileAbsolute(io, out_path, .{});
-
     const argv = [_][]const u8{ git_path, "push", remote, "HEAD:refs/heads/main" };
     var child = try std.process.spawn(io, .{
         .argv = &argv,
         .cwd = .{ .path = repo },
         .environ_map = &env,
         .stdin = .ignore,
-        .stdout = .{ .file = said_file },
-        .stderr = .{ .file = said_file },
+        .stdout = .pipe,
+        .stderr = .pipe,
     });
 
+    var said: std.Io.Writer.Allocating = .init(gpa);
+    errdefer said.deinit();
+
     // A caller that blocked on `git` would deadlock, since `git` waits on the helper.
-    var settled = false;
-    var looks: usize = 0;
-    while (looks < 400) : (looks += 1) {
+    //
+    // **Both sockets are served until `git` is gone, and not for a fixed
+    // number of turns.** A count is a budget in disguise: a loaded machine
+    // spends longer on the first two requests than the turns allow, the helper
+    // then waits on an endpoint nobody steps, and git gives up with no
+    // password at all. `git` and the helper hold the only other ends of these
+    // two pipes, so the end of both streams is the whole tree leaving. The
+    // deadline ends a run that is wedged, and it says so instead of hanging.
+    const deadline_ms = 120_000;
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    var ended: usize = 0;
+    var out_ended = false;
+    var err_ended = false;
+    while (ended < 2) {
         _ = server.serve(5);
         // Poll briefly when idle, but allow the helper time to send its frame
         // after connecting, especially when the test runner is under load.
         if (chock_broker.socket.readable(endpoint.server.socket.handle, 20)) {
             _ = try endpoint.step(gpa, io, &locked, asker, 1000);
         }
-        if (settled) continue;
-        const asked = endpoint.answered + endpoint.refused;
-        if (server.authorizationValue().len != 0 or (asked >= 1 and endpoint.answered == 0)) {
-            settled = true;
-            looks = 400 - 40;
+        if (!out_ended and try drain(child.stdout.?.handle, &said)) {
+            out_ended = true;
+            ended += 1;
+        }
+        if (!err_ended and try drain(child.stderr.?.handle, &said)) {
+            err_ended = true;
+            ended += 1;
+        }
+        if (ended < 2 and started.untilNow(io).raw.toMilliseconds() > deadline_ms) {
+            child.kill(io);
+            return error.GitNeverFinished;
         }
     }
-    const term = child.wait(io) catch {
-        said_file.close(io);
-        return error.GitNeverFinished;
-    };
+    const term = child.wait(io) catch return error.GitNeverFinished;
     _ = term;
-    said_file.close(io);
 
     return .{
         .gpa = gpa,
-        .said = try std.Io.Dir.readFileAlloc(.cwd(), io, out_path, gpa, .limited(1 << 20)),
+        .said = try said.toOwnedSlice(),
         .log = try gpa.dupe(u8, backing.bytes.items),
         .authorization = try gpa.dupe(u8, server.authorizationValue()),
+        .prompt = try gpa.dupe(u8, firstPrompt(&endpoint)),
         .answered = endpoint.answered,
         .refused = endpoint.refused,
+        .strangers = endpoint.strangers,
+        .requests = server.requests,
     };
+}
+
+/// Takes what one of git's streams holds, and says whether that stream ended.
+fn drain(handle: std.Io.File.Handle, into: *std.Io.Writer.Allocating) !bool {
+    if (!chock_broker.socket.readable(handle, 0)) return false;
+    var scratch: [4096]u8 = undefined;
+    const read = std.posix.read(handle, &scratch) catch return true;
+    if (read == 0) return true;
+    try into.writer.writeAll(scratch[0..read]);
+    return false;
+}
+
+/// What the helper asked for, which says whether it reached the socket at all.
+fn firstPrompt(endpoint: *const askpass.Endpoint) []const u8 {
+    if (endpoint.kept_count == 0) return "";
+    return endpoint.kept[0][0..endpoint.kept_lens[0]];
 }
 
 fn joined(gpa: std.mem.Allocator, dir: []const u8, leaf: []const u8) ![]u8 {
@@ -340,10 +426,8 @@ test "an approved push prompts the person and the typed password reaches git" {
     var pushed = try push(gpa, io, .{});
     defer pushed.deinit();
 
-    try testing.expectEqual(@as(usize, 1), pushed.answered);
-    try testing.expectEqual(@as(usize, 0), pushed.refused);
-
-    try testing.expect(pushed.authorization.len != 0);
+    try pushed.expectAsked(1, 0);
+    try pushed.expectCredential();
     const credential = try decodeBasic(gpa, pushed.authorization);
     defer gpa.free(credential);
     const expected = the_user ++ ":" ++ the_password;
@@ -358,7 +442,7 @@ test "the password a person types is in neither the log nor anything git printed
     var pushed = try push(gpa, io, .{});
     defer pushed.deinit();
 
-    try testing.expect(pushed.authorization.len != 0);
+    try pushed.expectCredential();
 
     try testing.expect(std.mem.indexOf(u8, pushed.log, the_password) == null);
     try testing.expect(std.mem.indexOf(u8, pushed.said, the_password) == null);
@@ -380,8 +464,7 @@ test "a push nobody typed a password for sends no credential at all" {
     var pushed = try push(gpa, io, .{ .typed = "" });
     defer pushed.deinit();
 
-    try testing.expectEqual(@as(usize, 0), pushed.answered);
-    try testing.expectEqual(@as(usize, 1), pushed.refused);
+    try pushed.expectAsked(0, 1);
     try testing.expectEqualStrings("", pushed.authorization);
     try testing.expect(std.mem.indexOf(u8, pushed.log, the_password) == null);
 }
