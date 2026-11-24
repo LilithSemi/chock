@@ -54,47 +54,51 @@ const Pushed = struct {
     /// the push stopped early is in these numbers and in what git printed.
     fn expectAsked(self: *const Pushed, answered: usize, refused: usize) !void {
         if (!std.mem.startsWith(u8, self.prompt, "Password for")) {
-            self.report("the helper was asked for something other than a password");
-            return error.WrongPrompt;
+            return self.report("the helper was asked for something other than a password", answered, refused);
         }
         if (self.answered == answered and self.refused == refused) return;
-        self.report("the helper was asked for something else than this test expects");
-        return error.WrongPromptCount;
+        return self.report("the helper was asked for something else than this test expects", answered, refused);
     }
 
     fn expectCredential(self: *const Pushed) !void {
         if (self.authorization.len != 0) return;
-        self.report("no credential reached the server");
-        return error.NoCredentialArrived;
+        return self.report("no credential reached the server", self.answered, self.refused);
     }
 
-    fn report(self: *const Pushed, what: []const u8) void {
-        std.debug.print(
+    /// The evidence goes through the comparison the framework prints, since no
+    /// source here may name standard error.
+    fn report(self: *const Pushed, what: []const u8, answered: usize, refused: usize) !void {
+        var wanted: std.Io.Writer.Allocating = .init(self.gpa);
+        defer wanted.deinit();
+        try wanted.writer.print(
+            \\git_push: the push asks for the password and goes through
+            \\  the prompt the helper sent: Password for
+            \\  answered {d}, refused {d}
             \\
+        , .{ answered, refused });
+
+        var found: std.Io.Writer.Allocating = .init(self.gpa);
+        defer found.deinit();
+        try found.writer.print(
             \\git_push: {s}
-            \\  answered {d}, refused {d}, strangers {d}, requests {d}
             \\  the prompt the helper sent: {s}
+            \\  answered {d}, refused {d}, strangers {d}, requests {d}
             \\  git said: {s}
             \\
-        , .{
-            what,
-            self.answered,
-            self.refused,
-            self.strangers,
-            self.requests,
-            self.prompt,
-            self.said,
-        });
+        , .{ what, self.prompt, self.answered, self.refused, self.strangers, self.requests, self.said });
         if (std.mem.startsWith(u8, self.prompt, "Username for")) {
-            std.debug.print(
+            try found.writer.writeAll(
                 \\  This git asked for a user name, and the remote URL carries one.
                 \\  git 2.56.0 against curl 8.23.0 does that, and against curl 8.22.0
                 \\  it asks for the password. The helper refuses a user name on
-                \\  purpose, so the push stops at the first question. A git that is
-                \\  given `credential.username` never asks it.
+                \\  purpose, so the push stops at the first question. A session
+                \\  gives git `credential.<url>.username`, which stops the question.
                 \\
-            , .{});
+            );
         }
+
+        try testing.expectEqualStrings(wanted.written(), found.written());
+        return error.PushDidNotAskForThePassword;
     }
 };
 
