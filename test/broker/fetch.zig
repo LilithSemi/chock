@@ -42,6 +42,36 @@ const TestServer = struct {
         return startOnPort(gpa, io, host, 0, routes);
     }
 
+    /// How many ports to ask for before giving up on a pair.
+    const port_tries = 32;
+
+    /// Starts a server whose port its partner can take on another address. The
+    /// kernel picks a port that is free for this address alone, and a busy
+    /// machine can already hold that port on the other one, so this asks again.
+    fn startSharingAPort(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        host: []const u8,
+        routes: []const Route,
+        partner_host: []const u8,
+    ) !*TestServer {
+        var tries: usize = 0;
+        while (tries < port_tries) : (tries += 1) {
+            const self = try start(gpa, io, host, routes);
+            if (portIsFree(io, partner_host, self.port)) return self;
+            self.deinit();
+        }
+        return error.NoPortIsFreeOnBothAddresses;
+    }
+
+    /// The same bind the partner will do, which is the only honest answer here.
+    fn portIsFree(io: std.Io, host: []const u8, port: u16) bool {
+        const address = std.Io.net.IpAddress.parse(host, port) catch return false;
+        var probe = address.listen(io, .{ .reuse_address = true }) catch return false;
+        probe.deinit(io);
+        return true;
+    }
+
     /// Two servers on one port and two addresses, so only the address tells them apart.
     fn startOnPort(
         gpa: std.mem.Allocator,
@@ -75,9 +105,10 @@ const TestServer = struct {
         return std.fmt.bufPrint(buffer, "http://{s}:{d}", .{ self.host, self.port }) catch unreachable;
     }
 
-    /// Ends the serving thread, which is blocked in `accept`, so this sends it a connection.
+    /// Ends the serving thread, which is blocked in `accept`, so this sends it a
+    /// connection. A second call does nothing, since `deinit` ends the thread too.
     fn stop(self: *TestServer) void {
-        self.stopping.store(true, .release);
+        if (self.stopping.swap(true, .acq_rel)) return;
         if (self.address.connect(self.io, .{ .mode = .stream })) |stream| {
             var poke = stream;
             poke.close(self.io);
@@ -85,7 +116,10 @@ const TestServer = struct {
         self.thread.join();
     }
 
+    /// The thread holds the listener and this struct, so it goes first. A test
+    /// that ends early reaches here through its `defer` and never through `stop`.
     fn deinit(self: *TestServer) void {
+        self.stop();
         self.net_server.deinit(self.io);
         for (self.seen.items) |path| self.gpa.free(path);
         self.seen.deinit(self.gpa);
@@ -1121,7 +1155,7 @@ test "the request goes to the address that was checked, and not to the one a sec
         .{ .path = "/robots.txt", .raw = robots },
         .{ .path = "/manual", .raw = page },
     };
-    const checked = try TestServer.start(gpa, io, "127.0.0.2", &checked_routes);
+    const checked = try TestServer.startSharingAPort(gpa, io, "127.0.0.2", &checked_routes, "127.0.0.1");
     defer checked.deinit();
 
     const secret = try okReply(gpa, "the rebound address answered\n");
@@ -1167,7 +1201,7 @@ test "a redirect hop is dialled at the address that was checked as well" {
         .{ .path = "/old", .raw = not_found },
         .{ .path = "/new", .raw = not_found },
     };
-    const rebound = try TestServer.start(gpa, io, "127.0.0.1", &rebound_routes);
+    const rebound = try TestServer.startSharingAPort(gpa, io, "127.0.0.1", &rebound_routes, "127.0.0.2");
     defer rebound.deinit();
     checked_port = rebound.port;
 
